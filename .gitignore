@@ -1,0 +1,21 @@
+# Build trees
+build/
+build-*/
+cmake-build-*/
+
+# Benchmark / test output
+bench-results/*.tmp
+*.wav.out
+
+# Derived model data (regenerated from the vendored core at build time)
+tests/data/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local tooling
+.cache/
+compile_commands.json

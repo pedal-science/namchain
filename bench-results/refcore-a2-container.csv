@@ -1,0 +1,13 @@
+model,quantum,avg_us_2s,rtf,pct_deadline_per_block
+A2.nam(container),32,238407.0,0.1192,11.92
+A2.nam(container),32,240615.0,0.1203,12.03
+A2.nam(container),32,255046.0,0.1275,12.75
+A2.nam(container),64,228228.0,0.1141,11.41
+A2.nam(container),64,215372.0,0.1077,10.77
+A2.nam(container),64,220787.0,0.1104,11.04
+A2.nam(container),128,204604.0,0.1023,10.23
+A2.nam(container),128,200871.0,0.1004,10.04
+A2.nam(container),128,205002.0,0.1025,10.25
+A2.nam(container),256,199095.0,0.0995,9.95
+A2.nam(container),256,199185.0,0.0996,9.96
+A2.nam(container),256,194950.0,0.0975,9.75

@@ -1,0 +1,100 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-x86_64:
+    name: linux-x86_64 (build + unit tests)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DNAMCHAIN_WERROR=ON
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # RealtimeSanitizer flags allocations/locks/syscalls on the render path (plan.md §10.4).
+  # It requires clang >= 20: Ubuntu 24.04's default clang 18 rejects -fsanitize=realtime
+  # with "unsupported argument 'realtime' to option '-fsanitize='".
+  rtsan:
+    name: linux-x86_64 (RealtimeSanitizer, clang-20)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-20
+      - name: Verify the toolchain actually supports RTSan
+        run: |
+          printf 'int main(){return 0;}\n' > /tmp/rtsan-probe.cpp
+          clang++-20 -fsanitize=realtime /tmp/rtsan-probe.cpp -o /tmp/rtsan-probe
+      - name: Configure
+        run: >
+          cmake -S . -B build-rtsan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_COMPILER=clang-20
+          -DCMAKE_CXX_COMPILER=clang++-20
+          -DNAMCHAIN_RTSAN=ON
+      - name: Build
+        run: cmake --build build-rtsan -j"$(nproc)"
+      - name: Test
+        run: ctest --test-dir build-rtsan --output-on-failure
+
+  aarch64-cross:
+    name: aarch64 cross + qemu smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-aarch64-linux-gnu qemu-user-static
+      - name: Configure
+        run: >
+          cmake -S . -B build-aarch64 -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux-gnu.cmake
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build-aarch64 -j"$(nproc)"
+      - name: Smoke test under qemu
+        run: qemu-aarch64-static -L /usr/aarch64-linux-gnu ./build-aarch64/namchain-tests
+
+  armv7-cross:
+    name: armv7 cross (build only)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-arm-linux-gnueabihf
+      - name: Configure
+        run: >
+          cmake -S . -B build-armv7 -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/armv7-linux-gnueabihf.cmake
+          -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build-armv7 -j"$(nproc)"
+
+  # NOTE: the authoritative performance/soak numbers come from a self-hosted bare-metal
+  # Raspberry Pi job (plan.md §1, §10.5), not from a shared cloud runner. It is
+  # deliberately not defined here until the Pi is registered as a runner; numbers
+  # measured under a cloud VM's noisy-neighbour CPU would be meaningless.
