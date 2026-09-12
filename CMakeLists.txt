@@ -93,14 +93,25 @@ file(GLOB NAMC_CORE_SOURCES
 # Third-party code: never let its warnings fail our build.
 set_source_files_properties(${NAMC_CORE_SOURCES} PROPERTIES COMPILE_FLAGS "-w")
 
+# AudioDSPTools' WAV reader. Using the same loader as the core's own `render` tool means the
+# golden comparison compares DSP results rather than two different WAV decoders.
+set(NAMCHAIN_AUDIODSPTOOLS_DIR "${NAMCHAIN_NAM_CORE_DIR}/Dependencies/AudioDSPTools")
+set(NAMCHAIN_AUDIODSPTOOLS_WAV "${NAMCHAIN_AUDIODSPTOOLS_DIR}/dsp/wav.cpp")
+set_source_files_properties(${NAMCHAIN_AUDIODSPTOOLS_WAV} PROPERTIES COMPILE_FLAGS "-w")
+
 add_library(namchain OBJECT
   src/nam/lookback.cpp
+  src/io/wav.cpp
+  src/offline/render.cpp
+  ${NAMCHAIN_AUDIODSPTOOLS_WAV}
   ${NAMC_CORE_SOURCES})
 
 target_include_directories(namchain SYSTEM PUBLIC
   "${NAMCHAIN_NAM_CORE_DIR}"
   "${NAMCHAIN_NAM_CORE_DIR}/Dependencies/eigen"
   "${NAMCHAIN_NAM_CORE_DIR}/Dependencies/nlohmann")
+# Private: the WAV loader is an implementation detail of libnamchain, not part of its surface.
+target_include_directories(namchain PRIVATE "${NAMCHAIN_AUDIODSPTOOLS_DIR}/dsp")
 target_include_directories(namchain PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(namchain PUBLIC cxx_std_20)
 target_compile_options(namchain PRIVATE -Wall -Wextra)
@@ -131,6 +142,14 @@ if(NAMCHAIN_BUILD_TOOLS)
   add_executable(namchain-bench tools/bench/namchain-bench.cpp)
   target_link_libraries(namchain-bench PRIVATE namchain)
   target_compile_options(namchain-bench PRIVATE ${NAMCHAIN_WARN_FLAGS})
+
+  add_executable(namchain-render tools/render/namchain-render.cpp)
+  target_link_libraries(namchain-render PRIVATE namchain)
+  target_compile_options(namchain-render PRIVATE ${NAMCHAIN_WARN_FLAGS})
+
+  add_executable(namchain-wavcmp tools/wavcmp/namchain-wavcmp.cpp)
+  target_link_libraries(namchain-wavcmp PRIVATE namchain)
+  target_compile_options(namchain-wavcmp PRIVATE ${NAMCHAIN_WARN_FLAGS})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -161,17 +180,72 @@ if(NAMCHAIN_BUILD_TESTS)
 
   add_executable(namchain-tests
     tests/test_lookback.cpp
-    tests/test_a2_planar_parity.cpp)
+    tests/test_a2_planar_parity.cpp
+    tests/test_render.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
   target_compile_definitions(namchain-tests PRIVATE
     NAMCHAIN_TEST_DATA_DIR="${_namchain_gen_dir}"
-    NAMCHAIN_EXAMPLE_MODELS_DIR="${NAMCHAIN_NAM_CORE_DIR}/example_models")
+    NAMCHAIN_EXAMPLE_MODELS_DIR="${NAMCHAIN_NAM_CORE_DIR}/example_models"
+    NAMCHAIN_EXAMPLE_AUDIO_DIR="${NAMCHAIN_NAM_CORE_DIR}/example_audio")
   if(NAMCHAIN_REQUIRE_A2_PARITY)
     target_compile_definitions(namchain-tests PRIVATE NAMCHAIN_REQUIRE_A2_PARITY)
   endif()
   add_test(NAME unit COMMAND namchain-tests)
+
+  # -------------------------------------------------------------------------
+  # Golden comparison against the vendored core's own `render` tool (§10.2).
+  #
+  # The reference is built in its own CMake tree because upstream defines no library target
+  # -- its tools compile NAM_SOURCES directly. It is built by a CTest fixture rather than by
+  # the default build, so an ordinary build does not pay for a second full compile of the
+  # core. Skipped when cross-compiling, where we could not run the reference anyway.
+  # -------------------------------------------------------------------------
+  option(NAMCHAIN_BUILD_GOLDEN_REFERENCE "Compare our offline render against the core's render tool" ON)
+  # Measured on the Pi 500 (aarch64, planar kernels active): the difference is exactly 0 --
+  # the two WAVs are byte-identical, despite the reference being built -Ofast and ours -O3,
+  # because with the planar kernels the arithmetic is fixed by NEON intrinsics and does not
+  # move with the optimisation level. The tolerance is kept non-zero because that is a
+  # property of this target/toolchain, not a promise: on a target where A2 runs the Eigen
+  # path (x86), -O3 and -Ofast may legitimately diverge. A tolerance of 1e-4 is ~-66 dBFS
+  # against a signal peaking near 0.19, so it still catches any real pipeline error.
+  set(NAMCHAIN_GOLDEN_TOLERANCE "1e-4" CACHE STRING
+      "Maximum |difference| allowed against the core's render output (see tests/golden)")
+
+  if(NAMCHAIN_BUILD_GOLDEN_REFERENCE AND NOT CMAKE_CROSSCOMPILING AND NAMCHAIN_BUILD_TOOLS)
+    set(_namchain_ref_build "${CMAKE_CURRENT_BINARY_DIR}/namcore-ref")
+    set(_namchain_ref_render "${_namchain_ref_build}/tools/render")
+
+    add_custom_command(
+      OUTPUT "${_namchain_ref_render}"
+      COMMAND ${CMAKE_COMMAND} -S "${NAMCHAIN_NAM_CORE_DIR}" -B "${_namchain_ref_build}"
+              -DCMAKE_BUILD_TYPE=Release
+      COMMAND ${CMAKE_COMMAND} --build "${_namchain_ref_build}" --target render -j
+      DEPENDS "${NAMCHAIN_NAM_CORE_DIR}/tools/render.cpp"
+              "${NAMCHAIN_NAM_CORE_DIR}/NAM/dsp.h"
+      COMMENT "Building the vendored core's render tool (golden reference)"
+      VERBATIM)
+    add_custom_target(namchain-golden-reference DEPENDS "${_namchain_ref_render}")
+
+    add_test(NAME golden_setup
+      COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}" --target namchain-golden-reference)
+    set_tests_properties(golden_setup PROPERTIES FIXTURES_SETUP namchain_golden)
+
+    add_test(NAME golden_a2_lite
+      COMMAND ${CMAKE_COMMAND}
+        -DNAMCHAIN_RENDER=$<TARGET_FILE:namchain-render>
+        -DNAMCHAIN_WAVCMP=$<TARGET_FILE:namchain-wavcmp>
+        -DNAMCHAIN_CORE_RENDER=${_namchain_ref_render}
+        -DNAMCHAIN_MODEL=${_namchain_gen_dir}/A2-Lite.nam
+        -DNAMCHAIN_INPUT=${NAMCHAIN_NAM_CORE_DIR}/example_audio/input.wav
+        -DNAMCHAIN_WORK=${CMAKE_CURRENT_BINARY_DIR}/golden
+        -DNAMCHAIN_TOLERANCE=${NAMCHAIN_GOLDEN_TOLERANCE}
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/golden/run_a2_golden.cmake")
+    set_tests_properties(golden_a2_lite PROPERTIES
+      FIXTURES_REQUIRED namchain_golden
+      DEPENDS unit)
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------

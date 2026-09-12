@@ -705,6 +705,20 @@ level, and note that this is a *GCC-on-AArch64* property — the PR documents th
 the reference itself computes different bits, so the honest claim is "bit-identical wherever the
 reference contracts its own FMAs". A tolerance-based fallback stays for other toolchains.
 
+**Implemented at M0 (`tests/golden/`, `tests/test_render.cpp`).** `namchain-render` renders a `.nam`
+over a WAV and `namchain-wavcmp` compares two WAVs with a tolerance, so the golden test runs our
+renderer and the vendored core's own `render` tool over the same model and input, then compares sample
+by sample. **Measured on the Pi 500: the difference is exactly 0 — the two WAVs are byte-identical**,
+even though the core's tool is built `-Ofast` and ours `-O3`, because with the planar kernels the
+arithmetic is fixed by NEON intrinsics and does not move with the optimisation level. The comparison
+is nevertheless expressed as a tolerance (default `1e-4`, ≈ −66 dBFS against a signal peaking at 0.19)
+because that bit-identity is a property of this target and toolchain rather than a promise — on x86,
+where A2 uses the Eigen path, `-O3` and `-Ofast` may legitimately diverge. Alongside it, the offline
+path is pinned by tests for run-to-run determinism (byte-identical), block-size invariance across
+1/3/32/64/128/256 frames, exact frame accounting (one output frame per input frame), refusal to
+resample a rate mismatch (G11), and error paths for missing/malformed inputs. The core's `render` tool
+is a mono pipeline, so the golden comparison covers the mono path only.
+
 ### 10.3 The glitch detector (the headline test)
 
 `namchain-render` renders a file through a chain while applying a scripted edit timeline at exact
@@ -843,7 +857,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 
 | M | Deliverable | Acceptance |
 |---|---|---|
-| **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with file I/O — not yet started** | Builds green locally (aarch64 native; x86_64 + armv7 cross defined in CI, not yet run); bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; §11 table revised with real numbers ✔ |
+| **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **locally** (aarch64 native; x86_64 + armv7 cross defined in CI, **not yet run — there is no remote**); bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
 | **M1** | `libnamchain` core: RT primitives, arena, command ring, epoch reclamation; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; `alsa_raw` + `pipewire` + `null` + `file` backends; daemon skeleton; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)** | Plays a guitar through 2 chains at 64 samples; 1 h zero xruns; allocation interposer clean; latency measured with `jdelay`; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
