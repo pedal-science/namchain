@@ -647,8 +647,10 @@ AUHAL, workgroups, `QOS_CLASS_USER_INTERACTIVE`, `.measurement` session mode) in
   mismatch, G11). The I/O layer negotiates 48 kHz with the device; if the device can only do 44.1/96
   kHz, a fixed-latency polyphase SRC at the I/O boundary carries the whole graph (one resampler, not
   one per model) and the added latency is reported and compensated.
-- **Quantum = device period**, clamped to [32, 256], fixed for the session. Device period change ⇒
-  recompile off-thread + crossfade; instances are re-`Reset()` on a worker before handoff.
+- **Quantum = device period**, clamped to [32, 256], fixed for the session. **On full-speed USB the
+  practical floor is 48 frames (1 ms)** — see §9.5 — so `alsa_raw` must verify the negotiated period
+  rather than trust the request. Device period change ⇒ recompile off-thread + crossfade; instances
+  are re-`Reset()` on a worker before handoff.
 - Engine algorithmic latency = I/O buffer + any declared node/PDC latency; target 64 samples (1.33 ms)
   at 48 kHz on Pi 5.
 
@@ -681,6 +683,38 @@ Cooler mandatory for always-on low-latency use (G18).
   ARM: for ARMv7 the engine must set FZ explicitly.
 - **Pi 5 / Apple**: FP16 + dot-product available for a later validated fast path (G20); Accelerate on
   Apple behind a build flag, never required.
+
+### 9.5 Reference USB interface — measured capabilities (2026-09-12)
+
+The development interface is a **TI/Burr-Brown PCM2902** (`08bb:2902`, "USB Audio CODEC", card 4) on a
+**full-speed (12 Mbit/s)** bus. Measured from `/proc/asound/card4/stream0`, `--dump-hw-params`, and
+direct playback/capture runs:
+
+| property | value |
+|---|---|
+| playback | S16_LE (also S8/U8), 1–2 ch, RATE 32000/44100/48000, endpoint **ADAPTIVE** |
+| capture | S16_LE (also S8), 1–2 ch, 48000/44100/32000/22050/16000 (+8-bit 8000/11025), endpoint **ASYNC** |
+| period | PERIOD_TIME floor **1000 µs**; PERIOD_SIZE [32–48000] playback, [16–48000] capture |
+| buffer | BUFFER_SIZE [64–96000]; PERIODS [2–1024] |
+| formats | **no float, no 24/32-bit — S16_LE at 48 kHz** |
+| controls | `PCM Playback Volume` (S16, −128…0 dB), `PCM Playback Switch` (**INV_BOOLEAN**) |
+
+Three consequences that change implementation details:
+
+1. **The quantum floor at 48 kHz is 48 frames, not 32.** Full-speed USB services transfers on 1 ms
+   frames, so `PERIOD_TIME ≥ 1000 µs`. Requesting `--period-size=32` **silently yields 48** — verified:
+   the negotiated parameters report `period_size: 48, period_time: 1000`. `alsa_raw` must therefore
+   **read the negotiated `period_size` back** after `SNDRV_PCM_IOCTL_HW_PARAMS` and fail loudly when it
+   differs from the requested quantum: an engine whose quantum silently differs from the device period
+   has a wrong render plan and wrong buffer accounting. It also means **§1 criterion 3 and the §10.3
+   torture render can only be validated at q ≥ 48 on this interface**; q = 32 stays valid for the
+   offline paths, which is precisely why those are specified across 32/64/128/256.
+2. **A float32 engine meets a 16-bit device.** S16_LE conversion belongs at the I/O boundary, and the
+   playback volume control is real (currently near 0 dB) — gain must not be assumed unity.
+3. **Capture is ASYNC with no explicit feedback endpoint**, so the driver derives implicit feedback.
+   The engine should open both directions together, as a full-duplex chain does anyway. Verified
+   working: 10 s of simultaneous capture+playback at 48 kHz / period 64 with no errors, and capture
+   alone for 5 s likewise clean.
 
 ---
 
