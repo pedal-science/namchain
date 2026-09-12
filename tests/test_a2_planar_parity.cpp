@@ -76,15 +76,18 @@ std::vector<NAM_SAMPLE> render(nam::DSP& dsp, const std::vector<NAM_SAMPLE>& inp
 
 TEST_CASE("planar A2 kernels are bit-identical to the reference A2FastModel")
 {
-#if !defined(__OPTIMIZE__)
-  // This build cannot meaningfully exercise the gate. CI sets NAMCHAIN_REQUIRE_A2_PARITY so that
-  // this is a hard failure rather than a quiet skip -- otherwise a mis-configured build type
-  // would silently retire the strongest correctness test we have for the planar kernels.
+#if !defined(NAMCHAIN_A2_PARITY_O3)
+  // Bit-identity is specifically an -O3 property, not merely "an optimised build": at -O2 the
+  // reference A2FastModel contracts its FMAs differently from the explicit-intrinsic planar
+  // kernels, so the comparison fails without either side being wrong (measured on aarch64/GCC 13;
+  // -O0 behaves the same way). CMake defines NAMCHAIN_A2_PARITY_O3 only when the release flags
+  // really are -O3. CI sets NAMCHAIN_REQUIRE_A2_PARITY so a mis-configured build fails loudly
+  // instead of quietly retiring the strongest correctness test we have.
   #if defined(NAMCHAIN_REQUIRE_A2_PARITY)
-  FAIL("the A2 planar parity gate needs an optimised build, but this is an unoptimised one; "
-       "configure a Release build (see this file's header)");
+  FAIL("the A2 planar parity gate is being required on a build that is not -O3, where the "
+       "comparison is not meaningful; configure CMAKE_BUILD_TYPE=Release (see this file's header)");
   #else
-  MESSAGE("skipped: bit-identity is a property of an optimised build; see this file's header");
+  MESSAGE("skipped: the planar bit-identity gate requires -O3; see this file's header");
   #endif
   return;
 #else

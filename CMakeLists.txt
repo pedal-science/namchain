@@ -139,7 +139,16 @@ endif()
 if(NAMCHAIN_SAMPLE_FLOAT)
   target_compile_definitions(namchain PUBLIC NAM_SAMPLE_FLOAT)
 endif()
-if(NAMCHAIN_RT_CHECK)
+# The two instruments cannot both own operator new: a sanitizer runtime installs its own
+# interceptors, which bypass a replacement (observed: allocations uncounted while frees were
+# counted, in the RTSan CI job). RTSan covers allocations itself, so prefer it and drop ours.
+set(_namchain_rt_check ${NAMCHAIN_RT_CHECK})
+if(NAMCHAIN_RTSAN AND _namchain_rt_check)
+  message(STATUS "RTSan is on: allocation interposer disabled (the sanitizer runtime intercepts operator new; RTSan checks allocations itself)")
+  set(_namchain_rt_check OFF)
+endif()
+
+if(_namchain_rt_check)
   target_compile_definitions(namchain PRIVATE NAMCHAIN_RT_CHECK_ENABLED)
 endif()
 
@@ -213,6 +222,19 @@ if(NAMCHAIN_BUILD_TESTS)
     NAMCHAIN_EXAMPLE_AUDIO_DIR="${NAMCHAIN_NAM_CORE_DIR}/example_audio")
   if(NAMCHAIN_REQUIRE_A2_PARITY)
     target_compile_definitions(namchain-tests PRIVATE NAMCHAIN_REQUIRE_A2_PARITY)
+  endif()
+  # The planar bit-identity gate is an -O3 property: at -O2 the reference A2FastModel contracts
+  # its FMAs differently, so the comparison fails even though nothing is wrong with either side.
+  # Measured on aarch64/GCC 13. Gate the test on the actual flag rather than assuming.
+  # Check the flags for the build type actually selected: CMAKE_CXX_FLAGS_RELEASE is populated
+  # whatever the configuration, so testing it directly would enable the gate for a -O2 build too.
+  string(TOUPPER "${CMAKE_BUILD_TYPE}" _namchain_build_type_upper)
+  set(_namchain_opt_flags "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_namchain_build_type_upper}}")
+  if(_namchain_opt_flags MATCHES "-O3")
+    target_compile_definitions(namchain-tests PRIVATE NAMCHAIN_A2_PARITY_O3)
+    message(STATUS "A2 planar parity gate: enabled (-O3 build)")
+  else()
+    message(STATUS "A2 planar parity gate: will self-skip (this build is not -O3)")
   endif()
   add_test(NAME unit COMMAND namchain-tests)
 

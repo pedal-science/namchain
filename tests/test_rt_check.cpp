@@ -79,7 +79,11 @@ ProcessAllocationResult measure_process(const std::string& path, int max_buffer,
 
 TEST_CASE("the allocation interposer is compiled in and starts clean")
 {
-  CHECK(namchain::rt_check_available());
+  if (!namchain::rt_check_available())
+  {
+    MESSAGE("skipped: interposer not compiled in (RTSan builds disable it on purpose)");
+    return;
+  }
   namchain::rt_reset_counters();
   CHECK(namchain::rt_allocation_count() == 0);
   CHECK(namchain::rt_deallocation_count() == 0);
@@ -88,6 +92,13 @@ TEST_CASE("the allocation interposer is compiled in and starts clean")
 
 TEST_CASE("allocations inside the scope are counted and outside are ignored")
 {
+  if (!namchain::rt_check_available())
+  {
+    MESSAGE("skipped: the allocation interposer is not compiled in (RTSan builds disable it; "
+            "the sanitizer runtime owns operator new and checks allocations itself)");
+    return;
+  }
+
   namchain::rt_reset_counters();
 
   // Outside: must not be attributed to the render path.
@@ -118,6 +129,13 @@ TEST_CASE("allocations inside the scope are counted and outside are ignored")
 
 TEST_CASE("render-path scopes nest")
 {
+  if (!namchain::rt_check_available())
+  {
+    MESSAGE("skipped: the allocation interposer is not compiled in (RTSan builds disable it; "
+            "the sanitizer runtime owns operator new and checks allocations itself)");
+    return;
+  }
+
   namchain::rt_reset_counters();
   {
     namchain::RtScope outer;
@@ -133,6 +151,13 @@ TEST_CASE("render-path scopes nest")
 
 TEST_CASE("A2 process() is allocation-free on the render path, including the planar kernels")
 {
+  if (!namchain::rt_check_available())
+  {
+    MESSAGE("skipped: the allocation interposer is not compiled in (RTSan builds disable it; "
+            "the sanitizer runtime owns operator new and checks allocations itself)");
+    return;
+  }
+
   // This is the check that matters for the code we adopted in vendor/patches/0001: upstream's
   // allocation test only ever covered the generic a2_fast path, and the planar NEON kernels are
   // ours. On an AArch64 host the factory routes here, so this exercises them for real.
@@ -147,6 +172,13 @@ TEST_CASE("A2 process() is allocation-free on the render path, including the pla
 
 TEST_CASE("the IR path is allocation-free too")
 {
+  if (!namchain::rt_check_available())
+  {
+    MESSAGE("skipped: the allocation interposer is not compiled in (RTSan builds disable it; "
+            "the sanitizer runtime owns operator new and checks allocations itself)");
+    return;
+  }
+
   const ProcessAllocationResult result = measure_process(model_path("CabIR.nam"), 256, 4);
   CHECK(result.allocations == 0);
   CHECK(result.deallocations == 0);

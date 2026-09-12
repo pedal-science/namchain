@@ -860,6 +860,33 @@ Torture render: 60 s, 500 randomised edits, all node types and transition classe
 `pthread_mutex_lock`/`read`/`write` interposer that aborts when called from the audio thread; a 10⁶-block
 randomised edit storm with the interposer armed; assertion that `frames <= max_quantum` always (G3).
 
+**Implemented at M1 — and the boundary it forced.** `namchain::RtScope` marks the render path, and a
+global `operator new`/`delete` replacement counts allocations and frees observed inside it — see
+`src/rt/rt_check.cpp`, enabled by `-DNAMCHAIN_RT_CHECK=ON` (default) and off for a production daemon.
+Building the instrument *first* settled a question the engine would otherwise have been written around:
+
+> **The rule is about a scope, not a thread.** §3.3 says "no allocation, lock, syscall on the audio
+> thread", but a device loop *must* issue read/write syscalls to move audio at all — read literally the
+> rule is unsatisfiable. It means the engine's **render function**: everything between the backend's
+> read and its write is in scope, and everything the backend does is out of it. That seam is now drawn
+> in code in both soak paths, so the engine gets written into the right shape rather than retrofitted.
+
+Division of labour, because neither instrument covers everything:
+
+| instrument | covers | runs where |
+|---|---|---|
+| `RtScope` + allocation interposer | allocations and frees, in Release, any compiler | the target (GCC/aarch64) **and** CI |
+| RealtimeSanitizer (`clang ≥ 20`) | allocations, **locks and syscalls**, via `[[clang::nonblocking]]` | CI only (clang-only) |
+
+Known limitation, stated rather than implied: interposing `pthread_mutex_lock` or `read`/`write`
+portably would mean preempting libc symbols process-wide, so locks and syscalls are left to RTSan, and
+a raw `malloc` on the render path would also go unseen. Both are reasons the RTSan job stays.
+
+**First result:** `A2-Full`, `A2-Lite` (the adopted planar kernels) and the IR path are
+**allocation-free across buffer sizes 1…256** after `Reset()`, verified on the target. Upstream's own
+allocation test only ever covered the generic `a2_fast` path, so this is the first such check of the
+code vendored in `vendor/patches/0001`.
+
 ### 10.5 Soak, fuzz, and tools
 
 8–24 h soak on bare-metal Pi 5 with periodic edit storms, thermal logging, `vcgencmd get_throttled`,
