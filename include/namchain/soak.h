@@ -32,6 +32,14 @@ struct SoakOptions
   std::string output_wav;
   /// Tolerance passed to the oracle comparison (see namchain::compare_wav_mono).
   double oracle_tolerance = 1e-5;
+
+  /// When non-empty, run against a real ALSA device in passthrough (capture -> playback) instead
+  /// of a model: "hw:4,0", "4,0" or a /dev/snd path. This is the device half of the acceptance
+  /// criterion, and the stage where `driver_xruns` stops being permanently zero.
+  std::string device;
+  unsigned device_channels = 1;
+  unsigned device_periods = 4;
+  unsigned device_sample_rate = 48000;
 };
 
 struct OracleResult
@@ -77,6 +85,15 @@ struct SoakResult
   /// engine fits its deadline, not whether the scheduler is well behaved -- the latter shows up
   /// as driver xruns once a real device is attached.
   double max_lateness_ms = 0.0;
+
+  // ---- device mode only ----
+  bool device_mode = false;
+  unsigned device_period_size = 0;
+  unsigned device_buffer_size = 0;
+  /// False when the device rounded the requested period (e.g. to its 1 ms full-speed USB floor).
+  bool device_period_exact = false;
+  std::string device_capture_node;
+  std::string device_playback_node;
 
   OracleResult oracle;
 };

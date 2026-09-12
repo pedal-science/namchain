@@ -1,0 +1,104 @@
+#pragma once
+
+// Raw ALSA backend: kernel UAPI ioctls on /dev/snd/pcmC*D*p, with no libasound anywhere. This is
+// the appliance backend and the one that matters for latency on a Pi (plan.md §4.3), and it is why
+// xrun detection is a first-class part of the design rather than an add-on: `-EPIPE` and
+// SNDRV_PCM_STATE_XRUN come straight from the ioctls we already issue.
+#if defined(__linux__)
+
+  #include <cstdint>
+  #include <memory>
+  #include <string>
+
+namespace namchain
+{
+
+struct AlsaRawConfig
+{
+  /// "hw:4,0", "4,0", or an explicit "/dev/snd/pcmC4D0c".
+  std::string capture;
+  std::string playback;
+  unsigned sample_rate = 48000;
+  unsigned channels = 1;
+  /// Requested period size in frames. The device period IS the engine quantum (§9.2).
+  unsigned quantum = 64;
+  /// Target buffer length in periods.
+  unsigned periods = 4;
+  /// Refuse to open when the device cannot give exactly `quantum`. This is the guard against
+  /// the silent rounding measured in §9.5 (ask for 32, get 48), which would otherwise leave the
+  /// engine's render plan and buffer accounting describing a period that does not exist.
+  bool require_exact_period = true;
+};
+
+struct AlsaRawInfo
+{
+  unsigned period_size = 0;
+  unsigned buffer_size = 0;
+  unsigned channels = 0;
+  unsigned sample_rate = 0;
+  /// False when the device rounded the requested period (e.g. up to its 1 ms floor).
+  bool period_exact = false;
+  std::string capture_node;
+  std::string playback_node;
+};
+
+/// Full-duplex S16_LE stream. Both directions are opened and configured together because the
+/// PCM2902's capture endpoint is ASYNC with no explicit feedback endpoint, so the driver relies on
+/// implicit feedback from the other direction (§9.5).
+class AlsaRawDuplex
+{
+public:
+  ~AlsaRawDuplex();
+
+  AlsaRawDuplex(const AlsaRawDuplex&) = delete;
+  AlsaRawDuplex& operator=(const AlsaRawDuplex&) = delete;
+
+  /// Open and configure both directions. \return nullptr on failure, with \p error set.
+  static std::unique_ptr<AlsaRawDuplex> open(const AlsaRawConfig& config, std::string& error);
+
+  bool start(std::string& error);
+  void stop();
+
+  /// Wait until capture has a period available, without transferring anything. The engine's
+  /// real-time loop is: wait (untimed) -> read, DSP, write (timed). Measuring from the start of
+  /// the wait would just report the period length.
+  bool wait_capture(int timeout_ms, std::string& error);
+
+  /// Read exactly \p frames into \p dst, waiting up to \p timeout_ms. Returns frames transferred,
+  /// or -1 on error. An xrun is counted, recovered from, and reported through driver_xruns().
+  int read_capture(int16_t* dst, unsigned frames, int timeout_ms, std::string& error);
+
+  /// Write exactly \p frames from \p src.
+  int write_playback(const int16_t* src, unsigned frames, int timeout_ms, std::string& error);
+
+  /// Count of `-EPIPE` conditions. Every one is counted and reported; the engine never silently
+  /// re-prepares (plan.md §10.5.1).
+  uint64_t driver_xruns() const { return driver_xruns_; }
+  /// How many times recovery was performed (one per handled xrun, normally).
+  uint64_t recoveries() const { return recoveries_; }
+
+  const AlsaRawInfo& info() const { return info_; }
+
+private:
+  AlsaRawDuplex() = default;
+
+  bool configure(int fd, const char* direction, std::string& error);
+  void recover(int fd);
+  int transfer(int fd, void* buf, unsigned frames, bool playback, int timeout_ms, std::string& error);
+
+  int capture_fd_ = -1;
+  int playback_fd_ = -1;
+  unsigned quantum_ = 64;
+  unsigned periods_ = 4;
+  unsigned bytes_per_frame_ = 2;
+  AlsaRawInfo info_;
+  uint64_t driver_xruns_ = 0;
+  uint64_t recoveries_ = 0;
+};
+
+/// Resolve "hw:4,0", "4,0" or a "/dev/snd/..." path to a PCM device node.
+bool resolve_pcm_node(const std::string& spec, bool capture, std::string& node, std::string& error);
+
+} // namespace namchain
+
+#endif // __linux__

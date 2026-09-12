@@ -36,6 +36,10 @@ void usage()
                "  --tolerance X        oracle tolerance (default 1e-5)\n"
                "  --max-p99-percent X  gate on p99 block time, %% of deadline (default 50)\n"
                "  --json               print a JSON summary instead of text\n"
+               "device mode (passthrough, no model):\n"
+               "  --device hw:C,D      capture and play back through a real ALSA device\n"
+               "  --channels N         1 or 2 (default 1)\n"
+               "  --periods N          buffer length in periods (default 4)\n"
                "exit: 0 pass, 1 failed a gate, 2 usage/IO error\n",
                NAMCHAIN_VERSION_STRING);
 }
@@ -71,6 +75,12 @@ int main(int argc, char** argv)
       options.oracle_tolerance = std::atof(argv[++i]);
     else if (arg == "--max-p99-percent" && i + 1 < argc)
       max_p99_percent = std::atof(argv[++i]);
+    else if (arg == "--device" && i + 1 < argc)
+      options.device = argv[++i];
+    else if (arg == "--channels" && i + 1 < argc)
+      options.device_channels = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (arg == "--periods" && i + 1 < argc)
+      options.device_periods = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--json")
       json = true;
     else if (arg == "-h" || arg == "--help")
@@ -96,7 +106,7 @@ int main(int argc, char** argv)
     }
   }
 
-  if (model_path.empty() || input_path.empty())
+  if (options.device.empty() && (model_path.empty() || input_path.empty()))
   {
     usage();
     return 2;
@@ -133,6 +143,14 @@ int main(int argc, char** argv)
     j["max_lateness_ms"] = result.max_lateness_ms;
     j["deadline_overruns"] = result.deadline_overruns;
     j["driver_xruns"] = result.driver_xruns;
+    if (result.device_mode)
+    {
+      j["device"] = {{"capture_node", result.device_capture_node},
+                     {"playback_node", result.device_playback_node},
+                     {"period_size", result.device_period_size},
+                     {"buffer_size", result.device_buffer_size},
+                     {"period_exact", result.device_period_exact}};
+    }
     if (result.oracle.checked)
     {
       j["oracle"] = {{"source", result.oracle.source},
@@ -147,7 +165,17 @@ int main(int argc, char** argv)
   }
   else
   {
-    std::printf("model:            %s\n", model_path.c_str());
+    if (result.device_mode)
+    {
+      std::printf("device:           %s -> %s\n", result.device_capture_node.c_str(),
+                  result.device_playback_node.c_str());
+      std::printf("period/buffer:    %u / %u frames%s\n", result.device_period_size, result.device_buffer_size,
+                  result.device_period_exact ? "" : " (rounded by the device)");
+    }
+    else
+    {
+      std::printf("model:            %s\n", model_path.c_str());
+    }
     std::printf("quantum:          %d\n", options.quantum);
     std::printf("pacing:           %s\n", options.realtime_paced ? "wall clock" : "flat out");
     std::printf("blocks:           %llu\n", static_cast<unsigned long long>(result.blocks));
@@ -161,7 +189,7 @@ int main(int argc, char** argv)
     std::printf("max lateness:     %.3f ms\n", result.max_lateness_ms);
     std::printf("deadline overruns:%llu\n", static_cast<unsigned long long>(result.deadline_overruns));
     std::printf("driver xruns:     %llu%s\n", static_cast<unsigned long long>(result.driver_xruns),
-                result.driver_xruns == 0 && result.blocks > 0 ? " (no device backend yet)" : "");
+                (!result.device_mode && result.driver_xruns == 0) ? " (no device backend in this mode)" : "");
     if (result.oracle.checked)
     {
       std::printf("oracle:           %s vs %s\n", result.oracle.match ? "match" : "MISMATCH",

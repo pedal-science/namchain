@@ -16,6 +16,10 @@
 #include "namchain/telemetry.h"
 #include "namchain/wav.h"
 
+#if defined(__linux__)
+  #include "namchain/io/alsa_raw.h"
+#endif
+
 namespace namchain
 {
 namespace
@@ -54,6 +58,88 @@ struct TempFileGuard
   }
 };
 
+#if defined(__linux__)
+/// Device-backed soak: capture a period, (later: run the engine), play it back, and count what the
+/// driver reports. This is the passthrough stage -- no DSP yet -- so it establishes the host's
+/// real-time baseline before any engine complexity exists to confuse the picture.
+SoakResult run_device_soak(const SoakOptions& options)
+{
+  AlsaRawConfig config;
+  config.capture = options.device;
+  config.playback = options.device;
+  config.sample_rate = options.device_sample_rate;
+  config.channels = options.device_channels;
+  config.quantum = options.quantum;
+  config.periods = options.device_periods;
+  config.require_exact_period = true; // §9.5: a silently rounded quantum is not acceptable
+
+  std::string error;
+  std::unique_ptr<AlsaRawDuplex> device = AlsaRawDuplex::open(config, error);
+  if (!device)
+    return fail(error);
+
+  const AlsaRawInfo info = device->info();
+  if (!device->start(error))
+    return fail(error);
+
+  const uint64_t deadline_ns =
+    static_cast<uint64_t>(std::llround(1e9 * static_cast<double>(info.period_size) / static_cast<double>(info.sample_rate)));
+  BlockTimer timer(deadline_ns);
+
+  std::vector<int16_t> buffer(static_cast<size_t>(info.period_size) * info.channels);
+  const uint64_t total_blocks =
+    std::max<uint64_t>(1, static_cast<uint64_t>(options.duration_seconds * info.sample_rate / info.period_size));
+
+  const auto start = Clock::now();
+  for (uint64_t block = 0; block < total_blocks; ++block)
+  {
+    // Wait untimed; time only the work. Measuring from the start of the wait would just report the
+    // period length, which is not what the deadline is about.
+    if (!device->wait_capture(2000, error))
+    {
+      device->stop();
+      return fail(error);
+    }
+
+    const auto t0 = Clock::now();
+    if (device->read_capture(buffer.data(), info.period_size, 1000, error) < 0 ||
+        device->write_playback(buffer.data(), info.period_size, 1000, error) < 0)
+    {
+      device->stop();
+      return fail(error);
+    }
+    const auto t1 = Clock::now();
+    timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+  }
+  const auto end = Clock::now();
+  const uint64_t driver_xruns = device->driver_xruns();
+  device->stop();
+
+  SoakResult result;
+  result.ok = true;
+  result.device_mode = true;
+  result.device_period_size = info.period_size;
+  result.device_buffer_size = info.buffer_size;
+  result.device_period_exact = info.period_exact;
+  result.device_capture_node = info.capture_node;
+  result.device_playback_node = info.playback_node;
+
+  result.blocks = timer.blocks();
+  result.frames = timer.blocks() * info.period_size;
+  result.deadline_overruns = timer.deadline_overruns();
+  result.driver_xruns = driver_xruns;
+  result.deadline_ns = deadline_ns;
+  result.p50_ns = timer.p50_ns();
+  result.p99_ns = timer.p99_ns();
+  result.max_ns = timer.max_ns();
+  result.p99_percent_of_deadline = timer.p99_percent_of_deadline();
+  result.audio_seconds = static_cast<double>(result.frames) / info.sample_rate;
+  result.wall_seconds = std::chrono::duration<double>(end - start).count();
+  result.rtf = result.audio_seconds > 0.0 ? result.wall_seconds / result.audio_seconds : 0.0;
+  return result;
+}
+#endif // __linux__
+
 } // namespace
 
 SoakResult run_soak(const std::string& model_path, const std::string& input_wav_path, const SoakOptions& options)
@@ -62,6 +148,15 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
     return fail("quantum " + std::to_string(options.quantum) + " is out of range [1, 4096]");
   if (options.duration_seconds <= 0.0)
     return fail("duration must be > 0");
+
+  if (!options.device.empty())
+  {
+#if defined(__linux__)
+    return run_device_soak(options);
+#else
+    return fail("device mode requires Linux; this build has no ALSA backend");
+#endif
+  }
 
   const bool want_oracle = options.self_oracle || !options.oracle_wav.empty();
   if (want_oracle && options.duration_seconds > kMaxOracleSeconds)

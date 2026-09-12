@@ -716,6 +716,32 @@ Three consequences that change implementation details:
    working: 10 s of simultaneous capture+playback at 48 kHz / period 64 with no errors, and capture
    alone for 5 s likewise clean.
 
+**Measured passthrough baseline (2026-09-12, `namchain-soak --device hw:4,0`).** With no DSP in the
+path — capture straight to playback through the raw-ioctl backend — the host's I/O cost is:
+
+| quantum | channels | duration | blocks | p50 | p99 | max | p99/deadline | deadline overruns | driver xruns |
+|---|---|---|---|---|---|---|---|---|---|
+| 64 | 1 | **60 s** | 45 000 | 8.7 µs | 11.7 µs | 25.3 µs | 0.88 % | **0** | **0** |
+| 128 | 1 | 20 s | 7 500 | 8.8 µs | 15.2 µs | 24.6 µs | 0.57 % | 0 | 0 |
+| 256 | 1 | 20 s | 3 750 | 9.3 µs | 14.5 µs | 37.4 µs | 0.27 % | 0 | 0 |
+| 64 | 2 | 20 s | 15 000 | 8.7 µs | 11.6 µs | 22.0 µs | 0.87 % | 0 | 0 |
+
+So the I/O layer consumes well under 1 % of the deadline and leaves essentially the whole budget to
+the engine — which is the number the §11 per-model figures were always meant to be spent against.
+The driver itself confirms the floor: HW_REFINE reports `period_size [48..48000]`,
+`period_time [1000..1000000] µs`, so a request for 32 fails loudly rather than being rounded.
+
+**Implementation note worth carrying (cost an afternoon).** `SNDRV_PCM_IOCTL_HW_REFINE` only refines
+the parameters named in `snd_pcm_hw_params::rmask`. Leaving `rmask` at zero returns the input space
+**unchanged** — no error, every bound still reads as "any" — so negotiation appears to work while
+doing nothing, and the failure only surfaces later as an `EINVAL` from `HW_PARAMS` on the sizes that
+were never really constrained. Two smaller ones from the same session: the kernel expects the buffer
+to be a whole multiple of the period (4 × 32 = 128 is not a multiple of the clamped 48), and playback
+must not be `START`ed on an empty ring — it underruns immediately and the `START` ioctl itself returns
+`-EPIPE`. Priming one buffer of silence fixes the latter; the hardware then auto-starts, so an
+explicit `START` may report `EBADFD`, which means "already running" and is checked by state rather
+than assumed.
+
 ---
 
 ## 10. Verification — how "bulletproof" is proven
@@ -962,7 +988,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: RT primitives, arena, command ring, epoch reclamation; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; `alsa_raw` + `pipewire` + `null` + `file` backends; daemon skeleton; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline oracle (§10.5.1)** | Plays a guitar through 2 chains at 64 samples; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, captured output sample-identical to the offline render); allocation interposer clean; true round-trip latency measured with `jdelay` over a physical loopback cable; **parity test green at release flags** |
+| **M1** | `libnamchain` core: RT primitives, arena, command ring, epoch reclamation; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 (§9.5)**; `pipewire` + `null` + `file`; daemon skeleton; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline oracle (§10.5.1)** | Plays a guitar through 2 chains at 64 samples; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, captured output sample-identical to the offline render); allocation interposer clean; true round-trip latency measured with `jdelay` over a physical loopback cable; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |
