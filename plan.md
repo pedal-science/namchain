@@ -708,14 +708,21 @@ reference contracts its own FMAs". A tolerance-based fallback stays for other to
 **Implemented at M0 (`tests/golden/`, `tests/test_render.cpp`).** `namchain-render` renders a `.nam`
 over a WAV and `namchain-wavcmp` compares two WAVs with a tolerance, so the golden test runs our
 renderer and the vendored core's own `render` tool over the same model and input, then compares sample
-by sample. **Measured on the Pi 500: the difference is exactly 0 — the two WAVs are byte-identical**,
-even though the core's tool is built `-Ofast` and ours `-O3`, because with the planar kernels the
-arithmetic is fixed by NEON intrinsics and does not move with the optimisation level. The comparison
-is nevertheless expressed as a tolerance (default `1e-4`, ≈ −66 dBFS against a signal peaking at 0.19)
-because that bit-identity is a property of this target and toolchain rather than a promise — on x86,
-where A2 uses the Eigen path, `-O3` and `-Ofast` may legitimately diverge. Alongside it, the offline
-path is pinned by tests for run-to-run determinism (byte-identical), block-size invariance across
-1/3/32/64/128/256 frames, exact frame accounting (one output frame per input frame), refusal to
+by sample. **Measured, against a reference built `-Ofast` while ours is `-O3`:**
+
+| host / toolchain | max&#124;a−b&#124; |
+|---|---|
+| Cortex-A76, GCC 13 `-O3` | **0** (byte-identical) |
+| Cortex-A76, clang 20 `-O2` + RTSan | **0** (byte-identical) |
+| x86_64, GCC `-O3` | 1.71e-07 (≈ −154 dBFS RMS) |
+
+On AArch64 the planar kernels fix the arithmetic in NEON intrinsics, so the result does not move with
+the compiler *or* the optimisation level — which is a stronger form of the §7.8 bit-identity claim than
+originally established. Only x86 differs, where A2 takes the Eigen path and `-O3` vs `-Ofast`
+legitimately diverges. The tolerance is therefore **1e-5**: ~58× above the only non-zero measurement,
+~−100 dBFS against a signal peaking at 0.19, and far tighter than any real pipeline error. Alongside it,
+the offline path is pinned by tests for run-to-run determinism (byte-identical), block-size invariance
+across 1/3/32/64/128/256 frames, exact frame accounting (one output frame per input frame), refusal to
 resample a rate mismatch (G11), and error paths for missing/malformed inputs. The core's `render` tool
 is a mono pipeline, so the golden comparison covers the mono path only.
 

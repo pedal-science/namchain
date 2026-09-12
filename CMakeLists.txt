@@ -206,14 +206,16 @@ if(NAMCHAIN_BUILD_TESTS)
   # core. Skipped when cross-compiling, where we could not run the reference anyway.
   # -------------------------------------------------------------------------
   option(NAMCHAIN_BUILD_GOLDEN_REFERENCE "Compare our offline render against the core's render tool" ON)
-  # Measured on the Pi 500 (aarch64, planar kernels active): the difference is exactly 0 --
-  # the two WAVs are byte-identical, despite the reference being built -Ofast and ours -O3,
-  # because with the planar kernels the arithmetic is fixed by NEON intrinsics and does not
-  # move with the optimisation level. The tolerance is kept non-zero because that is a
-  # property of this target/toolchain, not a promise: on a target where A2 runs the Eigen
-  # path (x86), -O3 and -Ofast may legitimately diverge. A tolerance of 1e-4 is ~-66 dBFS
-  # against a signal peaking near 0.19, so it still catches any real pipeline error.
-  set(NAMCHAIN_GOLDEN_TOLERANCE "1e-4" CACHE STRING
+  # Measured differences from the core's render tool, which is itself built -Ofast:
+  #   Cortex-A76 / GCC 13 -O3              -> 0        (byte-identical)
+  #   Cortex-A76 / clang 20 -O2 + RTSan    -> 0        (byte-identical)
+  #   x86_64     / GCC -O3                 -> 1.71e-07
+  # On AArch64 the planar kernels fix the arithmetic in NEON intrinsics, so the result does not
+  # move with the compiler or the optimisation level. On x86, A2 takes the Eigen path, where
+  # -O3 and -Ofast legitimately differ. 1e-5 is ~58x above the only non-zero measurement and
+  # ~-100 dBFS against a signal peaking at 0.19 -- far tighter than any real pipeline error
+  # (wrong model, dropped frames, wrong rate) while leaving room for toolchain variation.
+  set(NAMCHAIN_GOLDEN_TOLERANCE "1e-5" CACHE STRING
       "Maximum |difference| allowed against the core's render output (see tests/golden)")
 
   if(NAMCHAIN_BUILD_GOLDEN_REFERENCE AND NOT CMAKE_CROSSCOMPILING AND NAMCHAIN_BUILD_TOOLS)
