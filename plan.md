@@ -278,7 +278,17 @@ rigs/                                             # example chain sets + test si
   `No config parser registered for architecture: WaveNet`. Upstream sidesteps this by compiling
   `NAM_SOURCES` into every tool.
 - Vendored NAM core patched only through `vendor/patches/*.patch` applied at configure time; every
-  patch is upstream-PR-shaped (§7.8). No Eigen `EIGEN_MAX_ALIGN_BYTES=0` hack unless measurement
+  patch is upstream-PR-shaped (§7.8).
+- **Bit-identity constraints from PR #313 (§7.8).** Where the planar kernels are active, the reference
+  `A2FastModel` and the kernels agree bit-for-bit only under conditions we must hold deliberately:
+  `-O3`-class optimisation with FMA contraction enabled, and **no `-ffast-math`** (§3.3 already forbids
+  it on the model path). Two traps: (a) the core's own `render` and `bench_a2_fast` targets are
+  compiled `-Ofast` in Release, so a comparison against *those* binaries is meaningless — a parity or
+  golden comparison must use an `-O3` reference; (b) `-O0` builds break the premise too, which is why
+  the PR's in-tree parity test currently fails (§7.8). Our CI must therefore build the A2 parity test
+  at the same optimisation level as the shipping build, and treat "parity holds at our release flags"
+  as the acceptance criterion rather than "parity holds somewhere". No Eigen
+  `EIGEN_MAX_ALIGN_BYTES=0` hack unless measurement
   demands it (README "Sharp edges"), and a startup self-test that verifies Eigen alignment on the
   target.
 - Cross-compile via toolchain files (aarch64, armv7 hard-float; both committed under
@@ -535,6 +545,23 @@ reports the quality change. Measured breakpoints per model drive the choice.
 `A2-Full` 219.7 → 261.3 ms, `A2.nam` container 220.3 → 265.2 ms, `A2-Lite` 51.1 → 186.3 ms. The
 patches that are actually worth carrying upstream:
 
+0. **PR #313 — planar NEON kernels for the A2 fast path.** *The single largest measured win available,
+   and it is already written.* Authored in-house, base commit == our pin, so it applies to the vendored
+   core as-is. **Independently reproduced on this host** (§11): A2-Full RTF 0.1072 → 0.0501 (**2.14×**)
+   and A2-Lite 0.0262 → 0.0087 (**3.01×**) at q = 64, with 2.00–2.35× / 2.96–3.14× across q = 32…256
+   (`bench-results/pr313-planar-ab.csv`). Output is **bit-identical** to `A2FastModel`, confirmed both
+   by the PR's own harness ("bit-identical over all 192000 frames") and by our A/B build, which loads
+   `A2PlanarFull` instead of `A2FastModel<8>`. Gating: auto-on for `__aarch64__`, and for
+   `__arm__ && __ARM_NEON && __ARM_FEATURE_FMA`; `NAM_DISABLE_A2_PLANAR` opts out; on x86 it compiles
+   to nothing at all. Constraints it imposes on us are spelled out in §4.2 (bit-identity is an `-O3`
+   property and is void under `-ffast-math`), §9.4 (the ARMv7 arm is a **compile-time** gate, which
+   collides with G19's runtime-NEON packaging policy), and §10.2 (it lets the golden test assert
+   bit-exactness instead of a tolerance).
+   **In-tree wiring bug to fix when vendoring:** the parity test lives in `run_tests`, which the core
+   builds with `-O0`; at `-O0` the reference does not contract to FMA, so the test fails on the first
+   sample of the first block size (verified on this host). Rebuilt at `-O3`, the same test passes all
+   14 block sizes including the 1/3/4-frame tails. It needs its own `-O3` target or a per-source
+   `COMPILE_OPTIONS "-O3"` override, otherwise it guards nothing.
 1. `nam::SlimmableWavenet`: implement `GetPrewarmSamples()` from the layer config instead of returning
    0 (`wavenet/slimmable.h:66`), and route A2-shaped submodels through `is_a2_shape()` in its own
    factory (`wavenet/slimmable.cpp:587`). The A2-Lite fast path is **3.6×** faster on this host, so a
@@ -622,7 +649,16 @@ Cooler mandatory for always-on low-latency use (G18).
 - **ARMv7**: 32-bit VA and bandwidth limits (G19) ⇒ resident-model budget is configurable and small by
   default; NEON is runtime-detected for redistributable packages; FMA-less NEON halves FLOPs/cycle, so
   A2-Full counts will be much lower there — the engine should prefer A2-Lite and aggressive slimming
-  on that target.
+  on that target. **Interaction with PR #313 (§7.8):** its ARMv7 arm is a *compile-time* gate requiring
+  `__ARM_NEON && __ARM_FEATURE_FMA`, so our default `-mfpu=vfpv3-d16` cross build compiles the kernels
+  out and gets none of the 1.42–1.55× measured on a Cortex-A17. The FMA requirement is load-bearing,
+  not defensive: without it Eigen picks the non-fused path and `a2_fast`'s own arithmetic changes, so
+  the reference the kernels are compared against no longer exists. That means the ARMv7 win cannot be
+  obtained by runtime-dispatching the kernel alone — it needs a separate `-mfpu=neon-vfpv4` artifact
+  (Pi 2+/Pi 3-class and newer), which is a packaging decision for M6. The PR also documents that
+  ARMv7 bit-identity rests on `FPSCR.FZ` being set (AArch32 NEON is unconditionally flush-to-zero,
+  scalar VFP is not), which corrects §3.3's assumption that denormal handling needs no attention on
+  ARM: for ARMv7 the engine must set FZ explicitly.
 - **Pi 5 / Apple**: FP16 + dot-product available for a later validated fast path (G20); Accelerate on
   Apple behind a build flag, never required.
 
@@ -643,6 +679,15 @@ Per node against references: gain/EQ/delay against analytic responses; `nc.cab.i
 the NAM core's own `tools/render` output (tolerance-based, bit-exactness not assumed because `a2_fast`
 reorders operations). Determinism: repeated renders byte-identical. Quantum-invariance: outputs at
 32/64/128/256 match within tolerance (state-continuity proof).
+
+**Stronger A2 test now available (PR #313, §7.8).** On AArch64 the planar kernels are *bit-identical*
+to `A2FastModel`, so the A2 golden test can assert exact equality (`memcmp`) against a reference
+instance rather than a tolerance, across block sizes including the partial-tile and single-frame tails
+(the PR ships such a test; it covers 1/3/4/7/8/15/16/31/32/33/64/65/128/512 frames and a
+dispatcher check so it cannot pass on dead code). Two conditions: build it at the release optimisation
+level, and note that this is a *GCC-on-AArch64* property — the PR documents that on ARMv7 under clang
+the reference itself computes different bits, so the honest claim is "bit-identical wherever the
+reference contracts its own FMAs". A tolerance-based fallback stays for other toolchains.
 
 ### 10.3 The glitch detector (the headline test)
 
@@ -705,6 +750,33 @@ single-threaded, `-O3`, 2 s of audio × 10 iterations, RTF excludes `Reset()`/pr
 - The container case costs the same as its active submodel, so container overhead is negligible.
 - q = 32 is the worst quantum (12.54 % vs 9.94 % at q = 256) — small blocks hurt, as predicted.
 
+**Same host, same harness, with PR #313's planar NEON kernels** (back-to-back A/B, `NAM_DISABLE_A2_PLANAR`
+as the control; `bench-results/pr313-planar-ab.csv`):
+
+| Model | q | RTF off → on | p99 off → on | speedup | p99 % deadline (on) | instances at 50 % |
+|---|---|---|---|---|---|---|
+| A2-Full | 32 | 0.1186 → 0.0505 | 82.2 → 38.8 µs | **2.35×** | 5.81 % | 8.6 |
+| A2-Full | 64 | 0.1072 → 0.0501 | 147.8 → 74.2 µs | **2.14×** | 5.57 % | 9.0 |
+| A2-Full | 128 | 0.0999 → 0.0494 | 273.0 → 141.1 µs | 2.02× | 5.29 % | 9.5 |
+| A2-Full | 256 | 0.0978 → 0.0490 | 536.3 → 275.6 µs | 2.00× | 5.17 % | 9.7 |
+| A2-Lite | 32 | 0.0272 → 0.0092 | 20.5 → 8.2 µs | 2.96× | 1.23 % | 40.6 |
+| A2-Lite | 64 | 0.0262 → 0.0087 | 37.4 → 13.9 µs | **3.01×** | 1.04 % | 48.1 |
+| A2-Lite | 256 | 0.0251 → 0.0080 | 137.3 → 45.9 µs | 3.14× | 0.86 % | 58.1 |
+
+This reproduces the PR's published Cortex-A76 numbers (2.15× / 3.08× at block 64), and an independent
+third party reproduced >2× on Apple M1 and inside the plugin. Three consequences, all large:
+
+- **§1 criterion 3 stops being the binding constraint.** A2-Full goes from 4 instances at 50 % of the
+  deadline to **9**; A2-Lite from 17 to **48**. The throughput targets should be re-set in M1 rather
+  than left at values chosen when CPU was the limit.
+- **§14 risk 2 (cold-switch cost) largely dissolves.** Warm replay is 6347 samples = 132.2 ms of audio,
+  so a cold A2-Full switch costs `132.2 ms × RTF`: **14.2 ms** on `a2_fast` — at or over the 15 ms
+  `max_defer_ms` budget, which is exactly why it was the top technical risk — versus **6.6 ms** planar,
+  and 1.15 ms for A2-Lite. The `instant` warming policy (§7.5) becomes affordable too: 4 hot A2-Full
+  candidates cost ~20 % of a core instead of ~43 %.
+- **The ceiling is no longer arithmetic.** At ~9 concurrent A2-Full, expect memory bandwidth and I/O to
+  bind rather than FLOPs — which is what the §11 lever list already predicted.
+
 **What the measurements did to the old estimates:**
 - The predicted A2-Full/A2-Lite ratio was 6.7× (from 1.27 / 0.19 GFLOP/s); **measured is 4.1×**
   (0.1075 / 0.0262). The absolute GFLOP/s figures were not validated, and the "~6 GFLOPS effective on
@@ -741,11 +813,13 @@ attached, taken on a bare-metal host with a desktop-class OS (no `threadirqs`, n
 `isolcpus`). They establish the CPU budget, not xrun behaviour. Real-time I/O claims (§1 criterion 3's
 "zero xruns over 1 h") still require a capture-capable interface, which this box lacks (§0).
 
-Levers, in measured order: memory traffic (weight sharing, larger quantums, cache blocking) → A2 fast
-path coverage incl. slimmable submodels (§7.8) → FP16/dot-product kernels on A76/Apple
-(accuracy-validated) → multi-thread parallel rendering. **Parallel rendering is M4 and off by default**,
-because RT-safe worker synchronization is the single largest reliability risk in the design; it is
-admitted only if soak + glitch tests pass with it enabled.
+Levers, in measured order: **planar NEON A2 kernels (PR #313 — 2.0–3.1×, written and verified, §7.8)**
+→ memory traffic (weight sharing, larger quantums, cache blocking) → A2 fast path coverage incl.
+slimmable submodels (§7.8) → FP16/dot-product kernels on A76/Apple (accuracy-validated) →
+multi-thread parallel rendering. **Parallel rendering is M4 and off by default**, because RT-safe
+worker synchronization is the single largest reliability risk in the design; it is admitted only if
+soak + glitch tests pass with it enabled. With PR #313 in place the arithmetic budget roughly doubles,
+so parallel rendering's urgency drops further and the attention belongs on memory bandwidth and I/O.
 
 ---
 
@@ -795,9 +869,14 @@ Critical path to the headline claim is **M0 → M1 → M2 → M3**; M4–M7 add 
    `danger-full-access` file policy, the toolchain is installed, and M0 builds and benchmarks run on
    the host. Residual risk: the host has no usable sandbox backend, so reverting the file policy to
    `workspace-write` disables shell execution entirely (§0).
-2. **Cold-switch cost may exceed the deferral budget** on Pi 5 for A2-Full (132 ms of replay at
-   RTF≈0.2–0.4 ⇒ 26–53 ms of CPU). Mitigation: hot-set warming (§7.5), incremental catch-up, silence
-   skip, `maxmodels` mode, slimming; measured in M0 before the policy is frozen.
+2. **Cold-switch cost may exceed the deferral budget** — *largely resolved by measurement, 2026-09-11.*
+   Replay is 132.2 ms of audio, so the cost is `132.2 ms × RTF`: on `a2_fast` that is **14.2 ms** of
+   CPU for A2-Full, at/over the 15 ms `max_defer_ms` budget — the original risk was real. With PR #313
+   (§7.8) it is **6.6 ms**, and 1.15 ms for A2-Lite, so cold switches fit the deferral budget with
+   room and the `instant` warming policy becomes affordable. Residual: the numbers are for one
+   instance on an idle core; under load with several candidates the token bucket (§7.5) still decides.
+   Mitigations that remain available: hot-set warming, incremental catch-up, silence skip,
+   `maxmodels` mode, slimming.
 3. **Parallel rendering correctness** — largest RT risk. Mitigation: off by default; admitted only on
    soak + glitch passes.
 4. **Upstream drift** — the core is active (commits in Aug 2026). Mitigation: pinned commit + patch set
