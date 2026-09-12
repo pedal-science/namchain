@@ -25,4 +25,28 @@ bool load_wav_mono(const std::string& path, std::vector<float>& samples, double&
 bool save_wav_float32(const std::string& path, const float* interleaved, size_t frames, int channels,
                       double sample_rate, std::string& error);
 
+/// \brief Sample-by-sample difference between two mono WAV files.
+struct WavDiff
+{
+  size_t frames = 0;
+  double max_abs = 0.0;
+  size_t max_abs_index = 0;
+  double rms = 0.0;      ///< RMS of the difference, in linear units.
+  double peak_a = 0.0;   ///< Peak of the first file, for putting \ref rms in context.
+};
+
+enum class WavCompareStatus
+{
+  Match,  ///< Within tolerance.
+  Differs,///< Over tolerance, or a length/rate mismatch.
+  Error   ///< A file could not be read.
+};
+
+/// \brief Compare two mono WAV files.
+///
+/// One implementation shared by `namchain-wavcmp` (golden test) and the soak harness's oracle
+/// check, so the two can never disagree about what "the same audio" means.
+WavCompareStatus compare_wav_mono(const std::string& a_path, const std::string& b_path, double tolerance,
+                                  WavDiff& diff, std::string& error);
+
 } // namespace namchain

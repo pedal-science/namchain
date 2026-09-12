@@ -1,17 +1,15 @@
 // namchain-wavcmp — compare two mono WAV files sample by sample.
 //
-// Written for the M0 golden test (ours vs the vendored core's `render` output) and reused by
-// the M2 glitch detector's oracle comparisons. Reports the maximum absolute difference and
-// the RMS difference in dBFS; exits non-zero when the maximum exceeds the tolerance.
+// Used by the M0 golden test (ours vs the vendored core's `render` output) and available as an
+// oracle comparator elsewhere. Reports the maximum absolute difference and the RMS difference;
+// exits non-zero when the maximum exceeds the tolerance.
 //
 // Usage: namchain-wavcmp [--max-abs X] [--quiet] <a.wav> <b.wav>
-#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <string>
-#include <vector>
 
 #include "namchain/version.h"
 #include "namchain/wav.h"
@@ -85,63 +83,39 @@ int main(int argc, char** argv)
     return 2;
   }
 
-  std::vector<float> a;
-  std::vector<float> b;
-  double a_rate = 0.0;
-  double b_rate = 0.0;
+  namchain::WavDiff diff;
   std::string error;
-  if (!namchain::load_wav_mono(a_path, a, a_rate, error) || !namchain::load_wav_mono(b_path, b, b_rate, error))
+  const namchain::WavCompareStatus status =
+    namchain::compare_wav_mono(a_path, b_path, tolerance, diff, error);
+
+  if (status == namchain::WavCompareStatus::Error)
   {
     std::fprintf(stderr, "error: %s\n", error.c_str());
     return 2;
   }
 
-  if (a.size() != b.size())
-  {
-    std::fprintf(stderr, "error: sample count differs: %zu vs %zu\n", a.size(), b.size());
-    return 1;
-  }
-  if (std::abs(a_rate - b_rate) > 0.5)
-  {
-    std::fprintf(stderr, "error: sample rate differs: %.0f vs %.0f\n", a_rate, b_rate);
-    return 1;
-  }
-
-  double max_abs = 0.0;
-  size_t max_index = 0;
-  double sum_sq = 0.0;
-  double peak = 0.0;
-  for (size_t i = 0; i < a.size(); ++i)
-  {
-    const double d = std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
-    if (d > max_abs)
-    {
-      max_abs = d;
-      max_index = i;
-    }
-    sum_sq += d * d;
-    peak = std::max(peak, std::abs(static_cast<double>(a[i])));
-  }
-
-  const double rms = a.empty() ? 0.0 : std::sqrt(sum_sq / static_cast<double>(a.size()));
-  const double rms_dbfs = rms > 0.0 ? 20.0 * std::log10(rms) : -std::numeric_limits<double>::infinity();
+  const double rms_dbfs = diff.rms > 0.0 ? 20.0 * std::log10(diff.rms) : -std::numeric_limits<double>::infinity();
 
   if (!quiet)
   {
-    std::printf("samples:      %zu\n", a.size());
-    std::printf("rate:         %.0f Hz\n", a_rate);
-    std::printf("peak(a):      %.6f\n", peak);
-    std::printf("max|a-b|:     %.9g (at sample %zu)\n", max_abs, max_index);
-    std::printf("rms(a-b):     %.9g (%.2f dBFS)\n", rms, rms_dbfs);
+    std::printf("samples:      %zu\n", diff.frames);
+    std::printf("peak(a):      %.6f\n", diff.peak_a);
+    std::printf("max|a-b|:     %.9g (at sample %zu)\n", diff.max_abs, diff.max_abs_index);
+    std::printf("rms(a-b):     %.9g (%.2f dBFS)\n", diff.rms, rms_dbfs);
     std::printf("tolerance:    %.9g\n", tolerance);
   }
 
-  if (max_abs > tolerance)
+  if (status == namchain::WavCompareStatus::Differs)
   {
     if (!quiet)
+    {
+      if (!error.empty())
+        std::printf("mismatch:     %s\n", error.c_str());
       std::printf("result:       FAIL\n");
+    }
     return 1;
   }
+
   if (!quiet)
     std::printf("result:       PASS\n");
   return 0;

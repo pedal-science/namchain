@@ -1,5 +1,7 @@
 #include "namchain/wav.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 
@@ -96,6 +98,48 @@ bool save_wav_float32(const std::string& path, const float* interleaved, size_t 
     return false;
   }
   return true;
+}
+
+WavCompareStatus compare_wav_mono(const std::string& a_path, const std::string& b_path, double tolerance,
+                                  WavDiff& diff, std::string& error)
+{
+  diff = WavDiff{};
+
+  std::vector<float> a;
+  std::vector<float> b;
+  double a_rate = 0.0;
+  double b_rate = 0.0;
+  if (!load_wav_mono(a_path, a, a_rate, error) || !load_wav_mono(b_path, b, b_rate, error))
+    return WavCompareStatus::Error;
+
+  if (a.size() != b.size())
+  {
+    error = "sample count differs: " + std::to_string(a.size()) + " vs " + std::to_string(b.size());
+    return WavCompareStatus::Differs;
+  }
+  if (std::abs(a_rate - b_rate) > 0.5)
+  {
+    error = "sample rate differs: " + std::to_string(static_cast<long long>(a_rate)) + " vs " +
+            std::to_string(static_cast<long long>(b_rate));
+    return WavCompareStatus::Differs;
+  }
+
+  double sum_sq = 0.0;
+  for (size_t i = 0; i < a.size(); ++i)
+  {
+    const double d = std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+    if (d > diff.max_abs)
+    {
+      diff.max_abs = d;
+      diff.max_abs_index = i;
+    }
+    sum_sq += d * d;
+    diff.peak_a = std::max(diff.peak_a, std::abs(static_cast<double>(a[i])));
+  }
+  diff.frames = a.size();
+  diff.rms = a.empty() ? 0.0 : std::sqrt(sum_sq / static_cast<double>(a.size()));
+
+  return diff.max_abs > tolerance ? WavCompareStatus::Differs : WavCompareStatus::Match;
 }
 
 } // namespace namchain

@@ -126,9 +126,13 @@ switching genuinely seamless via state-accurate warm starts rather than crossfad
 2. **State-accurate NAM switching.** Warm-started instance output vs. an always-on instance differs
    by < −60 dBFS after the switch point; switch-in produces no discontinuity above the idle-signal
    second-difference bound.
-3. **Throughput (Pi 5, bare metal, 48 kHz, 64-sample quantum).** ≥ 4 concurrent A2-Full (8-channel)
-   **or** ≥ 12 concurrent A2-Lite (3-channel) audible NAM models with p99 block time ≤ 50 % of the
-   1.33 ms deadline and zero xruns over 1 h.
+3. **Throughput and real-time integrity (Pi 5, bare metal, 48 kHz, 64-sample quantum).** ≥ 4 concurrent
+   A2-Full (8-channel) **or** ≥ 12 concurrent A2-Lite (3-channel) audible NAM models, with **all** of:
+   p99 block time ≤ 50 % of the 1.33 ms deadline; max block time < the deadline; **zero driver-reported
+   xruns over 1 h** — `-EPIPE` or `SNDRV_PCM_STATE_XRUN`, counted, never silently recovered from;
+   no thermal throttle flags raised; and the captured output **sample-identical** to the deterministic
+   offline render of the same input. Established from measurements by `namchain-soak`, not by ear: the
+   procedure and the reasoning are in §10.5.
 4. **Resident/switchable set.** ≥ 16 loaded model instances switchable with p99 ready-time ≤ 5 ms and
    zero click; ≥ 64 resident instances where RAM allows (RAM is not the binding constraint;
    **warming CPU is** — §7.5).
@@ -757,6 +761,65 @@ the control-protocol parser (malformed input must produce errors, never crashes/
 tools: `cyclictest`/`rtla timerlat`, `jdelay`/`jack_iodelay` for true round-trip latency, `perf stat`
 for cache/cycles, Instruments + `os_signpost` on Apple.
 
+#### 10.5.1 How "zero xruns" is actually established
+
+**Listening cannot establish it, and is not required.** An xrun is a *timing* failure — the DMA ring
+buffer ran dry (playback) or overflowed (capture) because the app missed a period deadline — and the
+kernel reports it. A single dropped 64-sample period is 1.3 ms and is frequently inaudible, while an
+*audible* click may be our own engine glitching while the driver reports nothing. Human listening is a
+sanity check for "right sound"; it is neither sensitive, reproducible, nor diagnostic.
+
+Three programmatic signals, all of which suit the no-libasound `alsa_raw` design (§4.3) because they
+are plain ioctls:
+
+1. **Return codes.** `readi`/`writei` return `-EPIPE` on xrun (`-ESTRPIPE` on suspend, `-ENODEV` on
+   unplug). **Rule: every one is counted and reported; the engine never silently re-`prepare`s.** A
+   recover-and-continue handler is how hosts end up believing they never xrun.
+2. **PCM state.** `SNDRV_PCM_IOCTL_STATUS` → `state == SNDRV_PCM_STATE_XRUN`. The same state is
+   readable out-of-process from `/proc/asound/card*/pcm*/sub*/status` (`state: RUNNING`, `avail`,
+   `avail_max`), which gives a supervisor that can watch for transitions without being in the audio
+   path. Note this kernel (6.8.0-1064-raspi) exposes **no `xrun_debug` knob** on `snd_pcm`, so
+   app-level detection is the reliable route, not kernel logging.
+3. **Timing margin.** Timestamp every block and report p50/p99/max against the deadline. This is the
+   *proactive* half: if p99 stays far under the deadline, xruns are structurally impossible, and
+   near-misses that never became xruns are still visible. Waiting to observe an xrun proves less and
+   takes longer.
+
+**The stronger test is an oracle, not a counter.** Because the engine is deterministic and A2 measured
+block-size invariant (§10.2), the audio a real-time run produces can be compared sample-for-sample
+against the offline render of the same input. Sample-identical output proves no sample was dropped,
+duplicated or reordered — a *positive* result — and it catches the failures ALSA never sees (model
+switches, transition bugs; the M2 detector's whole premise). Xrun counters validate the host and
+driver; the oracle validates the engine. Both are required.
+
+**The input must not be silent.** Content does not affect the *mechanism*, but it does affect the
+*load*: NAM's silence handling (§7.5) skips work below −80 dBFS and denormal/FTZ behaviour changes
+cost, so a silence-based soak under-loads the CPU and can "pass" where a real signal would xrun. This
+is not hypothetical — the vendored `example_audio/input.wav` is **1 s of digital silence followed by
+1 s of signal**, so a soak that loops it from the top spends half its life on silence. Hence
+`--input-offset`, which starts and loops within the signal.
+
+**Layered, because the device determines what can be concluded:**
+
+| layer | what it proves | what it cannot |
+|---|---|---|
+| `null`/`file` paced run + self-oracle (works today) | engine determinism and CPU margin under a wall-clock schedule; sample-exactness of the block loop | nothing about the driver, DMA clock, or true latency |
+| `snd-aloop` (virtual, loaded on this box) | a real capture/playback API feeding the engine from a file loop; genuine xruns of that device | its periods come from a timer, not hardware; cannot validate the USB stack or round-trip latency |
+| USB interface (bare metal) | the real driver, DMA clock, USB scheduling and IRQ behaviour — the authoritative run | — |
+
+**The authoritative run (no human needed):** 1 h at 48 k/64 counting `-EPIPE`/XRUN with timestamps;
+block-time p50/p99/max against the deadline; true round-trip latency measured with a **physical cable
+from output back to input** using an impulse and cross-correlation (what `jdelay`/`jack_iodelay`
+automate) rather than a stopwatch; `cyclictest`/`rtla timerlat` for host scheduling latency, which
+degrades before xruns appear; `vcgencmd get_throttled`/`measure_temp` for thermals; and the oracle diff
+on the captured output.
+
+**Implemented at M0/M1:** `namchain-soak` runs a bounded soak and applies the criterion as a
+machine-checkable gate (exit 0/1), reporting the evidence as text or `--json`: block percentiles,
+deadline overruns, `driver_xruns` (a first-class field, currently always 0, which the ALSA backend will
+drive), `max_lateness_ms`, and the oracle result. Its `--input-offset` exists specifically so a soak
+runs in the signal rather than in the fixture's silence.
+
 ---
 
 ## 11. Performance — MEASURED on the target host (2026-09-11)
@@ -865,7 +928,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: RT primitives, arena, command ring, epoch reclamation; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; `alsa_raw` + `pipewire` + `null` + `file` backends; daemon skeleton; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)** | Plays a guitar through 2 chains at 64 samples; 1 h zero xruns; allocation interposer clean; latency measured with `jdelay`; **parity test green at release flags** |
+| **M1** | `libnamchain` core: RT primitives, arena, command ring, epoch reclamation; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; `alsa_raw` + `pipewire` + `null` + `file` backends; daemon skeleton; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline oracle (§10.5.1)** | Plays a guitar through 2 chains at 64 samples; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, captured output sample-identical to the offline render); allocation interposer clean; true round-trip latency measured with `jdelay` over a physical loopback cable; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |

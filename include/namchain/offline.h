@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace namchain
@@ -15,6 +16,14 @@ struct OfflineRenderOptions
   bool apply_slim = false;
   /// Slimmable size in [0, 1] when \ref apply_slim is set.
   double slim_size = 1.0;
+  /// Stop after this many frames; 0 means render the whole input.
+  ///
+  /// Exists so an oracle render can be bounded to exactly the frames a soak produced: comparing
+  /// a bounded real-time run against an unbounded offline render would fail on length alone and
+  /// the comparison would silently be about nothing.
+  uint64_t max_frames = 0;
+  /// Skip this many frames before rendering. Lets an oracle render start where a soak started.
+  uint64_t start_frame = 0;
 };
 
 struct OfflineRenderStats

@@ -112,6 +112,8 @@ add_library(namchain OBJECT
   src/nam/lookback.cpp
   src/io/wav.cpp
   src/offline/render.cpp
+  src/rt/telemetry.cpp
+  src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
   ${NAMC_CORE_SOURCES})
 
@@ -153,6 +155,11 @@ if(NAMCHAIN_BUILD_TOOLS)
   add_executable(namchain-wavcmp tools/wavcmp/namchain-wavcmp.cpp)
   target_link_libraries(namchain-wavcmp PRIVATE namchain)
   target_compile_options(namchain-wavcmp PRIVATE ${NAMCHAIN_WARN_FLAGS})
+
+  # The M1 acceptance harness (plan.md §1 criterion 3, §10.5).
+  add_executable(namchain-soak tools/soak/namchain-soak.cpp)
+  target_link_libraries(namchain-soak PRIVATE namchain)
+  target_compile_options(namchain-soak PRIVATE ${NAMCHAIN_WARN_FLAGS})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -184,7 +191,8 @@ if(NAMCHAIN_BUILD_TESTS)
   add_executable(namchain-tests
     tests/test_lookback.cpp
     tests/test_a2_planar_parity.cpp
-    tests/test_render.cpp)
+    tests/test_render.cpp
+    tests/test_soak.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")

@@ -109,12 +109,18 @@ OfflineRenderResult render_model_to_wav(const std::string& model_path, const std
   std::vector<float> interleaved;
   interleaved.reserve(input.size() * static_cast<size_t>(out_channels));
 
-  size_t read_pos = 0;
-  while (read_pos < input.size())
+  const size_t start = std::min<size_t>(static_cast<size_t>(options.start_frame), input.size());
+  const size_t available = input.size() - start;
+  const size_t frames_to_render =
+    options.max_frames == 0 ? available : std::min<size_t>(available, static_cast<size_t>(options.max_frames));
+
+  size_t processed = 0;
+  while (processed < frames_to_render)
   {
-    const int frames = static_cast<int>(std::min<size_t>(static_cast<size_t>(options.quantum), input.size() - read_pos));
+    const int frames = static_cast<int>(
+      std::min<size_t>(static_cast<size_t>(options.quantum), frames_to_render - processed));
     for (int i = 0; i < frames; ++i)
-      in_buffers[0][static_cast<size_t>(i)] = static_cast<NAM_SAMPLE>(input[read_pos + static_cast<size_t>(i)]);
+      in_buffers[0][static_cast<size_t>(i)] = static_cast<NAM_SAMPLE>(input[start + processed + static_cast<size_t>(i)]);
 
     model->process(in_ptrs.data(), out_ptrs.data(), frames);
 
@@ -122,16 +128,16 @@ OfflineRenderResult render_model_to_wav(const std::string& model_path, const std
       for (int ch = 0; ch < out_channels; ++ch)
         interleaved.push_back(static_cast<float>(out_buffers[static_cast<size_t>(ch)][static_cast<size_t>(i)]));
 
-    read_pos += static_cast<size_t>(frames);
+    processed += static_cast<size_t>(frames);
   }
 
   std::string save_error;
-  if (!save_wav_float32(output_wav_path, interleaved.data(), input.size(), out_channels, engine_rate, save_error))
+  if (!save_wav_float32(output_wav_path, interleaved.data(), frames_to_render, out_channels, engine_rate, save_error))
     return fail(save_error);
 
   OfflineRenderResult result;
   result.ok = true;
-  result.stats.frames = static_cast<int>(input.size());
+  result.stats.frames = static_cast<int>(frames_to_render);
   result.stats.input_channels = in_channels;
   result.stats.output_channels = out_channels;
   result.stats.sample_rate = engine_rate;
