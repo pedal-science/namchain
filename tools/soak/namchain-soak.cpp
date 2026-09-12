@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <string>
 
+#include <sound/asound.h>
+
 #include <json.hpp>
 
 #include "namchain/soak.h"
@@ -17,6 +19,17 @@
 
 namespace
 {
+
+const char* format_name(unsigned format)
+{
+  switch (format)
+  {
+  case SNDRV_PCM_FORMAT_S16_LE: return "S16_LE";
+  case SNDRV_PCM_FORMAT_S24_3LE: return "S24_3LE";
+  case SNDRV_PCM_FORMAT_S32_LE: return "S32_LE";
+  default: return "unknown";
+  }
+}
 
 void usage()
 {
@@ -149,7 +162,9 @@ int main(int argc, char** argv)
                      {"playback_node", result.device_playback_node},
                      {"period_size", result.device_period_size},
                      {"buffer_size", result.device_buffer_size},
-                     {"period_exact", result.device_period_exact}};
+                     {"period_exact", result.device_period_exact},
+                     {"sample_format", result.device_sample_format},
+                     {"bytes_per_sample", result.device_bytes_per_sample}};
     }
     if (result.oracle.checked)
     {
@@ -171,6 +186,8 @@ int main(int argc, char** argv)
                   result.device_playback_node.c_str());
       std::printf("period/buffer:    %u / %u frames%s\n", result.device_period_size, result.device_buffer_size,
                   result.device_period_exact ? "" : " (rounded by the device)");
+      std::printf("sample format:    %s (%u bytes/sample)\n", format_name(result.device_sample_format),
+                  result.device_bytes_per_sample);
     }
     else
     {

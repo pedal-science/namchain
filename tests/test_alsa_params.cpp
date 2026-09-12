@@ -32,14 +32,19 @@ TEST_CASE("a fresh parameter space is 'any', with rmask set so the kernel will r
   CHECK_FALSE(namchain::alsa::params_format_is_exactly(params, SNDRV_PCM_FORMAT_S16_LE));
 }
 
-TEST_CASE("narrowing pins channels, rate and S16_LE, leaving sizes free")
+TEST_CASE("narrowing pins channels and rate but deliberately leaves the format open")
 {
   struct snd_pcm_hw_params params;
   namchain::alsa::params_set_any(params);
   namchain::alsa::params_narrow_basics(params, 2, 48000);
 
-  CHECK(namchain::alsa::params_format_is_exactly(params, SNDRV_PCM_FORMAT_S16_LE));
-  CHECK_FALSE(namchain::alsa::params_format_is_exactly(params, SNDRV_PCM_FORMAT_S32_LE));
+  // FORMAT stays wide so HW_REFINE reports what the device really offers; the backend then picks
+  // from that with a preference list. Pinning S16_LE here would make a 24-bit interface look
+  // 16-bit and silently throw away precision.
+  CHECK(namchain::alsa::params_format_available(params, SNDRV_PCM_FORMAT_S16_LE));
+  CHECK(namchain::alsa::params_format_available(params, SNDRV_PCM_FORMAT_S24_3LE));
+  CHECK(namchain::alsa::params_format_available(params, SNDRV_PCM_FORMAT_S32_LE));
+  CHECK_FALSE(namchain::alsa::params_format_is_exactly(params, SNDRV_PCM_FORMAT_S16_LE));
 
   unsigned value = 0;
   REQUIRE(namchain::alsa::params_single_value(params, SNDRV_PCM_HW_PARAM_CHANNELS, value));
@@ -52,6 +57,39 @@ TEST_CASE("narrowing pins channels, rate and S16_LE, leaving sizes free")
   unsigned max = 0;
   REQUIRE(namchain::alsa::params_interval_bounds(params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, min, max));
   CHECK(max == 4294967295u);
+}
+
+TEST_CASE("format preference picks the best the device offers, and fails when none is offered")
+{
+  const unsigned preferred[] = {SNDRV_PCM_FORMAT_S24_3LE, SNDRV_PCM_FORMAT_S32_LE, SNDRV_PCM_FORMAT_S16_LE};
+  const unsigned count = 3;
+  unsigned chosen = 0;
+
+  // A 24-bit interface: the top preference wins.
+  struct snd_pcm_hw_params params;
+  namchain::alsa::params_set_any(params);
+  namchain::alsa::params_set_format(params, SNDRV_PCM_FORMAT_S24_3LE);
+  REQUIRE(namchain::alsa::params_pick_format(params, preferred, count, chosen));
+  CHECK(chosen == SNDRV_PCM_FORMAT_S24_3LE);
+
+  // The PCM2902: only S16_LE, so the list falls through rather than failing.
+  namchain::alsa::params_set_any(params);
+  namchain::alsa::params_set_format(params, SNDRV_PCM_FORMAT_S16_LE);
+  REQUIRE(namchain::alsa::params_pick_format(params, preferred, count, chosen));
+  CHECK(chosen == SNDRV_PCM_FORMAT_S16_LE);
+
+  // A device offering only something we do not support must be refused, not coerced.
+  namchain::alsa::params_set_any(params);
+  namchain::alsa::params_set_format(params, SNDRV_PCM_FORMAT_FLOAT_LE);
+  CHECK_FALSE(namchain::alsa::params_pick_format(params, preferred, count, chosen));
+}
+
+TEST_CASE("bytes per sample treats S24_3LE as packed, not padded")
+{
+  CHECK(namchain::alsa::bytes_per_sample(SNDRV_PCM_FORMAT_S16_LE) == 2u);
+  CHECK(namchain::alsa::bytes_per_sample(SNDRV_PCM_FORMAT_S24_3LE) == 3u);
+  CHECK(namchain::alsa::bytes_per_sample(SNDRV_PCM_FORMAT_S32_LE) == 4u);
+  CHECK(namchain::alsa::bytes_per_sample(SNDRV_PCM_FORMAT_FLOAT_LE) == 0u);
 }
 
 TEST_CASE("interval pinning and single-value readback round-trip")

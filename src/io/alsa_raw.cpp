@@ -88,7 +88,7 @@ std::unique_ptr<AlsaRawDuplex> AlsaRawDuplex::open(const AlsaRawConfig& config, 
   std::unique_ptr<AlsaRawDuplex> self(new AlsaRawDuplex());
   self->quantum_ = config.quantum;
   self->periods_ = config.periods == 0 ? 4 : config.periods;
-  self->bytes_per_frame_ = config.channels * 2; // S16_LE
+  self->format_preference_ = config.format_preference;
   self->info_.channels = config.channels;
   self->info_.sample_rate = config.sample_rate;
 
@@ -147,11 +147,23 @@ bool AlsaRawDuplex::configure(int fd, const char* direction, std::string& error)
     return false;
   }
 
-  if (!alsa::params_format_is_exactly(params, SNDRV_PCM_FORMAT_S16_LE))
+  // Pick the best format the device actually offers, rather than demanding one. FORMAT was left
+  // as "any" by params_narrow_basics precisely so that refine reports the device's real list here.
+  unsigned chosen_format = 0;
+  if (!alsa::params_pick_format(params, format_preference_.data(),
+                                static_cast<unsigned>(format_preference_.size()), chosen_format))
   {
-    error = "device does not accept S16_LE exclusively";
+    error = std::string(direction) +
+            ": device offers none of the requested sample formats (S24_3LE, S32_LE, S16_LE)";
     return false;
   }
+  const unsigned format_width = alsa::bytes_per_sample(chosen_format);
+  if (format_width == 0)
+  {
+    error = std::string(direction) + ": unsupported sample format " + std::to_string(chosen_format);
+    return false;
+  }
+  alsa::params_set_format(params, chosen_format);
 
   unsigned period_min = 0;
   unsigned period_max = 0;
@@ -235,7 +247,17 @@ bool AlsaRawDuplex::configure(int fd, const char* direction, std::string& error)
   {
     info_.period_size = actual_period;
     info_.buffer_size = actual_buffer;
+    info_.sample_format = chosen_format;
+    info_.bytes_per_sample = format_width;
     info_.period_exact = (actual_period == quantum_);
+    bytes_per_frame_ = info_.channels * format_width;
+  }
+  else if (info_.sample_format != chosen_format)
+  {
+    error = std::string(direction) + " agreed sample format " + std::to_string(chosen_format) +
+            " but the other direction agreed " + std::to_string(info_.sample_format) +
+            "; both directions must agree";
+    return false;
   }
   else if (info_.period_size != actual_period || info_.buffer_size != actual_buffer)
   {

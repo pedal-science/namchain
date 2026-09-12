@@ -8,7 +8,9 @@
 
   #include <cstdint>
   #include <memory>
+  #include <sound/asound.h>
   #include <string>
+  #include <vector>
 
 namespace namchain
 {
@@ -28,6 +30,12 @@ struct AlsaRawConfig
   /// the silent rounding measured in §9.5 (ask for 32, get 48), which would otherwise leave the
   /// engine's render plan and buffer accounting describing a period that does not exist.
   bool require_exact_period = true;
+  /// Sample formats to try, most preferred first (SNDRV_PCM_FORMAT_* values). The default asks for
+  /// 24-bit packing before 16-bit: the engine is float32 internally, and 16-bit at the boundary
+  /// puts a floor near -96 dBFS uncomfortably close to the -60 dBFS state-continuity target (§1).
+  /// The PCM2902 offers only S16_LE and falls through; 24-bit interfaces use the top entry.
+  std::vector<unsigned> format_preference{SNDRV_PCM_FORMAT_S24_3LE, SNDRV_PCM_FORMAT_S32_LE,
+                                          SNDRV_PCM_FORMAT_S16_LE};
 };
 
 struct AlsaRawInfo
@@ -36,13 +44,16 @@ struct AlsaRawInfo
   unsigned buffer_size = 0;
   unsigned channels = 0;
   unsigned sample_rate = 0;
+  /// The SNDRV_PCM_FORMAT_* the device agreed to, and its width in bytes.
+  unsigned sample_format = 0;
+  unsigned bytes_per_sample = 0;
   /// False when the device rounded the requested period (e.g. up to its 1 ms floor).
   bool period_exact = false;
   std::string capture_node;
   std::string playback_node;
 };
 
-/// Full-duplex S16_LE stream. Both directions are opened and configured together because the
+/// Full-duplex PCM stream. Both directions are opened and configured together because the
 /// PCM2902's capture endpoint is ASYNC with no explicit feedback endpoint, so the driver relies on
 /// implicit feedback from the other direction (§9.5).
 class AlsaRawDuplex
@@ -90,6 +101,7 @@ private:
   int playback_fd_ = -1;
   unsigned quantum_ = 64;
   unsigned periods_ = 4;
+  std::vector<unsigned> format_preference_;
   unsigned bytes_per_frame_ = 2;
   AlsaRawInfo info_;
   uint64_t driver_xruns_ = 0;

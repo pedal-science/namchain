@@ -108,16 +108,22 @@ void params_narrow_basics(struct snd_pcm_hw_params& params, unsigned channels, u
   mask_clear(*access);
   mask_add(*access, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
 
-  struct snd_mask* format = mask_of(params, SNDRV_PCM_HW_PARAM_FORMAT);
-  mask_clear(*format);
-  mask_add(*format, SNDRV_PCM_FORMAT_S16_LE);
-
+  // FORMAT is deliberately left as "any" so that HW_REFINE reports what the device actually
+  // offers; configure() then picks from that with a preference list. Pinning S16_LE here would
+  // make 24-bit interfaces look like 16-bit ones.
   struct snd_mask* subformat = mask_of(params, SNDRV_PCM_HW_PARAM_SUBFORMAT);
   mask_clear(*subformat);
   mask_add(*subformat, SNDRV_PCM_SUBFORMAT_STD);
 
   interval_pin(*interval_of(params, SNDRV_PCM_HW_PARAM_CHANNELS), channels);
   interval_pin(*interval_of(params, SNDRV_PCM_HW_PARAM_RATE), sample_rate);
+}
+
+void params_set_format(struct snd_pcm_hw_params& params, unsigned format)
+{
+  struct snd_mask* mask = mask_of(params, SNDRV_PCM_HW_PARAM_FORMAT);
+  mask_clear(*mask);
+  mask_add(*mask, format);
 }
 
 bool params_interval_bounds(const struct snd_pcm_hw_params& params, unsigned param, unsigned& min,
@@ -141,6 +147,37 @@ void params_set_interval(struct snd_pcm_hw_params& params, unsigned param, unsig
 bool params_format_is_exactly(const struct snd_pcm_hw_params& params, unsigned format)
 {
   return mask_is_single(*mask_of(params, SNDRV_PCM_HW_PARAM_FORMAT), format);
+}
+
+bool params_format_available(const struct snd_pcm_hw_params& params, unsigned format)
+{
+  const struct snd_mask& mask = *mask_of(params, SNDRV_PCM_HW_PARAM_FORMAT);
+  return (mask.bits[format / 32] >> (format % 32)) & 1u;
+}
+
+bool params_pick_format(const struct snd_pcm_hw_params& params, const unsigned* preferred, unsigned count,
+                        unsigned& chosen)
+{
+  for (unsigned i = 0; i < count; ++i)
+  {
+    if (params_format_available(params, preferred[i]))
+    {
+      chosen = preferred[i];
+      return true;
+    }
+  }
+  return false;
+}
+
+unsigned bytes_per_sample(unsigned format)
+{
+  switch (format)
+  {
+  case SNDRV_PCM_FORMAT_S16_LE: return 2;
+  case SNDRV_PCM_FORMAT_S24_3LE: return 3; // packed 3-byte, not padded to 4
+  case SNDRV_PCM_FORMAT_S32_LE: return 4;
+  default: return 0;
+  }
 }
 
 bool params_single_value(const struct snd_pcm_hw_params& params, unsigned param, unsigned& value)

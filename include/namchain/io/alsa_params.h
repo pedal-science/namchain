@@ -32,8 +32,22 @@ bool params_interval_bounds(const struct snd_pcm_hw_params& params, unsigned par
 /// Pin an interval parameter to a single value.
 void params_set_interval(struct snd_pcm_hw_params& params, unsigned param, unsigned value);
 
+/// Pin the format mask to exactly one value.
+void params_set_format(struct snd_pcm_hw_params& params, unsigned format);
+
 /// True when exactly `format` is permitted (and nothing else).
 bool params_format_is_exactly(const struct snd_pcm_hw_params& params, unsigned format);
+
+/// True when `format` is permitted at all.
+bool params_format_available(const struct snd_pcm_hw_params& params, unsigned format);
+
+/// Pick the first of `preferred` (in order) that the device offers.
+/// \return false when none of them is available, leaving \p chosen untouched.
+bool params_pick_format(const struct snd_pcm_hw_params& params, const unsigned* preferred, unsigned count,
+                        unsigned& chosen);
+
+/// Bytes per sample for a SNDRV_PCM_FORMAT_* value we support; 0 if unknown.
+unsigned bytes_per_sample(unsigned format);
 
 /// Read back a single-valued interval parameter. Returns false if it is not exactly one value.
 bool params_single_value(const struct snd_pcm_hw_params& params, unsigned param, unsigned& value);

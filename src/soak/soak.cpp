@@ -120,6 +120,8 @@ SoakResult run_device_soak(const SoakOptions& options)
   result.device_mode = true;
   result.device_period_size = info.period_size;
   result.device_buffer_size = info.buffer_size;
+  result.device_sample_format = info.sample_format;
+  result.device_bytes_per_sample = info.bytes_per_sample;
   result.device_period_exact = info.period_exact;
   result.device_capture_node = info.capture_node;
   result.device_playback_node = info.playback_node;

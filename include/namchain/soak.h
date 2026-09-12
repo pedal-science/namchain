@@ -90,6 +90,8 @@ struct SoakResult
   bool device_mode = false;
   unsigned device_period_size = 0;
   unsigned device_buffer_size = 0;
+  unsigned device_sample_format = 0;   ///< SNDRV_PCM_FORMAT_* the device agreed to
+  unsigned device_bytes_per_sample = 0;
   /// False when the device rounded the requested period (e.g. to its 1 ms full-speed USB floor).
   bool device_period_exact = false;
   std::string device_capture_node;
