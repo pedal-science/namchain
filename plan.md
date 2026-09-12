@@ -1,7 +1,7 @@
 # namchain — a glitch-free, headless NAM signal-chain engine
 
-**Status:** approved and in progress. Phase 0 is done and M0 has started (§0, §12) — see §11 for the
-first *measured* numbers, which replace the previous estimates.
+**Status:** approved and in progress. **Phase 0 and M0 are complete** — the repo builds green in CI on
+all four jobs (§12) and §11 now carries *measured* numbers rather than estimates. M1 is next.
 **Author:** planning session (research grounded in the sources cited in §2 and §16), resumed for
 implementation.
 **Updated:** 2026-09-11, after the DSH environment was repaired and verified on the target host.
@@ -857,7 +857,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 
 | M | Deliverable | Acceptance |
 |---|---|---|
-| **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **locally** (aarch64 native; x86_64 + armv7 cross defined in CI, **not yet run — there is no remote**); bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
+| **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
 | **M1** | `libnamchain` core: RT primitives, arena, command ring, epoch reclamation; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; `alsa_raw` + `pipewire` + `null` + `file` backends; daemon skeleton; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)** | Plays a guitar through 2 chains at 64 samples; 1 h zero xruns; allocation interposer clean; latency measured with `jdelay`; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |

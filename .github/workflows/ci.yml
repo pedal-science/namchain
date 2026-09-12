@@ -25,6 +25,12 @@ jobs:
         run: cmake --build build -j"$(nproc)"
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Golden comparison numbers
+        # Recorded verbosely because ctest hides the output of a passing test. The measured
+        # max|diff| is what tells us whether NAMCHAIN_GOLDEN_TOLERANCE is still meaningful:
+        # on AArch64 (planar kernels) it is 0, and this is the only place the x86_64 value
+        # (Eigen path) is visible.
+        run: ctest --test-dir build -R golden_a2_lite -V
 
   # RealtimeSanitizer flags allocations/locks/syscalls on the render path (plan.md §10.4).
   # It requires clang >= 20: Ubuntu 24.04's default clang 18 rejects -fsanitize=realtime
