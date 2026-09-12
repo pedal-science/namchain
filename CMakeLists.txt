@@ -25,6 +25,9 @@ option(NAMCHAIN_A2_FAST "Enable the NAM A2 fast path (A2-Full/A2-Lite)" ON)
 option(NAMCHAIN_APPLY_VENDOR_PATCHES "Apply vendor/patches/*.patch to the vendored NAM core" ON)
 option(NAMCHAIN_REQUIRE_A2_PARITY "Fail instead of skip the A2 planar bit-identity test when the build is unoptimised" OFF)
 option(NAMCHAIN_RTSAN "Build with RealtimeSanitizer (needs clang >= 20)" OFF)
+# Render-path allocation interposer (§10.4). Works on GCC/aarch64 where RTSan cannot, but it
+# replaces global operator new/delete, so a production daemon builds with this OFF.
+option(NAMCHAIN_RT_CHECK "Compile the render-path allocation interposer" ON)
 option(NAMCHAIN_WERROR "Treat warnings as errors" OFF)
 
 set(NAMCHAIN_NAM_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/NeuralAmpModelerCore"
@@ -115,6 +118,7 @@ add_library(namchain OBJECT
   src/io/alsa_raw.cpp
   src/offline/render.cpp
   src/rt/telemetry.cpp
+  src/rt/rt_check.cpp
   src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
   ${NAMC_CORE_SOURCES})
@@ -134,6 +138,9 @@ if(NAMCHAIN_A2_FAST)
 endif()
 if(NAMCHAIN_SAMPLE_FLOAT)
   target_compile_definitions(namchain PUBLIC NAM_SAMPLE_FLOAT)
+endif()
+if(NAMCHAIN_RT_CHECK)
+  target_compile_definitions(namchain PRIVATE NAMCHAIN_RT_CHECK_ENABLED)
 endif()
 
 if(NAMCHAIN_RTSAN)
@@ -195,7 +202,8 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_a2_planar_parity.cpp
     tests/test_render.cpp
     tests/test_soak.cpp
-    tests/test_alsa_params.cpp)
+    tests/test_alsa_params.cpp
+    tests/test_rt_check.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")

@@ -13,6 +13,7 @@
 #include "NAM/get_dsp.h"
 
 #include "namchain/offline.h"
+#include "namchain/rt_check.h"
 #include "namchain/telemetry.h"
 #include "namchain/wav.h"
 
@@ -94,6 +95,7 @@ SoakResult run_device_soak(const SoakOptions& options)
   const uint64_t total_blocks =
     std::max<uint64_t>(1, static_cast<uint64_t>(options.duration_seconds * info.sample_rate / info.period_size));
 
+  rt_reset_counters();
   const auto start = Clock::now();
   for (uint64_t block = 0; block < total_blocks; ++block)
   {
@@ -110,8 +112,17 @@ SoakResult run_device_soak(const SoakOptions& options)
       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(tw1 - tw0).count()));
 
     const auto t0 = Clock::now();
-    if (device->read_capture(buffer.data(), info.period_size, 1000, error) < 0 ||
-        device->write_playback(buffer.data(), info.period_size, 1000, error) < 0)
+    if (device->read_capture(buffer.data(), info.period_size, 1000, error) < 0)
+    {
+      device->stop();
+      return fail(error);
+    }
+    {
+      // The engine's render path lives here. The read and write either side of it are the
+      // backend's own syscalls and are deliberately outside the scope (namchain/rt_check.h).
+      RtScope scope;
+    }
+    if (device->write_playback(buffer.data(), info.period_size, 1000, error) < 0)
     {
       device->stop();
       return fail(error);
@@ -125,6 +136,9 @@ SoakResult run_device_soak(const SoakOptions& options)
 
   SoakResult result;
   result.ok = true;
+  result.rt_instrumented = rt_check_available();
+  result.rt_allocations = rt_allocation_count();
+  result.rt_deallocations = rt_deallocation_count();
   result.device_mode = true;
   result.device_period_size = info.period_size;
   result.device_buffer_size = info.buffer_size;
@@ -260,6 +274,7 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
 
   size_t input_pos = input_start;
   double max_lateness_ns = 0.0;
+  rt_reset_counters();
   const auto start = Clock::now();
   uint64_t expected_elapsed_ns = 0;
 
@@ -276,7 +291,12 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
     }
 
     const auto t0 = Clock::now();
-    model->process(in_ptrs.data(), out_ptrs.data(), frames);
+    {
+      // The render-path boundary, expressed in code: everything the engine does happens here and
+      // nothing here may allocate (plan.md §3.3, §10.4).
+      RtScope scope;
+      model->process(in_ptrs.data(), out_ptrs.data(), frames);
+    }
     const auto t1 = Clock::now();
 
     const uint64_t duration_ns =
@@ -313,6 +333,9 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
 
   SoakResult result;
   result.ok = true;
+  result.rt_instrumented = rt_check_available();
+  result.rt_allocations = rt_allocation_count();
+  result.rt_deallocations = rt_deallocation_count();
   result.blocks = timer.blocks();
   result.frames = total_blocks * static_cast<uint64_t>(options.quantum);
   result.deadline_overruns = timer.deadline_overruns();

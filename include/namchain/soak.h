@@ -65,6 +65,13 @@ struct SoakResult
   /// Blocks whose processing time exceeded the period deadline. On a real device this is
   /// what becomes an xrun, and it is the number that lets us argue xruns *cannot* happen
   /// (p99 comfortably under the deadline) instead of waiting to observe one.
+  /// Allocations and deallocations observed *inside the render-path scope*. Both must be zero;
+  /// rt_instrumented says whether the interposer was compiled in at all, because "zero" and "not
+  /// measured" are very different claims.
+  uint64_t rt_allocations = 0;
+  uint64_t rt_deallocations = 0;
+  bool rt_instrumented = false;
+
   uint64_t deadline_overruns = 0;
   /// Xruns reported by the driver (`-EPIPE`, `SNDRV_PCM_STATE_XRUN`). Always 0 until the
   /// `alsa_raw`/`pipewire` backends land: the counters and the reporting path exist now so

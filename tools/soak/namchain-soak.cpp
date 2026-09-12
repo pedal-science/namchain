@@ -156,6 +156,9 @@ int main(int argc, char** argv)
     j["max_lateness_ms"] = result.max_lateness_ms;
     j["device_wait_ns"] = {{"p50", result.wait_p50_ns}, {"p99", result.wait_p99_ns}, {"max", result.wait_max_ns}};
     j["deadline_overruns"] = result.deadline_overruns;
+    j["rt_check"] = {{"instrumented", result.rt_instrumented},
+                     {"allocations", result.rt_allocations},
+                     {"deallocations", result.rt_deallocations}};
     j["driver_xruns"] = result.driver_xruns;
     if (result.device_mode)
     {
@@ -210,6 +213,12 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(result.max_ns));
     std::printf("p99/deadline:     %.2f%% (gate <= %.2f%%)\n", result.p99_percent_of_deadline, max_p99_percent);
     std::printf("max lateness:     %.3f ms\n", result.max_lateness_ms);
+    if (result.rt_instrumented)
+      std::printf("render-path alloc:%llu allocations, %llu frees (must be 0)\n",
+                  static_cast<unsigned long long>(result.rt_allocations),
+                  static_cast<unsigned long long>(result.rt_deallocations));
+    else
+      std::printf("render-path alloc:not instrumented\n");
     std::printf("deadline overruns:%llu\n", static_cast<unsigned long long>(result.deadline_overruns));
     std::printf("driver xruns:     %llu%s\n", static_cast<unsigned long long>(result.driver_xruns),
                 (!result.device_mode && result.driver_xruns == 0) ? " (no device backend in this mode)" : "");
