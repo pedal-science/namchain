@@ -64,6 +64,32 @@ jobs:
   # NEON kernels are compiled in (they are AArch64/ARMv7-only), so it is where the bit-identity
   # parity gate against the reference A2FastModel actually executes. qemu emulates NEON, so the
   # memcmp parity checks are meaningful here even though the timings are not.
+  # ThreadSanitizer for the RT primitives (plan.md §10.1). The SPSC ring and the reclaimer are the
+  # only concurrent code in the engine, and a race in them corrupts audio in ways nothing else
+  # catches. TSan is far too slow for the render path, so it is a correctness instrument only --
+  # which is also why the allocation interposer is auto-disabled here: a sanitizer runtime
+  # intercepts operator new and would bypass it.
+  tsan:
+    name: linux-x86_64 (ThreadSanitizer -- RT primitives)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-20
+      - name: Configure
+        run: >
+          cmake -S . -B build-tsan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_COMPILER=clang-20
+          -DCMAKE_CXX_COMPILER=clang++-20
+          -DNAMCHAIN_TSAN=ON
+      - name: Build
+        run: cmake --build build-tsan -j"$(nproc)"
+      - name: Test
+        run: ctest --test-dir build-tsan -R unit --output-on-failure
+
   aarch64-cross:
     name: aarch64 cross + qemu (incl. A2 planar parity gate)
     runs-on: ubuntu-24.04

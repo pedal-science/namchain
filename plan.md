@@ -830,6 +830,15 @@ patch application (all-or-nothing, error cases), ramp/equal-power fade math, SPS
 reclamation under TSan, lookback calculator vs. hand-computed A2 numbers (6346/6347), model capability
 probe, resampler.
 
+**Implemented at M1:** `rt::Arena` (bump allocator whose *backing store* is aligned, not just the
+offset -- the first version returned 32 mod 64 for a "64-byte aligned" request), `rt::SpscRing<T>`
+(wait-free, cache-line-separated indices, a full ring *refuses* rather than overwriting and counts the
+refusal) and `rt::Reclaimer` (epoch-based with a grace window, type-erased deleter held as a function
+pointer rather than `std::function`, which would allocate on the render path). Each is tested for
+behaviour *and* for allocating nothing inside an `RtScope`; the ring additionally runs under
+ThreadSanitizer in a dedicated CI job, since a single-threaded test cannot see a missing
+acquire/release pair.
+
 ### 10.2 Golden audio tests
 
 Per node against references: gain/EQ/delay against analytic responses; `nc.cab.ir` and `nc.nam` against

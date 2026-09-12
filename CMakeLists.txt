@@ -28,6 +28,9 @@ option(NAMCHAIN_RTSAN "Build with RealtimeSanitizer (needs clang >= 20)" OFF)
 # Render-path allocation interposer (§10.4). Works on GCC/aarch64 where RTSan cannot, but it
 # replaces global operator new/delete, so a production daemon builds with this OFF.
 option(NAMCHAIN_RT_CHECK "Compile the render-path allocation interposer" ON)
+# ThreadSanitizer, for the SPSC ring and reclaimer concurrency tests (§10.1). Not for the audio
+# path: it is far too slow to run in real time, so it is a correctness instrument only.
+option(NAMCHAIN_TSAN "Build with ThreadSanitizer" OFF)
 option(NAMCHAIN_WERROR "Treat warnings as errors" OFF)
 
 set(NAMCHAIN_NAM_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/NeuralAmpModelerCore"
@@ -120,6 +123,8 @@ add_library(namchain OBJECT
   src/offline/render.cpp
   src/rt/telemetry.cpp
   src/rt/rt_check.cpp
+  src/rt/arena.cpp
+  src/rt/reclaimer.cpp
   src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
   ${NAMC_CORE_SOURCES})
@@ -144,8 +149,8 @@ endif()
 # interceptors, which bypass a replacement (observed: allocations uncounted while frees were
 # counted, in the RTSan CI job). RTSan covers allocations itself, so prefer it and drop ours.
 set(_namchain_rt_check ${NAMCHAIN_RT_CHECK})
-if(NAMCHAIN_RTSAN AND _namchain_rt_check)
-  message(STATUS "RTSan is on: allocation interposer disabled (the sanitizer runtime intercepts operator new; RTSan checks allocations itself)")
+if((NAMCHAIN_RTSAN OR NAMCHAIN_TSAN) AND _namchain_rt_check)
+  message(STATUS "a sanitizer is on: allocation interposer disabled (sanitizer runtimes intercept operator new, which bypasses a replacement)")
   set(_namchain_rt_check OFF)
 endif()
 
@@ -157,6 +162,11 @@ if(NAMCHAIN_RTSAN)
   target_compile_options(namchain PUBLIC -fsanitize=realtime)
   target_link_options(namchain PUBLIC -fsanitize=realtime)
   message(STATUS "RealtimeSanitizer enabled (requires clang >= 20)")
+endif()
+if(NAMCHAIN_TSAN)
+  target_compile_options(namchain PUBLIC -fsanitize=thread)
+  target_link_options(namchain PUBLIC -fsanitize=thread)
+  message(STATUS "ThreadSanitizer enabled")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -214,7 +224,8 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_soak.cpp
     tests/test_alsa_params.cpp
     tests/test_rt_check.cpp
-    tests/test_pcm.cpp)
+    tests/test_pcm.cpp
+    tests/test_rt_primitives.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
