@@ -85,6 +85,9 @@ SoakResult run_device_soak(const SoakOptions& options)
   const uint64_t deadline_ns =
     static_cast<uint64_t>(std::llround(1e9 * static_cast<double>(info.period_size) / static_cast<double>(info.sample_rate)));
   BlockTimer timer(deadline_ns);
+  // Time blocked on the device, kept separate from the work we do. If wait + work exceeds the
+  // deadline the run cannot keep real time; which of the two dominates says where the problem is.
+  BlockTimer wait_timer(deadline_ns);
 
   // Bytes, not samples: period_size frames x bytes_per_frame. See AlsaRawDuplex::read_capture.
   std::vector<unsigned char> buffer(static_cast<size_t>(info.period_size) * info.bytes_per_sample * info.channels);
@@ -96,11 +99,15 @@ SoakResult run_device_soak(const SoakOptions& options)
   {
     // Wait untimed; time only the work. Measuring from the start of the wait would just report the
     // period length, which is not what the deadline is about.
+    const auto tw0 = Clock::now();
     if (!device->wait_capture(2000, error))
     {
       device->stop();
       return fail(error);
     }
+    const auto tw1 = Clock::now();
+    wait_timer.record(
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(tw1 - tw0).count()));
 
     const auto t0 = Clock::now();
     if (device->read_capture(buffer.data(), info.period_size, 1000, error) < 0 ||
@@ -132,6 +139,9 @@ SoakResult run_device_soak(const SoakOptions& options)
   result.deadline_overruns = timer.deadline_overruns();
   result.driver_xruns = driver_xruns;
   result.deadline_ns = deadline_ns;
+  result.wait_p50_ns = wait_timer.p50_ns();
+  result.wait_p99_ns = wait_timer.p99_ns();
+  result.wait_max_ns = wait_timer.max_ns();
   result.p50_ns = timer.p50_ns();
   result.p99_ns = timer.p99_ns();
   result.max_ns = timer.max_ns();

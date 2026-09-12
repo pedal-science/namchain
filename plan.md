@@ -759,10 +759,29 @@ the physical loopback cable, §10.5.1). The two UAC1 devices stay useful as the 
 the engine must still support, and the MOMIX additionally pins 48 kHz with no other rate available.
 
 **A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
-but the loop cannot sustain 3000 periods/s through it: RTF is 1.333 — it falls behind by a third — with
-no xrun reported. q = 32 is fully sustainable (RTF 1.000 over 30 s). So the operational question is not
-"does the device accept this quantum" but "does the run keep real time at it", which is precisely why
-the harness reports RTF and lateness beside the xrun count rather than xruns alone.
+but the run does not keep real time at it: RTF 1.333, i.e. it loses a third. Instrumenting the loop to
+separate **device wait** from **work** shows where the time goes:
+
+| quantum | nominal period | wait p50 | work p50 | mean wait + work | RTF |
+|---|---|---|---|---|---|
+| 48 | 1000 µs | 991 µs | 8.8 µs | ≈ 1000 µs | 1.000 |
+| 32 | 667 µs | 741 µs | 8.6 µs | ≈ 667 µs | 1.000 |
+| 16 | 333 µs | 366 µs | 8.7 µs | ≈ 444 µs | **1.333** |
+
+At q = 32 and 48 the *mean* wait per period equals the nominal period almost exactly, so the loop tracks
+real time. At q = 16 the mean wait is a third longer than the nominal period: the device/driver is
+offering a 16-frame period at roughly 2.25 kHz rather than 3 kHz. Our work is ~9 µs — under 3 % of the
+budget — so this is not something more efficient code can fix; it is the device's period delivery at that
+size. Why microframe packetisation produces exactly 4/3 is **not established** (high-speed USB carries
+6 frames per 125 µs microframe at 48 kHz, and 16 is not a multiple of 6, but that arithmetic does not by
+itself predict 444 µs); the thing to test next is `sw_params` wakeup thresholds, which we deliberately
+left at kernel defaults. The operational conclusion stands either way: **q = 32 is the floor on this
+interface**, well below the plan's default of 64.
+
+Note also that per-iteration waits are *elastic*: with a 4-period buffer the median wait at q = 32
+(741 µs) exceeds the nominal period while the run keeps exact time, because some iterations return
+immediately and others wait longer. Only the mean tracks the clock — which is why the harness reports
+RTF and mean-relevant totals rather than reading a single wait figure.
 
 **Bug this exposed.** The transfer buffers were sized as `int16_t` counts (`frames × channels`
 elements), i.e. half the bytes required on any device wider than 16-bit — a heap overflow that

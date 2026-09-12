@@ -154,6 +154,7 @@ int main(int argc, char** argv)
     j["block_ns"] = {{"p50", result.p50_ns}, {"p99", result.p99_ns}, {"max", result.max_ns}};
     j["p99_percent_of_deadline"] = result.p99_percent_of_deadline;
     j["max_lateness_ms"] = result.max_lateness_ms;
+    j["device_wait_ns"] = {{"p50", result.wait_p50_ns}, {"p99", result.wait_p99_ns}, {"max", result.wait_max_ns}};
     j["deadline_overruns"] = result.deadline_overruns;
     j["driver_xruns"] = result.driver_xruns;
     if (result.device_mode)
@@ -199,6 +200,11 @@ int main(int argc, char** argv)
     std::printf("audio:            %.3f s in %.3f s wall (RTF %.4f)\n", result.audio_seconds, result.wall_seconds,
                 result.rtf);
     std::printf("deadline:         %llu ns\n", static_cast<unsigned long long>(result.deadline_ns));
+    if (result.device_mode)
+      std::printf("device wait:      p50 %llu ns, p99 %llu ns, max %llu ns\n",
+                  static_cast<unsigned long long>(result.wait_p50_ns),
+                  static_cast<unsigned long long>(result.wait_p99_ns),
+                  static_cast<unsigned long long>(result.wait_max_ns));
     std::printf("block time:       p50 %llu ns, p99 %llu ns, max %llu ns\n",
                 static_cast<unsigned long long>(result.p50_ns), static_cast<unsigned long long>(result.p99_ns),
                 static_cast<unsigned long long>(result.max_ns));

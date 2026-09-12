@@ -72,6 +72,12 @@ struct SoakResult
   uint64_t driver_xruns = 0;
 
   uint64_t deadline_ns = 0;
+  /// Time spent blocked waiting for the device to offer a period, separate from the work we do
+  /// on it. This is what distinguishes "the device is pacing us slower than nominal" from "we are
+  /// too slow": if wait + work exceeds the deadline, the run cannot keep real time.
+  uint64_t wait_p50_ns = 0;
+  uint64_t wait_p99_ns = 0;
+  uint64_t wait_max_ns = 0;
   uint64_t p50_ns = 0;
   uint64_t p99_ns = 0;
   uint64_t max_ns = 0;
