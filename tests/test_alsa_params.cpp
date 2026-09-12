@@ -161,11 +161,11 @@ TEST_CASE("an invalid channel count is rejected before touching the device")
   namchain::AlsaRawConfig config;
   config.capture = "hw:4,0";
   config.playback = "hw:4,0";
-  config.channels = 7;
+  config.channels = 33;
 
   std::string error;
   CHECK(namchain::AlsaRawDuplex::open(config, error) == nullptr);
-  CHECK(error.find("channels") != std::string::npos);
+  CHECK(error.find("channel") != std::string::npos);
 }
 
 #endif // __linux__

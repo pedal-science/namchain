@@ -77,10 +77,14 @@ public:
 
   /// Read exactly \p frames into \p dst, waiting up to \p timeout_ms. Returns frames transferred,
   /// or -1 on error. An xrun is counted, recovered from, and reported through driver_xruns().
-  int read_capture(int16_t* dst, unsigned frames, int timeout_ms, std::string& error);
+  ///
+  /// \p dst must hold `frames * info().bytes_per_sample * info().channels` BYTES. It is void*
+  /// rather than a typed pointer on purpose: sizing it as a count of 16-bit samples is a heap
+  /// overflow on any device wider than 16-bit, which is exactly the bug this signature prevents.
+  int read_capture(void* dst, unsigned frames, int timeout_ms, std::string& error);
 
-  /// Write exactly \p frames from \p src.
-  int write_playback(const int16_t* src, unsigned frames, int timeout_ms, std::string& error);
+  /// Write exactly \p frames from \p src. Same sizing rule as read_capture().
+  int write_playback(const void* src, unsigned frames, int timeout_ms, std::string& error);
 
   /// Count of `-EPIPE` conditions. Every one is counted and reported; the engine never silently
   /// re-prepares (plan.md §10.5.1).

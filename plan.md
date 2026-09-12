@@ -742,6 +742,34 @@ must not be `START`ed on an empty ring — it underruns immediately and the `STA
 explicit `START` may report `EBADFD`, which means "already running" and is checked by state rather
 than assumed.
 
+**Interface comparison, measured (2026-09-12).** Three class-compliant interfaces through the same
+passthrough soak:
+
+| interface | class | bus | formats | period floor @48 k | q = 32 | q = 64 |
+|---|---|---|---|---|---|---|
+| TI PCM2902 | UAC1 | full speed | S16_LE, 2 ch | 1000 µs → 48 fr | refused (above) | ✓ 0 xruns, 0.88 % |
+| Joyo MOMIX | UAC1 | full speed | S16_LE, 2 ch, 48 k only | 1000 µs → 48 fr | refused | ✓ 0 xruns, 0.94 % |
+| **SSL 2+ Mk II** | **UAC2** | **high speed** | **S32_LE, 4 ch, 44.1–192 k** | **125 µs → 6 fr** | **✓ 30 s, RTF 1.000, 0 xruns, 1.70 %** | ✓ 0 xruns, 0.93 % |
+
+The UAC1/UAC2 split is the whole story: full-speed USB services transfers on 1 ms frames, high-speed on
+125 µs microframes, so **only the UAC2 device can honour the q = 32 column that §1 and §10.3 specify**.
+On this evidence the **SSL 2+ Mk II is the reference interface** for real-time work — the decision §11
+said should be made by measurement, and this is that measurement (true round-trip latency still needs
+the physical loopback cable, §10.5.1). The two UAC1 devices stay useful as the cheap end of the range
+the engine must still support, and the MOMIX additionally pins 48 kHz with no other rate available.
+
+**A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
+but the loop cannot sustain 3000 periods/s through it: RTF is 1.333 — it falls behind by a third — with
+no xrun reported. q = 32 is fully sustainable (RTF 1.000 over 30 s). So the operational question is not
+"does the device accept this quantum" but "does the run keep real time at it", which is precisely why
+the harness reports RTF and lateness beside the xrun count rather than xruns alone.
+
+**Bug this exposed.** The transfer buffers were sized as `int16_t` counts (`frames × channels`
+elements), i.e. half the bytes required on any device wider than 16-bit — a heap overflow that
+corrupted the allocator (`malloc(): corrupted top size`) on the S32_LE SSL. Both UAC1 devices are
+16-bit, so it worked by luck until a 32-bit device appeared. The API now takes `void*` and documents
+the requirement in **bytes**, so the mistake cannot be expressed.
+
 ---
 
 ## 10. Verification — how "bulletproof" is proven

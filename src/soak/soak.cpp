@@ -86,7 +86,8 @@ SoakResult run_device_soak(const SoakOptions& options)
     static_cast<uint64_t>(std::llround(1e9 * static_cast<double>(info.period_size) / static_cast<double>(info.sample_rate)));
   BlockTimer timer(deadline_ns);
 
-  std::vector<int16_t> buffer(static_cast<size_t>(info.period_size) * info.channels);
+  // Bytes, not samples: period_size frames x bytes_per_frame. See AlsaRawDuplex::read_capture.
+  std::vector<unsigned char> buffer(static_cast<size_t>(info.period_size) * info.bytes_per_sample * info.channels);
   const uint64_t total_blocks =
     std::max<uint64_t>(1, static_cast<uint64_t>(options.duration_seconds * info.sample_rate / info.period_size));
 

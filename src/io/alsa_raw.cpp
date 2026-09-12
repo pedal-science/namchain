@@ -74,9 +74,12 @@ AlsaRawDuplex::~AlsaRawDuplex()
 
 std::unique_ptr<AlsaRawDuplex> AlsaRawDuplex::open(const AlsaRawConfig& config, std::string& error)
 {
-  if (config.channels < 1 || config.channels > 2)
+  // Devices expose fixed channel counts per altset (the SSL 2+ offers only 4), so this is a
+  // sanity bound rather than a policy: the engine picks which of them it uses.
+  constexpr unsigned kMaxChannels = 32;
+  if (config.channels < 1 || config.channels > kMaxChannels)
   {
-    error = "only 1 or 2 channels are supported";
+    error = "channel count out of range [1, " + std::to_string(kMaxChannels) + "]";
     return nullptr;
   }
   if (config.quantum < 1)
@@ -290,7 +293,9 @@ bool AlsaRawDuplex::start(std::string& error)
   // deliberate follow-up, not an accident.
   if (info_.buffer_size > 0)
   {
-    std::vector<int16_t> silence(static_cast<size_t>(info_.buffer_size) * info_.channels, 0);
+    // Sized in BYTES: buffer_size frames x bytes_per_frame. A vector<int16_t> of
+    // buffer_size*channels elements is half the needed size on a 32-bit device.
+    std::vector<unsigned char> silence(static_cast<size_t>(info_.buffer_size) * bytes_per_frame_, 0);
     std::string prime_error;
     const int written = write_playback(silence.data(), info_.buffer_size, 1000, prime_error);
     if (written < static_cast<int>(info_.buffer_size))
@@ -391,7 +396,7 @@ int AlsaRawDuplex::transfer(int fd, void* buf, unsigned frames, bool playback, i
   return static_cast<int>(done);
 }
 
-int AlsaRawDuplex::read_capture(int16_t* dst, unsigned frames, int timeout_ms, std::string& error)
+int AlsaRawDuplex::read_capture(void* dst, unsigned frames, int timeout_ms, std::string& error)
 {
   return transfer(capture_fd_, dst, frames, false, timeout_ms, error);
 }
@@ -420,9 +425,9 @@ bool AlsaRawDuplex::wait_capture(int timeout_ms, std::string& error)
   }
 }
 
-int AlsaRawDuplex::write_playback(const int16_t* src, unsigned frames, int timeout_ms, std::string& error)
+int AlsaRawDuplex::write_playback(const void* src, unsigned frames, int timeout_ms, std::string& error)
 {
-  return transfer(playback_fd_, const_cast<int16_t*>(src), frames, true, timeout_ms, error);
+  return transfer(playback_fd_, const_cast<void*>(src), frames, true, timeout_ms, error);
 }
 
 } // namespace namchain
