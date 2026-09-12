@@ -22,6 +22,8 @@ option(NAMCHAIN_BUILD_TESTS "Build unit tests" ON)
 # definition, which is what this option does.
 option(NAMCHAIN_SAMPLE_FLOAT "Compile the NAM core with float samples (defines NAM_SAMPLE_FLOAT)" OFF)
 option(NAMCHAIN_A2_FAST "Enable the NAM A2 fast path (A2-Full/A2-Lite)" ON)
+option(NAMCHAIN_APPLY_VENDOR_PATCHES "Apply vendor/patches/*.patch to the vendored NAM core" ON)
+option(NAMCHAIN_REQUIRE_A2_PARITY "Fail instead of skip the A2 planar bit-identity test when the build is unoptimised" OFF)
 option(NAMCHAIN_RTSAN "Build with RealtimeSanitizer (needs clang >= 20)" OFF)
 option(NAMCHAIN_WERROR "Treat warnings as errors" OFF)
 
@@ -32,6 +34,46 @@ if(NOT EXISTS "${NAMCHAIN_NAM_CORE_DIR}/NAM/dsp.h")
   message(FATAL_ERROR
     "Vendored NAM core not found at ${NAMCHAIN_NAM_CORE_DIR}.\n"
     "Run: git submodule update --init --recursive")
+endif()
+
+# ---------------------------------------------------------------------------
+# Vendored-core patches (plan.md §4.2, §7.8)
+#
+# Patches live in vendor/patches/ and are applied to the pinned submodule at configure time.
+# Each must stay upstream-PR-shaped and is deleted once its PR merges. The apply is
+# idempotent: `git apply --reverse --check` succeeds only if the patch is already in place.
+#
+# This MUST run before the source glob below, because patches add source files (e.g.
+# NAM/wavenet/a2_planar.cpp) that the glob has to pick up.
+# ---------------------------------------------------------------------------
+if(NAMCHAIN_APPLY_VENDOR_PATCHES)
+  file(GLOB NAMCHAIN_VENDOR_PATCHES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/patches/*.patch")
+  find_package(Git REQUIRED)
+  foreach(_patch IN LISTS NAMCHAIN_VENDOR_PATCHES)
+    get_filename_component(_patch_name "${_patch}" NAME)
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_patch}"
+      WORKING_DIRECTORY "${NAMCHAIN_NAM_CORE_DIR}"
+      RESULT_VARIABLE _patch_applied
+      OUTPUT_QUIET ERROR_QUIET)
+    if(_patch_applied EQUAL 0)
+      message(STATUS "vendor patch already applied: ${_patch_name}")
+    else()
+      execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply "${_patch}"
+        WORKING_DIRECTORY "${NAMCHAIN_NAM_CORE_DIR}"
+        RESULT_VARIABLE _patch_rc
+        OUTPUT_VARIABLE _patch_out
+        ERROR_VARIABLE _patch_err)
+      if(NOT _patch_rc EQUAL 0)
+        message(FATAL_ERROR
+          "Failed to apply ${_patch_name} to ${NAMCHAIN_NAM_CORE_DIR}:\n${_patch_err}\n"
+          "The patch is pinned to the submodule commit in .gitmodules; if the submodule moved, "
+          "rebase the patch rather than forcing it.")
+      endif()
+      message(STATUS "applied vendor patch: ${_patch_name}")
+    endif()
+  endforeach()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -117,21 +159,41 @@ if(NAMCHAIN_BUILD_TESTS)
   add_custom_target(namchain-test-data
     DEPENDS "${_namchain_gen_dir}/A2-Full.nam" "${_namchain_gen_dir}/A2-Lite.nam" "${_namchain_gen_dir}/CabIR.nam")
 
-  add_executable(namchain-tests tests/test_lookback.cpp)
+  add_executable(namchain-tests
+    tests/test_lookback.cpp
+    tests/test_a2_planar_parity.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
   target_compile_definitions(namchain-tests PRIVATE
     NAMCHAIN_TEST_DATA_DIR="${_namchain_gen_dir}"
     NAMCHAIN_EXAMPLE_MODELS_DIR="${NAMCHAIN_NAM_CORE_DIR}/example_models")
+  if(NAMCHAIN_REQUIRE_A2_PARITY)
+    target_compile_definitions(namchain-tests PRIVATE NAMCHAIN_REQUIRE_A2_PARITY)
+  endif()
   add_test(NAME unit COMMAND namchain-tests)
 endif()
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+set(NAMCHAIN_A2_PLANAR_ACTIVE OFF)
+if(NAMCHAIN_A2_FAST AND NAMCHAIN_APPLY_VENDOR_PATCHES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv8)")
+  set(NAMCHAIN_A2_PLANAR_ACTIVE ON)
+endif()
+
+# The planar-kernel parity gate is only meaningful in an optimised build: at -O0 the reference
+# does not contract to FMA, so the comparison fails through no fault of either implementation.
+# See tests/test_a2_planar_parity.cpp and plan.md §7.8.
+if(NAMCHAIN_A2_PLANAR_ACTIVE AND (NOT CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "Debug"))
+  message(WARNING
+    "A2 planar kernels are active but CMAKE_BUILD_TYPE='${CMAKE_BUILD_TYPE}': the bit-identity "
+    "parity test will self-skip. Configure Release to actually exercise it.")
+endif()
+
 message(STATUS "namchain ${PROJECT_VERSION}")
 message(STATUS "  NAM core:        ${NAMCHAIN_NAM_CORE_DIR}")
 message(STATUS "  A2 fast path:    ${NAMCHAIN_A2_FAST}")
+message(STATUS "  A2 planar NEON:  ${NAMCHAIN_A2_PLANAR_ACTIVE}")
 message(STATUS "  float samples:   ${NAMCHAIN_SAMPLE_FLOAT}")
 message(STATUS "  RTSan:           ${NAMCHAIN_RTSAN}")

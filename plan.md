@@ -260,6 +260,20 @@ rigs/                                             # example chain sets + test si
 ### 4.2 Build
 
 - CMake ≥ 3.22, C++20, `-O3`; keep `NAM_ENABLE_A2_FAST=ON`.
+- **A2 planar NEON kernels: ON by default on AArch64 (decision, 2026-09-11).** Carried as
+  `vendor/patches/0001-a2-planar-neon-kernels.patch` (PR #313, §7.8) and applied idempotently to the
+  pinned submodule at configure time; `-DNAMCHAIN_APPLY_VENDOR_PATCHES=OFF` disables the mechanism and
+  `-DNAM_DISABLE_A2_PLANAR` disables only the kernels. Verified in-tree: the default Release build
+  loads `A2PlanarFull`/`A2PlanarNano` and measures RTF 0.0500 (A2-Full) and 0.0086 (A2-Lite) at q = 64 —
+  the §11 numbers — with the bit-identity parity test passing inside `namchain-tests` (12 cases, 188
+  assertions). CI's aarch64+qemu job is the enforcement point: it sets `-DNAMCHAIN_REQUIRE_A2_PARITY=ON`,
+  which turns the test's unoptimised-build skip into a hard failure, so the gate cannot pass vacuously
+  (verified on this host — a Debug build with that flag fails loudly; the cross build run under qemu
+  passes 146 parity assertions). The patch also touches `tools/`, which we do not build; that is
+  deliberate, because
+  keeping it byte-identical to the upstream PR makes it droppable the moment it merges. Consequence:
+  the submodule working tree is **intentionally dirty** after configure, so `.gitmodules` marks it
+  `ignore = dirty`. x86 targets compile the kernels out entirely and fall back to `a2_fast`.
 - **`NAM_SAMPLE_FLOAT`: default OFF; do not define it (decision, 2026-09-11).** It is not a precision
   knob — the model arithmetic is float32 either way (Eigen `MatrixXf`, and `a2_fast` keeps explicit
   `std::vector<float> _cond` / `_head_out`, described in-source as "float32 copy of the double
@@ -545,8 +559,10 @@ reports the quality change. Measured breakpoints per model drive the choice.
 `A2-Full` 219.7 → 261.3 ms, `A2.nam` container 220.3 → 265.2 ms, `A2-Lite` 51.1 → 186.3 ms. The
 patches that are actually worth carrying upstream:
 
-0. **PR #313 — planar NEON kernels for the A2 fast path.** *The single largest measured win available,
-   and it is already written.* Authored in-house, base commit == our pin, so it applies to the vendored
+0. **PR #313 — planar NEON kernels for the A2 fast path. ADOPTED 2026-09-11** — vendored as
+   `vendor/patches/0001-a2-planar-neon-kernels.patch`, applied at configure time and ON by default on
+   AArch64 (§4.2). It is the single largest measured win available, and it is already written.
+   Authored in-house, base commit == our pin, so it applies to the vendored
    core as-is. **Independently reproduced on this host** (§11): A2-Full RTF 0.1072 → 0.0501 (**2.14×**)
    and A2-Lite 0.0262 → 0.0087 (**3.01×**) at q = 64, with 2.00–2.35× / 2.96–3.14× across q = 32…256
    (`bench-results/pr313-planar-ab.csv`). Output is **bit-identical** to `A2FastModel`, confirmed both
@@ -828,7 +844,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with file I/O — not yet started** | Builds green locally (aarch64 native; x86_64 + armv7 cross defined in CI, not yet run); bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: RT primitives, arena, command ring, epoch reclamation; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; `alsa_raw` + `pipewire` + `null` + `file` backends; daemon skeleton | Plays a guitar through 2 chains at 64 samples; 1 h zero xruns; allocation interposer clean; latency measured with `jdelay` |
+| **M1** | `libnamchain` core: RT primitives, arena, command ring, epoch reclamation; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; `alsa_raw` + `pipewire` + `null` + `file` backends; daemon skeleton; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)** | Plays a guitar through 2 chains at 64 samples; 1 h zero xruns; allocation interposer clean; latency measured with `jdelay`; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |

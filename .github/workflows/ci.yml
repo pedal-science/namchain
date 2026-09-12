@@ -54,8 +54,12 @@ jobs:
       - name: Test
         run: ctest --test-dir build-rtsan --output-on-failure
 
+  # This job is load-bearing, not just a smoke test: it is the only CI job where the A2 planar
+  # NEON kernels are compiled in (they are AArch64/ARMv7-only), so it is where the bit-identity
+  # parity gate against the reference A2FastModel actually executes. qemu emulates NEON, so the
+  # memcmp parity checks are meaningful here even though the timings are not.
   aarch64-cross:
-    name: aarch64 cross + qemu smoke
+    name: aarch64 cross + qemu (incl. A2 planar parity gate)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -70,10 +74,17 @@ jobs:
           cmake -S . -B build-aarch64 -G Ninja
           -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/aarch64-linux-gnu.cmake
           -DCMAKE_BUILD_TYPE=Release
+          -DNAMCHAIN_REQUIRE_A2_PARITY=ON
       - name: Build
         run: cmake --build build-aarch64 -j"$(nproc)"
-      - name: Smoke test under qemu
+      - name: Test under qemu
         run: qemu-aarch64-static -L /usr/aarch64-linux-gnu ./build-aarch64/namchain-tests
+      - name: A2 planar parity gate must have actually run
+        # NAMCHAIN_REQUIRE_A2_PARITY turns a self-skip into a failure, so this cannot pass
+        # vacuously if the build type or arch gating changes underneath us.
+        run: |
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu ./build-aarch64/namchain-tests \
+            --test-case="planar*"
 
   armv7-cross:
     name: armv7 cross (build only)
