@@ -37,6 +37,12 @@ struct SoakOptions
   /// of a model: "hw:4,0", "4,0" or a /dev/snd path. This is the device half of the acceptance
   /// criterion, and the stage where `driver_xruns` stops being permanently zero.
   std::string device;
+  /// When set, run this model between the device's capture read and playback write. Several
+  /// instances are chained in series, which is the CPU cost of that many concurrent models.
+  std::string model;
+  unsigned instances = 1;
+  unsigned input_channel = 0;
+  unsigned output_channel = 0;
   unsigned device_channels = 1;
   unsigned device_periods = 4;
   unsigned device_sample_rate = 48000;
@@ -83,6 +89,11 @@ struct SoakResult
   /// on it. This is what distinguishes "the device is pacing us slower than nominal" from "we are
   /// too slow": if wait + work exceeds the deadline, the run cannot keep real time.
   uint64_t wait_p50_ns = 0;
+  /// Phase breakdown of the timed section, device mode only: backend read, engine chain, backend
+  /// write. A single "block time" cannot distinguish blocking in the backend from working.
+  uint64_t read_p50_ns = 0;
+  uint64_t chain_p50_ns = 0;
+  uint64_t write_p50_ns = 0;
   uint64_t wait_p99_ns = 0;
   uint64_t wait_max_ns = 0;
   uint64_t p50_ns = 0;
@@ -101,6 +112,13 @@ struct SoakResult
 
   // ---- device mode only ----
   bool device_mode = false;
+  /// Whether mlockall succeeded: without it the measurement includes page-fault stalls.
+  bool memory_locked = false;
+  /// Index of the first block that exceeded the deadline; UINT64_MAX if none. Distinguishes a
+  /// startup transient from steady-state overload, which need very different responses.
+  uint64_t first_overrun_block = UINT64_MAX;
+  /// Driver xruns seen during the untimed bring-up cycle, before steady state was reached.
+  uint64_t startup_driver_xruns = 0;
   unsigned device_period_size = 0;
   unsigned device_buffer_size = 0;
   unsigned device_sample_format = 0;   ///< SNDRV_PCM_FORMAT_* the device agreed to
@@ -109,6 +127,8 @@ struct SoakResult
   bool device_period_exact = false;
   std::string device_capture_node;
   std::string device_playback_node;
+  unsigned chain_instances = 0;
+  std::string chain_model;
 
   OracleResult oracle;
 };

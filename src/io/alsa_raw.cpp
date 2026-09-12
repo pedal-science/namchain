@@ -254,6 +254,7 @@ bool AlsaRawDuplex::configure(int fd, const char* direction, std::string& error)
     info_.bytes_per_sample = format_width;
     info_.period_exact = (actual_period == quantum_);
     bytes_per_frame_ = info_.channels * format_width;
+    prime_silence_.assign(static_cast<size_t>(info_.buffer_size) * bytes_per_frame_, 0);
   }
   else if (info_.sample_format != chosen_format)
   {
@@ -270,6 +271,25 @@ bool AlsaRawDuplex::configure(int fd, const char* direction, std::string& error)
     return false;
   }
 
+  return true;
+}
+
+bool AlsaRawDuplex::prime_playback(std::string& error)
+{
+  if (info_.buffer_size == 0 || prime_silence_.empty())
+    return true;
+  // Prime ONE period, not the whole ring. Filling the ring (which is what aplay effectively does
+  // for a file) leaves it permanently full, so every subsequent write then blocks for a whole
+  // period and the loop's latency becomes one buffer rather than one period. Measured: with a
+  // full-ring prime the write blocked 1416 us of a 1333 us period; the engine's actual work was
+  // 70 us. One period is enough to reach the kernel's start threshold.
+  const unsigned chunk = info_.period_size > 0 ? info_.period_size : info_.buffer_size;
+  const int written = write_playback(prime_silence_.data(), chunk, 1000, error);
+  if (written < static_cast<int>(chunk))
+  {
+    error = "could not prime the playback buffer: " + error;
+    return false;
+  }
   return true;
 }
 
@@ -291,19 +311,8 @@ bool AlsaRawDuplex::start(std::string& error)
   // what aplay does, and it is also what makes the kernel's start threshold reachable. The cost is
   // that the I/O latency floor is one buffer; tightening that with sw_params thresholds is a
   // deliberate follow-up, not an accident.
-  if (info_.buffer_size > 0)
-  {
-    // Sized in BYTES: buffer_size frames x bytes_per_frame. A vector<int16_t> of
-    // buffer_size*channels elements is half the needed size on a 32-bit device.
-    std::vector<unsigned char> silence(static_cast<size_t>(info_.buffer_size) * bytes_per_frame_, 0);
-    std::string prime_error;
-    const int written = write_playback(silence.data(), info_.buffer_size, 1000, prime_error);
-    if (written < static_cast<int>(info_.buffer_size))
-    {
-      error = "could not prime the playback buffer: " + prime_error;
-      return false;
-    }
-  }
+  if (!prime_playback(error))
+    return false;
 
   if (::ioctl(capture_fd_, SNDRV_PCM_IOCTL_START) < 0)
   {
@@ -337,12 +346,22 @@ void AlsaRawDuplex::stop()
     ::ioctl(capture_fd_, SNDRV_PCM_IOCTL_DROP);
 }
 
-void AlsaRawDuplex::recover(int fd)
+void AlsaRawDuplex::recover(int fd, bool playback)
 {
   // Recovering is right for a soak (we want to keep running); hiding it is not, which is why
   // driver_xruns() is reported alongside recoveries().
   if (::ioctl(fd, SNDRV_PCM_IOCTL_PREPARE) == 0)
+  {
+    // PREPARE empties the playback ring, so restarting without re-priming it underruns again
+    // immediately -- which showed up as hundreds of xruns per run with a median block cost of
+    // only 8% of the deadline. Re-prime before restarting.
+    if (playback)
+    {
+      std::string ignored;
+      prime_playback(ignored);
+    }
     ::ioctl(fd, SNDRV_PCM_IOCTL_START);
+  }
   ++recoveries_;
 }
 
@@ -381,7 +400,7 @@ int AlsaRawDuplex::transfer(int fd, void* buf, unsigned frames, bool playback, i
       if (errno == EPIPE)
       {
         ++driver_xruns_;
-        recover(fd);
+        recover(fd, playback);
         continue; // retry the remainder after re-preparing
       }
       if (errno == EAGAIN || errno == EINTR)

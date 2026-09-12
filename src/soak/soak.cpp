@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <sys/mman.h>
 #include <thread>
 #include <vector>
 
@@ -13,6 +14,7 @@
 #include "NAM/get_dsp.h"
 
 #include "namchain/offline.h"
+#include "namchain/pcm.h"
 #include "namchain/rt_check.h"
 #include "namchain/telemetry.h"
 #include "namchain/wav.h"
@@ -60,6 +62,20 @@ struct TempFileGuard
 };
 
 #if defined(__linux__)
+namespace
+{
+PcmFormat pcm_format_from_alsa(unsigned format)
+{
+  switch (format)
+  {
+  case SNDRV_PCM_FORMAT_S16_LE: return PcmFormat::S16_LE;
+  case SNDRV_PCM_FORMAT_S24_3LE: return PcmFormat::S24_3LE;
+  case SNDRV_PCM_FORMAT_S32_LE: return PcmFormat::S32_LE;
+  default: return PcmFormat::Unknown;
+  }
+}
+} // namespace
+
 /// Device-backed soak: capture a period, (later: run the engine), play it back, and count what the
 /// driver reports. This is the passthrough stage -- no DSP yet -- so it establishes the host's
 /// real-time baseline before any engine complexity exists to confuse the picture.
@@ -80,6 +96,11 @@ SoakResult run_device_soak(const SoakOptions& options)
     return fail(error);
 
   const AlsaRawInfo info = device->info();
+
+  // What the engine does after start (§3.3): lock the address space so a page fault cannot stall
+  // a period. Without it a soak measures the page cache as much as the engine.
+  const bool memory_locked = ::mlockall(MCL_CURRENT | MCL_FUTURE) == 0;
+
   if (!device->start(error))
     return fail(error);
 
@@ -89,13 +110,75 @@ SoakResult run_device_soak(const SoakOptions& options)
   // Time blocked on the device, kept separate from the work we do. If wait + work exceeds the
   // deadline the run cannot keep real time; which of the two dominates says where the problem is.
   BlockTimer wait_timer(deadline_ns);
+  // Phase breakdown. A single "block time" conflates our work with time spent blocked inside the
+  // backend's own read/write, and those two call for completely different responses.
+  BlockTimer read_timer(deadline_ns);
+  BlockTimer chain_timer(deadline_ns);
+  BlockTimer write_timer(deadline_ns);
 
   // Bytes, not samples: period_size frames x bytes_per_frame. See AlsaRawDuplex::read_capture.
   std::vector<unsigned char> buffer(static_cast<size_t>(info.period_size) * info.bytes_per_sample * info.channels);
+
+  // Optional DSP chain. Everything here is allocated before the loop, so the render scope stays
+  // allocation-free and the interposer is measuring the thing it is meant to measure.
+  std::vector<std::unique_ptr<nam::DSP>> chain;
+  const PcmFormat pcm_format = pcm_format_from_alsa(info.sample_format);
+  std::vector<NAM_SAMPLE> mono_a;
+  std::vector<NAM_SAMPLE> mono_b;
+  if (!options.model.empty())
+  {
+    if (pcm_format == PcmFormat::Unknown)
+      return fail("device sample format is not one the chain can convert");
+    for (unsigned i = 0; i < std::max(1u, options.instances); ++i)
+    {
+      std::unique_ptr<nam::DSP> model;
+      try
+      {
+        model = nam::get_dsp(std::filesystem::path(options.model));
+      }
+      catch (const std::exception& e)
+      {
+        return fail(std::string("failed to load chain model: ") + e.what());
+      }
+      if (!model)
+        return fail("failed to load chain model '" + options.model + "'");
+      if (model->NumInputChannels() != 1 || model->NumOutputChannels() != 1)
+        return fail("the device chain currently supports mono models only");
+      model->Reset(static_cast<double>(info.sample_rate), static_cast<int>(info.period_size));
+      chain.push_back(std::move(model));
+    }
+    mono_a.assign(static_cast<size_t>(info.period_size), static_cast<NAM_SAMPLE>(0));
+    mono_b.assign(static_cast<size_t>(info.period_size), static_cast<NAM_SAMPLE>(0));
+
+    // Warm the chain before the stream starts. The first process() call is cold -- measured at
+    // ~2.8 ms against an 80 us steady state -- and a stall that long can drain the ring on its
+    // own. The engine is expected to pre-touch at plan build for the same reason (§3.3).
+    for (auto& model : chain)
+    {
+      NAM_SAMPLE* in_ptrs[] = {mono_a.data()};
+      NAM_SAMPLE* out_ptrs[] = {mono_b.data()};
+      model->process(in_ptrs, out_ptrs, static_cast<int>(info.period_size));
+      mono_a.swap(mono_b);
+    }
+  }
   const uint64_t total_blocks =
     std::max<uint64_t>(1, static_cast<uint64_t>(options.duration_seconds * info.sample_rate / info.period_size));
 
+  // Bring-up iteration, deliberately untimed. The first period after START fills an empty capture
+  // ring, so its cost is an artefact of starting rather than a real-time property -- every
+  // configuration, passthrough included, showed exactly one overrun and it was always block 0.
+  // Run one cycle outside the measurement and report xruns seen during bring-up separately from
+  // those seen while running, rather than discarding either.
+  if (device->wait_capture(2000, error))
+  {
+    std::string ignored;
+    device->read_capture(buffer.data(), info.period_size, 1000, ignored);
+    device->write_playback(buffer.data(), info.period_size, 1000, ignored);
+  }
+  const uint64_t startup_xruns = device->driver_xruns();
+
   rt_reset_counters();
+  uint64_t first_overrun_block = std::numeric_limits<uint64_t>::max();
   const auto start = Clock::now();
   for (uint64_t block = 0; block < total_blocks; ++block)
   {
@@ -117,21 +200,51 @@ SoakResult run_device_soak(const SoakOptions& options)
       device->stop();
       return fail(error);
     }
+    const auto t1 = Clock::now();
+    read_timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
     {
       // The engine's render path lives here. The read and write either side of it are the
       // backend's own syscalls and are deliberately outside the scope (namchain/rt_check.h).
       RtScope scope;
+      if (!chain.empty())
+      {
+        const size_t width = info.bytes_per_sample;
+        const unsigned in_ch = std::min(options.input_channel, info.channels - 1);
+        const unsigned out_ch = std::min(options.output_channel, info.channels - 1);
+
+        for (unsigned i = 0; i < info.period_size; ++i)
+          mono_a[i] = static_cast<NAM_SAMPLE>(
+            pcm_decode(buffer.data() + (static_cast<size_t>(i) * info.channels + in_ch) * width, pcm_format));
+
+        for (auto& model : chain)
+        {
+          NAM_SAMPLE* in_ptrs[] = {mono_a.data()};
+          NAM_SAMPLE* out_ptrs[] = {mono_b.data()};
+          model->process(in_ptrs, out_ptrs, static_cast<int>(info.period_size));
+          mono_a.swap(mono_b); // swap, never copy: no allocation inside the scope
+        }
+
+        for (unsigned i = 0; i < info.period_size; ++i)
+          pcm_encode(buffer.data() + (static_cast<size_t>(i) * info.channels + out_ch) * width, pcm_format,
+                     static_cast<float>(mono_a[i]));
+      }
     }
+    const auto t2 = Clock::now();
+    chain_timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
     if (device->write_playback(buffer.data(), info.period_size, 1000, error) < 0)
     {
       device->stop();
       return fail(error);
     }
-    const auto t1 = Clock::now();
-    timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+    const auto t3 = Clock::now();
+    write_timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count()));
+    const uint64_t block_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t0).count());
+    timer.record(block_ns);
+    if (block_ns > deadline_ns && first_overrun_block == std::numeric_limits<uint64_t>::max())
+      first_overrun_block = block;
   }
   const auto end = Clock::now();
-  const uint64_t driver_xruns = device->driver_xruns();
+  const uint64_t steady_xruns = device->driver_xruns() - startup_xruns;
   device->stop();
 
   SoakResult result;
@@ -140,8 +253,12 @@ SoakResult run_device_soak(const SoakOptions& options)
   result.rt_allocations = rt_allocation_count();
   result.rt_deallocations = rt_deallocation_count();
   result.device_mode = true;
+  result.first_overrun_block = first_overrun_block;
+  result.memory_locked = memory_locked;
   result.device_period_size = info.period_size;
   result.device_buffer_size = info.buffer_size;
+  result.chain_instances = static_cast<unsigned>(chain.size());
+  result.chain_model = options.model;
   result.device_sample_format = info.sample_format;
   result.device_bytes_per_sample = info.bytes_per_sample;
   result.device_period_exact = info.period_exact;
@@ -151,8 +268,12 @@ SoakResult run_device_soak(const SoakOptions& options)
   result.blocks = timer.blocks();
   result.frames = timer.blocks() * info.period_size;
   result.deadline_overruns = timer.deadline_overruns();
-  result.driver_xruns = driver_xruns;
+  result.driver_xruns = steady_xruns;
+  result.startup_driver_xruns = startup_xruns;
   result.deadline_ns = deadline_ns;
+  result.read_p50_ns = read_timer.p50_ns();
+  result.chain_p50_ns = chain_timer.p50_ns();
+  result.write_p50_ns = write_timer.p50_ns();
   result.wait_p50_ns = wait_timer.p50_ns();
   result.wait_p99_ns = wait_timer.p99_ns();
   result.wait_max_ns = wait_timer.max_ns();

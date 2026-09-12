@@ -115,6 +115,7 @@ add_library(namchain OBJECT
   src/nam/lookback.cpp
   src/io/wav.cpp
   src/io/alsa_params.cpp
+  src/io/pcm.cpp
   src/io/alsa_raw.cpp
   src/offline/render.cpp
   src/rt/telemetry.cpp
@@ -212,7 +213,8 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_render.cpp
     tests/test_soak.cpp
     tests/test_alsa_params.cpp
-    tests/test_rt_check.cpp)
+    tests/test_rt_check.cpp
+    tests/test_pcm.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")

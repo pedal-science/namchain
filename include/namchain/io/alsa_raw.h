@@ -98,7 +98,9 @@ private:
   AlsaRawDuplex() = default;
 
   bool configure(int fd, const char* direction, std::string& error);
-  void recover(int fd);
+  /// \param playback when true the ring is re-primed with silence after the xrun.
+  void recover(int fd, bool playback);
+  bool prime_playback(std::string& error);
   int transfer(int fd, void* buf, unsigned frames, bool playback, int timeout_ms, std::string& error);
 
   int capture_fd_ = -1;
@@ -107,6 +109,8 @@ private:
   unsigned periods_ = 4;
   std::vector<unsigned> format_preference_;
   unsigned bytes_per_frame_ = 2;
+  /// Silence used to prime the playback ring; preallocated so recovery does not allocate.
+  std::vector<unsigned char> prime_silence_;
   AlsaRawInfo info_;
   uint64_t driver_xruns_ = 0;
   uint64_t recoveries_ = 0;

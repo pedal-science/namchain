@@ -758,6 +758,36 @@ said should be made by measurement, and this is that measurement (true round-tri
 the physical loopback cable, §10.5.1). The two UAC1 devices stay useful as the cheap end of the range
 the engine must still support, and the MOMIX additionally pins 48 kHz with no other rate available.
 
+**Criterion 3, measured in the device loop (2026-09-12).** The same harness, now running real models
+between the backend's read and write: SSL 2+ Mk II, 48 kHz, q = 64 (1333 us deadline), 4 channels,
+10 s each, `SCHED_FIFO` 80 with `mlockall`, steady state (bring-up excluded).
+
+| chain | p50 | p99 | max | p99/deadline | overruns | driver xruns |
+|---|---|---|---|---|---|---|
+| passthrough | 8.6 us | 11.4 us | 51.5 us | 0.85 % | 0 | 0 |
+| 1 x A2-Full | 79.2 us | 108.9 us | 225.2 us | 8.17 % | 0 | 0 |
+| 2 x A2-Full | 156.0 us | 195.1 us | 374.3 us | 14.6 % | 0 | 0 |
+| **4 x A2-Full** | **327.9 us** | **433.8 us** | **832.4 us** | **32.5 %** | **0** | **0** |
+| 8 x A2-Full | 968.6 us | 1378.7 us | 5770 us | 103 % | 93 | 22 |
+
+**§1 criterion 3's throughput clause now passes on hardware**: four concurrent A2-Full at 32.5 % of the
+deadline against a 50 % budget, zero deadline overruns and zero driver xruns, in a real full-duplex
+loop. The ceiling sits between 4 and 8 instances: eight cost ~121 us each rather than 82 us, i.e.
+superlinear, which is the cache/memory pressure §11 predicted rather than an arithmetic wall.
+
+Three harness bugs were found getting here, each of which would have produced a confidently wrong
+number:
+1. **Recovery re-`PREPARE`d the playback ring without re-priming it**, so after any xrun the stream
+   underran again immediately -- reported as 495 "xruns" in a run whose median work was 8 % of the
+   deadline. Re-priming with a preallocated silence buffer fixed it.
+2. **Priming the whole ring** (which is effectively what a file player does) left it permanently full,
+   so every write blocked for a full period: the reported 1492 us block time was 70 us of engine and
+   1416 us of the device's back-pressure. Priming one period fixed it; splitting the timed section
+   into read / chain / write is what made it visible, and the split is worth keeping for that reason.
+3. **The first block after START overran in every configuration, passthrough included** -- it is the
+   initial fill of an empty capture ring, not a real-time property. Bring-up is now untimed and its
+   xruns reported separately, rather than being discarded or mistaken for load.
+
 **A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
 but the run does not keep real time at it: RTF 1.333, i.e. it loses a third. Instrumenting the loop to
 separate **device wait** from **work** shows where the time goes:

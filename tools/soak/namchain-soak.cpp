@@ -53,6 +53,10 @@ void usage()
                "  --device hw:C,D      capture and play back through a real ALSA device\n"
                "  --channels N         1 or 2 (default 1)\n"
                "  --periods N          buffer length in periods (default 4)\n"
+               "  --model FILE         run this .nam between capture and playback\n"
+               "  --instances N        chain N copies of the model (default 1)\n"
+               "  --input-channel N    device channel feeding the chain (default 0)\n"
+               "  --output-channel N   device channel the chain writes to (default 0)\n"
                "exit: 0 pass, 1 failed a gate, 2 usage/IO error\n",
                NAMCHAIN_VERSION_STRING);
 }
@@ -94,6 +98,14 @@ int main(int argc, char** argv)
       options.device_channels = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--periods" && i + 1 < argc)
       options.device_periods = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (arg == "--model" && i + 1 < argc)
+      options.model = argv[++i];
+    else if (arg == "--instances" && i + 1 < argc)
+      options.instances = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (arg == "--input-channel" && i + 1 < argc)
+      options.input_channel = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (arg == "--output-channel" && i + 1 < argc)
+      options.output_channel = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--json")
       json = true;
     else if (arg == "-h" || arg == "--help")
@@ -168,7 +180,10 @@ int main(int argc, char** argv)
                      {"buffer_size", result.device_buffer_size},
                      {"period_exact", result.device_period_exact},
                      {"sample_format", result.device_sample_format},
-                     {"bytes_per_sample", result.device_bytes_per_sample}};
+                     {"bytes_per_sample", result.device_bytes_per_sample},
+                     {"chain_instances", result.chain_instances},
+                     {"chain_model", result.chain_model},
+                     {"startup_xruns", result.startup_driver_xruns}};
     }
     if (result.oracle.checked)
     {
@@ -192,6 +207,9 @@ int main(int argc, char** argv)
                   result.device_period_exact ? "" : " (rounded by the device)");
       std::printf("sample format:    %s (%u bytes/sample)\n", format_name(result.device_sample_format),
                   result.device_bytes_per_sample);
+      std::printf("mlockall:         %s\n", result.memory_locked ? "locked" : "FAILED (measurement includes page faults)");
+      if (result.chain_instances > 0)
+        std::printf("chain:            %u x %s\n", result.chain_instances, result.chain_model.c_str());
     }
     else
     {
@@ -203,6 +221,11 @@ int main(int argc, char** argv)
     std::printf("audio:            %.3f s in %.3f s wall (RTF %.4f)\n", result.audio_seconds, result.wall_seconds,
                 result.rtf);
     std::printf("deadline:         %llu ns\n", static_cast<unsigned long long>(result.deadline_ns));
+    if (result.device_mode)
+      std::printf("split (p50):      read %llu ns, chain %llu ns, write %llu ns\n",
+                  static_cast<unsigned long long>(result.read_p50_ns),
+                  static_cast<unsigned long long>(result.chain_p50_ns),
+                  static_cast<unsigned long long>(result.write_p50_ns));
     if (result.device_mode)
       std::printf("device wait:      p50 %llu ns, p99 %llu ns, max %llu ns\n",
                   static_cast<unsigned long long>(result.wait_p50_ns),
@@ -219,6 +242,13 @@ int main(int argc, char** argv)
                   static_cast<unsigned long long>(result.rt_deallocations));
     else
       std::printf("render-path alloc:not instrumented\n");
+    if (result.device_mode && result.startup_driver_xruns > 0)
+      std::printf("bring-up xruns:   %llu (before the measured loop)\n",
+                  static_cast<unsigned long long>(result.startup_driver_xruns));
+    if (result.device_mode && result.first_overrun_block != UINT64_MAX)
+      std::printf("first overrun at: block %llu of %llu\n",
+                  static_cast<unsigned long long>(result.first_overrun_block),
+                  static_cast<unsigned long long>(result.blocks));
     std::printf("deadline overruns:%llu\n", static_cast<unsigned long long>(result.deadline_overruns));
     std::printf("driver xruns:     %llu%s\n", static_cast<unsigned long long>(result.driver_xruns),
                 (!result.device_mode && result.driver_xruns == 0) ? " (no device backend in this mode)" : "");
