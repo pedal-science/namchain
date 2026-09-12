@@ -183,7 +183,8 @@ int main(int argc, char** argv)
                      {"bytes_per_sample", result.device_bytes_per_sample},
                      {"chain_instances", result.chain_instances},
                      {"chain_model", result.chain_model},
-                     {"startup_xruns", result.startup_driver_xruns}};
+                     {"startup_xruns", result.startup_driver_xruns},
+                     {"model_type", result.model_type}};
     }
     if (result.oracle.checked)
     {
@@ -210,6 +211,8 @@ int main(int argc, char** argv)
       std::printf("mlockall:         %s\n", result.memory_locked ? "locked" : "FAILED (measurement includes page faults)");
       if (result.chain_instances > 0)
         std::printf("chain:            %u x %s\n", result.chain_instances, result.chain_model.c_str());
+      if (!result.model_type.empty())
+        std::printf("model type:       %s\n", result.model_type.c_str());
     }
     else
     {

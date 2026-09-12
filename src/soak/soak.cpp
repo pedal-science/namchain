@@ -8,7 +8,12 @@
 #include <string>
 #include <sys/mman.h>
 #include <thread>
+#include <typeinfo>
 #include <vector>
+
+#if defined(__GNUG__)
+  #include <cxxabi.h>
+#endif
 
 #include "NAM/dsp.h"
 #include "NAM/get_dsp.h"
@@ -40,6 +45,20 @@ SoakResult fail(std::string message)
   r.ok = false;
   r.error = std::move(message);
   return r;
+}
+
+/// The concrete type behind a DSP, demangled. Measurements must name the implementation they
+/// measured: A2PlanarFull and A2FastModel<8> are ~2x apart on this host.
+std::string demangled_type(const nam::DSP& model)
+{
+#if defined(__GNUG__)
+  int status = 0;
+  std::unique_ptr<char, void (*)(void*)> name{abi::__cxa_demangle(typeid(model).name(), nullptr, nullptr, &status),
+                                              std::free};
+  if (status == 0 && name)
+    return name.get();
+#endif
+  return typeid(model).name();
 }
 
 std::string temp_wav_path(const std::string& tag)
@@ -259,6 +278,8 @@ SoakResult run_device_soak(const SoakOptions& options)
   result.device_buffer_size = info.buffer_size;
   result.chain_instances = static_cast<unsigned>(chain.size());
   result.chain_model = options.model;
+  if (!chain.empty())
+    result.model_type = demangled_type(*chain.front());
   result.device_sample_format = info.sample_format;
   result.device_bytes_per_sample = info.bytes_per_sample;
   result.device_period_exact = info.period_exact;
@@ -322,6 +343,7 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
   }
   if (!model)
     return fail("failed to load model '" + model_path + "'");
+  const std::string model_type = demangled_type(*model);
 
   std::vector<float> input;
   double input_rate = 0.0;
@@ -467,6 +489,7 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
   result.max_ns = timer.max_ns();
   result.p99_percent_of_deadline = timer.p99_percent_of_deadline();
   result.audio_seconds = audio_seconds;
+  result.model_type = model_type;
   result.wall_seconds = wall_seconds;
   result.rtf = audio_seconds > 0.0 ? wall_seconds / audio_seconds : 0.0;
   result.max_lateness_ms = max_lateness_ns / 1e6;

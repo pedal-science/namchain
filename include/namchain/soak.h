@@ -129,6 +129,10 @@ struct SoakResult
   std::string device_playback_node;
   unsigned chain_instances = 0;
   std::string chain_model;
+  /// The concrete C++ type the factory returned (e.g. A2PlanarFull vs A2FastModel<8>). A timing
+  /// number is only meaningful alongside the implementation it measured, and the two A2 paths
+  /// differ by ~2x.
+  std::string model_type;
 
   OracleResult oracle;
 };
