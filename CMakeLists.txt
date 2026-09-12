@@ -99,6 +99,15 @@ set(NAMCHAIN_AUDIODSPTOOLS_DIR "${NAMCHAIN_NAM_CORE_DIR}/Dependencies/AudioDSPTo
 set(NAMCHAIN_AUDIODSPTOOLS_WAV "${NAMCHAIN_AUDIODSPTOOLS_DIR}/dsp/wav.cpp")
 set_source_files_properties(${NAMCHAIN_AUDIODSPTOOLS_WAV} PROPERTIES COMPILE_FLAGS "-w")
 
+# Our own code is held to -Wall -Wextra (and -Werror where CI asks for it). Set before the
+# library target so that libnamchain's own sources are covered too, not just the tools and
+# tests -- third-party sources opt out individually via COMPILE_FLAGS "-w" above.
+if(NAMCHAIN_WERROR)
+  set(NAMCHAIN_WARN_FLAGS -Wall -Wextra -Werror)
+else()
+  set(NAMCHAIN_WARN_FLAGS -Wall -Wextra)
+endif()
+
 add_library(namchain OBJECT
   src/nam/lookback.cpp
   src/io/wav.cpp
@@ -114,7 +123,7 @@ target_include_directories(namchain SYSTEM PUBLIC
 target_include_directories(namchain PRIVATE "${NAMCHAIN_AUDIODSPTOOLS_DIR}/dsp")
 target_include_directories(namchain PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(namchain PUBLIC cxx_std_20)
-target_compile_options(namchain PRIVATE -Wall -Wextra)
+target_compile_options(namchain PRIVATE ${NAMCHAIN_WARN_FLAGS})
 
 if(NAMCHAIN_A2_FAST)
   target_compile_definitions(namchain PUBLIC NAM_ENABLE_A2_FAST)
@@ -127,12 +136,6 @@ if(NAMCHAIN_RTSAN)
   target_compile_options(namchain PUBLIC -fsanitize=realtime)
   target_link_options(namchain PUBLIC -fsanitize=realtime)
   message(STATUS "RealtimeSanitizer enabled (requires clang >= 20)")
-endif()
-
-if(NAMCHAIN_WERROR)
-  set(NAMCHAIN_WARN_FLAGS -Wall -Wextra -Werror)
-else()
-  set(NAMCHAIN_WARN_FLAGS -Wall -Wextra)
 endif()
 
 # ---------------------------------------------------------------------------
