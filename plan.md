@@ -259,10 +259,19 @@ rigs/                                             # example chain sets + test si
 
 ### 4.2 Build
 
-- CMake ≥ 3.22, C++20, `-O3`; **define `NAM_SAMPLE_FLOAT`** (G4) and keep `NAM_ENABLE_A2_FAST=ON`.
-  **Correction:** the core has no CMake option for either flag — `NAM_SAMPLE_FLOAT` is only an
-  `#ifdef` in `NAM/dsp.h`, so `-DNAM_SAMPLE_FLOAT=ON` is silently ignored by CMake. Our project
-  supplies it as a compile definition via `-DNAMCHAIN_SAMPLE_FLOAT=ON`.
+- CMake ≥ 3.22, C++20, `-O3`; keep `NAM_ENABLE_A2_FAST=ON`.
+- **`NAM_SAMPLE_FLOAT`: default OFF; do not define it (decision, 2026-09-11).** It is not a precision
+  knob — the model arithmetic is float32 either way (Eigen `MatrixXf`, and `a2_fast` keeps explicit
+  `std::vector<float> _cond` / `_head_out`, described in-source as "float32 copy of the double
+  NAM_SAMPLE input", `a2_fast.cpp:143-144`). All it changes is the **element type of the process()
+  boundary buffers**, and it removes a per-block double↔float conversion inside `a2_fast`. Measured:
+  no benefit on this host (A2-Full q=64: 0.1079 double vs 0.1097 float; A2-Lite 0.0262 both). Revisit
+  at M1 when the I/O backends land: PipeWire/ALSA/CoreAudio are float32-native and the §6.1 node ABI
+  is already `float* const*`, so a float engine avoids conversion at both ends, and ARMv7's ~5 GB/s
+  bandwidth (G19) is the other reason to retest. The option exists and both paths are verified to build.
+  **Correction to the earlier text here:** the core has no CMake option for this — `NAM_SAMPLE_FLOAT`
+  is only an `#ifdef` in `NAM/dsp.h`, so the originally planned `-DNAM_SAMPLE_FLOAT=ON` was silently
+  ignored by CMake (it warns "unused variable") and always built the double path.
 - **The core must be built as an object library, not a static one.** Architectures register via
   file-scope static initializers (`static ConfigParserHelper _register_WaveNet(...)`) that nothing
   references; any static archive discards those objects and every load fails at runtime with
@@ -391,6 +400,14 @@ typedef struct nac_node_vtable {
 Params are resolved to integer ids at compile time (no strings on the audio thread). Third-party nodes
 load via `dlopen` on Linux/macOS **only**; on iOS they are statically registered (G17) and plugin code
 is data-only.
+
+**Open sample-type decision (settle at M1).** This ABI is `float`, but the vendored core defaults
+`NAM_SAMPLE` to `double` (§4.2). Options: (a) build the core with `NAM_SAMPLE_FLOAT` so both sides are
+float and no conversion exists at the `nc.nam` boundary; (b) keep the core in double and convert once
+per block inside the `nc.nam` node; (c) run the whole engine in double. Measurement says the choice is
+performance-neutral on the Pi (§4.2, §11), so decide it on interface cleanliness and on the −60 dBFS
+state-continuity budget, not on speed. Option (a) would also make the engine's own input-history rings
+(§7.3) float, which is the one place the precision question genuinely touches the warm-start claim.
 
 ### 6.2 Built-ins
 
