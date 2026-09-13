@@ -323,14 +323,38 @@ Vendored/pinned: NAM core (MIT), Eigen (MPL-2.0 — file-level copyleft, unmodif
 nlohmann/json (MIT), doctest (MIT). No JUCE (dual/GPL), no iPlug2, no GPL/LGPL host frameworks.
 
 **One tension to flag:** the Linux audio stack is the only place where "permissive-only" bites. ALSA's
-`libasound` and JACK2 are LGPL-2.1; PipeWire and WirePlumber are MIT. The plan therefore ships:
+`libasound` and JACK's client library are LGPL-2.1; PipeWire and WirePlumber are MIT. The plan
+therefore ships:
 - `nac_io_file` / `nac_io_null` — no deps; used by CI and offline rendering (mandatory anyway for
   determinism).
 - `nac_io_pipewire` — MIT client, default for desktop/coexistence.
 - `nac_io_alsa_raw` — **direct kernel UAPI ioctls on `/dev/snd/pcmC*D*p`** (hw params, prepare,
   writei/readi, card enumeration via control ioctls). No `libasound`, hence no LGPL. This is the
   appliance backend and the one that matters for latency on a Pi.
-- `nac_io_jack` — deferred; requires accepting LGPL dynamic linking.
+- `nac_io_jack` — deferred, and **not for the reason this document used to give.** Checked against the
+  sources rather than assumed: JACK's *client* library is LGPL-2.1-or-later in both implementations —
+  JACK1's `COPYING` says the `libjack/` tree "is licensed under the LGPL **in order to allow for
+  proprietary usage of Jack**", and JACK2's `common/jack/jack.h` carries an LGPL-2.1-or-later header.
+  Only the *server* (`jackd`) and the tree around it are GPL-2.0, and a separate process is not a
+  derivative work, so that side does not reach us. Dynamically linking a proprietary client against
+  libjack is the intended use and is routine — that is how proprietary DAWs ship. So the real
+  obstacles are, in order of weight:
+  1. **Architecture, not licensing.** JACK is a *server*. Being a client means the period, the buffer
+     size and the scheduling belong to `jackd`, not to us — and §1 criterion 3 is a guarantee about
+     exactly those three. Handing them to a third-party server is a downgrade in the one area this
+     project is trying to be strong, whatever the license says.
+  2. **Our own policy.** §4.3's rule is *permissive-only*, and LGPL is weak copyleft, so JACK is
+     excluded by a self-imposed constraint rather than by law. If the policy is ever relaxed, this is
+     the dependency to relax it for.
+  3. **Static linking into an appliance image.** LGPL-2.1 §6 requires that a recipient be able to
+     relink the work against a modified library: shipping object files or a relinkable form, plus the
+     library's source. A stripped, signed, self-contained image is the case where that becomes real
+     per-release work — and it is the concrete blocker, not the dynamic-linking case.
+  The interoperability this node was meant to buy is available under MIT anyway: PipeWire ships a JACK
+  implementation (`pipewire-jack-audio-connection-kit`, license field **MIT**), which presents a
+  drop-in `libjack`. A user on a PipeWire desktop is therefore served by the MIT desktop backend, and
+  `nac_io_jack` is only needed by someone who specifically wants to be a client inside another
+  machine's `jackd` graph.
 
 **Decision:** build `alsa_raw` in M1 (≈600–900 lines incl. hw-param negotiation), keep the backend
 interface identical so a `libasound`-based backend can be dropped in later if you'd rather trade the
@@ -710,7 +734,8 @@ either compiles and commits, or is rejected with a reason — never partially ap
 
 `file` (WAV in/out, offline) and `null` (real-time-paced, no device) exist from M1 — they make CI and
 determinism possible and are the reason M1 doesn't block on hardware. `pipewire` (MIT) and `alsa_raw`
-(no libasound, §4.3) in M1. `jack` (LGPL, deferred, opt-in). `coreaudio` (macOS then iOS: RemoteIO/
+(no libasound, §4.3) in M1. `jack` (LGPL client library, deferred — the reason is architectural, not
+legal: see §4.3). `coreaudio` (macOS then iOS: RemoteIO/
 AUHAL, workgroups, `QOS_CLASS_USER_INTERACTIVE`, `.measurement` session mode) in M6.
 
 ### 9.2 Clock, rate, latency policy
@@ -1328,6 +1353,15 @@ Primary (fetched and read in full during planning):
 - Commercial prior art: Line 6 Helix preset spillover (forum + 3.80 manual); Neural DSP Quad Cortex
   Development Update #18 — https://neuraldsp.com/quad-cortex-updates/quad-cortex-development-update-february-15th
 - Model licensing: https://www.tone3000.com/terms , https://www.tone3000.com/api/terms
+- Audio-stack licensing, read directly rather than taken on trust: JACK1 `COPYING` (the `libjack/`
+  tree is LGPL, "in order to allow for proprietary usage of Jack") —
+  https://raw.githubusercontent.com/jackaudio/jack1/master/COPYING ; JACK2 `COPYING` (GPL-2.0 for the
+  tree) — https://raw.githubusercontent.com/jackaudio/jack2/develop/COPYING ; JACK2 public client
+  header `common/jack/jack.h` (LGPL-2.1-or-later per-file) —
+  https://raw.githubusercontent.com/jackaudio/jack2/develop/common/jack/jack.h ; PipeWire `COPYING`
+  (MIT/Expat) — https://gitlab.freedesktop.org/pipewire/pipewire/-/raw/master/COPYING ; and the
+  packaged JACK implementation's license field (**MIT**) —
+  https://packages.fedoraproject.org/pkgs/pipewire/pipewire-jack-audio-connection-kit/
 
 Local environment facts were established by direct inspection (no shell available): `/proc/cpuinfo`
 (Cortex-A76, part `0xd0b`), `/etc/os-release`, `/etc/apt/sources.list.d/debian.sources`,
