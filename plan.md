@@ -365,6 +365,16 @@ allocation) → **cost model** (per-node predicted µs from the measured cost ta
 Compile is transactional: any error leaves the running plan untouched and returns a structured error.
 A plan is published by an atomic index store; the previous plan is retired via §3.2/6.
 
+**Implemented at M1** (`src/graph/plan.cpp`): validation (unknown types, duplicate ids, dangling
+connections, port ranges, cycles via Kahn), deterministic topological order, **liveness + interval
+colouring** so a serial chain of six gains collapses to a handful of buffers rather than one per node,
+buffer allocation out of an `rt::Arena`, and all pointer binding done at compile time so `execute()` is
+allocation-free. Unconnected input ports are bound to one shared zeroed buffer rather than trusting a
+node to ignore a null pointer, and every node's output array is null-terminated so fan-out nodes can
+walk it. Tests cover rejection of malformed and cyclic graphs, topological ordering with nodes declared
+out of order, buffer reuse, silence on unconnected ports, determinism, zero allocations inside an
+`RtScope`, and `nc.nam` producing the same samples as running the model directly.
+
 ### 5.3 Edit semantics — every edit is one of four op classes
 
 | Edit | Mechanism | Cost | Glitch risk |
@@ -1101,7 +1111,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: RT primitives, arena, command ring, epoch reclamation; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 (§9.5)**; `pipewire` + `null` + `file`; daemon skeleton; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline oracle (§10.5.1)** | Plays a guitar through 2 chains at 64 samples; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, captured output sample-identical to the offline render); allocation interposer clean; true round-trip latency measured with `jdelay` over a physical loopback cable; **parity test green at release flags** |
+| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam` ✔**; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 (§9.5)**; `pipewire` + `null` + `file`; daemon skeleton; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline oracle (§10.5.1)** | Plays a guitar through 2 chains at 64 samples; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, captured output sample-identical to the offline render); allocation interposer clean; true round-trip latency measured with `jdelay` over a physical loopback cable; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |

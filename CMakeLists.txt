@@ -125,6 +125,8 @@ add_library(namchain OBJECT
   src/rt/rt_check.cpp
   src/rt/arena.cpp
   src/rt/reclaimer.cpp
+  src/graph/plan.cpp
+  src/nodes/builtin.cpp
   src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
   ${NAMC_CORE_SOURCES})
@@ -225,7 +227,8 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_alsa_params.cpp
     tests/test_rt_check.cpp
     tests/test_pcm.cpp
-    tests/test_rt_primitives.cpp)
+    tests/test_rt_primitives.cpp
+    tests/test_graph.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
