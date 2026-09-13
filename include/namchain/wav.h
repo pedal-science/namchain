@@ -17,6 +17,19 @@ namespace namchain
 /// in M1. `error` is set on failure.
 bool load_wav_mono(const std::string& path, std::vector<float>& samples, double& sample_rate, std::string& error);
 
+/// \brief Load a WAV of any channel count as interleaved float samples.
+///
+/// Our own reader, rather than the core's, because the core's refuses anything but mono
+/// (`ERROR_NOT_MONO`) and the `file` backend has to be able to read what it wrote. PCM 16/24/32-bit
+/// and 32-bit IEEE float are supported, which is what the engine's own writer produces plus what a
+/// device capture is likely to be.
+///
+/// \ref load_wav_mono deliberately still delegates to the core's loader: the golden test compares
+/// our render against the core's own `render` tool, so the two paths must decode identical floats.
+/// This one exists for the cases the core cannot serve, and is not used for that comparison.
+bool load_wav(const std::string& path, std::vector<float>& interleaved, unsigned& channels, double& sample_rate,
+              std::string& error);
+
 /// \brief Write interleaved float samples as a 32-bit IEEE-float WAV (format code 3).
 ///
 /// Own implementation rather than the core's, which is a mono-only helper local to its

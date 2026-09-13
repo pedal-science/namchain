@@ -108,3 +108,17 @@ TEST_CASE("encode writes exactly the bytes the format claims and no more")
   CHECK(buffer[2] != 0xAA);
   CHECK(buffer[3] == 0xAA); // untouched
 }
+
+TEST_CASE("float32 samples round trip bit-exactly, with no clamping surprise")
+{
+  // The engine's own format, used by the backends that have no wire to speak (`file`, `null`). It
+  // has to be exact: a file backend that quantises would make every offline comparison meaningless
+  // while still looking plausible.
+  for (const float value : {0.0f, 0.5f, -0.5f, 0.75f, -0.25f, 1.0f, -1.0f, 1e-30f, -3.5e-7f})
+  {
+    unsigned char bytes[4] = {0xAA, 0xAA, 0xAA, 0xAA};
+    namchain::pcm_encode(bytes, namchain::PcmFormat::F32_LE, value);
+    CHECK(namchain::pcm_decode(bytes, namchain::PcmFormat::F32_LE) == value);
+  }
+  CHECK(namchain::pcm_bytes_per_sample(namchain::PcmFormat::F32_LE) == 4u);
+}

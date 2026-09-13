@@ -12,7 +12,9 @@ enum class PcmFormat
   Unknown = 0,
   S16_LE,   ///< signed 16-bit little-endian
   S24_3LE,  ///< signed 24-bit little-endian, packed into 3 bytes (not padded to 4)
-  S32_LE    ///< signed 32-bit little-endian
+  S32_LE,   ///< signed 32-bit little-endian
+  F32_LE    ///< 32-bit IEEE float little-endian. The engine's own format: the backends that have no
+            ///< wire to speak (`file`, `null`) use it rather than quantising for no reason.
 };
 
 std::size_t pcm_bytes_per_sample(PcmFormat format);

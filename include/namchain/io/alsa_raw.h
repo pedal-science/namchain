@@ -43,6 +43,11 @@ struct AlsaRawConfig
   /// The PCM2902 offers only S16_LE and falls through; 24-bit interfaces use the top entry.
   std::vector<unsigned> format_preference{SNDRV_PCM_FORMAT_S24_3LE, SNDRV_PCM_FORMAT_S32_LE,
                                           SNDRV_PCM_FORMAT_S16_LE};
+  /// Ask the driver to timestamp each period. Off by default: the engine never reads the timestamps,
+  /// and a clock read per period in the render path is exactly the kind of cost this project exists
+  /// to avoid. A latency measurement turns it on because it is the only route to a common timebase
+  /// between the two streams.
+  bool enable_timestamps = false;
 };
 
 struct AlsaRawInfo
@@ -62,8 +67,39 @@ struct AlsaRawInfo
   unsigned bytes_per_sample = 0;
   /// False when the device rounded the requested period (e.g. up to its 1 ms floor).
   bool period_exact = false;
+  /// True when the driver agreed to record timestamps. Without this the status timestamps are all
+  /// zero, which is why a measurement that wants to relate the two streams to one clock has to ask.
+  bool timestamps_enabled = false;
   std::string capture_node;
   std::string playback_node;
+};
+
+/// \brief How much audio is sitting in one direction's ring right now.
+///
+/// This is the quantity that made the first round-trip latency figures irreproducible (§9.5): what
+/// you measure from "I wrote the stimulus" to "it came back" includes however much was already
+/// queued when you wrote, and that settles differently from run to run. Reading it at the moment of
+/// the write is what lets the measurement subtract it and report something that is a property of the
+/// device rather than of the run.
+struct AlsaRawOccupancy
+{
+  /// For playback: frames written but not yet played. For capture: frames the device has produced
+  /// that the application has not read. Either way, it is the gap between the application pointer
+  /// and the hardware pointer, which is exactly what has to be removed from a delay measurement.
+  long long delay_frames = 0;
+  /// The pointers behind the delay, for diagnostics. Both are ring offsets, not absolute counters,
+  /// so they are only meaningful next to the buffer size.
+  unsigned long long hw_ptr = 0;
+  unsigned long long appl_ptr = 0;
+  int state = 0;
+  /// The wall-clock instant the driver associated with that pointer, in nanoseconds, and the
+  /// device-clock timestamp for it. `audio_tstamp_valid` is false when the driver does not fill the
+  /// latter in. These are what would let a measurement relate the two streams to one clock, which
+  /// the pointers alone cannot do -- they are ring offsets and wrap.
+  long long tstamp_ns = 0;
+  long long audio_tstamp_ns = 0;
+  bool audio_tstamp_valid = false;
+  unsigned audio_tstamp_accuracy = 0;
 };
 
 /// Full-duplex PCM stream. Both directions are opened and configured together because the
@@ -105,6 +141,12 @@ public:
   /// How many times recovery was performed (one per handled xrun, normally).
   uint64_t recoveries() const { return recoveries_; }
 
+  /// \brief Read the ring occupancy and pointers for one direction.
+  ///
+  /// Cheap (one ioctl) and, unlike the transfer calls, non-blocking: it reports what is in the ring
+  /// at the instant it is called, which is the whole point. \return false with \p error set.
+  bool query_occupancy(bool capture, AlsaRawOccupancy& out, std::string& error) const;
+
   const AlsaRawInfo& info() const { return info_; }
 
 private:
@@ -121,6 +163,7 @@ private:
   unsigned quantum_ = 64;
   unsigned periods_ = 4;
   std::vector<unsigned> format_preference_;
+  bool enable_timestamps_ = false;
   unsigned capture_bytes_per_frame_ = 2;
   unsigned playback_bytes_per_frame_ = 2;
   /// Silence used to prime the playback ring; preallocated so recovery does not allocate.

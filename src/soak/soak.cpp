@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "namchain/io/backend.h"
 #include "namchain/offline.h"
 #include "namchain/pcm.h"
 #include "namchain/rt_check.h"
@@ -21,9 +22,6 @@
 #include "namchain/graph/rig.h"
 #include "namchain/rt/arena.h"
 
-#if defined(__linux__)
-  #include "namchain/io/alsa_raw.h"
-#endif
 
 namespace namchain
 {
@@ -65,46 +63,35 @@ struct TempFileGuard
   }
 };
 
-#if defined(__linux__)
-namespace
+/// Stream soak: drive a full-duplex backend a period at a time, run the chain in the middle, and
+/// count what the backend reports. Everything after this point is written once and runs against a
+/// WAV file, a paced clock with no device, or raw ALSA ioctls alike (plan.md §9.1).
+SoakResult run_backend_soak(const SoakOptions& options, const std::string& input_wav)
 {
-PcmFormat pcm_format_from_alsa(unsigned format)
-{
-  switch (format)
-  {
-  case SNDRV_PCM_FORMAT_S16_LE: return PcmFormat::S16_LE;
-  case SNDRV_PCM_FORMAT_S24_3LE: return PcmFormat::S24_3LE;
-  case SNDRV_PCM_FORMAT_S32_LE: return PcmFormat::S32_LE;
-  default: return PcmFormat::Unknown;
-  }
-}
-} // namespace
-
-/// Device-backed soak: capture a period, (later: run the engine), play it back, and count what the
-/// driver reports. This is the passthrough stage -- no DSP yet -- so it establishes the host's
-/// real-time baseline before any engine complexity exists to confuse the picture.
-SoakResult run_device_soak(const SoakOptions& options)
-{
-  AlsaRawConfig config;
-  config.capture = options.device;
-  config.playback = options.device;
+  BackendConfig config;
+  config.device = options.device;
   config.sample_rate = options.sample_rate;
   config.capture_channels = options.capture_channels == 0 ? options.device_channels : options.capture_channels;
   config.playback_channels = options.playback_channels == 0 ? options.device_channels : options.playback_channels;
-  config.quantum = options.quantum;
+  config.period_size = options.quantum;
   config.periods = options.device_periods;
+  config.input_path = input_wav;
+  config.output_path = options.output_wav;
+  config.realtime_paced = options.realtime_paced;
   config.require_exact_period = true; // §9.5: a silently rounded quantum is not acceptable
 
   std::string error;
-  std::unique_ptr<AlsaRawDuplex> device = AlsaRawDuplex::open(config, error);
-  if (!device)
+  std::unique_ptr<AudioBackend> device = open_backend(config, options.backend, error);
+  if (device == nullptr)
     return fail(error);
 
-  const AlsaRawInfo info = device->info();
+  const BackendInfo info = device->info();
 
-  // What the engine does after start (§3.3): lock the address space so a page fault cannot stall
-  // a period. Without it a soak measures the page cache as much as the engine.
-  const bool memory_locked = ::mlockall(MCL_CURRENT | MCL_FUTURE) == 0;
+  // What the engine does after start (§3.3): lock the address space so a page fault cannot stall a
+  // period. Without it a soak measures the page cache as much as the engine. Skipped for the file
+  // backend, which is offline by definition and would only end up locking a growing WAV buffer.
+  const bool memory_locked =
+    options.backend != BackendKind::File && ::mlockall(MCL_CURRENT | MCL_FUTURE) == 0;
 
   if (!device->start(error))
     return fail(error);
@@ -150,7 +137,7 @@ SoakResult run_device_soak(const SoakOptions& options)
     have_chain = true;
   }
 
-  const PcmFormat pcm_format = pcm_format_from_alsa(info.sample_format);
+  const PcmFormat pcm_format = info.format;
   std::vector<float> mono_in(static_cast<size_t>(info.period_size), 0.0f);
   std::vector<float> mono_out(static_cast<size_t>(info.period_size), 0.0f);
 
@@ -179,12 +166,35 @@ SoakResult run_device_soak(const SoakOptions& options)
   const uint64_t total_blocks =
     std::max<uint64_t>(1, static_cast<uint64_t>(options.duration_seconds * info.sample_rate / info.period_size));
 
+  // Device-mode self-oracle: the engine's output during a real-time run, against the same graph
+  // rendered offline from the very input that run consumed. This is the only form the comparison
+  // can take on a device -- the input is live capture, so "the same input" means recording it --
+  // and it is what makes criterion 3's last clause a measurement instead of an assumption.
+  //
+  // Bounded to a window, in whole blocks so that the offline re-render sees exactly the block sizes
+  // the real-time run did. Every buffer is allocated here, before the stream starts, because the
+  // recording happens on the audio thread.
+  if (options.self_oracle && !have_chain)
+    return fail("--self-oracle in device mode needs a chain (--model or --graph) to render");
+  std::vector<float> oracle_in;
+  std::vector<float> oracle_out;
+  size_t oracle_recorded = 0;
+  if (options.self_oracle && have_chain)
+  {
+    const uint64_t window_blocks = std::min<uint64_t>(
+      total_blocks, std::max<uint64_t>(1, static_cast<uint64_t>(options.oracle_window_seconds *
+                                                               info.sample_rate / info.period_size)));
+    const size_t window_frames = static_cast<size_t>(window_blocks) * info.period_size;
+    oracle_in.assign(window_frames, 0.0f);
+    oracle_out.assign(window_frames, 0.0f);
+  }
+
   // Bring-up iteration, deliberately untimed. The first period after START fills an empty capture
   // ring, so its cost is an artefact of starting rather than a real-time property -- every
   // configuration, passthrough included, showed exactly one overrun and it was always block 0.
   // Run one cycle outside the measurement and report xruns seen during bring-up separately from
   // those seen while running, rather than discarding either.
-  if (device->wait_capture(2000, error))
+  if (info.needs_bringup_cycle && device->wait_capture(2000, error))
   {
     std::string ignored;
     std::fill(playback_buffer.begin(), playback_buffer.end(), 0);
@@ -198,6 +208,11 @@ SoakResult run_device_soak(const SoakOptions& options)
   const auto start = Clock::now();
   for (uint64_t block = 0; block < total_blocks; ++block)
   {
+    // A file backend runs out of input; stop there rather than reading silence for an hour labelled
+    // as if it were a real measurement.
+    if (device->info().capture_exhausted)
+      break;
+
     // Wait untimed; time only the work. Measuring from the start of the wait would just report the
     // period length, which is not what the deadline is about.
     const auto tw0 = Clock::now();
@@ -256,17 +271,37 @@ SoakResult run_device_soak(const SoakOptions& options)
     timer.record(block_ns);
     if (block_ns > deadline_ns && first_overrun_block == std::numeric_limits<uint64_t>::max())
       first_overrun_block = block;
+
+    // After the timed section on purpose. The copy is real work, but it is work the next
+    // wait_capture absorbs, and charging it to the block would make the oracle change the number it
+    // is meant to be validating. It is still reported, because a run that passes only because the
+    // oracle is off is not the same claim as one that passes with it on.
+    if (!oracle_in.empty() && oracle_recorded < oracle_in.size())
+    {
+      const size_t room = oracle_in.size() - oracle_recorded;
+      const size_t count = std::min<size_t>(info.period_size, room);
+      std::copy(mono_in.begin(), mono_in.begin() + count, oracle_in.begin() + oracle_recorded);
+      std::copy(mono_out.begin(), mono_out.begin() + count, oracle_out.begin() + oracle_recorded);
+      oracle_recorded += count;
+    }
   }
   const auto end = Clock::now();
   const uint64_t steady_xruns = device->driver_xruns() - startup_xruns;
   device->stop();
+  {
+    // `file` writes its WAV here; every other backend has nothing buffered.
+    std::string finish_error;
+    if (!device->finish(finish_error))
+      return fail(finish_error);
+  }
 
   SoakResult result;
   result.ok = true;
   result.rt_instrumented = rt_check_available();
   result.rt_allocations = rt_allocation_count();
   result.rt_deallocations = rt_deallocation_count();
-  result.device_mode = true;
+  result.stream_mode = true;
+  result.backend = backend_kind_name(options.backend);
   result.first_overrun_block = first_overrun_block;
   result.memory_locked = memory_locked;
   result.device_period_size = info.period_size;
@@ -294,11 +329,11 @@ SoakResult run_device_soak(const SoakOptions& options)
     for (std::size_t i = 0; i < described.size(); ++i)
       result.model_type += (i == 0 ? "" : ", ") + described[i];
   }
-  result.device_sample_format = info.sample_format;
+  result.device_sample_format = pcm_format_name(info.format);
   result.device_bytes_per_sample = info.bytes_per_sample;
   result.device_period_exact = info.period_exact;
-  result.device_capture_node = info.capture_node;
-  result.device_playback_node = info.playback_node;
+  result.device_capture_node = info.capture_name;
+  result.device_playback_node = info.playback_name;
 
   result.blocks = timer.blocks();
   result.frames = timer.blocks() * info.period_size;
@@ -319,9 +354,61 @@ SoakResult run_device_soak(const SoakOptions& options)
   result.audio_seconds = static_cast<double>(result.frames) / info.sample_rate;
   result.wall_seconds = std::chrono::duration<double>(end - start).count();
   result.rtf = result.audio_seconds > 0.0 ? result.wall_seconds / result.audio_seconds : 0.0;
+
+  // The oracle itself, after the stream has stopped: the very input the run consumed, pushed
+  // through a freshly compiled plan for the same graph, compared frame by frame against what the
+  // real-time run wrote. A second plan and a second arena, because the first plan's state is the
+  // thing under suspicion and its arena is full of it.
+  if (!oracle_in.empty() && oracle_recorded > 0)
+  {
+    rt::Arena oracle_arena(1u << 20);
+    std::string compile_error;
+    std::unique_ptr<graph::RenderPlan> oracle_plan =
+      graph::RenderPlan::compile(graph, compile_options, oracle_arena, compile_error);
+    if (oracle_plan == nullptr)
+      return fail("oracle re-compile failed: " + compile_error);
+    // Prewarmed exactly as the real-time plan was, so the two start from the same state.
+    oracle_plan->prewarm();
+
+    std::vector<float> block_in(static_cast<size_t>(info.period_size), 0.0f);
+    std::vector<float> block_out(static_cast<size_t>(info.period_size), 0.0f);
+    double max_abs = 0.0;
+    double sum_squares = 0.0;
+    size_t first_mismatch = oracle_recorded;
+    for (size_t offset = 0; offset < oracle_recorded; offset += info.period_size)
+    {
+      const unsigned count =
+        static_cast<unsigned>(std::min<size_t>(info.period_size, oracle_recorded - offset));
+      std::copy(oracle_in.begin() + static_cast<std::ptrdiff_t>(offset),
+                oracle_in.begin() + static_cast<std::ptrdiff_t>(offset + count), block_in.begin());
+      oracle_plan->execute(block_in.data(), block_out.data(), static_cast<int>(count));
+      for (unsigned i = 0; i < count; ++i)
+      {
+        const double difference =
+          std::abs(static_cast<double>(block_out[i]) - static_cast<double>(oracle_out[offset + i]));
+        if (difference > options.oracle_tolerance && first_mismatch == oracle_recorded)
+          first_mismatch = offset + i;
+        max_abs = std::max(max_abs, difference);
+        sum_squares += difference * difference;
+      }
+    }
+
+    result.oracle.checked = true;
+    result.oracle.frames = oracle_recorded;
+    result.oracle.max_abs = max_abs;
+    result.oracle.rms =
+      oracle_recorded > 0 ? std::sqrt(sum_squares / static_cast<double>(oracle_recorded)) : 0.0;
+    result.oracle.match = max_abs <= options.oracle_tolerance;
+    result.oracle.source =
+      "offline render of the captured input, first " +
+      std::to_string(static_cast<double>(oracle_recorded) / info.sample_rate) + " s";
+    if (!result.oracle.match)
+      result.oracle.detail = "first difference at frame " + std::to_string(first_mismatch) +
+                             " of " + std::to_string(oracle_recorded);
+  }
+
   return result;
 }
-#endif // __linux__
 
 } // namespace
 
@@ -332,14 +419,10 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
   if (options.duration_seconds <= 0.0)
     return fail("duration must be > 0");
 
-  if (!options.device.empty())
-  {
-#if defined(__linux__)
-    return run_device_soak(options);
-#else
-    return fail("device mode requires Linux; this build has no ALSA backend");
-#endif
-  }
+  // A device was named, or a backend other than the device one was asked for. Either way this is a
+  // stream run rather than a flat-out batch render.
+  if (!options.device.empty() || options.backend != BackendKind::AlsaRaw)
+    return run_backend_soak(options, input_wav_path);
 
   const bool want_oracle = options.self_oracle || !options.oracle_wav.empty();
   if (want_oracle && options.duration_seconds > kMaxOracleSeconds)

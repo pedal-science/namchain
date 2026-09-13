@@ -95,6 +95,7 @@ std::unique_ptr<AlsaRawDuplex> AlsaRawDuplex::open(const AlsaRawConfig& config, 
   self->quantum_ = config.quantum;
   self->periods_ = config.periods == 0 ? 4 : config.periods;
   self->format_preference_ = config.format_preference;
+  self->enable_timestamps_ = config.enable_timestamps;
   self->info_.capture_channels = capture_channels;
   self->info_.playback_channels = playback_channels;
   self->info_.sample_rate = config.sample_rate;
@@ -286,6 +287,19 @@ bool AlsaRawDuplex::configure(int fd, bool capture, const char* direction, std::
     return false;
   }
 
+  // Timestamps are off unless asked for, and both the enable and the clock choice can be refused.
+  // Failure is not fatal: a caller that needs them can check info().timestamps_enabled.
+  if (enable_timestamps_)
+  {
+    int enabled = 1;
+    if (::ioctl(fd, SNDRV_PCM_IOCTL_TSTAMP, &enabled) == 0)
+    {
+      int clock_type = SNDRV_PCM_TSTAMP_TYPE_MONOTONIC_RAW;
+      ::ioctl(fd, SNDRV_PCM_IOCTL_TTSTAMP, &clock_type);
+      info_.timestamps_enabled = true;
+    }
+  }
+
   return true;
 }
 
@@ -463,6 +477,37 @@ bool AlsaRawDuplex::wait_capture(int timeout_ms, std::string& error)
 int AlsaRawDuplex::write_playback(const void* src, unsigned frames, int timeout_ms, std::string& error)
 {
   return transfer(playback_fd_, const_cast<void*>(src), frames, true, timeout_ms, error);
+}
+
+bool AlsaRawDuplex::query_occupancy(bool capture, AlsaRawOccupancy& out, std::string& error) const
+{
+  const int fd = capture ? capture_fd_ : playback_fd_;
+  if (fd < 0)
+  {
+    error = std::string("query_occupancy: ") + (capture ? "capture" : "playback") + " stream is not open";
+    return false;
+  }
+
+  // STATUS rather than DELAY: one ioctl returns the delay and the pointers that produced it, and
+  // the pointers are what make the figure auditable when it turns out not to be stable.
+  struct snd_pcm_status status;
+  std::memset(&status, 0, sizeof(status));
+  if (::ioctl(fd, SNDRV_PCM_IOCTL_STATUS, &status) < 0)
+  {
+    error = errno_text(std::string("SNDRV_PCM_IOCTL_STATUS failed for ") + (capture ? "capture" : "playback"));
+    return false;
+  }
+
+  out.delay_frames = static_cast<long long>(status.delay);
+  out.hw_ptr = static_cast<unsigned long long>(status.hw_ptr);
+  out.appl_ptr = static_cast<unsigned long long>(status.appl_ptr);
+  out.state = static_cast<int>(status.state);
+  out.tstamp_ns = static_cast<long long>(status.tstamp.tv_sec) * 1000000000LL + status.tstamp.tv_nsec;
+  out.audio_tstamp_ns =
+    static_cast<long long>(status.audio_tstamp.tv_sec) * 1000000000LL + status.audio_tstamp.tv_nsec;
+  out.audio_tstamp_valid = status.audio_tstamp_data != 0;
+  out.audio_tstamp_accuracy = status.audio_tstamp_accuracy;
+  return true;
 }
 
 } // namespace namchain

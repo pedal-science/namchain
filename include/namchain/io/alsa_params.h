@@ -12,6 +12,8 @@
 
   #include <sound/asound.h>
 
+  #include "namchain/pcm.h"
+
 namespace namchain
 {
 namespace alsa
@@ -48,6 +50,10 @@ bool params_pick_format(const struct snd_pcm_hw_params& params, const unsigned* 
 
 /// Bytes per sample for a SNDRV_PCM_FORMAT_* value we support; 0 if unknown.
 unsigned bytes_per_sample(unsigned format);
+
+/// The portable counterpart of a SNDRV_PCM_FORMAT_* value: what pcm_decode/pcm_encode take.
+/// PcmFormat::Unknown when the format is not one this project converts.
+PcmFormat pcm_format(unsigned format);
 
 /// Read back a single-valued interval parameter. Returns false if it is not exactly one value.
 bool params_single_value(const struct snd_pcm_hw_params& params, unsigned param, unsigned& value);

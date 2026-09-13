@@ -10,8 +10,6 @@
 #include <cstdlib>
 #include <string>
 
-#include <sound/asound.h>
-
 #include <json.hpp>
 
 #include "namchain/soak.h"
@@ -19,17 +17,6 @@
 
 namespace
 {
-
-const char* format_name(unsigned format)
-{
-  switch (format)
-  {
-  case SNDRV_PCM_FORMAT_S16_LE: return "S16_LE";
-  case SNDRV_PCM_FORMAT_S24_3LE: return "S24_3LE";
-  case SNDRV_PCM_FORMAT_S32_LE: return "S32_LE";
-  default: return "unknown";
-  }
-}
 
 void usage()
 {
@@ -49,10 +36,14 @@ void usage()
                "  --oracle FILE        compare output against this WAV instead\n"
                "  --output FILE        write the rendered audio here\n"
                "  --tolerance X        oracle tolerance (default 1e-5)\n"
+               "  --oracle-window S    device mode: seconds of the run the self-oracle compares\n"
+               "                       (default 60; the input has to be kept to re-render it)\n"
                "  --sample-rate N      engine rate in Hz (default 48000)\n"
                "  --max-p99-percent X  gate on p99 block time, %% of deadline (default 50)\n"
                "  --json               print a JSON summary instead of text\n"
-               "device mode (no model: capture straight to playback):\n"
+               "stream mode (a backend drives the loop a period at a time):\n"
+               "  --backend KIND       alsa_raw (default), null, or file. With null or file no\n"
+               "                       device is needed; file reads <input.wav> and writes --output\n"
                "  --device hw:C,D      capture and play back through a real ALSA device\n"
                "  --channels N         channel count for both directions (default 1)\n"
                "  --capture-channels N device capture channels, when it differs (SSL 2+ Mk II: 8)\n"
@@ -76,6 +67,7 @@ int main(int argc, char** argv)
   bool json = false;
   std::string model_path;
   std::string input_path;
+  std::vector<std::string> positionals;
 
   for (int i = 1; i < argc; ++i)
   {
@@ -96,8 +88,18 @@ int main(int argc, char** argv)
       options.output_wav = argv[++i];
     else if (arg == "--tolerance" && i + 1 < argc)
       options.oracle_tolerance = std::atof(argv[++i]);
+    else if (arg == "--oracle-window" && i + 1 < argc)
+      options.oracle_window_seconds = std::atof(argv[++i]);
     else if (arg == "--max-p99-percent" && i + 1 < argc)
       max_p99_percent = std::atof(argv[++i]);
+    else if (arg == "--backend" && i + 1 < argc)
+    {
+      if (!namchain::parse_backend_kind(argv[++i], options.backend))
+      {
+        std::fprintf(stderr, "error: unknown backend '%s'; expected alsa_raw, null or file\n", argv[i]);
+        return 2;
+      }
+    }
     else if (arg == "--device" && i + 1 < argc)
       options.device = argv[++i];
     else if (arg == "--channels" && i + 1 < argc)
@@ -133,16 +135,8 @@ int main(int argc, char** argv)
       usage();
       return 2;
     }
-    else if (model_path.empty())
-      model_path = arg;
-    else if (input_path.empty())
-      input_path = arg;
     else
-    {
-      std::fprintf(stderr, "error: unexpected extra argument '%s'\n", arg.c_str());
-      usage();
-      return 2;
-    }
+      positionals.push_back(arg);
   }
 
   // A rig and a model are two ways of saying the same thing, so accepting both would mean silently
@@ -152,15 +146,49 @@ int main(int argc, char** argv)
     std::fprintf(stderr, "error: --graph and --model are alternatives; give one\n");
     return 2;
   }
-  // With --graph the graph file replaces the model argument, so the single positional is the input.
-  if (!options.graph_path.empty() && input_path.empty() && !model_path.empty())
+  // What the positionals mean depends on how the graph was given, so they are collected first and
+  // assigned here:
+  //     --graph RIG in.wav          --model M in.wav          model.nam in.wav
+  // In the first two, the single positional is the input; in the third there are two.
+  //
+  // This used to be three separate special cases, and they disagreed: `--model X in.wav` set
+  // `options.model` but left the positional to be read as the model path, so the run was rejected
+  // with a usage message while `X in.wav` worked. A flag and its positional equivalent behaving
+  // differently is exactly the sort of thing that gets measured one way and quoted the other.
+  const bool source_from_flag = !options.graph_path.empty() || !options.model.empty();
+  if (source_from_flag)
   {
-    input_path = model_path;
-    model_path.clear();
+    if (positionals.size() > 1)
+    {
+      std::fprintf(stderr, "error: unexpected extra argument '%s'\n", positionals[1].c_str());
+      return 2;
+    }
+    if (!positionals.empty())
+      input_path = positionals[0];
+    // The offline path builds its graph from the positional path rather than from the option, so
+    // the two are kept equal here instead of being allowed to drift apart.
+    if (!options.model.empty())
+      model_path = options.model;
+  }
+  else
+  {
+    if (positionals.size() > 2)
+    {
+      std::fprintf(stderr, "error: unexpected extra argument '%s'\n", positionals[2].c_str());
+      return 2;
+    }
+    if (!positionals.empty())
+      model_path = positionals[0];
+    if (positionals.size() > 1)
+      input_path = positionals[1];
   }
 
   const bool have_source = !options.graph_path.empty() || !model_path.empty();
-  if (options.device.empty() && (!have_source || input_path.empty()))
+  // In offline mode a source and an input file are both required. In stream mode the chain is
+  // optional (passthrough is a real measurement of the host), so only a missing device has to be
+  // reported -- and the backend itself says that far better than a usage dump.
+  if (options.device.empty() && options.backend == namchain::BackendKind::AlsaRaw &&
+      (!have_source || input_path.empty()))
   {
     usage();
     return 2;
@@ -207,7 +235,7 @@ int main(int argc, char** argv)
                      {"allocations", result.rt_allocations},
                      {"deallocations", result.rt_deallocations}};
     j["driver_xruns"] = result.driver_xruns;
-    if (result.device_mode)
+    if (result.stream_mode)
     {
       j["device"] = {{"capture_node", result.device_capture_node},
                      {"playback_node", result.device_playback_node},
@@ -235,13 +263,13 @@ int main(int argc, char** argv)
   }
   else
   {
-    if (result.device_mode)
+    if (result.stream_mode)
     {
       std::printf("device:           %s -> %s\n", result.device_capture_node.c_str(),
                   result.device_playback_node.c_str());
       std::printf("period/buffer:    %u / %u frames%s\n", result.device_period_size, result.device_buffer_size,
                   result.device_period_exact ? "" : " (rounded by the device)");
-      std::printf("sample format:    %s (%u bytes/sample)\n", format_name(result.device_sample_format),
+      std::printf("sample format:    %s (%u bytes/sample)\n", result.device_sample_format.c_str(),
                   result.device_bytes_per_sample);
       std::printf("mlockall:         %s\n", result.memory_locked ? "locked" : "FAILED (measurement includes page faults)");
       if (result.chain_instances > 0)
@@ -264,12 +292,12 @@ int main(int argc, char** argv)
     std::printf("audio:            %.3f s in %.3f s wall (RTF %.4f)\n", result.audio_seconds, result.wall_seconds,
                 result.rtf);
     std::printf("deadline:         %llu ns\n", static_cast<unsigned long long>(result.deadline_ns));
-    if (result.device_mode)
+    if (result.stream_mode)
       std::printf("split (p50):      read %llu ns, chain %llu ns, write %llu ns\n",
                   static_cast<unsigned long long>(result.read_p50_ns),
                   static_cast<unsigned long long>(result.chain_p50_ns),
                   static_cast<unsigned long long>(result.write_p50_ns));
-    if (result.device_mode)
+    if (result.stream_mode)
       std::printf("device wait:      p50 %llu ns, p99 %llu ns, max %llu ns\n",
                   static_cast<unsigned long long>(result.wait_p50_ns),
                   static_cast<unsigned long long>(result.wait_p99_ns),
@@ -285,16 +313,16 @@ int main(int argc, char** argv)
                   static_cast<unsigned long long>(result.rt_deallocations));
     else
       std::printf("render-path alloc:not instrumented\n");
-    if (result.device_mode && result.startup_driver_xruns > 0)
+    if (result.stream_mode && result.startup_driver_xruns > 0)
       std::printf("bring-up xruns:   %llu (before the measured loop)\n",
                   static_cast<unsigned long long>(result.startup_driver_xruns));
-    if (result.device_mode && result.first_overrun_block != UINT64_MAX)
+    if (result.stream_mode && result.first_overrun_block != UINT64_MAX)
       std::printf("first overrun at: block %llu of %llu\n",
                   static_cast<unsigned long long>(result.first_overrun_block),
                   static_cast<unsigned long long>(result.blocks));
     std::printf("deadline overruns:%llu\n", static_cast<unsigned long long>(result.deadline_overruns));
     std::printf("driver xruns:     %llu%s\n", static_cast<unsigned long long>(result.driver_xruns),
-                (!result.device_mode && result.driver_xruns == 0) ? " (no device backend in this mode)" : "");
+                (!result.stream_mode && result.driver_xruns == 0) ? " (no device backend in this mode)" : "");
     if (result.oracle.checked)
     {
       std::printf("oracle:           %s vs %s\n", result.oracle.match ? "match" : "MISMATCH",

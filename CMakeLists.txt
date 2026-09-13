@@ -119,6 +119,7 @@ add_library(namchain OBJECT
   src/io/wav.cpp
   src/io/alsa_params.cpp
   src/io/pcm.cpp
+  src/io/backend.cpp
   src/io/alsa_raw.cpp
   src/offline/render.cpp
   src/rt/telemetry.cpp
@@ -245,6 +246,8 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_alsa_params.cpp
     tests/test_rt_check.cpp
     tests/test_pcm.cpp
+    tests/test_wav.cpp
+    tests/test_backend.cpp
     tests/test_rt_primitives.cpp
     tests/test_graph.cpp
     tests/test_nodes.cpp
@@ -274,6 +277,21 @@ if(NAMCHAIN_BUILD_TESTS)
     message(STATUS "A2 planar parity gate: will self-skip (this build is not -O3)")
   endif()
   add_test(NAME unit COMMAND namchain-tests)
+
+  # The soak harness's command line and its backend layer. Runs without hardware and without a
+  # clock (the file backend and the unpaced null backend), which is what makes the rest of the
+  # harness testable in CI at all -- see tests/cli/run_soak_backends.cmake.
+  if(NAMCHAIN_BUILD_TOOLS)
+    add_test(NAME soak_cli
+      COMMAND ${CMAKE_COMMAND}
+        -DNAMCHAIN_SOAK=$<TARGET_FILE:namchain-soak>
+        -DNAMCHAIN_RENDER=$<TARGET_FILE:namchain-render>
+        -DNAMCHAIN_WAVCMP=$<TARGET_FILE:namchain-wavcmp>
+        -DNAMCHAIN_MODEL=${_namchain_gen_dir}/A2-Lite.nam
+        -DNAMCHAIN_INPUT=${NAMCHAIN_NAM_CORE_DIR}/example_audio/input.wav
+        -DNAMCHAIN_WORK=${CMAKE_CURRENT_BINARY_DIR}/soak-cli
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/run_soak_backends.cmake")
+  endif()
 
   # -------------------------------------------------------------------------
   # Golden comparison against the vendored core's own `render` tool (§10.2).

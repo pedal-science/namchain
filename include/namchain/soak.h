@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <string>
 
+#include "namchain/io/backend.h"
+
 namespace namchain
 {
 
@@ -32,11 +34,26 @@ struct SoakOptions
   std::string output_wav;
   /// Tolerance passed to the oracle comparison (see namchain::compare_wav_mono).
   double oracle_tolerance = 1e-5;
+  /// Device mode only: how many seconds of the run the self-oracle compares.
+  ///
+  /// The comparison has to keep the captured input, and an hour of it is 1.4 GB, so it is bounded.
+  /// The bound is reported rather than left implicit: "the first N seconds are sample-identical to
+  /// the offline render" is a weaker claim than "the whole run is", and the number belongs next to
+  /// it. The rest of the run is still covered by the xrun and timing gates.
+  double oracle_window_seconds = 60.0;
 
   /// When non-empty, run against a real ALSA device in passthrough (capture -> playback) instead
   /// of a model: "hw:4,0", "4,0" or a /dev/snd path. This is the device half of the acceptance
   /// criterion, and the stage where `driver_xruns` stops being permanently zero.
   std::string device;
+  /// Which I/O backend drives the stream half of the harness (plan.md §9.1). The default is the
+  /// device backend, which is what the acceptance criterion means by "on the SSL"; `null` paces
+  /// against the wall clock with no device so CI can run the same timing gates, and `file` replays a
+  /// WAV through the same loop with neither a device nor a clock.
+  ///
+  /// Choosing a backend other than \ref device's also selects this path without a \ref device, which
+  /// is what makes `--backend null` usable on a machine with no audio at all.
+  BackendKind backend = BackendKind::AlsaRaw;
   /// When set, run this model between the device's capture read and playback write. Several
   /// instances are chained in series, which is the CPU cost of that many concurrent models.
   std::string model;
@@ -123,7 +140,12 @@ struct SoakResult
   double max_lateness_ms = 0.0;
 
   // ---- device mode only ----
-  bool device_mode = false;
+  /// True when the run was driven by an \ref AudioBackend a period at a time, rather than by the
+  /// flat-out offline path. Covers the device, the paced clock and the WAV file alike.
+  bool stream_mode = false;
+  /// Name of the backend that drove it, so a number can never be quoted without saying where it
+  /// came from.
+  std::string backend;
   /// Whether mlockall succeeded: without it the measurement includes page-fault stalls.
   bool memory_locked = false;
   /// Index of the first block that exceeded the deadline; UINT64_MAX if none. Distinguishes a
@@ -133,7 +155,9 @@ struct SoakResult
   uint64_t startup_driver_xruns = 0;
   unsigned device_period_size = 0;
   unsigned device_buffer_size = 0;
-  unsigned device_sample_format = 0;   ///< SNDRV_PCM_FORMAT_* the device agreed to
+  /// The sample format the backend presented, by PcmFormat name. A backend rather than a device
+  /// now, so this is the portable name and not an SNDRV_PCM_FORMAT_* value.
+  std::string device_sample_format;
   unsigned device_bytes_per_sample = 0;
   /// False when the device rounded the requested period (e.g. to its 1 ms full-speed USB floor).
   bool device_period_exact = false;

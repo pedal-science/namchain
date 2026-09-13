@@ -1,10 +1,13 @@
 # namchain — a glitch-free, headless NAM signal-chain engine
 
-**Status:** approved and in progress. **Phase 0 and M0 are complete** — the repo builds green in CI on
-all four jobs (§12) and §11 now carries *measured* numbers rather than estimates. M1 is next.
+**Status:** approved and in progress. **Phase 0, M0 and M1 are complete** — the repo builds green in CI
+on all five jobs (§12), §11 carries *measured* numbers rather than estimates, and every M1 acceptance
+clause is met on the reference interface (§9.5) except the 1 h criterion-3 soak, which is the one item
+that is only wall-clock and is run on an otherwise idle machine. **M2 is next**, and its first task is
+the glitch detector, by the standing instruction below.
 **Author:** planning session (research grounded in the sources cited in §2 and §16), resumed for
 implementation.
-**Updated:** 2026-09-11, after the DSH environment was repaired and verified on the target host.
+**Updated:** 2026-09-13, after the round-trip latency measurement and the I/O backend layer.
 
 ---
 
@@ -39,13 +42,25 @@ file still cannot `chrt`, so RT tests must run via a login session or a systemd 
 **Vendored NAM core:** `vendor/NeuralAmpModelerCore` as a git submodule pinned at G2, with
 `Dependencies/eigen` and `Dependencies/AudioDSPTools` initialised recursively.
 
-**M0 artifacts already produced on this host:**
+**Artifacts produced on this host (M0 and M1):**
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j4
-./build/namchain-tests                                             # 11 cases, all passing
+ctest --test-dir build                    # unit, soak_cli, golden_setup + golden_a2_lite
+./build/namchain-tests                    # 110 cases, all passing
 ./build/namchain-bench build/generated/A2-Full.nam --quantum 32,64,128,256
+
+# The soak harness with no hardware at all: a paced clock, or a WAV file in and out.
+./build/namchain-soak --backend null --seconds 10 --instances 4 --model build/generated/A2-Full.nam
+./build/namchain-soak --backend file --model build/generated/A2-Lite.nam in.wav --output out.wav
+
+# The device soak, and the round-trip measurement, both under SCHED_FIFO.
+sudo -n chrt -f 80 ./build/namchain-soak --device hw:4,0 --capture-channels 8 --playback-channels 6 \
+  --quantum 64 --periods 4 --seconds 3600 --instances 4 --model build/generated/A2-Full.nam \
+  --self-oracle --json
+sudo -n chrt -f 80 ./build/namchain-latency --device hw:4,0 --capture-channels 8 \
+  --playback-channels 6 --quantum 32 --periods 4 --output-channel 2 --measure 0,4 --runs 6
 ```
 
 Four corrections to the commands previously recorded here:
@@ -64,9 +79,10 @@ Four corrections to the commands previously recorded here:
    through file-scope static initializers that a static archive discards, giving
    `No config parser registered for architecture: WaveNet` at runtime.
 
-**First three tasks, in this order:** M0 (in progress: repo/CMake/CI, pinned core, bench harness and
-the measured RTF table are done; `namchain-render` is next), then M1, then M2. The instruction to
-write the glitch detector *before* the transition machinery (§10.3, M2) stands unchanged.
+**Order of work, still standing:** M0 ✔, M1 ✔, then M2 — and within M2 the glitch detector is written
+*before* the transition machinery (§10.3), because a transition you cannot measure is a transition you
+cannot claim. The one M1 item left open is the 1 h criterion-3 soak, which needs the machine to itself
+for an hour and nothing else.
 
 ---
 
@@ -730,13 +746,37 @@ either compiles and commits, or is rejected with a reason — never partially ap
 
 ## 9. Platform I/O layer
 
-### 9.1 Backends (identical interface)
+### 9.1 Backends (identical interface) — **implemented at M1**
 
-`file` (WAV in/out, offline) and `null` (real-time-paced, no device) exist from M1 — they make CI and
-determinism possible and are the reason M1 doesn't block on hardware. `pipewire` (MIT) and `alsa_raw`
-(no libasound, §4.3) in M1. `jack` (LGPL client library, deferred — the reason is architectural, not
-legal: see §4.3). `coreaudio` (macOS then iOS: RemoteIO/
-AUHAL, workgroups, `QOS_CLASS_USER_INTERACTIVE`, `.measurement` session mode) in M6.
+`include/namchain/io/backend.h` is the interface (§9.1's "identical interface", now a real one):
+`AudioBackend` with `info/start/stop/wait_capture/read_capture/write_playback/driver_xruns/finish`,
+byte-oriented and direction-symmetric because that is what the ioctls do (`namchain/pcm.h` converts).
+`open_backend(config, kind)` is the only way to get one, and a backend that does not exist **fails by
+name** rather than falling back — otherwise "I measured it on PipeWire" would not be checkable.
+
+| backend | state | notes |
+|---|---|---|
+| `alsa_raw` | **done** | adapter over `AlsaRawDuplex`; converts at the boundary and holds nothing, so the code measured on hardware (§9.5) is the code the soak drives |
+| `file` | **done** | WAV in, WAV out; the offline instance of the same interface. Bit-identical to `namchain-render` on the A2-Lite fixture, and checked by a CTest |
+| `null` | **done** | real-time paced against the wall clock, silence in and discarded out. Clocks off an absolute deadline, so a late period does not make every later one late |
+| `pipewire` | refused by name | MIT, so no licensing question; the work is the graph/stream plumbing, not the licence (see §4.3 for why JACK is the deferred one) |
+| `jack` | deferred | LGPL client library deliberately; the reason is architectural, not legal (§4.3) |
+| `coreaudio` | M6 | RemoteIO/AUHAL, workgroups, `QOS_CLASS_USER_INTERACTIVE`, `.measurement` session mode |
+
+Two consequences worth naming. First, the soak harness's stream path is now written once and runs
+against a device, a paced clock with no device, or a WAV file — which is what lets CI exercise the
+block timers, the deadline gates and the oracle on a machine with no audio at all (`ctest -R soak_cli`).
+Second, `BackendInfo::needs_bringup_cycle` is a capability, not a detail: a device's first period after
+START is an artefact of filling an empty ring, and running that "bring-up" cycle on a backend with no
+rings writes a silent period to the output WAV. That bug is why the file backend's output was one
+period longer than the renderer's before it was found.
+
+The **multichannel WAV reader** (`namchain::load_wav`, `src/io/wav.cpp`) came with this: the core's own
+loader refuses anything but mono (`ERROR_NOT_MONO`), and a device capture that is going to be replayed
+through the engine usually is not. It handles 16/24/32-bit PCM and 32-bit float, any channel count, and
+chunks in any order. `load_wav_mono` deliberately still delegates to the core's loader, because the
+golden test's whole premise is that our path and the core's `render` decode identical floats;
+`tests/test_wav.cpp` checks the two agree on the same bytes.
 
 ### 9.2 Clock, rate, latency policy
 
@@ -888,46 +928,69 @@ prediction is right to within a decibel).
 The measurement sends a 4096-frame pseudo-random stimulus four times and cross-correlates, so the delay
 falls out of the data rather than out of an assumption about the device's buffering. Both the analogue
 loop and the internal digital loopback are measured **in the same run**, from the same stimulus on the
-same playback channel:
+same playback channel.
 
-| quantum | periods | buffer | digital loopback | analogue (out 3 → in 1) | difference |
-|---|---|---|---|---|---|
-| 16 | 2 | 32 | 174 fr / 3.63 ms | 190 fr / 3.97 ms | **16 fr / 0.333 ms** |
-| 16 | 4 | 64 | 237 / 4.94 | 253 / 5.27 | 16 |
-| 32 | 2 | 64 | 273 / 5.69 | 289 / 6.02 | 16 |
-| 32 | 4 | 128 | 319 / 6.65 | 335 / 6.98 | 16 |
-| 64 | 2 | 128 | 428 / 8.92 | 444 / 9.25 | 16 |
-| **64** | **4** | **256** | **464 / 9.67** | **480 / 10.00** | **16** |
-| 128 | 2 | 256 | 588 / 12.25 | 604 / 12.59 | 16 |
-| 128 | 4 | 512 | 570 / 11.88 | 586 / 12.21 | 16 |
+**The occupancy open item is closed, and it changed the conclusion.** The first version of this section
+presented the delays as if they were properties of the device. They are not: what you measure from "I
+handed the stimulus to the playback ring" to "it came back" includes however much audio was already
+queued in the playback ring and buffered in the capture ring at that instant, and that settles
+differently every run. `namchain-latency` now reads both directions' ring occupancy with
+`SNDRV_PCM_IOCTL_STATUS` at the instant the stimulus is written and subtracts it. The identity it uses
+is derived in `src/latency/latency.cpp`; the short version is that the four measured terms
+(`frames_read`, `capture_delay`, `playback_delay`, and the stimulus's offset within its period) are an
+exact correction rather than a statistical one, because they are sampled at the one moment that makes
+the difference between the two streams' origins cancel.
 
-**Read the difference column, not the delay columns.** Three consecutive runs of the *same*
-configuration (q = 32, 4 periods) gave 261, 349 and 361 frames for the digital loopback — a 100-frame,
-2.1 ms spread, against a 128-frame buffer. So each row above is a single run and the absolute figures
-are good to about ± one buffer, not to the frame. The measured delay includes the ALSA ring's
-occupancy at the instant the stimulus is queued, and that occupancy settles differently depending on
-how the first few periods happen to interleave with the device's consumption. The table is therefore
-evidence of a *trend* — latency scales with the period size — and not a set of precise figures.
-Pinning that occupancy, or measuring and reporting it, is an open item; until then the absolute
-round-trip number should be quoted with its configuration and its uncertainty, never on its own.
+Three runs at each configuration, with the raw and corrected analogue figures:
 
-What is exact and reproducible is the converter round trip:
+| quantum | periods | buffer | raw analogue | **corrected analogue** | raw digital | corrected digital | difference |
+|---|---|---|---|---|---|---|---|
+| 16 | 2 | 32 | 185–190 | 80–103 | 169–188 | 82–87 | 16, but −2 and 17 once |
+| 16 | 4 | 64 | 247–259 | 87–99 | 230–242 | 70–82 | 16, 17 |
+| 32 | 2 | 64 | 277–334 | 105–134 | 261–318 | 89–118 | 16 |
+| 32 | 4 | 128 | 317–353 | 93–129 | 301–337 | 77–113 | 16 |
+| 64 | 2 | 128 | 420–433 | 116–129 | 404–417 | 100–113 | 16 |
+| **64** | **4** | **256** | 348–438 | 92–134 | 332–422 | 76–118 | 16 |
+| 128 | 2 | 256 | 556–586 | 92–122 | 540–570 | 76–106 | 16 |
+| 128 | 4 | 512 | 568–604 | 104–140 | 552–588 | 88–124 | 16 |
 
-- **The analogue-to-digital difference is 16 frames = 0.333 ms in every configuration, and in every
-  run.** That is the DAC plus ADC plus analogue path, and it is the one number here that nothing in the
-  ALSA setup can perturb — because it is a difference between two figures taken in the same run under
-  identical conditions, so the ring occupancy, our own priming and the period length all cancel. It is
-  the whole argument for measuring both loops at once rather than one per session.
-- **The absolute figure is dominated by the period size, not by our processing.** Going from q = 16 to
-  q = 128 adds roughly 8 ms while our chain costs 10.6 µs. The device's internal buffering scales with
-  the period it is given, which is the same effect that stopped q = 16 from keeping real time earlier
-  in this section. Latency here is bought and paid for in period size.
-- **One period of the absolute figure is ours.** `alsa_raw` queues exactly one period of silence to
-  reach the kernel's start threshold, and that silence really is played before the stimulus.
+**The period-size dependence was ours, not the device's.** The raw figure grows from 169 frames at
+q = 16 to 604 at q = 128 — a factor of 3.6 — while the corrected figure sits between 70 and 140 frames
+with no trend at all. So the earlier reading of this table ("the device's internal buffering scales with
+the period it is given") was wrong: what scales with the period is the *host's* ring occupancy, which is
+buffering we chose. The device's own contribution to the round trip is ~2 ms and roughly flat across
+every configuration measured. Latency still has to be bought in period size, but because of the rings,
+not the converters.
 
-The delays are stable to the frame across all four sends *within* a run, and the digital loopback's
-correlation is bit-exact (peak-to-sidelobe 999 dB) where the analogue path's is 32 dB — the expected
-difference between a digital tap and a path through two converters.
+**What the correction does not remove is the reason the corrected figure is still not frame-exact.**
+Six consecutive runs of the same configuration (q = 64, 4 periods) give raw 387–470 frames (spread 83)
+and corrected 76–129 (spread 53): the correction takes out 36 % of the movement and leaves about a
+millisecond of it. What is left is the *relative alignment of the two streams' origins* — when each
+`START` took effect — which is quantised by the USB frame clock (48 frames at 48 kHz) and is a property
+of how the host started the streams, not of the device's latency. ALSA's pointer interface cannot
+resolve it, because the pointers wrap; relating the two streams needs a common clock, and the driver
+will not give one. It accepts `SNDRV_PCM_IOCTL_TSTAMP` and still reports every status timestamp as
+zero, which `namchain-latency --json` reports as `timestamps_enabled: true` alongside zeros so the
+negative result is on the record.
+
+`--runs N` therefore exists: the tool repeats the whole measurement, stream start included, and reports
+the spread itself rather than leaving it to be guessed. Its output says plainly to compare channels
+*within* one run, and that is the figure to quote:
+
+- **The analogue-minus-digital difference is 16 frames = 0.333 ms in every configuration and every run**
+  — 16 in all 24 runs of the sweep above, in all 6 runs of the repeatability test, and 16 in every run
+  of the original table. That is the DAC plus ADC plus analogue path, and it is exact because both
+  channels are measured in one run from one stimulus: the ring occupancy, the start alignment and our
+  own priming are all common to both and cancel. It is the whole argument for measuring both loops at
+  once rather than one per session.
+- **At q = 16 the device cannot keep real time**, and the correction shows it: the difference came out
+  as 16, then −2, then 17, which is a stream that is not transferring frames consistently. Every other
+  configuration gives 16 every time.
+
+The delays are stable to the frame across all four sends *within* a run — because the sends are 9024
+frames apart, an exact multiple of the 48-frame USB frame, so all four share the same phase against it.
+The digital loopback's correlation is bit-exact (peak-to-sidelobe 999 dB) where the analogue path's is
+32 dB, the expected difference between a digital tap and a path through two converters.
 
 **q = 32 with 4 periods is the config to prefer**, and that is a change from the q = 64 this section
 assumed. It is lower-latency (6.98 ms analogue against 10.00) and comfortable for the guitar-chain rig:
@@ -1152,18 +1215,30 @@ duplicated or reordered — a *positive* result — and it catches the failures 
 switches, transition bugs; the M2 detector's whole premise). Xrun counters validate the host and
 driver; the oracle validates the engine. Both are required.
 
-**The input must not be silent.** Content does not affect the *mechanism*, but it does affect the
-*load*: NAM's silence handling (§7.5) skips work below −80 dBFS and denormal/FTZ behaviour changes
-cost, so a silence-based soak under-loads the CPU and can "pass" where a real signal would xrun. This
-is not hypothetical — the vendored `example_audio/input.wav` is **1 s of digital silence followed by
-1 s of signal**, so a soak that loops it from the top spends half its life on silence. Hence
-`--input-offset`, which starts and loops within the signal.
+**Does the input have to be non-silent? Measured — no, not for A2 on this build.** The concern was
+real: NAM's silence handling (§7.5) is supposed to skip work below −80 dBFS, so a silence-based soak
+would under-load the CPU and could "pass" where a real signal would xrun. So it was measured rather
+than assumed. 4 × A2-Full at q = 64, 30 s, looping the fixture from 0 s (half silence) against looping
+from 1 s (all signal):
+
+| loop start | p50 | p99 | max |
+|---|---|---|---|
+| 0.0 s (starts in silence) | 326.3 µs | 439.3 µs | 848.5 µs |
+| 1.0 s (all signal) | 317.2 µs | 472.5 µs | 904.5 µs |
+
+Silence is not cheaper: the adopted planar fast path (§4.2) has no silence short-circuit, so the
+p50 differs by 2.8 % in the *noisy* direction and the difference is not systematic. `--input-offset`
+therefore stays — it is still the right thing for the offline harness, where the fixture's 1 s of
+digital silence followed by 1 s of signal would otherwise make half the run unrepresentative — but a
+device soak with nothing plugged into the input is a valid measurement of load, and that is what the
+1 h criterion-3 run uses. Had this gone the other way, the device soak would have needed a source, and
+the plan would say so here.
 
 **Layered, because the device determines what can be concluded:**
 
 | layer | what it proves | what it cannot |
 |---|---|---|
-| `null`/`file` paced run + self-oracle (works today) | engine determinism and CPU margin under a wall-clock schedule; sample-exactness of the block loop | nothing about the driver, DMA clock, or true latency |
+| `null`/`file` paced run + self-oracle (**implemented**, `ctest -R soak_cli`) | engine determinism and CPU margin under a wall-clock schedule; sample-exactness of the block loop | nothing about the driver, DMA clock, or true latency |
 | `snd-aloop` (virtual, loaded on this box) | a real capture/playback API feeding the engine from a file loop; genuine xruns of that device | its periods come from a timer, not hardware; cannot validate the USB stack or round-trip latency |
 | USB interface (bare metal) | the real driver, DMA clock, USB scheduling and IRQ behaviour — the authoritative run | — |
 
@@ -1177,9 +1252,24 @@ on the captured output.
 
 **Implemented at M0/M1:** `namchain-soak` runs a bounded soak and applies the criterion as a
 machine-checkable gate (exit 0/1), reporting the evidence as text or `--json`: block percentiles,
-deadline overruns, `driver_xruns` (a first-class field, currently always 0, which the ALSA backend will
-drive), `max_lateness_ms`, and the oracle result. Its `--input-offset` exists specifically so a soak
-runs in the signal rather than in the fixture's silence.
+deadline overruns, `driver_xruns` (a first-class field, driven by the ALSA backend and structurally 0
+for the backends with no driver), `max_lateness_ms`, and the oracle result. `--input-offset` exists so
+an offline soak runs in the signal rather than in the fixture's silence, and `--backend` selects the
+I/O layer (§9.1) so the same loop runs against a device, a paced clock or a WAV.
+
+**The oracle now runs in device mode too, which is what criterion 3's last clause needed.** On a device
+the input is live capture, so "the same input" means recording it: the run keeps the first
+`--oracle-window` seconds (default 60) of the input it consumed and the output it produced, then pushes
+the recorded input through a *freshly compiled* plan of the same graph, prewarmed the same way, and
+compares frame by frame. It runs after the stream has stopped, with its own arena, because the first
+plan's state is the thing under suspicion.
+
+The window is a stated bound rather than an unstated one: an hour of captured input is 1.4 GB, and "the
+first 60 s are sample-identical to the offline render" is a weaker claim than "the whole run is". The
+rest of the hour is covered by the xrun and timing gates. The recording copy happens *after* the timed
+section on purpose — charging the oracle to the block would make it change the number it exists to
+validate — and the run reports what it did either way. Verified at 6 s: `max|diff| = 0` over 288 000
+frames, 4 × A2-Full, through the device.
 
 ---
 
@@ -1301,10 +1391,11 @@ The 60 s row also shows the honest spread: p99 was 53.7 µs over 5 s and 100.9 �
 rig, so p99 grows with the observation window on a desktop-class OS. Short soaks understate tail
 latency; criterion 3's "1 h" is not a formality.
 
-**Caveats on these numbers:** they are single-threaded throughput measurements with no audio device
-attached, taken on a bare-metal host with a desktop-class OS (no `threadirqs`, no PREEMPT_RT, no
-`isolcpus`). They establish the CPU budget, not xrun behaviour. Real-time I/O claims (§1 criterion 3's
-"zero xruns over 1 h") still require a capture-capable interface, which this box lacks (§0).
+**Caveats on these numbers:** the first two tables are single-threaded throughput measurements with no
+audio device attached, taken on a bare-metal host with a desktop-class OS (no `threadirqs`, no
+PREEMPT_RT, no `isolcpus`). They establish the CPU budget, not xrun behaviour. The device tables further
+down are the ones that speak to xruns, and they were taken with the SSL 2+ Mk II attached (a later
+addition — §0's original inventory had no capture-capable device, and risk 9 below is closed by it).
 
 Levers, in measured order: **planar NEON A2 kernels (PR #313 — 2.0–3.1×, written and verified, §7.8)**
 → memory traffic (weight sharing, larger quantums, cache blocking) → A2 fast path coverage incl.
@@ -1321,7 +1412,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; `pipewire` + `null` + `file`; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, captured output sample-identical to the offline render); allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference (§9.5)**; **parity test green at release flags** |
+| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; **`AudioBackend` interface with `null` and `file` implemented and `pipewire` refused by name ✔ (§9.1) — the stream loop is now written once and runs against a device, a paced clock or a WAV, so `ctest -R soak_cli` exercises the timers, the gates and the oracle with no hardware**; **multichannel WAV reader ✔**; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **device-mode self-oracle ✔ — the run records the input it consumed and compares its output against a freshly compiled offline render of it, `max|diff| = 0` (§10.5.1)**; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, first 60 s sample-identical to the offline render of the same input); allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference, and the ring occupancy measured and removed so the residual spread is reported rather than assumed (§9.5)**; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |
@@ -1378,16 +1469,17 @@ Critical path to the headline claim is **M0 → M1 → M2 → M3**; M4–M7 add 
    fast-path coverage; measured, not assumed.
 6. **iOS plugin story is constrained** (G17). Mitigation: ABI designed for static linking now;
    data-only plugins; decide the third-party story before M6.
-7. **ALSA-without-libasound** is real work (~600–900 lines of ioctl plumbing) and loses the
-   `plug`/`dmix` conveniences. Mitigation: `null`/`file`/`pipewire` exist by then, so M1 isn't blocked;
-   fall back to libasound if you accept LGPL dynamic linking.
+7. **ALSA-without-libasound** was real work (~600–900 lines of ioctl plumbing) and loses the
+   `plug`/`dmix` conveniences. **Largely resolved:** `alsa_raw` is written and measured, and the
+   `AudioBackend` interface plus `null`/`file` (§9.1) means nothing above the I/O layer depends on it.
+   Residual: `plug`-style format/rate conversion is not implemented, so a device that cannot do 48 kHz
+   exactly is still refused rather than converted (§9.2).
 8. **Thermals on Pi 5** (throttle from 80 °C) can silently destroy the CPU budget. Mitigation: health
    loop + governor + mandatory cooling for always-on use.
-9. **Measurement host has no capture-capable audio device** (§0). It *is* bare metal of the target
-   CPU class (Pi 500 / Cortex-A76), so CPU figures in §11 are target figures, but nothing about
-   xruns, true round-trip latency or thermals under sustained audio load can be measured until a USB
-   interface is attached. Mitigation: §1 criterion 3's "0 xruns over 1 h" is claimed only after that
-   device exists; until then the internet-facing claims rest on §11's CPU budget.
+9. ~~**Measurement host has no capture-capable audio device** (§0).~~ **Closed 2026-09-12** by the
+   SSL 2+ Mk II (§9.5), which is the reference interface the I/O layer was measured against. Residual:
+   thermals under a sustained hour of load are only now being observed, and one interface is not a
+   survey — the latency and xrun figures are that device's, and the plan says so wherever they appear.
 
 **Assumptions** — engine runs at 48 kHz internally; graphs are DAGs; permissive-only dependencies (with
 the ALSA note in §4.3); no UI in this project; `.nam` files are user-supplied, not redistributed; Linux

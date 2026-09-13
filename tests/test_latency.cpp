@@ -162,3 +162,45 @@ TEST_CASE("sub-sample refinement recovers a fractional delay")
   CHECK(estimate.lag_sub > static_cast<double>(integer) + 0.2);
   CHECK(estimate.lag_sub < static_cast<double>(integer) + 0.8);
 }
+
+TEST_CASE("the sidelobe error bar scales with the stimulus length, not a fixed constant")
+{
+  // The exclusion zone around the peak -- the region whose correlation cannot count as a sidelobe --
+  // has to be the stimulus's own length. With a hardcoded 4096 a shorter stimulus would have its own
+  // second arrival *inside* the zone, and the error bar would come back near 999 dB: "perfectly
+  // unambiguous" for a capture in which two delays are both plausible.
+  const std::vector<float> stimulus = pseudo_random(512, 0.25);
+
+  // A second, truncated copy of the stimulus at 800 -- inside a fixed 4096-sample zone, outside the
+  // true one (200 + 512 = 712). Truncated rather than scaled because the correlation is normalised
+  // by the window's own energy, so a scaled copy would score just as highly as the real one and the
+  // peak would be a coin toss; half the stimulus correlates at 1/sqrt(2).
+  std::vector<float> capture(1600, 0.0f);
+  for (std::size_t i = 0; i < stimulus.size(); ++i)
+    capture[200 + i] += stimulus[i];
+  for (std::size_t i = 0; i < stimulus.size() / 2; ++i)
+    capture[800 + i] += stimulus[i];
+
+  const namchain::DelayEstimate estimate =
+    namchain::estimate_delay(capture, stimulus, 0, static_cast<long long>(capture.size()));
+  REQUIRE(estimate.found);
+  CHECK(estimate.lag == 200);
+  // 20*log10(1 / (1/sqrt(2))) = 3.0 dB. The point is that it is nowhere near 999.
+  CHECK(estimate.peak_to_sidelobe_db > 2.0);
+  CHECK(estimate.peak_to_sidelobe_db < 5.0);
+}
+
+TEST_CASE("a clean short stimulus still reports an unambiguous peak")
+{
+  // The counterpart to the test above: making the zone follow the stimulus must not turn every short
+  // capture into a marginal one. A 512-sample PN sequence has autocorrelation sidelobes of order
+  // 1/sqrt(512), so the error bar should stay well clear of zero.
+  const std::vector<float> stimulus = pseudo_random(512, 0.25);
+  const std::vector<float> capture = capture_with(stimulus, 300, 1.0, 0.0, 1600);
+
+  const namchain::DelayEstimate estimate =
+    namchain::estimate_delay(capture, stimulus, 0, static_cast<long long>(capture.size()));
+  REQUIRE(estimate.found);
+  CHECK(estimate.lag == 300);
+  CHECK(estimate.peak_to_sidelobe_db > 12.0);
+}

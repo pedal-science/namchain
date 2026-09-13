@@ -196,6 +196,17 @@ unsigned clamp_to_bounds(unsigned requested, unsigned min, unsigned max)
   return requested;
 }
 
+PcmFormat pcm_format(unsigned format)
+{
+  switch (format)
+  {
+  case SNDRV_PCM_FORMAT_S16_LE: return PcmFormat::S16_LE;
+  case SNDRV_PCM_FORMAT_S24_3LE: return PcmFormat::S24_3LE;
+  case SNDRV_PCM_FORMAT_S32_LE: return PcmFormat::S32_LE;
+  default: return PcmFormat::Unknown;
+  }
+}
+
 } // namespace alsa
 } // namespace namchain
 

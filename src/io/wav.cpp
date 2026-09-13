@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
+
+#include "namchain/pcm.h"
 
 #include "wav.h" // AudioDSPTools' loader (include dir added privately by CMake)
 
@@ -32,6 +35,154 @@ bool load_wav_mono(const std::string& path, std::vector<float>& samples, double&
     return false;
   }
   return true;
+}
+
+namespace
+{
+
+uint32_t read_u32(const unsigned char* p)
+{
+  return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+         (static_cast<uint32_t>(p[3]) << 24);
+}
+
+uint16_t read_u16(const unsigned char* p)
+{
+  return static_cast<uint16_t>(static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8));
+}
+
+float decode_pcm(const unsigned char* p, unsigned bits)
+{
+  switch (bits)
+  {
+  case 16:
+    return pcm_decode(p, PcmFormat::S16_LE);
+  case 24:
+    return pcm_decode(p, PcmFormat::S24_3LE);
+  case 32:
+    return pcm_decode(p, PcmFormat::S32_LE);
+  default:
+    return 0.0f;
+  }
+}
+
+} // namespace
+
+bool load_wav(const std::string& path, std::vector<float>& interleaved, unsigned& channels, double& sample_rate,
+              std::string& error)
+{
+  interleaved.clear();
+  channels = 0;
+  sample_rate = 0.0;
+
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open())
+  {
+    error = "cannot open '" + path + "' for reading";
+    return false;
+  }
+
+  unsigned char header[12] = {};
+  in.read(reinterpret_cast<char*>(header), 12);
+  if (in.gcount() != 12 || std::memcmp(header, "RIFF", 4) != 0 || std::memcmp(header + 8, "WAVE", 4) != 0)
+  {
+    error = "'" + path + "' is not a RIFF/WAVE file";
+    return false;
+  }
+
+  bool have_format = false;
+  unsigned bits = 0;
+  unsigned format_code = 0;
+  unsigned num_channels = 0;
+
+  // Chunks are walked rather than assumed to be in the canonical order: a `LIST` or `fact` chunk
+  // before `data` is common in the wild, and the fixed-offset readers fall over on exactly those.
+  for (;;)
+  {
+    unsigned char chunk_header[8] = {};
+    in.read(reinterpret_cast<char*>(chunk_header), 8);
+    if (in.gcount() != 8)
+    {
+      error = "'" + path + "' has no data chunk";
+      return false;
+    }
+    const uint32_t chunk_size = read_u32(chunk_header + 4);
+
+    if (std::memcmp(chunk_header, "fmt ", 4) == 0)
+    {
+      std::vector<unsigned char> fmt(chunk_size);
+      in.read(reinterpret_cast<char*>(fmt.data()), static_cast<std::streamsize>(chunk_size));
+      if (in.gcount() != static_cast<std::streamsize>(chunk_size) || chunk_size < 16)
+      {
+        error = "'" + path + "' has a truncated fmt chunk";
+        return false;
+      }
+      format_code = read_u16(fmt.data());
+      num_channels = read_u16(fmt.data() + 2);
+      sample_rate = static_cast<double>(read_u32(fmt.data() + 4));
+      bits = read_u16(fmt.data() + 14);
+      have_format = true;
+    }
+    else if (std::memcmp(chunk_header, "data", 4) == 0)
+    {
+      if (!have_format)
+      {
+        error = "'" + path + "' has a data chunk before its fmt chunk";
+        return false;
+      }
+      const bool is_float = format_code == 3 || format_code == 0xFFFE;
+      const bool is_pcm = format_code == 1 || format_code == 0xFFFE;
+      if (!(is_float && bits == 32) && !(is_pcm && (bits == 16 || bits == 24 || bits == 32)))
+      {
+        error = "'" + path + "' uses unsupported WAV format code " + std::to_string(format_code) + " with " +
+                std::to_string(bits) + " bits per sample";
+        return false;
+      }
+      if (num_channels < 1 || num_channels > 64)
+      {
+        error = "'" + path + "' declares " + std::to_string(num_channels) + " channels";
+        return false;
+      }
+      if (sample_rate <= 0.0)
+      {
+        error = "'" + path + "' declares an invalid sample rate";
+        return false;
+      }
+
+      const unsigned sample_bytes = bits / 8u;
+      const size_t frames = chunk_size / (sample_bytes * num_channels);
+      std::vector<unsigned char> raw(static_cast<size_t>(frames) * sample_bytes * num_channels);
+      in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+      const size_t got = static_cast<size_t>(in.gcount());
+      const size_t usable_frames = got / (sample_bytes * num_channels);
+      if (usable_frames < frames)
+      {
+        error = "'" + path + "' is truncated: expected " + std::to_string(frames) + " frames, found " +
+                std::to_string(usable_frames);
+        return false;
+      }
+
+      interleaved.resize(static_cast<size_t>(frames) * num_channels);
+      for (size_t i = 0; i < frames * num_channels; ++i)
+      {
+        const unsigned char* source = raw.data() + i * sample_bytes;
+        interleaved[i] = bits == 32 && format_code == 3 ? pcm_decode(source, PcmFormat::F32_LE)
+                                                        : decode_pcm(source, bits);
+      }
+      channels = num_channels;
+      return true;
+    }
+    else
+    {
+      // Skip anything else, respecting the padding byte odd-sized chunks carry.
+      in.seekg(static_cast<std::streamoff>(chunk_size + (chunk_size & 1u)), std::ios::cur);
+      if (!in.good())
+      {
+        error = "'" + path + "' has no data chunk";
+        return false;
+      }
+    }
+  }
 }
 
 bool save_wav_float32(const std::string& path, const float* interleaved, size_t frames, int channels,

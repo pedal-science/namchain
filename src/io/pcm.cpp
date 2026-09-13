@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 
 namespace namchain
@@ -60,6 +61,7 @@ std::size_t pcm_bytes_per_sample(PcmFormat format)
   case PcmFormat::S16_LE: return 2;
   case PcmFormat::S24_3LE: return 3;
   case PcmFormat::S32_LE: return 4;
+  case PcmFormat::F32_LE: return 4;
   case PcmFormat::Unknown: return 0;
   }
   return 0;
@@ -72,6 +74,7 @@ const char* pcm_format_name(PcmFormat format)
   case PcmFormat::S16_LE: return "S16_LE";
   case PcmFormat::S24_3LE: return "S24_3LE";
   case PcmFormat::S32_LE: return "S32_LE";
+  case PcmFormat::F32_LE: return "F32_LE";
   case PcmFormat::Unknown: return "unknown";
   }
   return "unknown";
@@ -87,6 +90,19 @@ float pcm_decode(const unsigned char* src, PcmFormat format)
     return static_cast<float>(decode_signed_le(src, 3)) / 8388608.0f;
   case PcmFormat::S32_LE:
     return static_cast<float>(decode_signed_le(src, 4)) / 2147483648.0f;
+  case PcmFormat::F32_LE:
+  {
+    // Assembled byte by byte rather than aliased, so this is correct on a big-endian host too and
+    // does not depend on the compiler agreeing that a float can be read out of a char buffer.
+    uint32_t raw = 0;
+    for (int i = 0; i < 4; ++i)
+      raw |= static_cast<uint32_t>(src[i]) << (8 * i);
+    float value = 0.0f;
+    std::memcpy(&value, &raw, sizeof(value));
+    // A NaN on the wire is not a signal the engine should propagate; it is a fault, and silence is
+    // the least damaging reading of it.
+    return std::isnan(value) ? 0.0f : value;
+  }
   case PcmFormat::Unknown:
     break;
   }
@@ -110,6 +126,17 @@ void pcm_encode(unsigned char* dst, PcmFormat format, float value)
                      scale_to_int(clamped, 2147483647.0, std::numeric_limits<int32_t>::min(),
                                   std::numeric_limits<int32_t>::max()));
     return;
+  case PcmFormat::F32_LE:
+  {
+    const uint32_t raw = [&] {
+      uint32_t bits = 0;
+      std::memcpy(&bits, &clamped, sizeof(bits));
+      return bits;
+    }();
+    for (int i = 0; i < 4; ++i)
+      dst[i] = static_cast<unsigned char>((raw >> (8 * i)) & 0xFFu);
+    return;
+  }
   case PcmFormat::Unknown:
     return;
   }
