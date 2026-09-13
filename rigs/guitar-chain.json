@@ -1,0 +1,17 @@
+{
+  "nodes": [
+    { "id": "in", "type": "nc.input" },
+    { "id": "amp", "type": "nc.nam", "model": "A2-Lite.nam" },
+    { "id": "tone", "type": "nc.eq.biquad", "mode": "highshelf", "freq": 3200, "gain_db": -4 },
+    { "id": "mid", "type": "nc.eq.biquad", "mode": "peaking", "freq": 800, "q": 1.1, "gain_db": 3 },
+    { "id": "cab", "type": "nc.cab.ir", "ir": "CabIR.nam" },
+    { "id": "out", "type": "nc.output" }
+  ],
+  "connections": [
+    { "from": "in", "to": "amp" },
+    { "from": "amp", "to": "tone" },
+    { "from": "tone", "to": "mid" },
+    { "from": "mid", "to": "cab" },
+    { "from": "cab", "to": "out" }
+  ]
+}

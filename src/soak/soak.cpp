@@ -8,21 +8,18 @@
 #include <string>
 #include <sys/mman.h>
 #include <thread>
-#include <typeinfo>
 #include <vector>
-
-#if defined(__GNUG__)
-  #include <cxxabi.h>
-#endif
-
-#include "NAM/dsp.h"
-#include "NAM/get_dsp.h"
 
 #include "namchain/offline.h"
 #include "namchain/pcm.h"
 #include "namchain/rt_check.h"
 #include "namchain/telemetry.h"
 #include "namchain/wav.h"
+
+#include "namchain/graph/plan.h"
+#include "namchain/graph/reference.h"
+#include "namchain/graph/rig.h"
+#include "namchain/rt/arena.h"
 
 #if defined(__linux__)
   #include "namchain/io/alsa_raw.h"
@@ -47,20 +44,8 @@ SoakResult fail(std::string message)
   return r;
 }
 
-/// The concrete type behind a DSP, demangled. Measurements must name the implementation they
-/// measured: A2PlanarFull and A2FastModel<8> are ~2x apart on this host.
-std::string demangled_type(const nam::DSP& model)
-{
-#if defined(__GNUG__)
-  int status = 0;
-  std::unique_ptr<char, void (*)(void*)> name{abi::__cxa_demangle(typeid(model).name(), nullptr, nullptr, &status),
-                                              std::free};
-  if (status == 0 && name)
-    return name.get();
-#endif
-  return typeid(model).name();
-}
-
+/// A scratch WAV path for the oracle comparison. Unique per call so two soaks in one process (the
+/// unit tests do exactly that) cannot compare against each other's output.
 std::string temp_wav_path(const std::string& tag)
 {
   static int counter = 0;
@@ -103,7 +88,7 @@ SoakResult run_device_soak(const SoakOptions& options)
   AlsaRawConfig config;
   config.capture = options.device;
   config.playback = options.device;
-  config.sample_rate = options.device_sample_rate;
+  config.sample_rate = options.sample_rate;
   config.channels = options.device_channels;
   config.quantum = options.quantum;
   config.periods = options.device_periods;
@@ -138,47 +123,52 @@ SoakResult run_device_soak(const SoakOptions& options)
   // Bytes, not samples: period_size frames x bytes_per_frame. See AlsaRawDuplex::read_capture.
   std::vector<unsigned char> buffer(static_cast<size_t>(info.period_size) * info.bytes_per_sample * info.channels);
 
-  // Optional DSP chain. Everything here is allocated before the loop, so the render scope stays
-  // allocation-free and the interposer is measuring the thing it is meant to measure.
-  std::vector<std::unique_ptr<nam::DSP>> chain;
+  // The chain is now a compiled plan rather than a hand-rolled loop over models. That is the point
+  // of M1: the thing under test on the device is the compiler and the render path together, with
+  // the same code the offline renders and the unit tests use.
+  graph::Graph graph;
+  std::string graph_source;
+  bool have_chain = false;
+  if (!options.graph_path.empty())
+  {
+    std::string graph_error;
+    if (!graph::load_graph_json(options.graph_path, graph, graph_error))
+      return fail(graph_error);
+    graph_source = options.graph_path;
+    have_chain = true;
+  }
+  else if (!options.model.empty())
+  {
+    graph = graph::chain_graph(options.model, options.instances);
+    graph_source = "single model chain";
+    have_chain = true;
+  }
+
   const PcmFormat pcm_format = pcm_format_from_alsa(info.sample_format);
-  std::vector<NAM_SAMPLE> mono_a;
-  std::vector<NAM_SAMPLE> mono_b;
-  if (!options.model.empty())
+  std::vector<float> mono_in(static_cast<size_t>(info.period_size), 0.0f);
+  std::vector<float> mono_out(static_cast<size_t>(info.period_size), 0.0f);
+
+  render::CompileOptions compile_options;
+  compile_options.max_quantum = static_cast<int>(info.period_size);
+  compile_options.sample_rate = static_cast<double>(info.sample_rate);
+
+  // Big enough for any sane rig at a 64-frame quantum; the report states what it actually used, so
+  // the number in the log is measured rather than assumed.
+  rt::Arena arena(1u << 20);
+  std::unique_ptr<graph::RenderPlan> plan;
+  if (have_chain)
   {
     if (pcm_format == PcmFormat::Unknown)
       return fail("device sample format is not one the chain can convert");
-    for (unsigned i = 0; i < std::max(1u, options.instances); ++i)
-    {
-      std::unique_ptr<nam::DSP> model;
-      try
-      {
-        model = nam::get_dsp(std::filesystem::path(options.model));
-      }
-      catch (const std::exception& e)
-      {
-        return fail(std::string("failed to load chain model: ") + e.what());
-      }
-      if (!model)
-        return fail("failed to load chain model '" + options.model + "'");
-      if (model->NumInputChannels() != 1 || model->NumOutputChannels() != 1)
-        return fail("the device chain currently supports mono models only");
-      model->Reset(static_cast<double>(info.sample_rate), static_cast<int>(info.period_size));
-      chain.push_back(std::move(model));
-    }
-    mono_a.assign(static_cast<size_t>(info.period_size), static_cast<NAM_SAMPLE>(0));
-    mono_b.assign(static_cast<size_t>(info.period_size), static_cast<NAM_SAMPLE>(0));
+    std::string compile_error;
+    plan = graph::RenderPlan::compile(graph, compile_options, arena, compile_error);
+    if (plan == nullptr)
+      return fail(compile_error);
 
     // Warm the chain before the stream starts. The first process() call is cold -- measured at
     // ~2.8 ms against an 80 us steady state -- and a stall that long can drain the ring on its
-    // own. The engine is expected to pre-touch at plan build for the same reason (§3.3).
-    for (auto& model : chain)
-    {
-      NAM_SAMPLE* in_ptrs[] = {mono_a.data()};
-      NAM_SAMPLE* out_ptrs[] = {mono_b.data()};
-      model->process(in_ptrs, out_ptrs, static_cast<int>(info.period_size));
-      mono_a.swap(mono_b);
-    }
+    // own, so this is a control-thread job and not the first block's problem (§3.3).
+    plan->prewarm();
   }
   const uint64_t total_blocks =
     std::max<uint64_t>(1, static_cast<uint64_t>(options.duration_seconds * info.sample_rate / info.period_size));
@@ -225,27 +215,19 @@ SoakResult run_device_soak(const SoakOptions& options)
       // The engine's render path lives here. The read and write either side of it are the
       // backend's own syscalls and are deliberately outside the scope (namchain/rt_check.h).
       RtScope scope;
-      if (!chain.empty())
+      if (plan != nullptr)
       {
         const size_t width = info.bytes_per_sample;
         const unsigned in_ch = std::min(options.input_channel, info.channels - 1);
         const unsigned out_ch = std::min(options.output_channel, info.channels - 1);
 
         for (unsigned i = 0; i < info.period_size; ++i)
-          mono_a[i] = static_cast<NAM_SAMPLE>(
-            pcm_decode(buffer.data() + (static_cast<size_t>(i) * info.channels + in_ch) * width, pcm_format));
+          mono_in[i] = pcm_decode(buffer.data() + (static_cast<size_t>(i) * info.channels + in_ch) * width, pcm_format);
 
-        for (auto& model : chain)
-        {
-          NAM_SAMPLE* in_ptrs[] = {mono_a.data()};
-          NAM_SAMPLE* out_ptrs[] = {mono_b.data()};
-          model->process(in_ptrs, out_ptrs, static_cast<int>(info.period_size));
-          mono_a.swap(mono_b); // swap, never copy: no allocation inside the scope
-        }
+        plan->execute(mono_in.data(), mono_out.data(), static_cast<int>(info.period_size));
 
         for (unsigned i = 0; i < info.period_size; ++i)
-          pcm_encode(buffer.data() + (static_cast<size_t>(i) * info.channels + out_ch) * width, pcm_format,
-                     static_cast<float>(mono_a[i]));
+          pcm_encode(buffer.data() + (static_cast<size_t>(i) * info.channels + out_ch) * width, pcm_format, mono_out[i]);
       }
     }
     const auto t2 = Clock::now();
@@ -276,10 +258,29 @@ SoakResult run_device_soak(const SoakOptions& options)
   result.memory_locked = memory_locked;
   result.device_period_size = info.period_size;
   result.device_buffer_size = info.buffer_size;
-  result.chain_instances = static_cast<unsigned>(chain.size());
+  result.chain_instances = options.model.empty() ? 0u : std::max(1u, options.instances);
   result.chain_model = options.model;
-  if (!chain.empty())
-    result.model_type = demangled_type(*chain.front());
+  result.graph_mode = !options.graph_path.empty();
+  result.graph_source = graph_source;
+  result.plan_nodes = plan == nullptr ? 0u : static_cast<unsigned>(plan->nodes().size());
+  result.plan_buffers = plan == nullptr ? 0u : static_cast<unsigned>(plan->buffer_count());
+  result.plan_buffer_bytes = plan == nullptr ? 0u : static_cast<unsigned>(plan->buffer_bytes());
+  if (plan != nullptr)
+  {
+    // Every distinct implementation in the plan, not just the first: a rig can run an A2-Full and
+    // an IR convolution side by side, and a timing number has to name all of what it timed.
+    std::vector<std::string> described;
+    for (const graph::PlanNode& node : plan->nodes())
+    {
+      if (node.type == nullptr || node.type->describe == nullptr)
+        continue;
+      const std::string name = node.type->describe(node.state);
+      if (!name.empty() && std::find(described.begin(), described.end(), name) == described.end())
+        described.push_back(name);
+    }
+    for (std::size_t i = 0; i < described.size(); ++i)
+      result.model_type += (i == 0 ? "" : ", ") + described[i];
+  }
   result.device_sample_format = info.sample_format;
   result.device_bytes_per_sample = info.bytes_per_sample;
   result.device_period_exact = info.period_exact;
@@ -332,29 +333,46 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
     return fail("oracle comparison is intended for bounded runs (<= " + std::to_string(static_cast<int>(kMaxOracleSeconds)) +
                 " s); a multi-hour soak should check timing only");
 
-  std::unique_ptr<nam::DSP> model;
-  try
+  // The engine runs at a fixed rate; the input file and every model must agree with it. Deriving
+  // the rate from the model was only possible while a soak meant exactly one model, and it silently
+  // picked a different rate depending on which file happened to be named first.
+  const double rate = static_cast<double>(options.sample_rate);
+
+  graph::Graph graph;
+  std::string graph_source = "single model chain";
+  bool graph_mode = false;
+  if (!options.graph_path.empty())
   {
-    model = nam::get_dsp(std::filesystem::path(model_path));
+    std::string graph_error;
+    if (!graph::load_graph_json(options.graph_path, graph, graph_error))
+      return fail(graph_error);
+    graph_source = options.graph_path;
+    graph_mode = true;
   }
-  catch (const std::exception& e)
+  else
   {
-    return fail("failed to load model '" + model_path + "': " + e.what());
+    graph = graph::chain_graph(model_path, options.instances);
   }
-  if (!model)
-    return fail("failed to load model '" + model_path + "'");
-  const std::string model_type = demangled_type(*model);
+
+  render::CompileOptions compile_options;
+  compile_options.max_quantum = options.quantum;
+  compile_options.sample_rate = rate;
+
+  // Sized for any sane rig at a 64-frame quantum, and the report states what was actually used.
+  rt::Arena arena(1u << 20);
+  std::string compile_error;
+  std::unique_ptr<graph::RenderPlan> plan = graph::RenderPlan::compile(graph, compile_options, arena, compile_error);
+  if (plan == nullptr)
+    return fail(compile_error);
 
   std::vector<float> input;
   double input_rate = 0.0;
   std::string wav_error;
   if (!load_wav_mono(input_wav_path, input, input_rate, wav_error))
     return fail(wav_error);
-
-  const double expected_rate = model->GetExpectedSampleRate();
-  if (expected_rate > 0.0 && std::abs(input_rate - expected_rate) > 0.5)
-    return fail("input WAV sample rate does not match the model's expected rate");
-  const double rate = expected_rate > 0.0 ? expected_rate : input_rate;
+  if (std::abs(input_rate - rate) > 0.5)
+    return fail("the input WAV is " + std::to_string(input_rate) + " Hz but the engine runs at " +
+                std::to_string(rate) + " Hz");
 
   // A self-oracle compare must be a like-for-like render. If the run is longer than the input
   // file the input is looped, and there is no bounded offline render to compare against, so
@@ -372,36 +390,31 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
   const size_t input_start = std::min<size_t>(static_cast<size_t>(options.input_offset_seconds * input_rate),
                                               input.size() - 1);
 
-  const int in_channels = model->NumInputChannels();
-  const int out_channels = model->NumOutputChannels();
-  if (in_channels != 1)
-    return fail("soak harness supports mono input only for now");
-  if (want_oracle && out_channels != 1)
-    return fail("oracle comparison needs mono output");
-
-  try
+  // A rig cannot be checked against a single model's offline render, so its self-oracle is the
+  // naive interpreter instead: an independent evaluation of the same IR, run block for block
+  // alongside the plan. That checks the compiler -- schedule, buffer colouring, pointer binding --
+  // rather than merely re-running it.
+  std::unique_ptr<graph::ReferenceRender> reference;
+  if (graph_mode && options.self_oracle)
   {
-    model->Reset(rate, options.quantum);
-  }
-  catch (const std::exception& e)
-  {
-    return fail(std::string("Reset failed: ") + e.what());
+    std::string reference_error;
+    reference = graph::ReferenceRender::compile(graph, compile_options, reference_error);
+    if (reference == nullptr)
+      return fail("the reference oracle could not be built: " + reference_error);
   }
 
-  std::vector<std::vector<NAM_SAMPLE>> in_buffers(static_cast<size_t>(in_channels));
-  std::vector<std::vector<NAM_SAMPLE>> out_buffers(static_cast<size_t>(out_channels));
-  std::vector<NAM_SAMPLE*> in_ptrs(static_cast<size_t>(in_channels));
-  std::vector<NAM_SAMPLE*> out_ptrs(static_cast<size_t>(out_channels));
-  for (int ch = 0; ch < in_channels; ++ch)
-  {
-    in_buffers[static_cast<size_t>(ch)].assign(static_cast<size_t>(options.quantum), static_cast<NAM_SAMPLE>(0));
-    in_ptrs[static_cast<size_t>(ch)] = in_buffers[static_cast<size_t>(ch)].data();
-  }
-  for (int ch = 0; ch < out_channels; ++ch)
-  {
-    out_buffers[static_cast<size_t>(ch)].assign(static_cast<size_t>(options.quantum), static_cast<NAM_SAMPLE>(0));
-    out_ptrs[static_cast<size_t>(ch)] = out_buffers[static_cast<size_t>(ch)].data();
-  }
+  std::vector<float> block_in(static_cast<size_t>(options.quantum), 0.0f);
+  std::vector<float> block_out(static_cast<size_t>(options.quantum), 0.0f);
+  std::vector<float> block_reference(static_cast<size_t>(options.quantum), 0.0f);
+
+  // Warm both engines on the control thread before the timed loop. The first `process` call on a
+  // freshly built node does one-time work -- notably the FFT plan a partitioned convolution builds
+  // lazily on first use -- and that must not land inside the render path, where the interposer is
+  // watching, nor inside a block that is being timed. Both sides get the same warm-up, so the
+  // oracle comparison stays like for like.
+  plan->prewarm();
+  if (reference != nullptr)
+    reference->prewarm();
 
   const uint64_t deadline_ns = static_cast<uint64_t>(std::llround(1e9 * static_cast<double>(options.quantum) / rate));
   BlockTimer timer(deadline_ns);
@@ -412,8 +425,11 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
   // Keep the audio only when something will consume it: a one-hour run is ~690 MB as float32.
   const bool keep_audio = want_oracle || !options.output_wav.empty();
   std::vector<float> rendered;
+  std::vector<float> reference_rendered;
   if (keep_audio)
     rendered.reserve(static_cast<size_t>(total_blocks * static_cast<uint64_t>(options.quantum)));
+  if (reference != nullptr)
+    reference_rendered.reserve(static_cast<size_t>(total_blocks * static_cast<uint64_t>(options.quantum)));
 
   size_t input_pos = input_start;
   double max_lateness_ns = 0.0;
@@ -426,7 +442,7 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
     const int frames = options.quantum;
     for (int i = 0; i < frames; ++i)
     {
-      in_buffers[0][static_cast<size_t>(i)] = static_cast<NAM_SAMPLE>(input[input_pos]);
+      block_in[static_cast<size_t>(i)] = input[input_pos];
       // Loop back to the offset, not to the file start: an xrun is a timing failure and content
       // does not matter to it, but CPU load does, and the start of this fixture is silence.
       if (++input_pos >= input.size())
@@ -438,7 +454,7 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
       // The render-path boundary, expressed in code: everything the engine does happens here and
       // nothing here may allocate (plan.md §3.3, §10.4).
       RtScope scope;
-      model->process(in_ptrs.data(), out_ptrs.data(), frames);
+      plan->execute(block_in.data(), block_out.data(), frames);
     }
     const auto t1 = Clock::now();
 
@@ -447,9 +463,13 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
     timer.record(duration_ns);
 
     if (keep_audio)
+      rendered.insert(rendered.end(), block_out.begin(), block_out.begin() + frames);
+    if (reference != nullptr)
     {
-      for (int i = 0; i < frames; ++i)
-        rendered.push_back(static_cast<float>(out_buffers[0][static_cast<size_t>(i)]));
+      // Outside the RtScope on purpose: the oracle is not the render path, and timing it would
+      // halve the measured throughput of the thing under test.
+      reference->execute(block_in.data(), block_reference.data(), frames);
+      reference_rendered.insert(reference_rendered.end(), block_reference.begin(), block_reference.begin() + frames);
     }
 
     if (options.realtime_paced)
@@ -489,20 +509,60 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
   result.max_ns = timer.max_ns();
   result.p99_percent_of_deadline = timer.p99_percent_of_deadline();
   result.audio_seconds = audio_seconds;
-  result.model_type = model_type;
   result.wall_seconds = wall_seconds;
   result.rtf = audio_seconds > 0.0 ? wall_seconds / audio_seconds : 0.0;
   result.max_lateness_ms = max_lateness_ns / 1e6;
+  result.graph_mode = graph_mode;
+  result.graph_source = graph_source;
+  result.plan_nodes = static_cast<unsigned>(plan->nodes().size());
+  result.plan_buffers = static_cast<unsigned>(plan->buffer_count());
+  result.plan_buffer_bytes = static_cast<unsigned>(plan->buffer_bytes());
+  result.reference_buffers = reference == nullptr ? 0u : static_cast<unsigned>(reference->buffer_count());
+  for (const graph::PlanNode& node : plan->nodes())
+    if (node.type != nullptr && node.type->describe != nullptr)
+    {
+      const std::string described = node.type->describe(node.state);
+      if (!described.empty())
+      {
+        result.model_type = described;
+        break;
+      }
+    }
 
-  // ---- oracle: does a paced real-time-shaped run produce the same samples as offline? ----
-  if (want_oracle)
+  // ---- oracle: does a paced real-time-shaped run produce the same samples as a second, naive
+  // render of the same rig? ----
+  if (reference != nullptr)
+  {
+    result.oracle.checked = true;
+    result.oracle.source = "reference interpreter (in-process)";
+    result.oracle.frames = std::min(rendered.size(), reference_rendered.size());
+    double max_abs = 0.0;
+    double sum_squares = 0.0;
+    for (std::size_t i = 0; i < result.oracle.frames; ++i)
+    {
+      const double difference = static_cast<double>(rendered[i]) - static_cast<double>(reference_rendered[i]);
+      max_abs = std::max(max_abs, std::abs(difference));
+      sum_squares += difference * difference;
+    }
+    result.oracle.max_abs = max_abs;
+    result.oracle.rms = result.oracle.frames > 0
+                          ? std::sqrt(sum_squares / static_cast<double>(result.oracle.frames))
+                          : 0.0;
+    result.oracle.match = rendered.size() == reference_rendered.size() && max_abs <= options.oracle_tolerance;
+    if (rendered.size() != reference_rendered.size())
+      result.oracle.detail = "the plan produced " + std::to_string(rendered.size()) +
+                             " frames and the reference " + std::to_string(reference_rendered.size());
+    else if (!result.oracle.match)
+      result.oracle.detail = "the plan differs from the reference interpreter by more than the tolerance";
+  }
+  else if (want_oracle)
   {
     TempFileGuard paced_file;
     paced_file.path = options.output_wav.empty() ? temp_wav_path("paced") : options.output_wav;
     paced_file.keep = !options.output_wav.empty();
 
     std::string save_error;
-    if (!save_wav_float32(paced_file.path, rendered.data(), rendered.size(), out_channels, rate, save_error))
+    if (!save_wav_float32(paced_file.path, rendered.data(), rendered.size(), 1, rate, save_error))
       return fail(save_error);
 
     std::string reference_path;
@@ -545,6 +605,12 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
       result.oracle.detail = compare_error.empty()
                                ? "output differs from the oracle by more than the tolerance"
                                : compare_error;
+  }
+  else if (!options.output_wav.empty())
+  {
+    std::string save_error;
+    if (!save_wav_float32(options.output_wav, rendered.data(), rendered.size(), 1, rate, save_error))
+      return fail(save_error);
   }
 
   return result;

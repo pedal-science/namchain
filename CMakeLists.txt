@@ -126,6 +126,8 @@ add_library(namchain OBJECT
   src/rt/arena.cpp
   src/rt/reclaimer.cpp
   src/graph/plan.cpp
+  src/graph/reference.cpp
+  src/graph/rig.cpp
   src/nodes/builtin.cpp
   src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
@@ -219,6 +221,16 @@ if(NAMCHAIN_BUILD_TESTS)
   add_custom_target(namchain-test-data
     DEPENDS "${_namchain_gen_dir}/A2-Full.nam" "${_namchain_gen_dir}/A2-Lite.nam" "${_namchain_gen_dir}/CabIR.nam")
 
+  # The example rigs reference the generated fixtures by bare name, and rig paths resolve against
+  # the rig's own directory, so copying them next to the models makes `namchain-soak --graph
+  # <build>/generated/guitar-chain.json` work without editing anything.
+  file(GLOB NAMCHAIN_EXAMPLE_RIGS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/rigs/*.json")
+  add_custom_target(namchain-example-rigs ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NAMCHAIN_EXAMPLE_RIGS} "${_namchain_gen_dir}"
+    DEPENDS ${NAMCHAIN_EXAMPLE_RIGS}
+    COMMENT "Copying example rigs next to the generated test models")
+  add_dependencies(namchain-example-rigs namchain-test-data)
+
   add_executable(namchain-tests
     tests/test_lookback.cpp
     tests/test_a2_planar_parity.cpp
@@ -228,7 +240,9 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_rt_check.cpp
     tests/test_pcm.cpp
     tests/test_rt_primitives.cpp
-    tests/test_graph.cpp)
+    tests/test_graph.cpp
+    tests/test_nodes.cpp
+    tests/test_rig.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")

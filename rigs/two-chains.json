@@ -1,0 +1,18 @@
+{
+  "nodes": [
+    { "id": "in", "type": "nc.input" },
+    { "id": "split", "type": "nc.split" },
+    { "id": "amp_a", "type": "nc.nam", "model": "A2-Lite.nam" },
+    { "id": "amp_b", "type": "nc.nam", "model": "A2-Lite.nam" },
+    { "id": "mix", "type": "nc.mix" },
+    { "id": "out", "type": "nc.output" }
+  ],
+  "connections": [
+    { "from": "in", "to": "split" },
+    { "from": "split", "from_port": 0, "to": "amp_a" },
+    { "from": "split", "from_port": 1, "to": "amp_b" },
+    { "from": "amp_a", "to": "mix", "to_port": 0 },
+    { "from": "amp_b", "to": "mix", "to_port": 1 },
+    { "from": "mix", "to": "out" }
+  ]
+}

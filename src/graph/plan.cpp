@@ -58,6 +58,52 @@ Indexed index_graph(const Graph& graph, Validation& validation)
   return indexed;
 }
 
+/// The scheduling dependency graph, with block-delay nodes treated as sources.
+///
+/// An edge *into* a block-delay node is not a dependency: that node reads whatever its input buffer
+/// already holds, which is the previous block's value, so it does not have to wait for the producer
+/// to run. Its own outputs are ordinary dependencies. This is what turns a feedback loop into a
+/// DAG (§5.1), and dropping the edge on this side is what makes the delay come out as exactly one
+/// block rather than two.
+void build_dependencies(const Graph& graph, const Indexed& indexed, std::vector<std::vector<int>>& successors,
+                        std::vector<int>& indegree)
+{
+  const std::size_t n = graph.nodes.size();
+  successors.assign(n, {});
+  indegree.assign(n, 0);
+
+  std::map<std::pair<int, int>, bool> seen;
+  for (const Connection& connection : graph.connections)
+  {
+    const int from = indexed.position.at(connection.from);
+    const int to = indexed.position.at(connection.to);
+    if (indexed.types[static_cast<std::size_t>(to)]->block_delay)
+      continue;
+    if (seen.emplace(std::make_pair(from, to), true).second)
+    {
+      successors[static_cast<std::size_t>(from)].push_back(to);
+      ++indegree[static_cast<std::size_t>(to)];
+    }
+  }
+}
+
+/// The next node to place: a block-delay node if one is ready, otherwise the lowest ready index.
+///
+/// Block-delay nodes have no counted predecessors, so they are ready from the start; taking them
+/// first is what guarantees they read the previous block. Without this a graph that is *not* a
+/// cycle -- `nc.input -> nc.unit_delay -> nc.output` -- would sample the current block and delay by
+/// nothing, because the input node happens to be declared first.
+int next_ready(const Indexed& indexed, const std::vector<int>& indegree, const std::vector<bool>& placed)
+{
+  for (std::size_t i = 0; i < placed.size(); ++i)
+    if (!placed[i] && indegree[i] == 0 && indexed.types[i]->block_delay)
+      return static_cast<int>(i);
+  for (std::size_t i = 0; i < placed.size(); ++i)
+    if (!placed[i] && indegree[i] == 0)
+      return static_cast<int>(i);
+  return -1;
+}
+
 } // namespace
 
 Validation validate(const Graph& graph)
@@ -86,6 +132,7 @@ Validation validate(const Graph& graph)
     return Validation::failure("a chain needs exactly one nc.output, found " + std::to_string(outputs));
 
   // Connections: both ends must exist and the port must be within range.
+  std::map<std::pair<int, int>, std::string> driven_by;
   for (const Connection& connection : graph.connections)
   {
     const auto from = indexed.position.find(connection.from);
@@ -107,40 +154,31 @@ Validation validate(const Graph& graph)
       return Validation::failure("node '" + connection.from + "' produces no output");
     if (to_type->inputs == 0)
       return Validation::failure("node '" + connection.to + "' accepts no input");
+
+    // Two connections into one port leave the graph meaning "whichever one the compiler happened to
+    // keep". Rejecting it turns a silent 50/50 into a message.
+    const auto previous = driven_by.emplace(std::make_pair(to->second, connection.to_port), connection.from);
+    if (!previous.second)
+      return Validation::failure("node '" + connection.to + "' input port " +
+                                 std::to_string(connection.to_port) + " is already driven by '" +
+                                 previous.first->second + "'");
   }
 
-  // Cycles are a compile error; feedback is expressed with an explicit delay node (§5.1). Kahn's
+  // Cycles are a compile error, except through a block-delay node: feedback is expressed with an
+  // explicit `nc.unit_delay`, which reads its input as of the previous block (§5.1). Kahn's
   // algorithm both detects a cycle and produces the topological order the compiler needs.
   const std::size_t n = graph.nodes.size();
-  std::vector<std::vector<int>> successors(n);
-  std::vector<int> indegree(n, 0);
-  std::map<std::pair<int, int>, bool> seen;
-  for (const Connection& connection : graph.connections)
-  {
-    const int from = indexed.position.at(connection.from);
-    const int to = indexed.position.at(connection.to);
-    if (seen.emplace(std::make_pair(from, to), true).second)
-    {
-      successors[static_cast<std::size_t>(from)].push_back(to);
-      ++indegree[static_cast<std::size_t>(to)];
-    }
-  }
+  std::vector<std::vector<int>> successors;
+  std::vector<int> indegree;
+  build_dependencies(graph, indexed, successors, indegree);
 
   std::vector<bool> placed(n, false);
   std::size_t placed_count = 0;
   for (std::size_t step = 0; step < n; ++step)
   {
-    int chosen = -1;
-    for (std::size_t i = 0; i < n; ++i)
-    {
-      if (!placed[i] && indegree[i] == 0)
-      {
-        chosen = static_cast<int>(i);
-        break; // lowest index first: deterministic order for the same graph
-      }
-    }
+    const int chosen = next_ready(indexed, indegree, placed);
     if (chosen < 0)
-      return Validation::failure("graph contains a cycle; use an explicit delay node for feedback");
+      return Validation::failure("graph contains a cycle; use an explicit nc.unit_delay node for feedback");
     placed[static_cast<std::size_t>(chosen)] = true;
     ++placed_count;
     for (const int next : successors[static_cast<std::size_t>(chosen)])
@@ -163,34 +201,16 @@ namespace
 std::vector<int> topological_order(const Graph& graph, const Indexed& indexed)
 {
   const std::size_t n = graph.nodes.size();
-  std::vector<std::vector<int>> successors(n);
-  std::vector<int> indegree(n, 0);
-  std::map<std::pair<int, int>, bool> seen;
-  for (const Connection& connection : graph.connections)
-  {
-    const int from = indexed.position.at(connection.from);
-    const int to = indexed.position.at(connection.to);
-    if (seen.emplace(std::make_pair(from, to), true).second)
-    {
-      successors[static_cast<std::size_t>(from)].push_back(to);
-      ++indegree[static_cast<std::size_t>(to)];
-    }
-  }
+  std::vector<std::vector<int>> successors;
+  std::vector<int> indegree;
+  build_dependencies(graph, indexed, successors, indegree);
 
   std::vector<int> order;
   order.reserve(n);
   std::vector<bool> placed(n, false);
   for (std::size_t step = 0; step < n; ++step)
   {
-    int chosen = -1;
-    for (std::size_t i = 0; i < n; ++i)
-    {
-      if (!placed[i] && indegree[i] == 0)
-      {
-        chosen = static_cast<int>(i);
-        break;
-      }
-    }
+    const int chosen = next_ready(indexed, indegree, placed);
     if (chosen < 0)
       return {};
     placed[static_cast<std::size_t>(chosen)] = true;
@@ -203,12 +223,18 @@ std::vector<int> topological_order(const Graph& graph, const Indexed& indexed)
 
 } // namespace
 
-std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, int max_quantum, rt::Arena& arena,
-                                                std::string& error)
+std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render::CompileOptions& options,
+                                                rt::Arena& arena, std::string& error)
 {
+  const int max_quantum = options.max_quantum;
   if (max_quantum < 1)
   {
     error = "max_quantum must be at least 1";
+    return nullptr;
+  }
+  if (!(options.sample_rate > 0.0))
+  {
+    error = "sample_rate must be > 0";
     return nullptr;
   }
 
@@ -264,6 +290,13 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, int max_quan
     const int value = value_of(from, connection.from_port);
     last_use[static_cast<std::size_t>(value)] =
       std::max(last_use[static_cast<std::size_t>(value)], position_of[static_cast<std::size_t>(to)]);
+
+    // A value a block-delay node reads has to still be there at the *start of the next block*,
+    // because that node reads it before its producer has run. An ordinary last-use would let the
+    // colouring recycle the buffer later in the same block, and the next block's read would pick up
+    // whatever landed there instead.
+    if (indexed.types[static_cast<std::size_t>(to)]->block_delay)
+      last_use[static_cast<std::size_t>(value)] = static_cast<int>(order.size());
   }
 
   // Interval colouring: walk values in definition order and reuse the first buffer whose previous
@@ -323,9 +356,11 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, int max_quan
 
     PlanNode plan_node;
     plan_node.type = type;
-    plan_node.state = type->create(spec, max_quantum, error);
-    if (plan_node.state == nullptr && type->id != "nc.input" && type->id != "nc.output" && type->id != "nc.split" &&
-        type->id != "nc.mix")
+    // A null `create` means the type carries no state at all (nc.input, nc.split, ...). Using the
+    // vtable rather than a list of ids keeps this honest as node types are added: a type that does
+    // have a constructor and fails to allocate is an error, and cannot be mistaken for a marker.
+    plan_node.state = type->create == nullptr ? nullptr : type->create(spec, options, error);
+    if (type->create != nullptr && plan_node.state == nullptr)
       return nullptr; // create() set `error`
 
     plan_node.inputs.assign(static_cast<std::size_t>(type->inputs), plan->buffers_[static_cast<std::size_t>(silence_buffer)]);
@@ -351,7 +386,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, int max_quan
     }
 
     if (plan->nodes_[i].type->id == "nc.input")
-      plan->input_buffer_ = colour[static_cast<std::size_t>(value_of(order[i], 0))];
+      plan->input_node_ = static_cast<int>(i);
     if (plan->nodes_[i].type->id == "nc.output")
     {
       // The output node's single input buffer holds the chain's result.
@@ -394,13 +429,15 @@ const std::vector<int>& RenderPlan::output_buffer_of(std::size_t node_index) con
 void RenderPlan::execute(const float* input, float* output, int frames) noexcept
 {
   // Contract: frames <= max_quantum(), which is what every node was created for.
-  if (input_buffer_ >= 0)
+  //
+  // The graph input is handed to the input node rather than written into its buffer here. That is
+  // not a style choice: a block-delay node is scheduled before the input node and reads that
+  // buffer, so writing it up front would make the delay come out as zero samples.
+  if (input_node_ >= 0)
   {
-    float* destination = buffers_[static_cast<std::size_t>(input_buffer_)];
-    if (input != nullptr)
-      std::copy(input, input + frames, destination);
-    else
-      std::fill(destination, destination + frames, 0.0f);
+    PlanNode& node = nodes_[static_cast<std::size_t>(input_node_)];
+    if (node.type->set_block_input != nullptr)
+      node.type->set_block_input(node.state, input);
   }
 
   for (PlanNode& node : nodes_)
@@ -409,6 +446,20 @@ void RenderPlan::execute(const float* input, float* output, int frames) noexcept
   if (output_buffer_ >= 0 && output != nullptr)
     std::copy(buffers_[static_cast<std::size_t>(output_buffer_)],
               buffers_[static_cast<std::size_t>(output_buffer_)] + frames, output);
+}
+
+void RenderPlan::prewarm() noexcept
+{
+  if (max_quantum_ > 0)
+    execute(nullptr, nullptr, max_quantum_);
+}
+
+std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, int max_quantum, rt::Arena& arena,
+                                                std::string& error)
+{
+  render::CompileOptions options;
+  options.max_quantum = max_quantum;
+  return compile(graph, options, arena, error);
 }
 
 } // namespace graph

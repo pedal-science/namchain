@@ -40,12 +40,19 @@ struct SoakOptions
   /// When set, run this model between the device's capture read and playback write. Several
   /// instances are chained in series, which is the CPU cost of that many concurrent models.
   std::string model;
+  /// A rig file (plan.md §5). Mutually exclusive with \ref model: this is how an arbitrary graph
+  /// reaches the audio thread, and it is what makes the compiler -- not just a model -- the thing
+  /// being measured.
+  std::string graph_path;
   unsigned instances = 1;
   unsigned input_channel = 0;
   unsigned output_channel = 0;
   unsigned device_channels = 1;
   unsigned device_periods = 4;
-  unsigned device_sample_rate = 48000;
+  /// The engine's rate, and therefore the rate the device is asked for and that every input file
+  /// and model is checked against. Fixed rather than inferred: this is a 48 kHz engine at M1, and a
+  /// harness that quietly follows whichever file it was handed cannot compare two runs.
+  unsigned sample_rate = 48000;
 };
 
 struct OracleResult
@@ -133,6 +140,18 @@ struct SoakResult
   /// number is only meaningful alongside the implementation it measured, and the two A2 paths
   /// differ by ~2x.
   std::string model_type;
+
+  // ---- the compiled plan ----
+  /// Filled in both modes, because both now render through the same `RenderPlan`: a soak with
+  /// `--model` is a chain graph, so the compiler is always in the measurement path.
+  unsigned plan_nodes = 0;
+  unsigned plan_buffers = 0;
+  unsigned plan_buffer_bytes = 0;
+  /// Buffers a naive one-per-value interpreter would need. The ratio is the memory plan's point,
+  /// and reporting both is what keeps "the colouring works" from being an assertion.
+  unsigned reference_buffers = 0;
+  bool graph_mode = false;
+  std::string graph_source; ///< the rig path, or "single model chain"
 
   OracleResult oracle;
 };

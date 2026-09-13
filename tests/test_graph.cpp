@@ -118,12 +118,24 @@ TEST_CASE("validation rejects malformed graphs with a reason")
   SUBCASE("cycle")
   {
     // Feedback must be expressed with an explicit delay node, so a plain cycle is a compile error.
+    // Two mixers, so that the cycle does not also put two connections into one input port -- that
+    // is a separate error, checked separately, and would otherwise mask this one.
     Graph g;
-    g.nodes = {node("in", "nc.input"), node("a", "nc.gain"), node("b", "nc.gain"), node("out", "nc.output")};
-    g.connections = {{"in", 0, "a", 0}, {"a", 0, "b", 0}, {"b", 0, "a", 0}, {"b", 0, "out", 0}};
+    g.nodes = {node("in", "nc.input"), node("a", "nc.mix"), node("b", "nc.mix"), node("out", "nc.output")};
+    g.connections = {{"a", 0, "b", 0}, {"b", 0, "a", 0}, {"a", 0, "out", 0}};
     const auto result = namchain::graph::validate(g);
     CHECK_FALSE(result.ok);
     CHECK(result.message.find("cycle") != std::string::npos);
+  }
+
+  SUBCASE("two connections into one input port")
+  {
+    Graph g;
+    g.nodes = {node("in", "nc.input"), node("a", "nc.gain"), node("b", "nc.gain"), node("out", "nc.output")};
+    g.connections = {{"in", 0, "a", 0}, {"b", 0, "a", 0}, {"in", 0, "b", 0}, {"a", 0, "out", 0}};
+    const auto result = namchain::graph::validate(g);
+    CHECK_FALSE(result.ok);
+    CHECK(result.message.find("already driven") != std::string::npos);
   }
 
   SUBCASE("valid graph passes")

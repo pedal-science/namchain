@@ -13,6 +13,18 @@ namespace namchain
 namespace render
 {
 
+/// Everything a node needs to know at construction time that does not come from its own params.
+///
+/// This is the host-side half of the node contract (§6.1): a node converts times and frequencies to
+/// samples once, at build, rather than dividing by the rate on the audio thread. `max_quantum` is
+/// also the block size a node may assume, so a delay node can size its ring exactly.
+struct CompileOptions
+{
+  int max_quantum = 64;
+  /// The engine's rate. 48 kHz is the M1 target; models are loaded at whatever this says (§7.1).
+  double sample_rate = 48000.0;
+};
+
 /// A node type's vtable. `create`/`destroy` run on the control thread while a plan is built;
 /// `process` is the render path and must not allocate, lock or throw (§3.3).
 struct NodeType
@@ -21,10 +33,30 @@ struct NodeType
   int inputs = 0;
   int outputs = 0;
   /// \param error set when the node cannot be constructed (bad params, missing model, ...).
-  void* (*create)(const graph::NodeSpec& spec, int max_quantum, std::string& error) = nullptr;
+  void* (*create)(const graph::NodeSpec& spec, const CompileOptions& options, std::string& error) = nullptr;
   void (*destroy)(void* state) = nullptr;
   /// Buffers are mono for now; per-port channel counts arrive with the multichannel work.
   void (*process)(void* state, const float* const* in, float* const* out, int frames) noexcept = nullptr;
+  /// Control thread only: the concrete implementation behind a state, for measurement reports.
+  /// Which A2 kernel set is live changes the cost by ~2x, so a timing number without it is not
+  /// evidence (§11). Null for types whose implementation is not worth naming.
+  std::string (*describe)(void* state) = nullptr;
+  /// Render path, called once per block before any node runs: hands the graph's input block to the
+  /// node that samples it. Only `nc.input` uses it. This exists so that `nc.input` samples the
+  /// incoming audio at *its* point in the schedule, which is what lets a block-delay node read the
+  /// previous block's input rather than the current one.
+  void (*set_block_input)(void* state, const float* source) noexcept = nullptr;
+  /// \brief True for a node that reads its input as of the *previous* block, and so breaks a cycle.
+  ///
+  /// This is how feedback is expressed (§5.1). The compiler drops the edges *into* such a node when
+  /// it works out the schedule -- the node reads whatever its input buffer already contains, which
+  /// is last block's value -- and schedules it before every other node, so that "already contains"
+  /// is the previous block and not the current one. Its consumers then run after it and read a
+  /// value that is exactly one block old.
+  ///
+  /// The consequence to be aware of: the value such a node reads is pinned to the end of the block
+  /// by the memory plan, because its buffer has to survive until the next block's early read.
+  bool block_delay = false;
 };
 
 /// \return the built-in type, or nullptr if the id is unknown.
@@ -57,6 +89,10 @@ class RenderPlan
 public:
   /// \param arena supplies the intermediate buffers; the plan does not own storage, so one arena
   ///        per plan is the intended usage and is what makes reclamation a pointer swap.
+  static std::unique_ptr<RenderPlan> compile(const Graph& graph, const render::CompileOptions& options,
+                                             rt::Arena& arena, std::string& error);
+
+  /// Convenience for the common case where the engine rate is the 48 kHz default.
   static std::unique_ptr<RenderPlan> compile(const Graph& graph, int max_quantum, rt::Arena& arena,
                                              std::string& error);
 
@@ -67,6 +103,14 @@ public:
 
   /// Render one block. \p input and \p output are mono and \p frames long. RT-safe.
   void execute(const float* input, float* output, int frames) noexcept;
+
+  /// \brief Run one quantum of silence through every node, discarding the output.
+  ///
+  /// The first `process()` call on a freshly built model costs milliseconds -- reset and warm-up
+  /// work that has nothing to do with steady-state cost -- and a stall that long can drain the
+  /// device ring on its own. Call this on the control thread before publishing the plan (§3.3).
+  /// It is not part of `execute` because it mutates node state: the oracle has to be warmed too.
+  void prewarm() noexcept;
 
   int max_quantum() const noexcept { return max_quantum_; }
   /// Intermediate buffers the memory plan needed. Fewer than the node count means it worked.
@@ -82,7 +126,7 @@ private:
 
   std::vector<PlanNode> nodes_;    // topological order
   std::vector<float*> buffers_;    // all from the arena
-  int input_buffer_ = -1;          // buffer the graph input is written into
+  int input_node_ = -1;            // index in nodes_ whose block input is sampled from the graph
   int output_buffer_ = -1;         // buffer the graph output is read from
   int max_quantum_ = 0;
   std::vector<std::vector<int>> output_buffers_; // per node, per port

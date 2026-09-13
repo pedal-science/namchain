@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -114,9 +115,62 @@ TEST_CASE("a paced soak run keeps up with the wall clock")
   CHECK_FALSE(result.oracle.checked);
 }
 
-TEST_CASE("a soak run reproduces the offline render sample for sample")
+TEST_CASE("a rig soaks through the compiler, with the reference interpreter as its oracle")
 {
-  // The strongest statement the harness can make: the block loop the soak drives produces
+  // The single-model soak above is one graph. This is the general case: a rig file goes in, the
+  // compiler schedules and binds it, and the naive interpreter independently evaluates the same IR
+  // so a disagreement points at the compiler rather than at the model.
+  const auto dir = std::filesystem::temp_directory_path() / "namchain-soak-tests";
+  std::filesystem::create_directories(dir);
+  const std::string rig_path = (dir / "two-chains.json").string();
+  {
+    std::ofstream file(rig_path);
+    file << R"({
+      "nodes": [
+        { "id": "in", "type": "nc.input" },
+        { "id": "split", "type": "nc.split" },
+        { "id": "a", "type": "nc.nam", "model": ")" << model_path("A2-Lite.nam") << R"(" },
+        { "id": "b", "type": "nc.nam", "model": ")" << model_path("A2-Lite.nam") << R"(" },
+        { "id": "mix", "type": "nc.mix" },
+        { "id": "out", "type": "nc.output" }
+      ],
+      "connections": [
+        { "from": "in", "to": "split" },
+        { "from": "split", "from_port": 0, "to": "a" },
+        { "from": "split", "from_port": 1, "to": "b" },
+        { "from": "a", "to": "mix", "to_port": 0 },
+        { "from": "b", "to": "mix", "to_port": 1 },
+        { "from": "mix", "to": "out" }
+      ]
+    })";
+  }
+
+  namchain::SoakOptions options;
+  options.graph_path = rig_path;
+  options.quantum = 64;
+  options.duration_seconds = 0.25;
+  options.input_offset_seconds = 1.0;
+  options.realtime_paced = false;
+  options.self_oracle = true;
+
+  const namchain::SoakResult result = namchain::run_soak("", input_wav(), options);
+  REQUIRE_MESSAGE(result.ok, result.error);
+
+  CHECK(result.graph_mode);
+  CHECK(result.plan_nodes == 6u);
+  // The colouring has to beat one buffer per value, or the memory plan is not doing anything.
+  REQUIRE(result.reference_buffers > 0u);
+  CHECK(result.plan_buffers < result.reference_buffers);
+  CHECK(result.rt_allocations == 0);
+
+  REQUIRE(result.oracle.checked);
+  CHECK(result.oracle.source.find("reference interpreter") != std::string::npos);
+  CHECK(result.oracle.match);
+  CHECK(result.oracle.max_abs == 0.0);
+}
+
+TEST_CASE("a soak run reproduces the offline render sample for sample")
+{  // The strongest statement the harness can make: the block loop the soak drives produces
   // exactly the audio the deterministic offline renderer produces -- no sample dropped,
   // repeated or reordered. Run over the second half of the fixture, which is where the signal
   // is; the first second is digital silence (see SoakOptions::input_offset_seconds), and

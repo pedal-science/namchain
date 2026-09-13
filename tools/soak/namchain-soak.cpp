@@ -36,6 +36,7 @@ void usage()
   std::fprintf(stderr,
                "namchain-soak %s\n"
                "usage: namchain-soak [options] <model.nam> <input.wav>\n"
+               "       namchain-soak --graph rig.json [options] <input.wav>\n"
                "options:\n"
                "  --quantum N          block size, 1..4096 (default 64)\n"
                "  --seconds S          audio seconds to process (default 60)\n"
@@ -43,18 +44,21 @@ void usage()
                "                       fixture is 1 s silence then 1 s signal, so looping from 0\n"
                "                       spends half the run on silence\n"
                "  --no-pacing          run flat out; measures throughput, not lateness\n"
-               "  --self-oracle        compare output against an offline render of the same input\n"
+               "  --self-oracle        compare output against an independent render of the same input\n"
+               "                       (a rig compares against the reference interpreter in-process)\n"
                "  --oracle FILE        compare output against this WAV instead\n"
                "  --output FILE        write the rendered audio here\n"
                "  --tolerance X        oracle tolerance (default 1e-5)\n"
+               "  --sample-rate N      engine rate in Hz (default 48000)\n"
                "  --max-p99-percent X  gate on p99 block time, %% of deadline (default 50)\n"
                "  --json               print a JSON summary instead of text\n"
-               "device mode (passthrough, no model):\n"
+               "device mode (no model: capture straight to playback):\n"
                "  --device hw:C,D      capture and play back through a real ALSA device\n"
                "  --channels N         1 or 2 (default 1)\n"
                "  --periods N          buffer length in periods (default 4)\n"
                "  --model FILE         run this .nam between capture and playback\n"
                "  --instances N        chain N copies of the model (default 1)\n"
+               "  --graph FILE         run this rig instead: a JSON graph of nodes and connections\n"
                "  --input-channel N    device channel feeding the chain (default 0)\n"
                "  --output-channel N   device channel the chain writes to (default 0)\n"
                "exit: 0 pass, 1 failed a gate, 2 usage/IO error\n",
@@ -100,6 +104,10 @@ int main(int argc, char** argv)
       options.device_periods = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--model" && i + 1 < argc)
       options.model = argv[++i];
+    else if (arg == "--graph" && i + 1 < argc)
+      options.graph_path = argv[++i];
+    else if (arg == "--sample-rate" && i + 1 < argc)
+      options.sample_rate = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--instances" && i + 1 < argc)
       options.instances = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--input-channel" && i + 1 < argc)
@@ -131,7 +139,22 @@ int main(int argc, char** argv)
     }
   }
 
-  if (options.device.empty() && (model_path.empty() || input_path.empty()))
+  // A rig and a model are two ways of saying the same thing, so accepting both would mean silently
+  // choosing one. Say so instead.
+  if (!options.graph_path.empty() && !options.model.empty())
+  {
+    std::fprintf(stderr, "error: --graph and --model are alternatives; give one\n");
+    return 2;
+  }
+  // With --graph the graph file replaces the model argument, so the single positional is the input.
+  if (!options.graph_path.empty() && input_path.empty() && !model_path.empty())
+  {
+    input_path = model_path;
+    model_path.clear();
+  }
+
+  const bool have_source = !options.graph_path.empty() || !model_path.empty();
+  if (options.device.empty() && (!have_source || input_path.empty()))
   {
     usage();
     return 2;
@@ -168,6 +191,12 @@ int main(int argc, char** argv)
     j["max_lateness_ms"] = result.max_lateness_ms;
     j["device_wait_ns"] = {{"p50", result.wait_p50_ns}, {"p99", result.wait_p99_ns}, {"max", result.wait_max_ns}};
     j["deadline_overruns"] = result.deadline_overruns;
+    j["plan"] = {{"source", result.graph_source},
+                 {"graph_mode", result.graph_mode},
+                 {"nodes", result.plan_nodes},
+                 {"buffers", result.plan_buffers},
+                 {"buffer_bytes", result.plan_buffer_bytes},
+                 {"reference_buffers", result.reference_buffers}};
     j["rt_check"] = {{"instrumented", result.rt_instrumented},
                      {"allocations", result.rt_allocations},
                      {"deallocations", result.rt_deallocations}};
@@ -218,6 +247,11 @@ int main(int argc, char** argv)
     {
       std::printf("model:            %s\n", model_path.c_str());
     }
+    std::printf("plan:             %s, %u nodes, %u buffers (%u bytes)\n", result.graph_source.c_str(),
+                result.plan_nodes, result.plan_buffers, result.plan_buffer_bytes);
+    if (result.reference_buffers > 0)
+      std::printf("                  a naive one-buffer-per-value layout would need %u\n",
+                  result.reference_buffers);
     std::printf("quantum:          %d\n", options.quantum);
     std::printf("pacing:           %s\n", options.realtime_paced ? "wall clock" : "flat out");
     std::printf("blocks:           %llu\n", static_cast<unsigned long long>(result.blocks));

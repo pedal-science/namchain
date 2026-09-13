@@ -366,14 +366,48 @@ Compile is transactional: any error leaves the running plan untouched and return
 A plan is published by an atomic index store; the previous plan is retired via §3.2/6.
 
 **Implemented at M1** (`src/graph/plan.cpp`): validation (unknown types, duplicate ids, dangling
-connections, port ranges, cycles via Kahn), deterministic topological order, **liveness + interval
-colouring** so a serial chain of six gains collapses to a handful of buffers rather than one per node,
-buffer allocation out of an `rt::Arena`, and all pointer binding done at compile time so `execute()` is
-allocation-free. Unconnected input ports are bound to one shared zeroed buffer rather than trusting a
-node to ignore a null pointer, and every node's output array is null-terminated so fan-out nodes can
-walk it. Tests cover rejection of malformed and cyclic graphs, topological ordering with nodes declared
-out of order, buffer reuse, silence on unconnected ports, determinism, zero allocations inside an
-`RtScope`, and `nc.nam` producing the same samples as running the model directly.
+connections, port ranges, two connections into one input port, cycles via Kahn), deterministic
+topological order, **liveness + interval colouring** so a serial chain of six gains collapses to a
+handful of buffers rather than one per node, buffer allocation out of an `rt::Arena`, and all pointer
+binding done at compile time so `execute()` is allocation-free. Unconnected input ports are bound to
+one shared zeroed buffer rather than trusting a node to ignore a null pointer, and every node's output
+array is null-terminated so fan-out nodes can walk it. Tests cover rejection of malformed and cyclic
+graphs, topological ordering with nodes declared out of order, buffer reuse, silence on unconnected
+ports, determinism, zero allocations inside an `RtScope`, and `nc.nam` producing the same samples as
+running the model directly.
+
+**Rigs are JSON** (`src/graph/rig.cpp`, §5.1's `Graph` IR): `{"nodes": [...], "connections": [...]}`,
+where a node's `id` and `type` are reserved and every other key is a parameter — a number or boolean
+becomes a numeric param, a string becomes a string param, so `"model": "amp.nam"` needs no wrapper.
+Explicit `"params"`/`"strings"` objects are also accepted. A structured value (an array) is rejected
+rather than dropped, because dropping it would compile and run while quietly ignoring what the rig
+author meant. Relative paths in string params resolve against the rig's own directory first, so an
+example rig copied next to its models needs no editing (the committed `rigs/*.json` are copied into
+the generated-fixture directory by CMake for exactly this reason). `chain_graph(model, n)` builds the
+`nc.input → n × nc.nam → nc.output` chain that `--model --instances N` means, so the CLI, the offline
+renders and the unit tests all go through the same compiler rather than each having its own loop.
+
+**Feedback is a schedule property, not a node's memory** (`nc.unit_delay`, marked `block_delay` in its
+vtable). §5.1 wants cycles to be a compile error, which leaves the question of how a feedback loop is
+ever expressed. The answer here: a node whose input is read as of *the previous block* breaks the
+cycle, because an edge into it is not a scheduling dependency — it reads whatever its input buffer
+already holds. The compiler drops those edges when building the dependency graph, schedules
+block-delay nodes before everything else, and pins any value one of them reads to the end of the block
+so its buffer survives until the next block's early read. `nc.unit_delay` is therefore a plain
+pass-through whose one block of delay comes from *when* it runs; a stateful version would add a second
+block on top of the one the schedule already provides. This forced one more change: `nc.input` samples
+the incoming block at its own point in the schedule (via a `set_block_input` hook `execute` calls
+before any node runs) rather than having its buffer pre-filled, or a delay fed straight from the input
+would come out as zero. The reference interpreter implements the same rule, deliberately — it exists to
+check the compiler's colouring and binding, not to second-guess a documented semantic.
+
+**The compiler has an oracle** (`src/graph/reference.cpp`): a naive evaluator of the same IR that gives
+every value its own storage, orders nodes by depth-first post-order instead of Kahn's algorithm, and
+reuses nothing. Comparing a plan against a second run of that plan proves determinism and nothing else;
+comparing it against this catches schedule, colouring and binding bugs — which is what the soak's
+`--graph --self-oracle` does, block for block, in process. A rig reports both counts, so "the colouring
+works" is a measurement: the guitar chain needs 3 buffers where the naive layout needs 6, two parallel
+chains 4 where it needs 7.
 
 ### 5.3 Edit semantics — every edit is one of four op classes
 
@@ -454,6 +488,34 @@ state-continuity budget, not on speed. Option (a) would also make the engine's o
 `nc.nam` (§7), `nc.gate`, `nc.limiter` (declares latency), `nc.reverb` (declares tail; M5),
 `nc.unit_delay`, `nc.resample` (rate adapter, declares latency), `nc.meter` (telemetry tap,
 audio-transparent), `nc.bypass` (wrapper).
+
+**Implemented at M1** (`src/nodes/builtin.cpp`): `nc.input`, `nc.output`, `nc.gain`, `nc.split`,
+`nc.mix`, `nc.nam`, `nc.cab.ir`, `nc.eq.biquad`, `nc.delay`, `nc.unit_delay`. Notes that are decisions
+rather than transcriptions:
+
+- **A node converts time and frequency to samples once, at build.** `CompileOptions` carries the
+  engine rate and the maximum quantum, so `nc.delay ms` → samples and an EQ's coefficients are
+  control-thread work, not per-block arithmetic. It is also the hook a resampler will need.
+- **`nc.eq.biquad`** is RBJ audio-EQ-cookbook: `peaking` (default), `lowshelf`, `highshelf`,
+  `lowpass`, `highpass`, `bandpass`, `notch`; `freq`, `q`, `gain_db`. DF2T, two state floats.
+  Shelves have no bandwidth, so RBJ parameterises them by *slope*; `q` is used as that slope, clamped
+  to the range that stays monotonic, rather than accepted and ignored. Out-of-range settings (a
+  frequency at or above Nyquist, `q <= 0`) are **rejected, not clamped** — a filter that silently
+  ignores a 30 kHz request is a bug report about "the EQ does nothing", and one that wraps is a bug
+  report about noise.
+- **`nc.delay`** takes `samples` or `ms` and nothing else; a sub-sample delay or a typo'd
+  millisecond value is refused instead of approximated. The ring is `delay + 1` slots so the read
+  pointer is visibly `delay` behind the write pointer rather than coinciding with it.
+- **`nc.cab.ir`** loads a mono `.wav` IR (checking the IR's rate against the engine's — there is no
+  resampler yet, and a 44.1 kHz cab at 48 kHz is detuned, not broken-sounding) or a `Linear` `.nam`.
+  The tap order is the natural one: the core's `Linear` reverses its weights internally, so a WAV's
+  first sample is the direct sound. A test pins that with a two-tap IR, because a reversal here is
+  inaudible as an error and audible as a wrong-sounding cabinet.
+- **`nc.nam` and `nc.cab.ir` refuse a rate mismatch.** The core has no rate guard of its own: a
+  44.1 kHz model driven at 48 kHz runs happily and is simply wrong.
+- **Arity is fixed for now**: `nc.split` is 1→2 and `nc.mix` is 2→1. That is enough for the M1
+  headline (two parallel chains) but not for N-way fan-out, which needs per-spec arity in the vtable
+  and is the next step for the node ABI.
 
 ---
 
@@ -785,6 +847,12 @@ deadline against a 50 % budget, zero deadline overruns and zero driver xruns, in
 loop. The ceiling sits between 4 and 8 instances: eight cost ~121 us each rather than 82 us, i.e.
 superlinear, which is the cache/memory pressure §11 predicted rather than an arithmetic wall.
 
+**The device loop now renders a compiled plan, not a model chain** (§11 has the table): 2 × A2-Lite in
+parallel from a rig JSON at 7.57 % of the deadline over 60 s, 2 × A2-Full at 15.29 %, and 4 × A2-Full in
+series at 34.95 % — the last of which is this same 32.5 % workload re-run through the compiler, so the
+two tables together are the evidence that the graph costs nothing measurable. Every one of those runs
+reports 0 driver xruns, 0 deadline overruns and 0 render-path allocations.
+
 Three harness bugs were found getting here, each of which would have produced a confidently wrong
 number:
 1. **Recovery re-`PREPARE`d the playback ring without re-priming it**, so after any xrun the stream
@@ -1082,14 +1150,46 @@ measured in M0's remainder.
 
 | Metric | Target (Pi 5 class, 48 kHz, q=64) | Status |
 |---|---|---|
-| Concurrent audible A2-Full (8ch) | ≥ 4, p99 ≤ 50 % deadline, 0 xruns/1 h | **met on p99; xruns/1 h not yet tested** (needs M1 + a device) |
+| Concurrent audible A2-Full (8ch) | ≥ 4, p99 ≤ 50 % deadline, 0 xruns/1 h | **met on p99 and on xruns for 30 s through the compiler (34.95 % with 4 in series, 0 xruns, §11); 1 h still to run** |
 | Concurrent audible A2-Lite (3ch) | ≥ 12 | **met** (17 at 50 %) |
 | Resident switchable instances | ≥ 16 (≥ 64 if RAM allows) | **RAM supports ≥ 64**; switching itself is M3 |
 | Switch ready-time (p99, warm set) | ≤ 5 ms, zero click | M3 |
 | Cold switch (deferred) | ≤ 15 ms, zero gap, `exact` when possible | M3 |
 | Added CPU for `balanced` warming | ≤ 2 × RTF of hot set | M3 |
-| Engine latency @48 k/64 q | 1.33 ms I/O + 0 algorithmic | M1 |
+| Engine latency @48 k/64 q | 1.33 ms I/O + 0 algorithmic | **1.33 ms I/O confirmed on the SSL (period 64 frames, 4 periods); 0 algorithmic, and every M1 built-in is zero-latency** |
 | Block-time jitter | p99/max measured and published | **measured above** (max/p99 is noisy: see the q=64 outlier) |
+
+**The engine, measured through the graph compiler on a real device** (SSL 2+ Mk II, `hw:4,0`,
+UAC2/S32_LE, q = 64, 4 periods, `SCHED_FIFO` 80 + `mlockall`, `namchain-soak` driving a compiled
+`RenderPlan` — not a private model loop). Steady state; the two bring-up xruns the device produces
+before the measured loop are reported separately, as always.
+
+| Rig | nodes | buffers (naive) | p50 | p99 | p99 % deadline | xruns | allocs |
+|---|---|---|---|---|---|---|---|
+| 2 × A2-Lite in parallel, 60 s | 6 | 4 (7) | 35.8 µs | 100.9 µs | 7.57 % | 0 | 0 |
+| 2 × A2-Full in parallel, 30 s | 6 | 4 (7) | 157.7 µs | 203.9 µs | 15.29 % | 0 | 0 |
+| 4 × A2-Full in series, 30 s | 6 | 3 (5) | 323.3 µs | 466.0 µs | 34.95 % | 0 | 0 |
+
+Three things this settles:
+
+- **The compiler's indirection is free.** The 4 × A2-Full row is the same workload the earlier
+  hand-rolled chain loop measured at p50 327.9 µs / p99 433.8 µs (32.5 %): through the plan it is
+  323.3 / 466.0 µs (34.95 %). p50 is inside run-to-run noise and slightly *better*; the p99 difference
+  is the Pi's scheduler, not the engine. A graph of six nodes and three buffers costs what five
+  values and no graph cost.
+- **The memory plan does something on real rigs, not just in unit tests.** A two-chain rig needs 4
+  buffers where one-per-value needs 7; the serial chain 3 where it needs 5. Both numbers are printed
+  by every soak, so the claim is re-measured on each run rather than asserted once.
+- **Nothing allocates in the render path, from the first measured block.** That required warming the
+  plan before the loop: a partitioned convolution builds its FFT plan lazily on first `process`, which
+  showed up as exactly one allocation (duration-independent) inside the `RtScope`. `RenderPlan::prewarm`
+  removes it, and it is sample-neutral — the A2 self-oracle against the core's own render tool is still
+  `max|diff| = 0` with warming on. The soak now warms the plan *and* the reference interpreter, so the
+  oracle stays like-for-like and the allocation count is an unconditional claim.
+
+The 60 s row also shows the honest spread: p99 was 53.7 µs over 5 s and 100.9 µs over 60 s on the same
+rig, so p99 grows with the observation window on a desktop-class OS. Short soaks understate tail
+latency; criterion 3's "1 h" is not a formality.
 
 **Caveats on these numbers:** they are single-threaded throughput measurements with no audio device
 attached, taken on a bare-metal host with a desktop-class OS (no `threadirqs`, no PREEMPT_RT, no
@@ -1111,7 +1211,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam` ✔**; static DAG render; `nc.input/output/gain/split/mix/eq/delay`; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 (§9.5)**; `pipewire` + `null` + `file`; daemon skeleton; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline oracle (§10.5.1)** | Plays a guitar through 2 chains at 64 samples; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, captured output sample-identical to the offline render); allocation interposer clean; true round-trip latency measured with `jdelay` over a physical loopback cable; **parity test green at release flags** |
+| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; `pipewire` + `null` + `file`; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, captured output sample-identical to the offline render); allocation interposer clean; true round-trip latency measured with `jdelay` over a physical loopback cable; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |
