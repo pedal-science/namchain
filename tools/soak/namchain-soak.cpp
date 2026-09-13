@@ -237,6 +237,7 @@ int main(int argc, char** argv)
     j["driver_xruns"] = result.driver_xruns;
     if (result.stream_mode)
     {
+      j["backend"] = result.backend;
       j["device"] = {{"capture_node", result.device_capture_node},
                      {"playback_node", result.device_playback_node},
                      {"period_size", result.device_period_size},
@@ -265,6 +266,7 @@ int main(int argc, char** argv)
   {
     if (result.stream_mode)
     {
+      std::printf("backend:          %s\n", result.backend.c_str());
       std::printf("device:           %s -> %s\n", result.device_capture_node.c_str(),
                   result.device_playback_node.c_str());
       std::printf("period/buffer:    %u / %u frames%s\n", result.device_period_size, result.device_buffer_size,
@@ -321,8 +323,12 @@ int main(int argc, char** argv)
                   static_cast<unsigned long long>(result.first_overrun_block),
                   static_cast<unsigned long long>(result.blocks));
     std::printf("deadline overruns:%llu\n", static_cast<unsigned long long>(result.deadline_overruns));
+    // Only the ALSA backend has a driver to report anything, so a zero from any other backend is a
+    // statement about the backend and not about the host. Say which, rather than letting a bare 0
+    // read as "the device never underran".
+    const bool driver_backed = result.backend == "alsa_raw";
     std::printf("driver xruns:     %llu%s\n", static_cast<unsigned long long>(result.driver_xruns),
-                (!result.stream_mode && result.driver_xruns == 0) ? " (no device backend in this mode)" : "");
+                (!driver_backed && result.driver_xruns == 0) ? " (this backend has no driver to report)" : "");
     if (result.oracle.checked)
     {
       std::printf("oracle:           %s vs %s\n", result.oracle.match ? "match" : "MISMATCH",

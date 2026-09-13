@@ -48,8 +48,6 @@ struct BackendConfig
   /// `null` only: pace against the wall clock the way a device would. False runs flat out, which is
   /// what a throughput measurement wants and a lateness measurement cannot use.
   bool realtime_paced = true;
-  /// `null` only: stop after this many periods. 0 means "never".
-  uint64_t max_periods = 0;
   /// Refuse a period size other than the one requested. On a device this is the guard against the
   /// silent rounding measured in §9.5.
   bool require_exact_period = true;

@@ -32,8 +32,7 @@ using Clock = std::chrono::steady_clock;
 class NullBackend final : public AudioBackend
 {
 public:
-  explicit NullBackend(const BackendConfig& config)
-    : paced_(config.realtime_paced), max_periods_(config.max_periods)
+  explicit NullBackend(const BackendConfig& config) : paced_(config.realtime_paced)
   {
     const unsigned periods = config.periods == 0 ? 4 : config.periods;
     info_.period_size = config.period_size;
@@ -91,11 +90,6 @@ public:
 
   int read_capture(void* dst, unsigned frames, int /*timeout_ms*/, std::string& /*error*/) override
   {
-    if (max_periods_ != 0 && period_ > max_periods_)
-    {
-      info_.capture_exhausted = true;
-      return 0;
-    }
     // Silence, and silence is the honest thing for a device with no input: the engine cannot tell
     // this apart from an interface with nothing plugged into it.
     std::memset(dst, 0, static_cast<size_t>(frames) * info_.capture_bytes_per_frame);
@@ -112,7 +106,6 @@ public:
 private:
   BackendInfo info_;
   bool paced_ = true;
-  uint64_t max_periods_ = 0;
   bool running_ = false;
   uint64_t period_ = 0;
   std::chrono::nanoseconds period_ns_{0};
