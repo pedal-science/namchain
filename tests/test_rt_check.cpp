@@ -7,6 +7,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -101,10 +102,19 @@ TEST_CASE("allocations inside the scope are counted and outside are ignored")
 
   namchain::rt_reset_counters();
 
-  // Outside: must not be attributed to the render path.
+  // Deliberate calls to the replaceable allocation functions, not new-expressions.
+  //
+  // The compiler is explicitly allowed to elide an allocation it can prove is dead (N3664), and this
+  // test used to make one through a local `std::vector` that was never read. GCC 15 compiles that
+  // whole vector -- reserve, malloc, free -- to a bare `ret` at -O3, so the interposer had nothing to
+  // count and the "must be caught" assertion was describing code that no longer existed. It survived
+  // on GCC 13 and broke on GCC 15, which is the kind of instrument bug that makes every later
+  // "0 allocations" claim worth less than it looks. A direct call to `::operator new` is an ordinary
+  // call to a replaceable function: it cannot be elided, and it is exactly what the interposer
+  // replaces.
   {
-    std::vector<int> scratch;
-    scratch.reserve(4096);
+    void* scratch = ::operator new(4096);
+    ::operator delete(scratch);
   }
   CHECK(namchain::rt_allocation_count() == 0);
   CHECK(namchain::rt_deallocation_count() == 0);
@@ -114,13 +124,14 @@ TEST_CASE("allocations inside the scope are counted and outside are ignored")
     namchain::RtScope scope;
     CHECK(namchain::rt_in_scope());
     {
-      std::vector<int> scratch;
-      scratch.reserve(4096);
+      void* scratch = ::operator new(4096);
+      CHECK(scratch != nullptr);
       CHECK(namchain::rt_allocation_count() >= 1);
       CHECK(namchain::rt_deallocation_count() == 0); // still alive
+      ::operator delete(scratch);
     }
-    // Destroyed while the scope is still active (reverse construction order), so the free is
-    // render-path work too -- and free-on-the-render-thread is the same class of mistake.
+    // Freed while the scope is still active, so the free is render-path work too -- and
+    // free-on-the-render-thread is the same class of mistake.
     CHECK(namchain::rt_deallocation_count() >= 1);
   }
 
