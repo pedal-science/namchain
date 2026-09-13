@@ -130,6 +130,7 @@ add_library(namchain OBJECT
   src/graph/reference.cpp
   src/graph/rig.cpp
   src/latency/latency.cpp
+  src/glitch/glitch.cpp
   src/nodes/builtin.cpp
   src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
@@ -252,7 +253,8 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_graph.cpp
     tests/test_nodes.cpp
     tests/test_rig.cpp
-    tests/test_latency.cpp)
+    tests/test_latency.cpp
+    tests/test_glitch.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
