@@ -314,6 +314,20 @@ public:
 
   uint64_t driver_xruns() const override { return device_->driver_xruns(); }
 
+  bool ring_occupancy(long long& capture_frames, long long& playback_frames) const override
+  {
+    AlsaRawOccupancy capture;
+    AlsaRawOccupancy playback;
+    std::string ignored;
+    if (!device_->query_occupancy(true, capture, ignored))
+      return false;
+    if (!device_->query_occupancy(false, playback, ignored))
+      return false;
+    capture_frames = capture.delay_frames;
+    playback_frames = playback.delay_frames;
+    return true;
+  }
+
 private:
   AlsaBackend() = default;
 

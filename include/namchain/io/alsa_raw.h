@@ -119,9 +119,17 @@ public:
   bool start(std::string& error);
   void stop();
 
-  /// Wait until capture has a period available, without transferring anything. The engine's
-  /// real-time loop is: wait (untimed) -> read, DSP, write (timed). Measuring from the start of
-  /// the wait would just report the period length.
+  /// Wait until the device has one period of capture available to read.
+  ///
+  /// Not "until some data is available". The difference is what `sw_params.avail_min` decides, and
+  /// leaving it at the kernel's default is how the loop came to be paced by the wrong ring: `poll`
+  /// returns almost immediately in a running stream, the loop free-runs until the playback ring is
+  /// full, and from then on the write blocks for the best part of a period -- which a soak then
+  /// reports as engine block time. Measured here: a 20 s run had `write` p50 7.8 us, and the same
+  /// binary over an hour settled at 699 us with `device wait` down to 8 us.
+  ///
+  /// The gate is checked against the device's own pointer rather than trusting the wakeup, so the
+  /// cadence holds even if a driver wakes early.
   bool wait_capture(int timeout_ms, std::string& error);
 
   /// Read exactly \p frames into \p dst, waiting up to \p timeout_ms. Returns frames transferred,

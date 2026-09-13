@@ -3,6 +3,7 @@
 #if defined(__linux__)
 
   #include <cerrno>
+  #include <chrono>
   #include <cstdio>
   #include <cstdlib>
   #include <cstring>
@@ -287,6 +288,32 @@ bool AlsaRawDuplex::configure(int fd, bool capture, const char* direction, std::
     return false;
   }
 
+  // Software parameters, which is where the transfer cadence actually lives.
+  //
+  // `avail_min` is what `poll` wakes on, and leaving it at whatever the kernel picked is how the loop
+  // ended up paced by the wrong ring: with a threshold of one frame, `poll` returns almost
+  // immediately in a running stream, so the loop free-runs until the playback ring is full and the
+  // write becomes the clock. One period makes the wakeup land on the period boundary the loop
+  // actually consumes at, which is what wait_capture() then checks against the device position.
+  //
+  // `start_threshold` for playback is one period, matching prime_playback()'s one-period prime: the
+  // ring is deliberately not filled, so a write always has room and the I/O latency floor is a
+  // period rather than a buffer (§9.5).
+  struct snd_pcm_sw_params sw;
+  std::memset(&sw, 0, sizeof(sw));
+  sw.tstamp_mode = SNDRV_PCM_TSTAMP_NONE;
+  sw.period_step = 1;
+  sw.avail_min = actual_period;
+  sw.start_threshold = capture ? 1 : actual_period;
+  sw.stop_threshold = actual_buffer;
+  sw.silence_threshold = 0;
+  sw.silence_size = 0;
+  if (::ioctl(fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sw) < 0)
+  {
+    error = errno_text("SNDRV_PCM_IOCTL_SW_PARAMS failed for " + std::string(direction));
+    return false;
+  }
+
   // Timestamps are off unless asked for, and both the enable and the clock choice can be refused.
   // Failure is not fatal: a caller that needs them can check info().timestamps_enabled.
   if (enable_timestamps_)
@@ -452,25 +479,51 @@ int AlsaRawDuplex::read_capture(void* dst, unsigned frames, int timeout_ms, std:
 
 bool AlsaRawDuplex::wait_capture(int timeout_ms, std::string& error)
 {
+  const auto started = std::chrono::steady_clock::now();
+
   for (;;)
   {
+    // One period *available to read*, which is a question about the device pointer, not about how
+    // much happens to be queued: reading a period takes the availability back below a period, so the
+    // gate throttles the loop to the device's own rate however far behind it once fell.
+    //
+    // "Has a period of production happened since my last read" is the tempting phrasing and it is
+    // wrong: production continues while the engine works, so that gate charges the work to the
+    // deadline as well and the loop runs (work / period) short of real time. Measured with that gate:
+    // RTF 1.175 and 39 170 xruns in five minutes, against RTF 0.9999 for this one.
+    AlsaRawOccupancy status;
+    std::string ignored;
+    if (query_occupancy(true, status, ignored) &&
+        status.delay_frames >= static_cast<long long>(info_.period_size))
+      return true;
+
+    const auto elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+    const int remaining = timeout_ms - static_cast<int>(elapsed);
+    if (remaining <= 0)
+    {
+      error = "capture timed out after " + std::to_string(timeout_ms) + " ms";
+      return false;
+    }
+
     struct pollfd pfd;
     pfd.fd = capture_fd_;
     pfd.events = POLLIN;
     pfd.revents = 0;
 
-    const int ready = ::poll(&pfd, 1, timeout_ms);
-    if (ready > 0)
-      return true;
+    const int ready = ::poll(&pfd, 1, remaining);
     if (ready == 0)
     {
       error = "capture timed out after " + std::to_string(timeout_ms) + " ms";
       return false;
     }
-    if (errno == EINTR)
-      continue;
-    error = errno_text("poll failed");
-    return false;
+    if (ready < 0)
+    {
+      if (errno == EINTR)
+        continue;
+      error = errno_text("poll failed");
+      return false;
+    }
   }
 }
 

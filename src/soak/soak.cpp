@@ -242,6 +242,14 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
 
   rt_reset_counters();
   uint64_t first_overrun_block = std::numeric_limits<uint64_t>::max();
+  bool occupancy_seen = false;
+  long long capture_occupancy_min = 0;
+  long long capture_occupancy_max = 0;
+  long long capture_occupancy_last = 0;
+  long long playback_occupancy_min = 0;
+  long long playback_occupancy_max = 0;
+  long long playback_occupancy_last = 0;
+  uint64_t playback_full_blocks = 0;
   const auto start = Clock::now();
   for (uint64_t block = 0; block < total_blocks; ++block)
   {
@@ -297,6 +305,34 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     }
     const auto t2 = Clock::now();
     chain_timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
+
+    // Sampled before the write, and after the timed section is closed: what decides whether the write
+    // can proceed immediately is how much room the playback ring has *now*, not after the period we
+    // are about to add to it. Reading it after the write reports the ring one period fuller than the
+    // state the write actually met, which is the difference between "the ring is full" and "the ring
+    // is full because I just filled it".
+    {
+      long long capture_frames = 0;
+      long long playback_frames = 0;
+      if (device->ring_occupancy(capture_frames, playback_frames))
+      {
+        if (!occupancy_seen)
+        {
+          occupancy_seen = true;
+          capture_occupancy_min = capture_occupancy_max = capture_frames;
+          playback_occupancy_min = playback_occupancy_max = playback_frames;
+        }
+        capture_occupancy_min = std::min(capture_occupancy_min, capture_frames);
+        capture_occupancy_max = std::max(capture_occupancy_max, capture_frames);
+        playback_occupancy_min = std::min(playback_occupancy_min, playback_frames);
+        playback_occupancy_max = std::max(playback_occupancy_max, playback_frames);
+        capture_occupancy_last = capture_frames;
+        playback_occupancy_last = playback_frames;
+        if (playback_frames + static_cast<long long>(info.period_size) > static_cast<long long>(info.buffer_size))
+          ++playback_full_blocks;
+      }
+    }
+
     if (device->write_playback(playback_buffer.data(), info.period_size, 1000, error) < 0)
     {
       device->stop();
@@ -371,6 +407,14 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.device_period_exact = info.period_exact;
   result.device_capture_node = info.capture_name;
   result.device_playback_node = info.playback_name;
+  result.occupancy_measured = occupancy_seen;
+  result.capture_occupancy_min = capture_occupancy_min;
+  result.capture_occupancy_max = capture_occupancy_max;
+  result.capture_occupancy_last = capture_occupancy_last;
+  result.playback_occupancy_min = playback_occupancy_min;
+  result.playback_occupancy_max = playback_occupancy_max;
+  result.playback_occupancy_last = playback_occupancy_last;
+  result.playback_full_blocks = playback_full_blocks;
 
   result.blocks = timer.blocks();
   result.frames = timer.blocks() * info.period_size;
@@ -380,6 +424,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.deadline_ns = deadline_ns;
   result.read_p50_ns = read_timer.p50_ns();
   result.chain_p50_ns = chain_timer.p50_ns();
+  result.chain_p99_ns = chain_timer.p99_ns();
   result.write_p50_ns = write_timer.p50_ns();
   result.wait_p50_ns = wait_timer.p50_ns();
   result.wait_p99_ns = wait_timer.p99_ns();

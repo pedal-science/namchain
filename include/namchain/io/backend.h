@@ -125,6 +125,17 @@ public:
   /// reporting rather than a reason to omit the field (§10.5.1).
   virtual uint64_t driver_xruns() const = 0;
 
+  /// \brief Frames sitting in each ring right now, when the backend has rings to report.
+  ///
+  /// This is here because a soak can be paced by the wrong ring and its percentiles will not say so.
+  /// A single late period leaves a capture backlog; `poll` then returns immediately for ever, the
+  /// loop free-runs until the playback ring fills, and from then on the block time being measured is
+  /// the write's wait for space rather than the engine's work. That state is invisible in p50/p99 and
+  /// unmistakable here -- which is the whole reason it cost an hour to find (plan.md §9.5).
+  ///
+  /// \return false when there is no ring to report, which is every backend that is not a device.
+  virtual bool ring_occupancy(long long& /*capture_frames*/, long long& /*playback_frames*/) const { return false; }
+
   /// Flush anything buffered. A no-op for every backend that is not `file`, where it writes the
   /// output WAV.
   virtual bool finish(std::string& error)

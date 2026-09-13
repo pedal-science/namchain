@@ -1,0 +1,27 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 256 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+chain:            4 x build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/258, playback min/max 128/545 frames (224510 blocks wrote into a full playback ring)
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           225000
+audio:            300.000 s in 299.976 s wall (RTF 0.9999)
+deadline:         1333333 ns
+split (p50):      read 2815 ns, chain 298742 ns, write 187908 ns
+device wait:      p50 1004837 ns, p99 1196708 ns, max 1368079 ns
+block time:       p50 491039 ns, p99 1495727 ns, max 4243311 ns
+p99/deadline:     112.18% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+bring-up xruns:   1 (before the measured loop)
+first overrun at: block 1315 of 225000
+deadline overruns:5599
+driver xruns:     1
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           FAIL

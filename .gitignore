@@ -19,3 +19,4 @@ tests/data/
 # Local tooling
 .cache/
 compile_commands.json
+bench-results/*.watch

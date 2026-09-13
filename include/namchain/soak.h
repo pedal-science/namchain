@@ -123,6 +123,10 @@ struct SoakResult
   uint64_t read_p50_ns = 0;
   uint64_t chain_p50_ns = 0;
   uint64_t write_p50_ns = 0;
+  /// The engine's own tail. `p99_ns` below is the block time, which includes whatever the backend's
+  /// write waited for; this one is the render path alone, and on a device whose playback ring runs
+  /// near-full it is the difference between a measurement of the engine and one of the queue.
+  uint64_t chain_p99_ns = 0;
   uint64_t wait_p99_ns = 0;
   uint64_t wait_max_ns = 0;
   uint64_t p50_ns = 0;
@@ -163,6 +167,21 @@ struct SoakResult
   bool device_period_exact = false;
   std::string device_capture_node;
   std::string device_playback_node;
+  /// Ring occupancy, in frames, sampled once per block. This is the measurement that tells a
+  /// capture-paced run apart from one paced by a full playback ring: the two have completely
+  /// different block percentiles and identical engine work, and only this says which happened. The
+  /// min is as informative as the max -- a capture minimum that never returns to zero means the loop
+  /// was never waiting on the device again after its first late period.
+  bool occupancy_measured = false;
+  long long capture_occupancy_min = 0;
+  long long capture_occupancy_max = 0;
+  long long capture_occupancy_last = 0;
+  long long playback_occupancy_min = 0;
+  long long playback_occupancy_max = 0;
+  long long playback_occupancy_last = 0;
+  /// Blocks whose playback ring was at or above the buffer length: the loop was writing into a full
+  /// ring, which is the state that turns the write's wait for space into reported block time.
+  uint64_t playback_full_blocks = 0;
   unsigned chain_instances = 0;
   std::string chain_model;
   /// The concrete C++ type the factory returned (e.g. A2PlanarFull vs A2FastModel<8>). A timing

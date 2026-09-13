@@ -249,6 +249,15 @@ int main(int argc, char** argv)
                      {"chain_model", result.chain_model},
                      {"startup_xruns", result.startup_driver_xruns},
                      {"model_type", result.model_type}};
+      if (result.occupancy_measured)
+        j["device"]["ring_occupancy_frames"] = {
+          {"capture_min", result.capture_occupancy_min},
+          {"capture_max", result.capture_occupancy_max},
+          {"capture_last", result.capture_occupancy_last},
+          {"playback_min", result.playback_occupancy_min},
+          {"playback_max", result.playback_occupancy_max},
+          {"playback_last", result.playback_occupancy_last},
+          {"playback_full_blocks", result.playback_full_blocks}};
     }
     if (result.oracle.checked)
     {
@@ -278,6 +287,19 @@ int main(int argc, char** argv)
         std::printf("chain:            %u x %s\n", result.chain_instances, result.chain_model.c_str());
       if (!result.model_type.empty())
         std::printf("model type:       %s\n", result.model_type.c_str());
+      if (result.occupancy_measured)
+      {
+        // Printed next to the device because it is a statement about how the loop was paced, not
+        // about the engine: a capture minimum that never comes back to zero, or a playback maximum
+        // at the buffer length, means the block percentiles below are describing a queue.
+        std::printf("ring occupancy:   capture min/max %lld/%lld, playback min/max %lld/%lld frames",
+                    result.capture_occupancy_min, result.capture_occupancy_max, result.playback_occupancy_min,
+                    result.playback_occupancy_max);
+        if (result.playback_full_blocks > 0)
+          std::printf(" (%llu blocks wrote into a full playback ring)",
+                      static_cast<unsigned long long>(result.playback_full_blocks));
+        std::printf("\n");
+      }
     }
     else
     {
@@ -299,6 +321,17 @@ int main(int argc, char** argv)
                   static_cast<unsigned long long>(result.read_p50_ns),
                   static_cast<unsigned long long>(result.chain_p50_ns),
                   static_cast<unsigned long long>(result.write_p50_ns));
+    if (result.stream_mode)
+      // The engine's own p99, separately from the block time. The block time includes whatever the
+      // write waited for, and on this device the playback ring is close to full nearly always, so the
+      // write's wait for room is charged to the "block" -- which turns a statement about the engine
+      // into a statement about the ring. This is the number that answers "did the engine finish its
+      // work inside the deadline", and it is printed next to the one that does not.
+      std::printf("chain p99:        %llu ns (%.2f%% of deadline)\n",
+                  static_cast<unsigned long long>(result.chain_p99_ns),
+                  result.deadline_ns == 0
+                    ? 0.0
+                    : 100.0 * static_cast<double>(result.chain_p99_ns) / static_cast<double>(result.deadline_ns));
     if (result.stream_mode)
       std::printf("device wait:      p50 %llu ns, p99 %llu ns, max %llu ns\n",
                   static_cast<unsigned long long>(result.wait_p50_ns),
