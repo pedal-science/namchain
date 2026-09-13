@@ -851,9 +851,92 @@ passthrough soak:
 The UAC1/UAC2 split is the whole story: full-speed USB services transfers on 1 ms frames, high-speed on
 125 µs microframes, so **only the UAC2 device can honour the q = 32 column that §1 and §10.3 specify**.
 On this evidence the **SSL 2+ Mk II is the reference interface** for real-time work — the decision §11
-said should be made by measurement, and this is that measurement (true round-trip latency still needs
-the physical loopback cable, §10.5.1). The two UAC1 devices stay useful as the cheap end of the range
-the engine must still support, and the MOMIX additionally pins 48 kHz with no other rate available.
+said should be made by measurement, and this is that measurement. The two UAC1 devices stay useful as
+the cheap end of the range the engine must still support, and the MOMIX additionally pins 48 kHz with
+no other rate available.
+
+**Firmware V1.16 changed the device, and the topology-with-it (2026-09-13).** SSL's V1.16 adds two more
+stereo loopbacks (three in total) and reports round-trip latency improvements. The channel counts moved
+from 4/4 to **6 playback / 8 capture**, and the channel map was established by measurement rather than
+from the descriptors, which are generic (`FL FR FC LFE RL RR`):
+
+| capture channel | is | fed by |
+|---|---|---|
+| 0, 1 | analogue inputs 1, 2 | the combo jacks |
+| 2, 3 | loopback 1 | playback 0, 1 (the monitor pair) |
+| 4, 5 | loopback 2 | playback 2, 3 (physical outputs 3 and 4) |
+| 6, 7 | loopback 3 | playback 4, 5 (**no physical output**) |
+
+Two consequences worth stating. **The loopbacks are bit-exact digital taps** of the playback stream —
+an amplitude-coded probe came back at exactly the amplitudes sent, to four decimals — so they measure
+the USB and driver round trip with no converters in it. And **playback 4/5 exist only as a loopback
+source**: there is no fifth or sixth output on the box, so those two channels are a way to inject audio
+into a stream without it appearing on any physical output. That is the feature a podcaster wants, and
+it is also why the capture side gained two channels and the playback side gained two.
+
+A channel count the device does not offer now fails to open rather than being trimmed: USB audio
+exposes one altset per channel count, so asking the V1.16 device for 4 channels returns `EINVAL` from
+`HW_REFINE`. `alsa_raw` reports the count it asked for and the rate in that message, because "Invalid
+argument" from an ioctl named HW_REFINE is not a diagnosis.
+
+**True round-trip latency, measured (2026-09-13, `namchain-latency`).** The cable is a TRS patch from
+output 3 to input 1, with input 1 in LINE mode at minimum gain (the manual's +14.5 dBu maximum output
+against its +24 dBu maximum line input budgets 9.5 dB of headroom, and the measured path gain is
+**-10.2 dB** by sine and **-10.5 dB** by RMS of a broadband stimulus — the two agree, and the
+prediction is right to within a decibel).
+
+The measurement sends a 4096-frame pseudo-random stimulus four times and cross-correlates, so the delay
+falls out of the data rather than out of an assumption about the device's buffering. Both the analogue
+loop and the internal digital loopback are measured **in the same run**, from the same stimulus on the
+same playback channel:
+
+| quantum | periods | buffer | digital loopback | analogue (out 3 → in 1) | difference |
+|---|---|---|---|---|---|
+| 16 | 2 | 32 | 174 fr / 3.63 ms | 190 fr / 3.97 ms | **16 fr / 0.333 ms** |
+| 16 | 4 | 64 | 237 / 4.94 | 253 / 5.27 | 16 |
+| 32 | 2 | 64 | 273 / 5.69 | 289 / 6.02 | 16 |
+| 32 | 4 | 128 | 319 / 6.65 | 335 / 6.98 | 16 |
+| 64 | 2 | 128 | 428 / 8.92 | 444 / 9.25 | 16 |
+| **64** | **4** | **256** | **464 / 9.67** | **480 / 10.00** | **16** |
+| 128 | 2 | 256 | 588 / 12.25 | 604 / 12.59 | 16 |
+| 128 | 4 | 512 | 570 / 11.88 | 586 / 12.21 | 16 |
+
+**Read the difference column, not the delay columns.** Three consecutive runs of the *same*
+configuration (q = 32, 4 periods) gave 261, 349 and 361 frames for the digital loopback — a 100-frame,
+2.1 ms spread, against a 128-frame buffer. So each row above is a single run and the absolute figures
+are good to about ± one buffer, not to the frame. The measured delay includes the ALSA ring's
+occupancy at the instant the stimulus is queued, and that occupancy settles differently depending on
+how the first few periods happen to interleave with the device's consumption. The table is therefore
+evidence of a *trend* — latency scales with the period size — and not a set of precise figures.
+Pinning that occupancy, or measuring and reporting it, is an open item; until then the absolute
+round-trip number should be quoted with its configuration and its uncertainty, never on its own.
+
+What is exact and reproducible is the converter round trip:
+
+- **The analogue-to-digital difference is 16 frames = 0.333 ms in every configuration, and in every
+  run.** That is the DAC plus ADC plus analogue path, and it is the one number here that nothing in the
+  ALSA setup can perturb — because it is a difference between two figures taken in the same run under
+  identical conditions, so the ring occupancy, our own priming and the period length all cancel. It is
+  the whole argument for measuring both loops at once rather than one per session.
+- **The absolute figure is dominated by the period size, not by our processing.** Going from q = 16 to
+  q = 128 adds roughly 8 ms while our chain costs 10.6 µs. The device's internal buffering scales with
+  the period it is given, which is the same effect that stopped q = 16 from keeping real time earlier
+  in this section. Latency here is bought and paid for in period size.
+- **One period of the absolute figure is ours.** `alsa_raw` queues exactly one period of silence to
+  reach the kernel's start threshold, and that silence really is played before the stimulus.
+
+The delays are stable to the frame across all four sends *within* a run, and the digital loopback's
+correlation is bit-exact (peak-to-sidelobe 999 dB) where the analogue path's is 32 dB — the expected
+difference between a digital tap and a path through two converters.
+
+**q = 32 with 4 periods is the config to prefer**, and that is a change from the q = 64 this section
+assumed. It is lower-latency (6.98 ms analogue against 10.00) and comfortable for the guitar-chain rig:
+p99 7.6 % of the 667 µs deadline, 0 deadline overruns, 0 driver xruns, 0 render-path allocations over
+20 s. The period *size* is what the latency lives in; the period *count* is what the safety margin
+lives in — at 2 periods the same rig reports p99 37 % of the deadline at both q = 32 and q = 64, which
+is the buffer running out of room rather than the engine being slow. p99 varies enough between runs
+(18.7 % at q = 64 / 4 periods on one 20 s run) that the latency table, not the percentile, is the
+stable comparison here; that is what the 1 h soak is for.
 
 **Criterion 3, measured in the device loop (2026-09-12).** The same harness, now running real models
 between the backend's read and write: SSL 2+ Mk II, 48 kHz, q = 64 (1333 us deadline), 4 channels,
@@ -1034,7 +1117,8 @@ code vendored in `vendor/patches/0001`.
 8–24 h soak on bare-metal Pi 5 with periodic edit storms, thermal logging, `vcgencmd get_throttled`,
 asserting zero xruns and reporting p50/p99/max block time. libFuzzer targets for the `.nam` loader and
 the control-protocol parser (malformed input must produce errors, never crashes/hangs/OOM). On-device
-tools: `cyclictest`/`rtla timerlat`, `jdelay`/`jack_iodelay` for true round-trip latency, `perf stat`
+tools: `cyclictest`/`rtla timerlat`, `perf stat` (round-trip latency is measured by
+`namchain-latency` instead of `jdelay`, which would need JACK — §4.3)
 for cache/cycles, Instruments + `os_signpost` on Apple.
 
 #### 10.5.1 How "zero xruns" is actually established
@@ -1085,8 +1169,9 @@ is not hypothetical — the vendored `example_audio/input.wav` is **1 s of digit
 
 **The authoritative run (no human needed):** 1 h at 48 k/64 counting `-EPIPE`/XRUN with timestamps;
 block-time p50/p99/max against the deadline; true round-trip latency measured with a **physical cable
-from output back to input** using an impulse and cross-correlation (what `jdelay`/`jack_iodelay`
-automate) rather than a stopwatch; `cyclictest`/`rtla timerlat` for host scheduling latency, which
+from output back to input** and with the device's internal loopback, using a pseudo-random stimulus and
+cross-correlation (what `jdelay`/`jack_iodelay` automate) rather than a stopwatch;
+`cyclictest`/`rtla timerlat` for host scheduling latency, which
 degrades before xruns appear; `vcgencmd get_throttled`/`measure_temp` for thermals; and the oracle diff
 on the captured output.
 
@@ -1236,7 +1321,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; `pipewire` + `null` + `file`; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, captured output sample-identical to the offline render); allocation interposer clean; true round-trip latency measured with `jdelay` over a physical loopback cable; **parity test green at release flags** |
+| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; `pipewire` + `null` + `file`; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, captured output sample-identical to the offline render); allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference (§9.5)**; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |

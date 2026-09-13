@@ -21,7 +21,14 @@ struct AlsaRawConfig
   std::string capture;
   std::string playback;
   unsigned sample_rate = 48000;
+  /// Channel count for both directions. Overridden by \ref capture_channels / \ref playback_channels
+  /// when the device is asymmetric: the SSL 2+ Mk II reports 6 playback and 8 capture channels on
+  /// firmware V1.16 (2 analogue inputs + three stereo loopbacks), and requesting one count for both
+  /// directions simply fails to open.
   unsigned channels = 1;
+  /// 0 means "the same as \ref channels".
+  unsigned capture_channels = 0;
+  unsigned playback_channels = 0;
   /// Requested period size in frames. The device period IS the engine quantum (§9.2).
   unsigned quantum = 64;
   /// Target buffer length in periods.
@@ -42,8 +49,14 @@ struct AlsaRawInfo
 {
   unsigned period_size = 0;
   unsigned buffer_size = 0;
-  unsigned channels = 0;
   unsigned sample_rate = 0;
+  /// Per-direction channel counts. These are not one number: the SSL 2+ Mk II is 6 out / 8 in.
+  unsigned capture_channels = 0;
+  unsigned playback_channels = 0;
+  /// Bytes per frame, per direction. Derived from the channel count, so they differ whenever the
+  /// channel counts do -- which is why buffer sizing must ask the direction it is sizing for.
+  unsigned capture_bytes_per_frame = 0;
+  unsigned playback_bytes_per_frame = 0;
   /// The SNDRV_PCM_FORMAT_* the device agreed to, and its width in bytes.
   unsigned sample_format = 0;
   unsigned bytes_per_sample = 0;
@@ -97,7 +110,7 @@ public:
 private:
   AlsaRawDuplex() = default;
 
-  bool configure(int fd, const char* direction, std::string& error);
+  bool configure(int fd, bool capture, const char* direction, std::string& error);
   /// \param playback when true the ring is re-primed with silence after the xrun.
   void recover(int fd, bool playback);
   bool prime_playback(std::string& error);
@@ -108,7 +121,8 @@ private:
   unsigned quantum_ = 64;
   unsigned periods_ = 4;
   std::vector<unsigned> format_preference_;
-  unsigned bytes_per_frame_ = 2;
+  unsigned capture_bytes_per_frame_ = 2;
+  unsigned playback_bytes_per_frame_ = 2;
   /// Silence used to prime the playback ring; preallocated so recovery does not allocate.
   std::vector<unsigned char> prime_silence_;
   AlsaRawInfo info_;

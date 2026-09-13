@@ -54,7 +54,9 @@ void usage()
                "  --json               print a JSON summary instead of text\n"
                "device mode (no model: capture straight to playback):\n"
                "  --device hw:C,D      capture and play back through a real ALSA device\n"
-               "  --channels N         1 or 2 (default 1)\n"
+               "  --channels N         channel count for both directions (default 1)\n"
+               "  --capture-channels N device capture channels, when it differs (SSL 2+ Mk II: 8)\n"
+               "  --playback-channels N device playback channels (SSL 2+ Mk II: 6)\n"
                "  --periods N          buffer length in periods (default 4)\n"
                "  --model FILE         run this .nam between capture and playback\n"
                "  --instances N        chain N copies of the model (default 1)\n"
@@ -100,6 +102,10 @@ int main(int argc, char** argv)
       options.device = argv[++i];
     else if (arg == "--channels" && i + 1 < argc)
       options.device_channels = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (arg == "--capture-channels" && i + 1 < argc)
+      options.capture_channels = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (arg == "--playback-channels" && i + 1 < argc)
+      options.playback_channels = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--periods" && i + 1 < argc)
       options.device_periods = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--model" && i + 1 < argc)

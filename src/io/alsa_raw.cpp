@@ -77,7 +77,10 @@ std::unique_ptr<AlsaRawDuplex> AlsaRawDuplex::open(const AlsaRawConfig& config, 
   // Devices expose fixed channel counts per altset (the SSL 2+ offers only 4), so this is a
   // sanity bound rather than a policy: the engine picks which of them it uses.
   constexpr unsigned kMaxChannels = 32;
-  if (config.channels < 1 || config.channels > kMaxChannels)
+  const unsigned capture_channels = config.capture_channels == 0 ? config.channels : config.capture_channels;
+  const unsigned playback_channels = config.playback_channels == 0 ? config.channels : config.playback_channels;
+  if (capture_channels < 1 || capture_channels > kMaxChannels || playback_channels < 1 ||
+      playback_channels > kMaxChannels)
   {
     error = "channel count out of range [1, " + std::to_string(kMaxChannels) + "]";
     return nullptr;
@@ -92,7 +95,8 @@ std::unique_ptr<AlsaRawDuplex> AlsaRawDuplex::open(const AlsaRawConfig& config, 
   self->quantum_ = config.quantum;
   self->periods_ = config.periods == 0 ? 4 : config.periods;
   self->format_preference_ = config.format_preference;
-  self->info_.channels = config.channels;
+  self->info_.capture_channels = capture_channels;
+  self->info_.playback_channels = playback_channels;
   self->info_.sample_rate = config.sample_rate;
 
   if (!resolve_pcm_node(config.capture, true, self->info_.capture_node, error))
@@ -115,9 +119,9 @@ std::unique_ptr<AlsaRawDuplex> AlsaRawDuplex::open(const AlsaRawConfig& config, 
     return nullptr;
   }
 
-  if (!self->configure(self->capture_fd_, "capture", error))
+  if (!self->configure(self->capture_fd_, true, "capture", error))
     return nullptr;
-  if (!self->configure(self->playback_fd_, "playback", error))
+  if (!self->configure(self->playback_fd_, false, "playback", error))
     return nullptr;
 
   if (!self->info_.period_exact)
@@ -135,18 +139,26 @@ std::unique_ptr<AlsaRawDuplex> AlsaRawDuplex::open(const AlsaRawConfig& config, 
   return self;
 }
 
-bool AlsaRawDuplex::configure(int fd, const char* direction, std::string& error)
+bool AlsaRawDuplex::configure(int fd, bool capture, const char* direction, std::string& error)
 {
   struct snd_pcm_hw_params params;
   alsa::params_set_any(params);
-  alsa::params_narrow_basics(params, info_.channels, info_.sample_rate);
+  alsa::params_narrow_basics(params, capture ? info_.capture_channels : info_.playback_channels,
+                             info_.sample_rate);
 
   // Phase 1: let the kernel narrow our request to what the device can actually do. Leaving the
   // period and buffer sizes unconstrained here is what makes it report its real ranges -- notably
   // the 1000 us PERIOD_TIME floor that turns a request for 32 frames into 48.
   if (::ioctl(fd, SNDRV_PCM_IOCTL_HW_REFINE, &params) < 0)
   {
-    error = errno_text("SNDRV_PCM_IOCTL_HW_REFINE failed");
+    // The usual cause is a channel count the device does not offer: USB audio exposes one altset
+    // per channel count, so asking for a subset of what the device has fails outright rather than
+    // being trimmed. The SSL 2+ Mk II is 6 out / 8 in on firmware V1.16, and asking for 4 gets
+    // EINVAL from here.
+    error = errno_text("SNDRV_PCM_IOCTL_HW_REFINE failed") + " (" + direction + " with " +
+            std::to_string(capture ? info_.capture_channels : info_.playback_channels) +
+            " channels at " + std::to_string(info_.sample_rate) +
+            " Hz; a channel count the device does not offer is the usual cause)";
     return false;
   }
 
@@ -253,8 +265,11 @@ bool AlsaRawDuplex::configure(int fd, const char* direction, std::string& error)
     info_.sample_format = chosen_format;
     info_.bytes_per_sample = format_width;
     info_.period_exact = (actual_period == quantum_);
-    bytes_per_frame_ = info_.channels * format_width;
-    prime_silence_.assign(static_cast<size_t>(info_.buffer_size) * bytes_per_frame_, 0);
+    info_.capture_bytes_per_frame = info_.capture_channels * format_width;
+    info_.playback_bytes_per_frame = info_.playback_channels * format_width;
+    capture_bytes_per_frame_ = info_.capture_bytes_per_frame;
+    playback_bytes_per_frame_ = info_.playback_bytes_per_frame;
+    prime_silence_.assign(static_cast<size_t>(info_.buffer_size) * playback_bytes_per_frame_, 0);
   }
   else if (info_.sample_format != chosen_format)
   {
@@ -391,7 +406,8 @@ int AlsaRawDuplex::transfer(int fd, void* buf, unsigned frames, bool playback, i
 
     struct snd_xferi xfer;
     std::memset(&xfer, 0, sizeof(xfer));
-    xfer.buf = static_cast<char*>(buf) + static_cast<size_t>(done) * bytes_per_frame_;
+    xfer.buf = static_cast<char*>(buf) +
+              static_cast<size_t>(done) * (playback ? playback_bytes_per_frame_ : capture_bytes_per_frame_);
     xfer.frames = frames - done;
 
     const int rc = ::ioctl(fd, playback ? SNDRV_PCM_IOCTL_WRITEI_FRAMES : SNDRV_PCM_IOCTL_READI_FRAMES, &xfer);

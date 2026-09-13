@@ -128,6 +128,7 @@ add_library(namchain OBJECT
   src/graph/plan.cpp
   src/graph/reference.cpp
   src/graph/rig.cpp
+  src/latency/latency.cpp
   src/nodes/builtin.cpp
   src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
@@ -193,6 +194,11 @@ if(NAMCHAIN_BUILD_TOOLS)
   add_executable(namchain-soak tools/soak/namchain-soak.cpp)
   target_link_libraries(namchain-soak PRIVATE namchain)
   target_compile_options(namchain-soak PRIVATE ${NAMCHAIN_WARN_FLAGS})
+
+  # True round-trip latency over a loopback or a patch cable (plan.md §10.5.1).
+  add_executable(namchain-latency tools/latency/namchain-latency.cpp)
+  target_link_libraries(namchain-latency PRIVATE namchain)
+  target_compile_options(namchain-latency PRIVATE ${NAMCHAIN_WARN_FLAGS})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -242,7 +248,8 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_rt_primitives.cpp
     tests/test_graph.cpp
     tests/test_nodes.cpp
-    tests/test_rig.cpp)
+    tests/test_rig.cpp
+    tests/test_latency.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")

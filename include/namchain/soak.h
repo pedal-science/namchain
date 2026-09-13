@@ -48,6 +48,11 @@ struct SoakOptions
   unsigned input_channel = 0;
   unsigned output_channel = 0;
   unsigned device_channels = 1;
+  /// 0 means "the same as device_channels". Needed wherever the device is asymmetric:
+  /// the SSL 2+ Mk II is 6 out / 8 in on firmware V1.16, and USB audio only offers the
+  /// channel counts it has, so a subset fails to open rather than being trimmed.
+  unsigned capture_channels = 0;
+  unsigned playback_channels = 0;
   unsigned device_periods = 4;
   /// The engine's rate, and therefore the rate the device is asked for and that every input file
   /// and model is checked against. Fixed rather than inferred: this is a 48 kHz engine at M1, and a

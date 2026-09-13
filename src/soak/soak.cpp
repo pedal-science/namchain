@@ -89,7 +89,8 @@ SoakResult run_device_soak(const SoakOptions& options)
   config.capture = options.device;
   config.playback = options.device;
   config.sample_rate = options.sample_rate;
-  config.channels = options.device_channels;
+  config.capture_channels = options.capture_channels == 0 ? options.device_channels : options.capture_channels;
+  config.playback_channels = options.playback_channels == 0 ? options.device_channels : options.playback_channels;
   config.quantum = options.quantum;
   config.periods = options.device_periods;
   config.require_exact_period = true; // §9.5: a silently rounded quantum is not acceptable
@@ -121,7 +122,12 @@ SoakResult run_device_soak(const SoakOptions& options)
   BlockTimer write_timer(deadline_ns);
 
   // Bytes, not samples: period_size frames x bytes_per_frame. See AlsaRawDuplex::read_capture.
-  std::vector<unsigned char> buffer(static_cast<size_t>(info.period_size) * info.bytes_per_sample * info.channels);
+  // Bytes, not samples, and per direction: the SSL 2+ Mk II is 6 out / 8 in, so one count for
+  // both would size the capture buffer 25 % short.
+  const size_t capture_frame_bytes = static_cast<size_t>(info.period_size) * info.capture_bytes_per_frame;
+  const size_t playback_frame_bytes = static_cast<size_t>(info.period_size) * info.playback_bytes_per_frame;
+  std::vector<unsigned char> capture_buffer(capture_frame_bytes);
+  std::vector<unsigned char> playback_buffer(playback_frame_bytes);
 
   // The chain is now a compiled plan rather than a hand-rolled loop over models. That is the point
   // of M1: the thing under test on the device is the compiler and the render path together, with
@@ -181,8 +187,9 @@ SoakResult run_device_soak(const SoakOptions& options)
   if (device->wait_capture(2000, error))
   {
     std::string ignored;
-    device->read_capture(buffer.data(), info.period_size, 1000, ignored);
-    device->write_playback(buffer.data(), info.period_size, 1000, ignored);
+    std::fill(playback_buffer.begin(), playback_buffer.end(), 0);
+    device->read_capture(capture_buffer.data(), info.period_size, 1000, ignored);
+    device->write_playback(playback_buffer.data(), info.period_size, 1000, ignored);
   }
   const uint64_t startup_xruns = device->driver_xruns();
 
@@ -204,7 +211,7 @@ SoakResult run_device_soak(const SoakOptions& options)
       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(tw1 - tw0).count()));
 
     const auto t0 = Clock::now();
-    if (device->read_capture(buffer.data(), info.period_size, 1000, error) < 0)
+    if (device->read_capture(capture_buffer.data(), info.period_size, 1000, error) < 0)
     {
       device->stop();
       return fail(error);
@@ -218,21 +225,27 @@ SoakResult run_device_soak(const SoakOptions& options)
       if (plan != nullptr)
       {
         const size_t width = info.bytes_per_sample;
-        const unsigned in_ch = std::min(options.input_channel, info.channels - 1);
-        const unsigned out_ch = std::min(options.output_channel, info.channels - 1);
+        const unsigned in_ch = std::min(options.input_channel, info.capture_channels - 1);
+        const unsigned out_ch = std::min(options.output_channel, info.playback_channels - 1);
 
         for (unsigned i = 0; i < info.period_size; ++i)
-          mono_in[i] = pcm_decode(buffer.data() + (static_cast<size_t>(i) * info.channels + in_ch) * width, pcm_format);
+          mono_in[i] = pcm_decode(
+            capture_buffer.data() + (static_cast<size_t>(i) * info.capture_channels + in_ch) * width, pcm_format);
 
         plan->execute(mono_in.data(), mono_out.data(), static_cast<int>(info.period_size));
 
+        // Start from silence every block: the passthrough copy only fills one channel, and a device
+        // with 6 playback channels would otherwise be sent whatever was left in the buffer.
+        std::fill(playback_buffer.begin(), playback_buffer.end(), 0);
         for (unsigned i = 0; i < info.period_size; ++i)
-          pcm_encode(buffer.data() + (static_cast<size_t>(i) * info.channels + out_ch) * width, pcm_format, mono_out[i]);
+          pcm_encode(
+            playback_buffer.data() + (static_cast<size_t>(i) * info.playback_channels + out_ch) * width, pcm_format,
+            mono_out[i]);
       }
     }
     const auto t2 = Clock::now();
     chain_timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
-    if (device->write_playback(buffer.data(), info.period_size, 1000, error) < 0)
+    if (device->write_playback(playback_buffer.data(), info.period_size, 1000, error) < 0)
     {
       device->stop();
       return fail(error);
