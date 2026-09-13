@@ -7,7 +7,9 @@ that is only wall-clock and is run on an otherwise idle machine. **M2 is next**,
 the glitch detector, by the standing instruction below.
 **Author:** planning session (research grounded in the sources cited in §2 and §16), resumed for
 implementation.
-**Updated:** 2026-09-13, after the round-trip latency measurement and the I/O backend layer.
+**Updated:** 2026-09-13. The host was upgraded to Ubuntu 26.04 / kernel 7.0 / GCC 15 mid-session, which
+invalidated the in-flight 1 h soak and the toolchain provenance of every host measurement; §0 records
+what moved, and M1 exit is being re-established on the new toolchain before the soak is re-run.
 
 ---
 
@@ -19,8 +21,49 @@ and the commands that actually work.
 
 ```sh
 echo ok; uname -m; nproc          # ok / aarch64 / 4
-cmake --version; ninja --version  # 3.28.3 / 1.11.1
+cmake --version; ninja --version  # 4.2.3 / 1.13.2
 ```
+
+**The host was upgraded under the project on 2026-09-13** (Ubuntu 24.04.4 → **26.04 LTS**, kernel
+6.8.0-1064-raspi → **7.0.0-1017-raspi**, GCC 13.3 → **GCC 15.2**, cmake 3.28.3 → 4.2.3, ninja 1.11.1 →
+1.13.2, Python 3.12 → 3.14.4). Three consequences, in order of how much they cost:
+
+1. **The device number moved.** Card numbers are assigned by probe order, and the SSL 2+ Mk II is now
+   **card 2** (`hw:2,0`), not card 4 — card 4 is a `vc4hdmi` output. Every command in this file that
+   names `hw:4,0` is a command from the old boot; check with `aplay -l`/`arecord -l` and use the card
+   the interface actually has. The interface itself is unchanged (§9.5's measurements stand as
+   *device* measurements, but see 3).
+2. **The 1 h criterion-3 soak was lost with it.** It was running when the machine rebooted; `/tmp` was
+   cleared, taking its JSON, log and evidence file. Nothing was salvaged — the run had reached ~15 of
+   its 60 minutes. It is being re-run, and its output now goes to `bench-results/` rather than `/tmp`
+   precisely so that a reboot, a stall or a crash leaves evidence rather than silence.
+3. **Every "measured on this host" number now carries a toolchain it was not measured on.** §11's
+   figures, the golden tolerance notes in `CMakeLists.txt` and the latency sweep were all taken under
+   GCC 13 / kernel 6.8. On AArch64 the A2 kernels are NEON intrinsics, so the plan expects the golden
+   difference to stay exactly 0 across the compiler change — but that is a re-measurement, not an
+   assumption. **Re-measured 2026-09-13: it is still exactly 0**, so the bit-identity claim survived a
+   major compiler version and matches the §10.2 table's new row.
+
+**Re-verification on the new toolchain (2026-09-13), because a rebuilt tree is not the same claim as a
+green one:** a fresh `build/` configures and compiles clean under CMake 4.2.3 and **GCC 15.2 with
+`-DNAMCHAIN_WERROR=ON`**, `ctest` is 4/4, the unit binary is **120 cases / 230 719 assertions**, and
+`golden_a2_lite` reports `max|a-b| = 0`. Two things the newer compiler broke, both now fixed and both
+recorded where they happened:
+
+- `tests/test_rt_check.cpp` exercised the allocation interposer through a local `std::vector` whose
+  allocation was never read. GCC 15 compiles that to a bare `ret` at `-O3` — the allocation is elided
+  under N3664 — so the test that proves the instrument *can* see an allocation was passing while
+  watching nothing. It now calls `::operator new`/`::operator delete` directly, which cannot be
+  elided. This is the one failure mode that flatters every other result.
+- The glitch detector's dropout rule counted a black run as a dropout only where the oracle had energy
+  *sample by sample*; a 1 kHz sine crosses zero a thousand times a second, so a half-second dropout
+  fragmented into ~1 ms pieces and passed. The oracle is now asked about the run as a whole.
+
+What survived the upgrade, verified after it: `/etc/security/limits.d/99-namchain-audio.conf`,
+`sudo -n chrt -f 80` (works), `ulimit -l` = unlimited, `performance` governor, and
+`namchain-realtime-tune.service` (enabled and active). One thing got stricter: `/dev/vcio` is root-only
+now, so `vcgencmd get_throttled`/`measure_temp` need `sudo -n` — the health loop and the soak evidence
+file must call it that way (§9.3).
 
 **Toolchain that had to be installed** (cmake and clang were already present, contrary to the earlier
 note):
@@ -29,15 +72,20 @@ note):
 sudo apt-get install -y ninja-build pkg-config libpipewire-0.3-dev libasound2-dev clang-20
 ```
 
-`clang-20` is needed for RealtimeSanitizer (§4.2, §10.4): Ubuntu 24.04's default clang 18 rejects
-`-fsanitize=realtime`. `libeigen3-dev` is *not* needed — Eigen is vendored via the core's submodule.
+`clang-20` is needed for RealtimeSanitizer (§4.2, §10.4). It was installed because Ubuntu 24.04's
+default clang 18 rejects `-fsanitize=realtime`; after the 2026-09-13 upgrade the default is clang 21,
+which supports it, but the pinned `clang-20` is still present and is what CI installs, so the local
+and CI RTSan runs continue to use the same compiler. `libeigen3-dev` is *not* needed — Eigen is
+vendored via the core's submodule.
 
 **RT privileges are configured** (they were entirely absent before):
 `/etc/security/limits.d/99-namchain-audio.conf` grants `@audio` `rtprio 95` and `memlock unlimited`,
-and `namchain-cpu-performance.service` sets the `performance` governor and disables USB autosuspend
-at boot. Verified both through a fresh login session and through a transient systemd service with
-`LimitRTPRIO=95` — the path `namchaind` will use. A harness-spawned shell that predates the limits
-file still cannot `chrt`, so RT tests must run via a login session or a systemd unit.
+and `namchain-realtime-tune.service` sets the `performance` governor and disables USB autosuspend at
+boot. (An earlier revision of this file called that unit `namchain-cpu-performance.service`; that name
+does not exist on the box — `systemctl cat namchain-realtime-tune.service` is the real one.) Verified
+both through a fresh login session and through a transient systemd service with `LimitRTPRIO=95` — the
+path `namchaind` will use. A harness-spawned shell that predates the limits file still cannot `chrt`,
+so RT tests must run via a login session or a systemd unit. Both survived the OS upgrade.
 
 **Vendored NAM core:** `vendor/NeuralAmpModelerCore` as a git submodule pinned at G2, with
 `Dependencies/eigen` and `Dependencies/AudioDSPTools` initialised recursively.
@@ -56,10 +104,14 @@ ctest --test-dir build                    # unit, soak_cli, golden_setup + golde
 ./build/namchain-soak --backend file --model build/generated/A2-Lite.nam in.wav --output out.wav
 
 # The device soak, and the round-trip measurement, both under SCHED_FIFO.
-sudo -n chrt -f 80 ./build/namchain-soak --device hw:4,0 --capture-channels 8 --playback-channels 6 \
+# Card numbers are assigned by probe order and DO move between boots and kernel upgrades: read the
+# interface's own card from `arecord -l`/`aplay -l` first. It was `hw:4,0` before the 2026-09-13
+# upgrade and is `hw:2,0` after it. The soak writes its evidence to bench-results/, not /tmp.
+CARD=$(arecord -l | sed -n 's/^card \([0-9]*\): II \[SSL 2+ Mk II\].*/\1/p' | head -1)
+sudo -n chrt -f 80 ./build/namchain-soak --device "hw:$CARD,0" --capture-channels 8 --playback-channels 6 \
   --quantum 64 --periods 4 --seconds 3600 --instances 4 --model build/generated/A2-Full.nam \
   --self-oracle --json
-sudo -n chrt -f 80 ./build/namchain-latency --device hw:4,0 --capture-channels 8 \
+sudo -n chrt -f 80 ./build/namchain-latency --device "hw:$CARD,0" --capture-channels 8 \
   --playback-channels 6 --quantum 32 --periods 4 --output-channel 2 --measure 0,4 --runs 6
 ```
 
@@ -82,7 +134,11 @@ Four corrections to the commands previously recorded here:
 **Order of work, still standing:** M0 ✔, M1 ✔, then M2 — and within M2 the glitch detector is written
 *before* the transition machinery (§10.3), because a transition you cannot measure is a transition you
 cannot claim. The one M1 item left open is the 1 h criterion-3 soak, which needs the machine to itself
-for an hour and nothing else.
+for an hour and nothing else. As of 2026-09-13 that item is also the *re*-run: the first attempt was
+killed 15 minutes in by the OS upgrade's reboot, and the toolchain changed underneath the build, so M1
+exit now reads "rebuilt and re-verified on GCC 15 / kernel 7.0, then one clean hour". A soak run's
+output belongs in `bench-results/`, never `/tmp`: the reboot took the JSON, the log and the evidence
+file with it, and a lost hour is indistinguishable from an hour that was never spent.
 
 ---
 
@@ -102,7 +158,7 @@ with no shell available. Corrected by direct measurement:
 
 | Previously recorded | Actually is |
 |---|---|
-| Debian 12, container, pid 1 = `tini` | **Ubuntu 24.04.4 LTS, bare metal, pid 1 = `systemd`** |
+| Debian 12, container, pid 1 = `tini` | **Ubuntu 24.04.4 LTS, bare metal, pid 1 = `systemd`** (now 26.04 — see the upgrade note above) |
 | Raspberry Pi 5 | **Raspberry Pi 500 Rev 1.0** (same BCM2712/Cortex-A76 SoC class as the Pi 5) |
 | `cmake` missing, `gcc-12`, `pkg-config` present | **cmake 3.28.3 and clang 18 present; gcc/g++ 13.3.0; `pkg-config` was missing** |
 | No audio device, `/proc/asound` absent | **`/proc/asound` is present**: Loopback, Dummy, 2× vc4hdmi |
@@ -119,6 +175,8 @@ with no shell available. Corrected by direct measurement:
 - **`/usr/include/sound/asound.h` is present**, so the no-libasound `alsa_raw` backend (§4.3) has the
   kernel UAPI headers it needs; `asoundef.h` is absent and not required.
 - **Kernel is `6.8.0-1064-raspi` (PREEMPT_DYNAMIC), not PREEMPT_RT**; `/sys/kernel/realtime` is absent.
+  After the 2026-09-13 upgrade this is `7.0.0-1017-raspi`, still not PREEMPT_RT, and the absence of
+  `/sys/kernel/realtime` is the check that still holds (§9.3).
 - **Network, apt and passwordless sudo all work**, and the G2 pin `2563c0fd…` is still identical to
   upstream `HEAD` — no drift to reconcile.
 
@@ -237,8 +295,9 @@ handoff.
 - Every structural change is compiled to a **new immutable `RenderPlan`**, fully allocated before
   publication; the audio thread only swaps an index.
 - Reclamation is epoch-based; no `delete` ever runs on the audio thread.
-- Every buffer is preallocated at `maxQuantum` and page-touched at plan build;
-  `mlockall(MCL_CURRENT|MCL_FUTURE)` after start.
+- Every buffer is preallocated at `maxQuantum` and page-touched at plan build; `mlockall(MCL_CURRENT)`
+  is called **after** the plan and the stream buffers exist, and never with `MCL_FUTURE` — a finite
+  `RLIMIT_MEMLOCK` turns `MCL_FUTURE` into `std::bad_alloc` on the next mapping (§14.10).
 - No unbounded loop: graph size, node count, and transition count are validated at compile time.
 - Denormals: scoped FTZ/DAZ guard on x86 only (ARM handles subnormals in hardware); no `-ffast-math`
   on the model path.
@@ -853,7 +912,8 @@ Three consequences that change implementation details:
    working: 10 s of simultaneous capture+playback at 48 kHz / period 64 with no errors, and capture
    alone for 5 s likewise clean.
 
-**Measured passthrough baseline (2026-09-12, `namchain-soak --device hw:4,0`).** With no DSP in the
+**Measured passthrough baseline (2026-09-12, `namchain-soak --device hw:4,0` — the card number on
+that boot; see §0).** With no DSP in the
 path — capture straight to playback through the raw-ioctl backend — the host's I/O cost is:
 
 | quantum | channels | duration | blocks | p50 | p99 | max | p99/deadline | deadline overruns | driver xruns |
@@ -1112,6 +1172,7 @@ by sample. **Measured, against a reference built `-Ofast` while ours is `-O3`:**
 | host / toolchain | max&#124;a−b&#124; |
 |---|---|
 | Cortex-A76, GCC 13 `-O3` | **0** (byte-identical) |
+| Cortex-A76, **GCC 15.2 `-O3`, kernel 7.0** — re-measured after the 2026-09-13 upgrade | **0** (byte-identical) |
 | Cortex-A76, clang 20 `-O2` + RTSan | **0** (byte-identical) |
 | x86_64, GCC `-O3` | 1.71e-07 (≈ −154 dBFS RMS) |
 
@@ -1201,8 +1262,9 @@ are plain ioctls:
 2. **PCM state.** `SNDRV_PCM_IOCTL_STATUS` → `state == SNDRV_PCM_STATE_XRUN`. The same state is
    readable out-of-process from `/proc/asound/card*/pcm*/sub*/status` (`state: RUNNING`, `avail`,
    `avail_max`), which gives a supervisor that can watch for transitions without being in the audio
-   path. Note this kernel (6.8.0-1064-raspi) exposes **no `xrun_debug` knob** on `snd_pcm`, so
-   app-level detection is the reliable route, not kernel logging.
+   path. Note this kernel (6.8.0-1064-raspi at the time) exposes **no `xrun_debug` knob** on
+   `snd_pcm`, so app-level detection is the reliable route, not kernel logging. Re-check on 7.0.0
+   before relying on it either way: the claim is about a knob, and kernels do grow knobs.
 3. **Timing margin.** Timestamp every block and report p50/p99/max against the deadline. This is the
    *proactive* half: if p99 stays far under the deadline, xruns are structurally impossible, and
    near-misses that never became xruns are still visible. Waiting to observe an xrun proves less and
@@ -1276,7 +1338,9 @@ frames, 4 × A2-Full, through the device.
 ## 11. Performance — MEASURED on the target host (2026-09-11)
 
 **This section previously contained estimates. These are measurements.** Host: Raspberry Pi 500
-(BCM2712, 4× Cortex-A76 @ 2.4 GHz), Ubuntu 24.04, kernel 6.8.0-1064-raspi, `performance` governor,
+(BCM2712, 4× Cortex-A76 @ 2.4 GHz), Ubuntu 24.04 / kernel 6.8.0-1064-raspi at the time of
+measurement (§0 records the 2026-09-13 upgrade to 26.04 / 7.0.0-1017-raspi, which every number below
+predates), `performance` governor,
 40 °C, `throttled=0x0`. Engine configuration: 48 kHz, `NAM_ENABLE_A2_FAST=ON`, `double` samples,
 single-threaded, `-O3`, 2 s of audio × 10 iterations, RTF excludes `Reset()`/prewarm. Produced by
 `namchain-bench` and cross-checked against the core's own `benchmodel_bufsize` (agreement within 2 %).
@@ -1359,7 +1423,9 @@ measured in M0's remainder.
 | Engine latency @48 k/64 q | 1.33 ms I/O + 0 algorithmic | **1.33 ms I/O confirmed on the SSL (period 64 frames, 4 periods); 0 algorithmic, and every M1 built-in is zero-latency** |
 | Block-time jitter | p99/max measured and published | **measured above** (max/p99 is noisy: see the q=64 outlier) |
 
-**The engine, measured through the graph compiler on a real device** (SSL 2+ Mk II, `hw:4,0`,
+**The engine, measured through the graph compiler on a real device** (SSL 2+ Mk II, `hw:4,0` on the
+pre-upgrade boot and `hw:2,0` after it — the card number is probe-ordered, not a property of the
+interface,
 UAC2/S32_LE, q = 64, 4 periods, `SCHED_FIFO` 80 + `mlockall`, `namchain-soak` driving a compiled
 `RenderPlan` — not a private model loop). Steady state; the two bring-up xruns the device produces
 before the measured loop are reported separately, as always.
@@ -1412,7 +1478,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; **`AudioBackend` interface with `null` and `file` implemented and `pipewire` refused by name ✔ (§9.1) — the stream loop is now written once and runs against a device, a paced clock or a WAV, so `ctest -R soak_cli` exercises the timers, the gates and the oracle with no hardware**; **multichannel WAV reader ✔**; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **device-mode self-oracle ✔ — the run records the input it consumed and compares its output against a freshly compiled offline render of it, `max|diff| = 0` (§10.5.1)**; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, first 60 s sample-identical to the offline render of the same input); allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference, and the ring occupancy measured and removed so the residual spread is reported rather than assumed (§9.5)**; **parity test green at release flags** |
+| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; **`AudioBackend` interface with `null` and `file` implemented and `pipewire` refused by name ✔ (§9.1) — the stream loop is now written once and runs against a device, a paced clock or a WAV, so `ctest -R soak_cli` exercises the timers, the gates and the oracle with no hardware**; **memory locking made safe and the block timer sized from the run — `MCL_FUTURE` plus a fixed 44 MB timer reserve aborted the `null` backend with `std::bad_alloc` under a finite `RLIMIT_MEMLOCK`, and `soak_cli` now reproduces that limit ✔ (§14.10)**; **multichannel WAV reader ✔**; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **device-mode self-oracle ✔ — the run records the input it consumed and compares its output against a freshly compiled offline render of it, `max|diff| = 0` (§10.5.1)**; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, first 60 s sample-identical to the offline render of the same input); allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference, and the ring occupancy measured and removed so the residual spread is reported rather than assumed (§9.5)**; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |
@@ -1480,6 +1546,20 @@ Critical path to the headline claim is **M0 → M1 → M2 → M3**; M4–M7 add 
    SSL 2+ Mk II (§9.5), which is the reference interface the I/O layer was measured against. Residual:
    thermals under a sustained hour of load are only now being observed, and one interface is not a
    survey — the latency and xrun figures are that device's, and the plan says so wherever they appear.
+10. **`mlockall` can kill the process it is meant to protect.** `MCL_CURRENT|MCL_FUTURE` charges every
+    mapping made afterwards against `RLIMIT_MEMLOCK`, so a limit generous enough for the pages already
+    mapped is not necessarily generous enough for the next large allocation — and the failure is a
+    `std::bad_alloc` inside a process that has just been told its memory is locked. CI found exactly
+    that, on the `null` backend with no device and no audio involved: `mlockall` succeeded at ~6 MB of
+    RSS and the next allocation, a 44 MB `BlockTimer` reserve, came back `EAGAIN`. The developer host
+    allows ~1 GB of memlock and never saw it, which is why it survived until CI. **Fixed 2026-09-13,
+    both halves:** the lock uses `MCL_CURRENT` alone, after the model, the plan and every stream buffer
+    exist; and `BlockTimer` reserves the series its caller expects instead of a fixed "one hour at 32
+    frames", which was 44 MB × 5 timers on a one-second run. `soak_cli` now runs the `null` soak under
+    an 8 MiB limit, which reproduced the abort before the fix and is the reason it cannot come back
+    unseen. Residual: on a host whose hard limit is below the working set, `mlockall` fails and the
+    soak reports that as a caveat — the measurement then includes page faults, which is why the report
+    prints the lock status next to the percentiles instead of assuming it.
 
 **Assumptions** — engine runs at 48 kHz internally; graphs are DAGs; permissive-only dependencies (with
 the ALSA note in §4.3); no UI in this project; `.nam` files are user-supplied, not redistributed; Linux
