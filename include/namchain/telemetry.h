@@ -30,7 +30,13 @@ class BlockTimer
 {
 public:
   /// \param deadline_ns Period deadline: `quantum / sample_rate` in nanoseconds.
-  explicit BlockTimer(uint64_t deadline_ns);
+  /// \param expected_blocks How many blocks the caller expects to record. The series is reserved up
+  ///        front so that `record()` never allocates -- a reallocation mid-run would show up as a
+  ///        spike in exactly the measurement being made -- but the reserve is the caller's number and
+  ///        not a fixed "one hour at 32 frames". That default cost 44 MB per timer and five timers
+  ///        per soak, for a run of any length, and it was the allocation that turned a finite
+  ///        `RLIMIT_MEMLOCK` into a `std::bad_alloc` on CI (plan.md §14.10). 0 reserves nothing.
+  explicit BlockTimer(uint64_t deadline_ns, uint64_t expected_blocks = 0);
 
   /// Record one block's processing duration. No allocation if the estimate held.
   void record(uint64_t duration_ns);

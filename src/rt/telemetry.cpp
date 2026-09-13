@@ -7,12 +7,13 @@
 namespace namchain
 {
 
-BlockTimer::BlockTimer(uint64_t deadline_ns) : deadline_ns_(deadline_ns)
+BlockTimer::BlockTimer(uint64_t deadline_ns, uint64_t expected_blocks) : deadline_ns_(deadline_ns)
 {
-  // One hour at 32 frames / 48 kHz is ~5.4M blocks; reserving up front keeps `record()`
-  // allocation-free, which matters because a reallocation mid-run would show up as a spike
-  // in exactly the measurement we are trying to make.
-  durations_.reserve(5'500'000);
+  // Reserved from the caller's own count rather than from a fixed worst case: the run that asks for
+  // a second and the run that asks for an hour differ by six orders of magnitude in what they need
+  // to keep, and reserving the hour's worth for both is 44 MB a timer.
+  if (expected_blocks > 0)
+    durations_.reserve(static_cast<size_t>(expected_blocks));
 }
 
 void BlockTimer::record(uint64_t duration_ns)

@@ -3,7 +3,7 @@
 #   cmake -DNAMCHAIN_SOAK=... -DNAMCHAIN_RENDER=... -DNAMCHAIN_WAVCMP=... -DNAMCHAIN_MODEL=... \
 #         -DNAMCHAIN_INPUT=... -DNAMCHAIN_WORK=... -P tests/cli/run_soak_backends.cmake
 #
-# Three things are checked, each of which has been wrong at least once:
+# Four things are checked, each of which has been wrong at least once:
 #
 #   1. The `file` backend produces exactly what the offline renderer produces. It is the same
 #      engine driven from a different place, so anything but bit-identity is a bug -- and it was
@@ -13,6 +13,8 @@
 #      variable and the positional parser read another, so the flag form was rejected with a usage
 #      message while the positional form worked.
 #   3. A backend that does not exist fails by name rather than falling back to one that does.
+#   4. A tight `RLIMIT_MEMLOCK` does not kill the run. See the comment on that case: this is the
+#      one failure that could not reproduce on a developer machine.
 #
 # The `null` backend is exercised too, with pacing off: it is the path CI can run without hardware,
 # and in this test it is the functional half (the loop, the oracle, the report) that is checked --
@@ -65,12 +67,40 @@ _run_and_expect_success("offline soak, --model flag" 0
 _run_and_expect_success("offline soak, positional model" 0
   "${NAMCHAIN_SOAK}" --no-pacing --seconds 1 --quantum 64 "${NAMCHAIN_MODEL}" "${NAMCHAIN_INPUT}")
 
-# --- the null backend runs the stream path with no device ---------------------------------------
+# --- 3. the null backend runs the stream path with no device ------------------------------------
 _run_and_expect_success("null backend soak" 0
   "${NAMCHAIN_SOAK}" --backend null --no-pacing --seconds 1 --quantum 64 --model "${NAMCHAIN_MODEL}"
   --self-oracle --oracle-window 1)
 
-# --- 3. a backend that does not exist is refused -----------------------------------------------
+# --- 4. a modest memlock limit must not poison the run ------------------------------------------
+# `mlockall(MCL_CURRENT|MCL_FUTURE)` charges every mapping made after it against `RLIMIT_MEMLOCK`, so
+# a limit that was enough for the pages already mapped can still be too small for the next large
+# allocation -- and the failure is `std::bad_alloc` inside a process that has just been told its
+# memory is locked. GitHub's runner hit exactly that on the `null` backend, with no device and no
+# audio involved: `mlockall` succeeded at ~6 MB of RSS and the next allocation, a 44 MB block-timer
+# reserve, came back `EAGAIN`. This development machine allows ~1 GB of memlock, so it never saw it,
+# which is why CI was the first place the bug appeared.
+#
+# The runner's own limit has not been read; what is reproduced here is the *band* that produces the
+# failure, which is any limit between the process's RSS and its next big allocation. 8 MiB is inside
+# that band on both machines, and it aborted the soak before the fix.
+#
+# The assertion is "the run survives", not "the memory ended up locked": at a limit this tight
+# `mlockall` may legitimately fail, and the harness reports that as a caveat rather than an error.
+# What must never happen is the process aborting.
+if(UNIX)
+  set(_memlock_cmd "ulimit -l 8192 2>/dev/null; exec \"$1\" --backend null --no-pacing --seconds 1 --quantum 64 --model \"$2\" --self-oracle --oracle-window 1")
+  execute_process(
+    COMMAND bash -c "${_memlock_cmd}" _bash "${NAMCHAIN_SOAK}" "${NAMCHAIN_MODEL}"
+    RESULT_VARIABLE _memlock_rc
+    OUTPUT_VARIABLE _memlock_out
+    ERROR_VARIABLE _memlock_err)
+  if(NOT _memlock_rc EQUAL 0)
+    message(FATAL_ERROR "null backend soak under an 8 MiB memlock limit: expected exit 0, got ${_memlock_rc}\n--- stdout ---\n${_memlock_out}\n--- stderr ---\n${_memlock_err}")
+  endif()
+endif()
+
+# --- 5. a backend that does not exist is refused ------------------------------------------------
 _run_and_expect_success("pipewire backend is refused" 2
   "${NAMCHAIN_SOAK}" --backend pipewire --no-pacing --seconds 1 "${NAMCHAIN_MODEL}" "${NAMCHAIN_INPUT}")
 

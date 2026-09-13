@@ -7,6 +7,7 @@
 #include <memory>
 #include <string>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <thread>
 #include <vector>
 
@@ -63,6 +64,30 @@ struct TempFileGuard
   }
 };
 
+/// Lock the pages the audio path touches, once everything it touches has been allocated.
+///
+/// Deliberately `MCL_CURRENT` only, and deliberately last. With `MCL_FUTURE` every later mapping is
+/// charged against `RLIMIT_MEMLOCK`, so a limit generous enough for the pages already mapped is not
+/// necessarily generous enough for the next large one -- and the failure is a `std::bad_alloc` inside
+/// a process that has just been told its memory is locked. CI found exactly that, on the `null`
+/// backend with no device in the picture: `mlockall` succeeded at ~6 MB of RSS and the very next
+/// allocation, a 44 MB block-timer reserve, came back `EAGAIN`. Both halves of that are fixed now --
+/// the reserve is sized from the run (telemetry.h) and the lock no longer charges the future -- and
+/// this comment is the half that would otherwise come back.
+///
+/// The soft limit is raised to the hard one first: on a host whose administrator has already granted
+/// a large `LimitMEMLOCK`, the soft limit is the only thing in the way.
+bool lock_process_memory()
+{
+  rlimit limit{};
+  if (::getrlimit(RLIMIT_MEMLOCK, &limit) == 0 && limit.rlim_cur != limit.rlim_max)
+  {
+    limit.rlim_cur = limit.rlim_max;
+    ::setrlimit(RLIMIT_MEMLOCK, &limit); // best effort: the hard limit is the administrator's call
+  }
+  return ::mlockall(MCL_CURRENT) == 0;
+}
+
 /// Stream soak: drive a full-duplex backend a period at a time, run the chain in the middle, and
 /// count what the backend reports. Everything after this point is written once and runs against a
 /// WAV file, a paced clock with no device, or raw ALSA ioctls alike (plan.md §9.1).
@@ -87,26 +112,25 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
 
   const BackendInfo info = device->info();
 
-  // What the engine does after start (§3.3): lock the address space so a page fault cannot stall a
-  // period. Without it a soak measures the page cache as much as the engine. Skipped for the file
-  // backend, which is offline by definition and would only end up locking a growing WAV buffer.
-  const bool memory_locked =
-    options.backend != BackendKind::File && ::mlockall(MCL_CURRENT | MCL_FUTURE) == 0;
-
-  if (!device->start(error))
-    return fail(error);
+  // How many blocks the run will record, computed before the timers exist: each one reserves its
+  // whole expected series up front so that `record()` never allocates, and a fixed "one hour at 32
+  // frames" reserve is 220 MB across the five of them whatever the run actually asks for. That was
+  // not merely wasteful -- it was the allocation that turned a finite `RLIMIT_MEMLOCK` into a
+  // `std::bad_alloc` on CI (§14.10).
+  const uint64_t total_blocks =
+    std::max<uint64_t>(1, static_cast<uint64_t>(options.duration_seconds * info.sample_rate / info.period_size));
 
   const uint64_t deadline_ns =
     static_cast<uint64_t>(std::llround(1e9 * static_cast<double>(info.period_size) / static_cast<double>(info.sample_rate)));
-  BlockTimer timer(deadline_ns);
+  BlockTimer timer(deadline_ns, total_blocks);
   // Time blocked on the device, kept separate from the work we do. If wait + work exceeds the
   // deadline the run cannot keep real time; which of the two dominates says where the problem is.
-  BlockTimer wait_timer(deadline_ns);
+  BlockTimer wait_timer(deadline_ns, total_blocks);
   // Phase breakdown. A single "block time" conflates our work with time spent blocked inside the
   // backend's own read/write, and those two call for completely different responses.
-  BlockTimer read_timer(deadline_ns);
-  BlockTimer chain_timer(deadline_ns);
-  BlockTimer write_timer(deadline_ns);
+  BlockTimer read_timer(deadline_ns, total_blocks);
+  BlockTimer chain_timer(deadline_ns, total_blocks);
+  BlockTimer write_timer(deadline_ns, total_blocks);
 
   // Bytes, not samples: period_size frames x bytes_per_frame. See AlsaRawDuplex::read_capture.
   // Bytes, not samples, and per direction: the SSL 2+ Mk II is 6 out / 8 in, so one count for
@@ -163,8 +187,6 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     // own, so this is a control-thread job and not the first block's problem (§3.3).
     plan->prewarm();
   }
-  const uint64_t total_blocks =
-    std::max<uint64_t>(1, static_cast<uint64_t>(options.duration_seconds * info.sample_rate / info.period_size));
 
   // Device-mode self-oracle: the engine's output during a real-time run, against the same graph
   // rendered offline from the very input that run consumed. This is the only form the comparison
@@ -188,6 +210,21 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     oracle_in.assign(window_frames, 0.0f);
     oracle_out.assign(window_frames, 0.0f);
   }
+
+  // What the engine does after start (§3.3): lock the address space so a page fault cannot stall a
+  // period. Without it a soak measures the page cache as much as the engine. Skipped for the file
+  // backend, which is offline by definition and would only end up locking a growing WAV buffer.
+  // Last, so that the model, the plan and every stream buffer are covered by MCL_CURRENT -- see
+  // lock_process_memory.
+  const bool memory_locked = options.backend != BackendKind::File && lock_process_memory();
+
+  // Start the stream only now that everything it needs is in memory. `start` primes the playback
+  // ring and lets the device run, so the time between it and the first wait_capture is time the
+  // ring spends draining: with the model loaded afterwards instead, the device was already starving
+  // while the plan was built, which is where the single bring-up overrun every configuration
+  // showed came from.
+  if (!device->start(error))
+    return fail(error);
 
   // Bring-up iteration, deliberately untimed. The first period after START fills an empty capture
   // ring, so its cost is an artefact of starting rather than a real-time property -- every
@@ -513,10 +550,9 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
     reference->prewarm();
 
   const uint64_t deadline_ns = static_cast<uint64_t>(std::llround(1e9 * static_cast<double>(options.quantum) / rate));
-  BlockTimer timer(deadline_ns);
-
   const uint64_t total_frames = static_cast<uint64_t>(options.duration_seconds * rate);
   const uint64_t total_blocks = std::max<uint64_t>(1, total_frames / static_cast<uint64_t>(options.quantum));
+  BlockTimer timer(deadline_ns, total_blocks);
 
   // Keep the audio only when something will consume it: a one-hour run is ~690 MB as float32.
   const bool keep_audio = want_oracle || !options.output_wav.empty();
