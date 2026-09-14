@@ -1362,6 +1362,32 @@ Torture render: 60 s, 500 randomised edits, all node types and transition classe
 44.1/48/96 kHz. Plus a **state-continuity** test: warm-started `nc.nam` output vs. always-on output
 < −60 dBFS (this directly validates §7.4).
 
+**The second splice source: a dropped output period, and why the fade belongs at the loop.** §9.5 item 8
+made the output queue a knob, and a cap refuses a period when it would exceed the target. That refusal
+is not free: the ring is a FIFO of period-sized buffers, so skipping an append means the device plays
+`out(k−1)` and then `out(k+1)` -- a jump of 64 frames in the waveform, which at 48 kHz is 1.33 ms of
+missing signal and, for anything above a few hundred hertz, a step large enough to hear as a click.
+
+The fade that hides it cannot be applied where the model edits are: nothing is known about a drop until
+after the previous period has been written into the ring, and rewriting queued audio is not a thing. The
+workable shape is a **fade-in on the period after the drop**: hold the last sample written, and over `M`
+samples (a few ms, equal-power) glide from that held value into the real signal, so the step becomes a
+short slew instead of a discontinuity. The phase jump survives -- it is a 1.33 ms hole in the audio --
+but 1.33 ms is bounded and a slew is not a click. This makes the fade a **loop policy, not a model
+property**: it is applied to the interleaved output buffer between the render plan and
+`write_playback`, needs one sample of state per channel and an armed flag, and belongs in a reusable
+`rt::SpliceFader` rather than in the backend, because the backend is what *decides* to drop and the loop
+is what must answer for it.
+
+Order matters and is already honoured: **the detector exists before the machinery** (§10.3's continuity
+criterion 1 is exactly the test -- max `d2` inside a window against `κ·M` outside it -- and a drop is
+another edit window). The wiring that is missing is that nothing currently feeds a device-loop drop into
+the detector's timeline: the soak counts drops but never re-renders the spliced output to measure what
+they did to the waveform. Adding a dropped-period edit kind to the timeline plus the `SpliceFader` is
+one piece of work in two halves, and the `--periods 6 --output-queue-periods 4` configuration of §9.5
+item 8 (0 drops in 5 minutes) is the configuration in which it can be *tested* rather than merely
+needed.
+
 ### 10.4 RT-safety tests
 
 `clang -fsanitize=realtime` on the render path in CI; a global `operator new`/`free`/
