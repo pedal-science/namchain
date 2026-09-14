@@ -197,6 +197,68 @@ TEST_CASE("ring occupancy comes from the pointers, and matches the kernel's own 
   CHECK(namchain::alsa::pcm_ring_frames(1000, 1000, 0, true) == 0);
 }
 
+TEST_CASE("the queue target refuses only the periods that would exceed it")
+{
+  // The output-queue policy (plan.md §9.5 item 7) is one comparison, and the whole reason it is a
+  // function is that the comparison's direction is the difference between a loop that holds its queue
+  // and one that drops half the audio to hold it. The device consumes one period while the loop
+  // produces one, so a write made when the ring holds exactly the target leaves the ring holding the
+  // target again: `== target` is a fixed point and must be *allowed*. Refusing there instead drops
+  // every other period for ever, which is the failure this test exists to prevent from coming back.
+  const unsigned long long period = 64;
+  const unsigned long long target = 2 * period;
+
+  CHECK(namchain::alsa::queue_allows_write(0, target));
+  CHECK(namchain::alsa::queue_allows_write(period, target));
+  CHECK(namchain::alsa::queue_allows_write(target, target));       // the fixed point
+  CHECK_FALSE(namchain::alsa::queue_allows_write(target + 1, target)); // one frame over: refuse
+  CHECK_FALSE(namchain::alsa::queue_allows_write(3 * period, target));
+
+  // Zero means no target, and then the ring's own capacity is the only bound. This is the behaviour
+  // every measurement taken before the knob existed ran with, so it has to stay exactly "always write"
+  // rather than becoming "write only into an empty ring".
+  CHECK(namchain::alsa::queue_allows_write(0, 0));
+  CHECK(namchain::alsa::queue_allows_write(period, 0));
+  CHECK(namchain::alsa::queue_allows_write(4 * period, 0));
+}
+
+TEST_CASE("the prime is the target, and at least one period")
+{
+  // The cushion cannot be built after the fact -- the loop produces one period per period, so the
+  // ring only grows when a burst recovers a late period, which is what the target refuses -- so the
+  // prime is where the target comes from. One period is the floor whatever is asked for, because the
+  // kernel's start threshold is one period and a stream started empty underruns immediately.
+  CHECK(namchain::alsa::queue_prime_frames(64, 0) == 64); // no target: one period, as before the knob
+  CHECK(namchain::alsa::queue_prime_frames(64, 1) == 64);
+  CHECK(namchain::alsa::queue_prime_frames(64, 2) == 128);
+  CHECK(namchain::alsa::queue_prime_frames(64, 3) == 192);
+  // A rounded period must be used, not the requested one: the ring is measured in the device's frames.
+  CHECK(namchain::alsa::queue_prime_frames(48, 3) == 144);
+}
+
+TEST_CASE("a queue target that cannot fit the ring is refused before touching the device")
+{
+  // The failure this prevents is a target the policy can never satisfy: if the ring may hold T periods
+  // and the target is T, there is never room for the period being decided about, so every period is
+  // refused for ever and the run looks like a device that will not accept audio.
+  namchain::AlsaRawConfig config;
+  config.capture = "hw:4,0";
+  config.playback = "hw:4,0";
+  config.periods = 4;
+  config.output_queue_periods = 4;
+
+  std::string error;
+  CHECK(namchain::AlsaRawDuplex::open(config, error) == nullptr);
+  CHECK(error.find("output queue target") != std::string::npos);
+
+  // One period less than the ring is the largest target that fits, and it must get as far as trying
+  // to open the device (which does not exist here) rather than being refused by this check.
+  config.output_queue_periods = 3;
+  error.clear();
+  CHECK(namchain::AlsaRawDuplex::open(config, error) == nullptr);
+  CHECK(error.find("output queue target") == std::string::npos);
+}
+
 TEST_CASE("an invalid channel count is rejected before touching the device")
 {
   namchain::AlsaRawConfig config;

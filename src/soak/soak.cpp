@@ -113,6 +113,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   config.output_path = options.output_wav;
   config.realtime_paced = options.realtime_paced;
   config.require_exact_period = true; // §9.5: a silently rounded quantum is not acceptable
+  config.output_queue_periods = options.output_queue_periods;
 
   std::string error;
   std::unique_ptr<AudioBackend> device = open_backend(config, options.backend, error);
@@ -255,6 +256,19 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     device->write_playback(playback_buffer.data(), info.period_size, 1000, ignored);
   }
   const uint64_t startup_xruns = device->driver_xruns();
+  // The direction split is snapshotted at the same instant as the total, so the two differences below
+  // must still sum to the total difference. Taken separately so that a bring-up underrun is not
+  // reported as a steady-state one.
+  const StreamQueueStats startup_stats = device->queue_stats();
+
+  // The output queue, established at the last moment before anything is timed. The target cannot be
+  // reached any earlier: the bring-up above spends a period of the primed queue without writing one
+  // back, and the ring's contents are otherwise conserved, so a queue that starts a period short stays
+  // a period short for the whole run -- measured, and the reason this step exists (§9.5 item 7).
+  std::string prefill_error;
+  if (!device->prefill_output_queue(prefill_error))
+    return fail(prefill_error);
+  const uint64_t prefill_frames = device->queue_stats().prefill_frames - startup_stats.prefill_frames;
 
   rt_reset_counters();
   uint64_t first_overrun_block = std::numeric_limits<uint64_t>::max();
@@ -494,12 +508,23 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.slow_blocks = slowest;
   result.chain_spikes = std::move(chain_spikes);
   result.output_drops = output_drops;
+  result.output_queue_periods = info.output_queue_periods;
   {
     const StreamQueueStats stats = device->queue_stats();
     result.capture_bursts = stats.capture_bursts;
     result.occupancy_mismatches = stats.occupancy_mismatches;
     result.settle_discarded_frames = stats.settle_discarded_frames;
     result.gate_capture_xruns = stats.gate_capture_xruns;
+    result.output_target_drops = stats.output_target_drops;
+    result.prefill_frames = prefill_frames;
+    result.capture_overruns = stats.capture_overruns - startup_stats.capture_overruns;
+    result.playback_underruns = stats.playback_underruns - startup_stats.playback_underruns;
+    // Three counters, one event per xrun: the total and the two directions. They cannot legitimately
+    // disagree, so a disagreement is a bug in one of them and is reported rather than averaged away.
+    if (result.capture_overruns + result.playback_underruns != steady_xruns)
+      return fail("xrun accounting disagrees: " + std::to_string(result.capture_overruns) + " capture + " +
+                  std::to_string(result.playback_underruns) + " playback != " + std::to_string(steady_xruns) +
+                  " total");
     // Two counters, one event: the loop counts the zero the backend returned and the backend counts
     // the refusal it decided. They cannot legitimately differ, so a difference is a bug in one of
     // them and is reported rather than averaged away.

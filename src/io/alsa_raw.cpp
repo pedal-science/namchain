@@ -111,6 +111,19 @@ std::unique_ptr<AlsaRawDuplex> AlsaRawDuplex::open(const AlsaRawConfig& config, 
   std::unique_ptr<AlsaRawDuplex> self(new AlsaRawDuplex());
   self->quantum_ = config.quantum;
   self->periods_ = config.periods == 0 ? 4 : config.periods;
+  // A target equal to the ring is not a tight bound, it is an impossible one: the policy would refuse
+  // every period for ever, because the ring could never have room for one more. Caught here rather
+  // than at the first write, where it would look like the device refusing to accept audio.
+  if (config.output_queue_periods != 0 && config.output_queue_periods >= self->periods_)
+  {
+    error = "output queue target of " + std::to_string(config.output_queue_periods) +
+            " periods does not fit a ring of " + std::to_string(self->periods_) +
+            " periods (the target must be less than --periods, so that the ring can hold the target "
+            "plus the period being decided about)";
+    return nullptr;
+  }
+  self->requested_queue_periods_ = config.output_queue_periods;
+  self->queue_debug_ = std::getenv("NAMCHAIN_QUEUE_DEBUG") != nullptr;
   self->format_preference_ = config.format_preference;
   self->enable_timestamps_ = config.enable_timestamps;
   self->info_.capture_channels = capture_channels;
@@ -289,6 +302,14 @@ bool AlsaRawDuplex::configure(int fd, bool capture, const char* direction, std::
     playback_bytes_per_frame_ = info_.playback_bytes_per_frame;
     prime_silence_.assign(static_cast<size_t>(info_.buffer_size) * playback_bytes_per_frame_, 0);
     drain_buffer_.assign(static_cast<size_t>(info_.period_size) * capture_bytes_per_frame_, 0);
+    // The target in frames, now that a period is a known number rather than a request. `info_` carries
+    // it in periods too: the write path needs the frames and the report needs the periods, and
+    // deriving either from the other at the point of use is how the two come to disagree.
+    target_frames_ = requested_queue_periods_ == 0
+                       ? 0
+                       : static_cast<unsigned>(
+                           alsa::queue_prime_frames(info_.period_size, requested_queue_periods_));
+    info_.output_queue_periods = requested_queue_periods_;
   }
   else if (info_.sample_format != chosen_format)
   {
@@ -351,12 +372,23 @@ bool AlsaRawDuplex::prime_playback(std::string& error)
 {
   if (info_.buffer_size == 0 || prime_silence_.empty())
     return true;
-  // Prime ONE period, not the whole ring. Filling the ring (which is what aplay effectively does
-  // for a file) leaves it permanently full, so every subsequent write then blocks for a whole
-  // period and the loop's latency becomes one buffer rather than one period. Measured: with a
-  // full-ring prime the write blocked 1416 us of a 1333 us period; the engine's actual work was
-  // 70 us. One period is enough to reach the kernel's start threshold.
-  const unsigned chunk = info_.period_size > 0 ? info_.period_size : info_.buffer_size;
+  // Prime ONE period by default, not the whole ring. Filling the ring (which is what aplay
+  // effectively does for a file) leaves it permanently full, so every subsequent write then blocks
+  // for a whole period and the loop's latency becomes one buffer rather than one period. Measured:
+  // with a full-ring prime the write blocked 1416 us of a 1333 us period; the engine's actual work
+  // was 70 us. One period is enough to reach the kernel's start threshold.
+  //
+  // With a queue target set, the prime IS the target: the cushion a target describes has to exist
+  // before the first period is processed, and the loop cannot build it afterwards. It cannot, because
+  // it receives one period of input per period and can therefore produce at most one period of output
+  // per period -- the ring only grows when a capture burst lets the loop write twice in one period,
+  // which is exactly the event that pushes it over the target and gets refused. So the target is
+  // primed, then held, and never earned (§9.5 item 7).
+  //
+  // This is also why the original full-ring prime *looked* like it worked: it was an accidental queue
+  // target of the whole ring, latency and all.
+  const unsigned chunk = static_cast<unsigned>(
+    alsa::queue_prime_frames(info_.period_size, requested_queue_periods_));
   const int written = write_playback(prime_silence_.data(), chunk, 1000, error);
   if (written < static_cast<int>(chunk))
   {
@@ -376,11 +408,14 @@ bool AlsaRawDuplex::drain_capture(std::string& error)
   // the write's wait for space then becomes the reported block time for ever after. Draining here
   // makes the loop's starting occupancy a known number instead of however long bring-up took.
   //
-  // Each discarded period is replaced with a period of silence on the playback side. That is not
-  // cosmetic: the ring was primed with one period and nothing else feeds it while this runs, so
-  // discarding without writing would drain the prime and hand the loop an empty ring. With the
-  // replacement the ring is exactly as full as the prime left it, and the discarded audio is
-  // bring-up capture the engine never had a graph for. It is counted so the report can say how much.
+  // Each discarded period is replaced with a period of silence on the playback side, when the ring
+  // has room for it. That is not cosmetic: the ring is primed and nothing else feeds it while this
+  // runs, so discarding without writing would drain the prime and hand the loop less queue than it
+  // was promised. With the replacement the ring is exactly as full as the prime left it, and the
+  // discarded audio is bring-up capture the engine never had a graph for. It is counted so the report
+  // can say how much. The room check is what keeps the replacement from blocking: with a queue target
+  // the ring may already hold the target, and waiting for the device here would stall the very
+  // bring-up this function exists to make predictable.
   //
   // Both streams must already be running before this is called. An earlier version drained between
   // capture START and playback START, which leaves the capture stream running with no playback
@@ -403,10 +438,21 @@ bool AlsaRawDuplex::drain_capture(std::string& error)
       return true;
     }
     settle_discarded_frames_ += info_.period_size;
-    if (write_playback(prime_silence_.data(), info_.period_size, 1000, ignored) < 0)
+    // Only replace the discarded period if the playback ring can actually take it. With a queue
+    // target the ring may already be sitting at the target, and a blocking write there would wait for
+    // the device instead of bringing the loop up -- a stall during bring-up, which is the one thing
+    // this function exists to prevent. The occupancy is re-read rather than reused because the read
+    // above moved it.
+    AlsaRawOccupancy playback;
+    if (query_occupancy(false, playback, ignored) &&
+        playback.ring_frames + static_cast<long long>(info_.period_size) <=
+          static_cast<long long>(info_.buffer_size))
     {
-      error.clear();
-      return true;
+      if (write_playback(prime_silence_.data(), info_.period_size, 1000, ignored) < 0)
+      {
+        error.clear();
+        return true;
+      }
     }
   }
   return true;
@@ -465,6 +511,41 @@ void AlsaRawDuplex::stop()
     ::ioctl(capture_fd_, SNDRV_PCM_IOCTL_DROP);
 }
 
+bool AlsaRawDuplex::fill_output_queue(std::string& error)
+{
+  if (target_frames_ == 0 || info_.buffer_size == 0)
+    return true;
+  // A short loop rather than one write, because the thing being chased is a queue the device is
+  // draining: the deficit is measured again each time instead of being written once and hoped for.
+  // It cannot overshoot -- the ring only ever loses frames while this runs, so each write lands at or
+  // below the target -- and it cannot spin, because each attempt is bounded by the device's own rate:
+  // writing a period takes microseconds against a 1333 us period.
+  for (unsigned attempt = 0; attempt < 4; ++attempt)
+  {
+    AlsaRawOccupancy occupancy;
+    std::string ignored;
+    if (!query_occupancy(false, occupancy, ignored))
+    {
+      error = "cannot read the playback ring to establish the output queue: " + ignored;
+      return false;
+    }
+    if (occupancy.ring_frames >= static_cast<long long>(target_frames_))
+      return true;
+    const long long missing = static_cast<long long>(target_frames_) - occupancy.ring_frames;
+    const long long room = static_cast<long long>(info_.buffer_size) - occupancy.ring_frames;
+    const unsigned chunk = static_cast<unsigned>(std::min(missing, std::max(0LL, room)));
+    if (chunk == 0)
+      return true; // the ring is as full as it can be, which is a different report's problem
+    if (write_playback(prime_silence_.data(), chunk, 1000, ignored) < 0)
+    {
+      error = "could not establish the output queue of " + std::to_string(target_frames_) + " frames: " + ignored;
+      return false;
+    }
+    prefill_frames_ += chunk;
+  }
+  return true;
+}
+
 void AlsaRawDuplex::recover(int fd, bool playback)
 {
   // Recovering is right for a soak (we want to keep running); hiding it is not, which is why
@@ -520,6 +601,10 @@ int AlsaRawDuplex::transfer(int fd, void* buf, unsigned frames, bool playback, i
       if (errno == EPIPE)
       {
         ++driver_xruns_;
+        if (playback)
+          ++playback_xruns_;
+        else
+          ++capture_xruns_;
         recover(fd, playback);
         continue; // retry the remainder after re-preparing
       }
@@ -574,6 +659,7 @@ bool AlsaRawDuplex::wait_capture(int timeout_ms, std::string& error)
       if (status.state == SNDRV_PCM_STATE_XRUN)
       {
         ++driver_xruns_;
+        ++capture_xruns_;
         ++gate_capture_xruns_;
         last_state = status.state;
         last_ring = status.ring_frames;
@@ -635,10 +721,49 @@ int AlsaRawDuplex::write_playback(const void* src, unsigned frames, int timeout_
 
 int AlsaRawDuplex::try_write_playback(const void* src, unsigned frames, std::string& error)
 {
+  // The queue target's decision, taken before the kernel is asked anything. This is the difference
+  // between a loop that holds a stated latency and one whose latency is whatever the run happened to
+  // accumulate: a burst (two capture periods released together, the loop's recovery from a late
+  // period) would otherwise add a period to the ring, and the ring's capacity -- not the design --
+  // would decide how much latency the run carries. See alsa::queue_allows_write for why the bound is
+  // `<=` and why refusing above it is stable rather than a coin flip.
+  //
+  // Only queried when a target is set, so the default path is byte-for-byte the path every earlier
+  // measurement took, including the cost of the extra STATUS ioctl it would otherwise add per period.
+  if (target_frames_ != 0)
+  {
+    AlsaRawOccupancy occupancy;
+    std::string ignored;
+    if (!query_occupancy(false, occupancy, ignored))
+      return -1;
+    // Only a RUNNING stream has an occupancy. An xrun freezes hw_ptr, and the driver then reports an
+    // `avail` past the end of the ring -- 260 frames for a 256-frame buffer, measured -- so the pointer
+    // pair is describing a ring that no longer exists. Refusing on that figure starves the stream of
+    // the very write that would report the xrun and recover it, and the loop then drops every period
+    // for ever while the device sits stopped. Measured at target 1: one underrun at decision 5215, then
+    // 2285 refusals in a row with hw_ptr frozen, and a report claiming zero underruns for the whole
+    // run. So the target governs a running stream; anything else goes through to the driver, which is
+    // the only thing that can say what is actually wrong.
+    const bool running = occupancy.state == SNDRV_PCM_STATE_RUNNING;
+    const bool allowed =
+      running && alsa::queue_allows_write(static_cast<unsigned long long>(occupancy.ring_frames), target_frames_);
+    if (queue_debug_)
+      queue_debug_trace(occupancy, allowed);
+    if (!allowed && running)
+    {
+      ++output_drops_;
+      ++output_target_drops_;
+      return 0;
+    }
+  }
+
   // Ask the kernel whether the ring can take a period *now*, and do not wait if it cannot. This is
   // the same readiness condition the blocking path would sleep on (avail_min is one period, set in
   // configure()), so a "yes" here means the transfer below cannot block, and a "no" is exactly the
-  // state that used to cost 699 us of every period (plan.md §9.5 item 4).
+  // state that used to cost 699 us of every period (plan.md §9.5 item 4). With a target set and the
+  // stream running it should be unreachable -- the cap always leaves room for one more period -- but a
+  // stream that is not running bypasses the cap above, so a refusal here is counted separately from a
+  // target refusal rather than folded into it.
   struct pollfd pfd;
   pfd.fd = playback_fd_;
   pfd.events = POLLOUT;
@@ -675,10 +800,26 @@ int AlsaRawDuplex::try_write_playback(const void* src, unsigned frames, std::str
   return written;
 }
 
+void AlsaRawDuplex::queue_debug_trace(const AlsaRawOccupancy& occupancy, bool allowed)
+{
+  // The first decisions show the queue being established; after that only the abnormal ones, because
+  // the interesting event is a state that is not RUNNING and a healthy run is 100 % RUNNING. Bounded
+  // so a dead stream cannot turn a soak into gigabytes of stderr.
+  const bool abnormal = occupancy.state != SNDRV_PCM_STATE_RUNNING;
+  if (queue_debug_lines_ >= 200 || (queue_debug_lines_ >= 12 && !abnormal))
+    return;
+  ++queue_debug_lines_;
+  std::fprintf(stderr,
+               "[queue] decision %u: ring %lld frames, avail %lld, state %d, hw %llu, appl %llu, "
+               "target %u, %s\n",
+               queue_debug_lines_, occupancy.ring_frames, occupancy.avail_frames, occupancy.state,
+               occupancy.hw_ptr, occupancy.appl_ptr, target_frames_,
+               allowed ? "write" : "refuse");
+}
+
 bool AlsaRawDuplex::query_occupancy(bool capture, AlsaRawOccupancy& out, std::string& error) const
 {
-  const int fd = capture ? capture_fd_ : playback_fd_;
-  if (fd < 0)
+  const int fd = capture ? capture_fd_ : playback_fd_;  if (fd < 0)
   {
     error = std::string("query_occupancy: ") + (capture ? "capture" : "playback") + " stream is not open";
     return false;

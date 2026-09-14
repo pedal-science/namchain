@@ -260,6 +260,7 @@ TEST_CASE("a backend with no ring never drops a period")
   config.sample_rate = 48000;
   config.period_size = 64;
   config.realtime_paced = false; // no reason to wait in a unit test
+  config.output_queue_periods = 2; // deliberately requested of a backend that has no ring
 
   std::string error;
   std::unique_ptr<namchain::AudioBackend> backend =
@@ -275,6 +276,16 @@ TEST_CASE("a backend with no ring never drops a period")
   CHECK(stats.output_drops == 0);
   CHECK(stats.capture_bursts == 0);
   CHECK(stats.settle_discarded_frames == 0);
+  // A queue target is a property of a ring, and a backend without one cannot report holding a queue:
+  // the field is echoed from what the backend enforces rather than from what was requested, so an
+  // unapplied target cannot be read back as an applied one (plan.md §9.5 item 7). The CLI refuses the
+  // combination outright; this is the library-level statement of the same thing.
+  CHECK(stats.output_queue_periods == 0);
+  CHECK(backend->info().output_queue_periods == 0);
+  // The prefill step is a no-op where there is no ring, and must not fail: the soak calls it
+  // unconditionally so that "establish the queue" is one call site rather than a conditional the next
+  // backend has to remember.
+  CHECK(backend->prefill_output_queue(error));
   backend->stop();
 }
 

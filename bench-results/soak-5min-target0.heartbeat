@@ -1,0 +1,10 @@
+start       2026-09-14T22:46:09+01:00
+command     taskset -c 3 ./build/namchain-soak --device hw:2,0 --capture-channels 8 --playback-channels 6 --quantum 64 --periods 4 --output-queue-periods 0 --seconds 300 --instances 4 --model build/generated/A2-Full.nam --input-channel 0 --output-channel 0 --self-oracle --oracle-window 5 --rt-priority 80 --cpu 3
+2026-09-14T22:46:09+01:00
+2026-09-14T22:47:09+01:00
+2026-09-14T22:48:09+01:00
+2026-09-14T22:49:09+01:00
+2026-09-14T22:50:09+01:00
+2026-09-14T22:51:09+01:00
+end         2026-09-14T22:51:10+01:00
+exit        1

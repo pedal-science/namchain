@@ -40,7 +40,9 @@ void usage()
                "                       (default 60; the input has to be kept to re-render it)\n"
                "  --sample-rate N      engine rate in Hz (default 48000)\n"
                "  --max-p99-percent X  gate on p99 block time, %% of deadline (default 50)\n"
-               "  --max-output-drops N  gate on periods dropped for want of output room (default 0)\n"
+               "  --max-output-drops N  gate on periods dropped for want of output room (default 0; with\n"
+               "                       --output-queue-periods the drop gate is off unless this is given,\n"
+               "                       because a target trades a dropped period for latency by design)\n"
                "  --rt-priority N  request SCHED_FIFO at this priority, applied by the program (default 80,\n"
                "                   0 to leave the policy alone); a refusal is reported, not fatal\n"
                "  --cpu N          confine the loop thread to one CPU (default: leave the affinity alone)\n"
@@ -53,6 +55,11 @@ void usage()
                "  --capture-channels N device capture channels, when it differs (SSL 2+ Mk II: 8)\n"
                "  --playback-channels N device playback channels (SSL 2+ Mk II: 6)\n"
                "  --periods N          buffer length in periods (default 4)\n"
+               "  --output-queue-periods N  cap the output queue at N periods of processed audio: the\n"
+               "                       latency this run is willing to carry (default 0: no cap, write\n"
+               "                       whenever the kernel has room). A cap, not a cushion -- what a run\n"
+               "                       actually holds is measured and printed. Must be less than --periods,\n"
+               "                       and wants a ring with headroom above it (plan.md 9.5 item 8)\n"
                "  --model FILE         run this .nam between capture and playback\n"
                "  --instances N        chain N copies of the model (default 1)\n"
                "  --graph FILE         run this rig instead: a JSON graph of nodes and connections\n"
@@ -69,6 +76,7 @@ int main(int argc, char** argv)
   namchain::SoakOptions options;
   double max_p99_percent = 50.0;
   unsigned long long max_output_drops = 0;
+  bool drops_gate_given = false;
   int rt_priority = 80;
   int cpu = -1;
   bool json = false;
@@ -100,7 +108,10 @@ int main(int argc, char** argv)
     else if (arg == "--max-p99-percent" && i + 1 < argc)
       max_p99_percent = std::atof(argv[++i]);
     else if (arg == "--max-output-drops" && i + 1 < argc)
+    {
       max_output_drops = std::strtoull(argv[++i], nullptr, 10);
+      drops_gate_given = true;
+    }
     else if (arg == "--rt-priority" && i + 1 < argc)
       rt_priority = std::atoi(argv[++i]);
     else if (arg == "--cpu" && i + 1 < argc)
@@ -123,6 +134,8 @@ int main(int argc, char** argv)
       options.playback_channels = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--periods" && i + 1 < argc)
       options.device_periods = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (arg == "--output-queue-periods" && i + 1 < argc)
+      options.output_queue_periods = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--model" && i + 1 < argc)
       options.model = argv[++i];
     else if (arg == "--graph" && i + 1 < argc)
@@ -211,6 +224,18 @@ int main(int argc, char** argv)
   options.rt_priority = rt_priority;
   options.cpu = cpu;
 
+  // Refused by name rather than ignored. Only the ALSA backend has an output ring to hold a queue in,
+  // and a run that reports a latency it is not actually carrying is worse than one that will not
+  // start -- the whole point of the knob is that the number is a stated trade (plan.md §9.5 item 7).
+  if (options.output_queue_periods != 0 && options.backend != namchain::BackendKind::AlsaRaw)
+  {
+    std::fprintf(stderr,
+                 "error: --output-queue-periods only applies to --backend alsa_raw; the %s backend has no\n"
+                 "       output ring to hold a queue in, so the target would be reported and not applied\n",
+                 namchain::backend_kind_name(options.backend));
+    return 2;
+  }
+
   const namchain::SoakResult result = namchain::run_soak(model_path, input_path, options);
   if (!result.ok)
   {
@@ -224,7 +249,16 @@ int main(int argc, char** argv)
   // A dropped period is 1.33 ms of audio removed from the output, chosen by us rather than by the
   // driver. It is strictly better than the blocking write it replaces -- the engine keeps its
   // deadline -- but it is still an audible discontinuity, so the default gate is zero.
-  const bool drop_gate = result.output_drops <= max_output_drops;
+  //
+  // With a queue target set, a drop is not an accident, it is the trade: the target's whole purpose is
+  // to refuse the period that would have raised the queue, so every refusal is the policy working and
+  // a zero-drop gate would make a targeted run unable to pass. The gate is therefore off by default in
+  // target mode -- stated in the report rather than left implicit, and restored the moment an explicit
+  // --max-output-drops is given. What a target buys is the absence of *playback underruns*, and that
+  // is what the criterion should be read against.
+  const bool drop_gate =
+    drops_gate_given ? result.output_drops <= max_output_drops
+                     : (options.output_queue_periods == 0 ? result.output_drops == 0 : true);
   const bool oracle_gate = !result.oracle.checked || result.oracle.match;
   const bool pass = p99_gate && overrun_gate && drop_gate && oracle_gate;
 
@@ -310,10 +344,15 @@ int main(int argc, char** argv)
           {"playback_last", result.playback_occupancy_last},
           {"playback_full_blocks", result.playback_full_blocks}};
       j["device"]["queue"] = {{"output_drops", result.output_drops},
+                              {"output_target_drops", result.output_target_drops},
+                              {"output_queue_periods", result.output_queue_periods},
                               {"capture_bursts", result.capture_bursts},
                               {"settle_discarded_frames", result.settle_discarded_frames},
+                              {"prefill_frames", result.prefill_frames},
                               {"gate_capture_xruns", result.gate_capture_xruns},
                               {"occupancy_mismatches", result.occupancy_mismatches}};
+      j["device"]["xruns_by_direction"] = {{"capture_overruns", result.capture_overruns},
+                                           {"playback_underruns", result.playback_underruns}};
     }
     if (result.oracle.checked)
     {
@@ -325,6 +364,12 @@ int main(int argc, char** argv)
                      {"detail", result.oracle.detail}};
     }
     j["pass"] = pass;
+    j["gates"] = {{"max_p99_percent", max_p99_percent},
+                  {"max_output_drops", drops_gate_given ? nlohmann::json(max_output_drops) : nlohmann::json(nullptr)},
+                  {"drop_gate_applied", drops_gate_given || options.output_queue_periods == 0},
+                  {"deadline_overruns_zero", result.deadline_overruns == 0},
+                  {"driver_xruns_zero", result.driver_xruns == 0},
+                  {"oracle", oracle_gate}};
     std::printf("%s\n", j.dump(2).c_str());
   }
   else
@@ -350,22 +395,86 @@ int main(int argc, char** argv)
         // Printed next to the device because it is a statement about how the loop was paced, not
         // about the engine: a capture minimum that never comes back to zero, or a playback maximum
         // at the buffer length, means the block percentiles below are describing a queue.
-        std::printf("ring occupancy:   capture min/max %lld/%lld, playback min/max %lld/%lld frames",
+        //
+        // `last` is the one that says which way a run was going. The ring's contents are conserved --
+        // one period produced per period played -- so the cushion a queue target describes is spent by
+        // lateness and restored only by a burst, and a max/min pair cannot tell a queue that held from
+        // one that decayed to its final value. The last sample can.
+        std::printf("ring occupancy:   capture min/max %lld/%lld, playback min/max %lld/%lld (last %lld) frames",
                     result.capture_occupancy_min, result.capture_occupancy_max, result.playback_occupancy_min,
-                    result.playback_occupancy_max);
+                    result.playback_occupancy_max, result.playback_occupancy_last);
         if (result.playback_full_blocks > 0)
           std::printf(" (%llu blocks wrote into a full playback ring)",
                       static_cast<unsigned long long>(result.playback_full_blocks));
         std::printf("\n");
+        // The same figure as the thing it actually buys: how long the loop can be absent before the
+        // device runs out. The *minimum* is the number, not the target: the ring drains in steps
+        // between the write and the next one, so the worst instant of a run is well below its mean.
+        if (result.device_period_size > 0 && options.sample_rate > 0)
+        {
+          const double frames_per_period = static_cast<double>(result.device_period_size);
+          const double ms_per_frame = 1e3 / static_cast<double>(options.sample_rate);
+          std::printf("                  playback queue %.2f..%.2f periods (last %.2f); the floor is the "
+                      "stall the device\n"
+                      "                  absorbs without starving: %.2f periods = %.3f ms\n",
+                      static_cast<double>(result.playback_occupancy_min) / frames_per_period,
+                      static_cast<double>(result.playback_occupancy_max) / frames_per_period,
+                      static_cast<double>(result.playback_occupancy_last) / frames_per_period,
+                      static_cast<double>(result.playback_occupancy_min) / frames_per_period,
+                      static_cast<double>(result.playback_occupancy_min) * ms_per_frame);
+        }
+        // The cap, in the unit a listener cares about, and the line that says where the numbers that
+        // matter are. The trade is stated before the figures that trade produced.
+        if (result.output_queue_periods > 0)
+        {
+          // The cap in the unit a listener cares about, and explicitly *not* a promise of cushion.
+          // Saying "3 periods = 4 ms of tolerance" would be the easy lie here: the ring's contents are
+          // conserved, so the target only binds a burst that tries to grow the queue, while the level a
+          // run actually holds is established before block 0 and spent by lateness. The floor is the
+          // line above, and it is the number to read.
+          const double cap_ms = options.sample_rate == 0
+                                  ? 0.0
+                                  : 1e3 * static_cast<double>(result.output_queue_periods) *
+                                      static_cast<double>(result.device_period_size) /
+                                      static_cast<double>(options.sample_rate);
+          std::printf("queue target:     %u periods = %.3f ms: a cap on the ring's contents, so a burst\n"
+                      "                  cannot buy latency beyond it. Not a promise of cushion -- the\n"
+                      "                  floor held above is the number to read\n",
+                      result.output_queue_periods, cap_ms);
+        }
+        else
+        {
+          std::printf("queue target:     none: the loop writes whenever the kernel has room, so how much audio\n"
+                      "                  is queued -- and so the stall it can absorb -- is whatever the run holds\n");
+        }
         // The loop's own decisions, next to the occupancy that provoked them. A drop is audio the
         // run chose to lose rather than block for, so it is the one number here that a listener
-        // would hear; the burst count is the mechanism that leads to one.
-        std::printf("queue control:    %llu output drops (gate <= %llu), %llu capture bursts\n",
-                    static_cast<unsigned long long>(result.output_drops), max_output_drops,
+        // would hear; the burst count is the mechanism that leads to one. The gate is spelled out
+        // because in target mode it is deliberately not zero (see drop_gate).
+        const std::string drop_gate_text =
+          drops_gate_given ? "gate <= " + std::to_string(max_output_drops)
+                           : (options.output_queue_periods == 0
+                                ? std::string("gate <= 0")
+                                : std::string("not gated: each refusal is the target's trade"));
+        std::printf("queue control:    %llu output drops (%s), %llu capture bursts\n",
+                    static_cast<unsigned long long>(result.output_drops), drop_gate_text.c_str(),
                     static_cast<unsigned long long>(result.capture_bursts));
+        if (result.output_target_drops > 0 || result.output_queue_periods > 0)
+          std::printf("                  %llu of those drops were the queue target refusing a period that\n"
+                      "                  would have raised the ring past %u periods; %llu were the ring itself\n"
+                      "                  being full\n",
+                      static_cast<unsigned long long>(result.output_target_drops), result.output_queue_periods,
+                      static_cast<unsigned long long>(result.output_drops - result.output_target_drops));
         if (result.settle_discarded_frames > 0)
           std::printf("settle:           discarded %llu frames of bring-up capture (before block 0)\n",
                       static_cast<unsigned long long>(result.settle_discarded_frames));
+        if (result.prefill_frames > 0)
+          std::printf("queue prefill:    %llu frames of silence written before block 0 to bring the ring\n"
+                      "                  to its target (%.3f ms of output latency, paid once)\n",
+                      static_cast<unsigned long long>(result.prefill_frames),
+                      options.sample_rate == 0 ? 0.0
+                                               : 1e3 * static_cast<double>(result.prefill_frames) /
+                                                   static_cast<double>(options.sample_rate));
         if (result.gate_capture_xruns > 0)
           std::printf("capture xruns:    %llu found by the gate (a subset of the driver xruns below: an\n"
                       "                  xrun freezes hw_ptr, so without this the loop stalls instead)\n",
@@ -528,6 +637,13 @@ int main(int argc, char** argv)
     const bool driver_backed = result.backend == "alsa_raw";
     std::printf("driver xruns:     %llu%s\n", static_cast<unsigned long long>(result.driver_xruns),
                 (!driver_backed && result.driver_xruns == 0) ? " (this backend has no driver to report)" : "");
+    if (driver_backed)
+      // The split decides what a queue target can be chosen against: a capture overrun is the loop not
+      // reading promptly enough and no amount of output queue helps, while a playback underrun is the
+      // ring running dry, which is the event the target exists to prevent.
+      std::printf("  by direction:   %llu capture overruns, %llu playback underruns\n",
+                  static_cast<unsigned long long>(result.capture_overruns),
+                  static_cast<unsigned long long>(result.playback_underruns));
     if (result.oracle.checked)
     {
       std::printf("oracle:           %s vs %s\n", result.oracle.match ? "match" : "MISMATCH",

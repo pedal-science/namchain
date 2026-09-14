@@ -1,5 +1,5 @@
-The soak loop's timeline, and the three regimes it has actually run in
-=====================================================================
+The soak loop's timeline, the four regimes it has actually run in, and the one knob it has left
+=================================================================================================
 
 Configuration these numbers come from, unless stated otherwise:
 
@@ -8,6 +8,10 @@ Configuration these numbers come from, unless stated otherwise:
   buffer      256 frames = 4 periods    ->  5.333 ms of ring, per direction
   chain       4 x A2-Full (A2PlanarFull)
   pacing      SCHED_FIFO 80, mlockall, performance governor, no throttling
+
+Sections 7-8 are the fixed loop and its tail; section 9 is the output-queue
+knob, which is where sections 7-8's "1-2 periods queued" becomes a number
+somebody chose rather than one a run happened to land on.
 
 Every figure marked [m] below is measured. Figures marked [d] are derived from
 the cadence arithmetic and say so, because the interesting quantity in a
@@ -354,5 +358,78 @@ binary, same settings:
   good jitter cushion; the fixed loop keeps 1-2. The queue is no longer a
   runaway, so that occupancy is now a knob -- and picking its default is a
   product decision with a measured cost at both ends, not a bug to fix.
+
+
+9. THE KNOB, AND WHAT IT TURNED OUT TO BE
+=========================================
+
+  Two numbers govern this now, and they were conflated until they were swept:
+
+    the RING SIZE  --periods N. How much the queue may hold. It is NOT in the
+                   signal path: only the queue's *contents* are. It is headroom.
+    the CAP        --output-queue-periods N. How much processed audio the loop
+                   is willing to have queued. This is the latency, and it is
+                   the number a player would notice.
+
+  Six 5-minute device runs, 4 x A2-Full, q=64, pinned + SCHED_FIFO 80. Full
+  evidence in queue-target-sweep.txt. "queue" is the playback ring sampled per
+  block, in periods; "last" is where the run ended.
+
+   run               ring cap   queue min..max  last   underruns drops  p99%  ovr
+   ----------------  ---- ---   -------------  -----  --------- -----  ----  ---
+   4-ring, no cap     4  none   0.00 .. 3.98    2.00      7       9     43.1   11
+   4-ring, cap 2      4   2     0.00 .. 3.88    0.95      6      17     38.9    9
+   4-ring, cap 3      4   3     0.00 .. 3.88    1.98      5      17     47.2   25
+   6-ring, no cap     6  none   0.27 .. 5.88    3.12      1       0     46.8   36
+   6-ring, cap 2      6   2     0.00 .. 5.98    1.17      9      25     41.1   30
+   6-ring, cap 4      6   4     0.20 .. 3.52    3.25      0       0     39.2   30
+   4-ring, cap 1     4   1      0.00 .. 3.98    0.36    2620    2696     47.7   39
+     (90 s only: it collapses immediately)
+
+  Three shapes, and only one of them is a queue anyone chose:
+
+    cap BELOW what the queue      ring TOO SMALL for       cap ABOVE the natural
+    reaches on its own            the queue's own level    level: a ceiling
+
+    |################|  ring      |##############| ring    |##############| ring
+    |                |            |#### drops ###|         |              |
+    |    queue       |  cap ----  |  bursts hit  |         |     queue    |  cap ----
+    |  pushed down   |            |  the ceiling |         |    sits here |
+    +----------------+            +--------------+         +--------------+
+     every burst's 2nd             every burst near        bursts accumulate
+     period refused                the top refused         freely; the cap
+     = a period LOST                                          stops them
+     -> more bursts arrive         -> the same, plus the      running away
+        into a shallower ring         7 underruns            -> 0 underruns,
+     -> 9-25 underruns               of a ring that had       0 drops, latency
+        in 5 minutes                 no headroom              bounded at 4.7 ms
+
+  Reading it in one line: **a cap under the natural level does not trade latency
+  for tolerance, it manufactures drops**, because a refusal IS a lost period and
+  each drop leaves the ring shallower for the next burst. The useful cap is one
+  that sits just above where the queue settles: at ring 6 that is ~3.2 periods,
+  so a cap of 4 held the queue at 3.25 (4.7 ms worst case) against 5.88 (7.8 ms)
+  unbounded, and cost nothing measurable.
+
+  Two other things the sweep settled:
+
+    * A cap of ONE period is not a tight margin, it is positive feedback. 2620
+      underruns in 90 s, 29 per second: a 64-frame period is smaller than the
+      device's own consumption step (48-frame USB frames at 48 kHz), so the
+      sample is nearly always above the cap even in a healthy stream, the loop
+      refuses, the ring drains, the driver underruns, and the recovery re-primes
+      into the same cap. The floor is the period PLUS the device's step.
+    * The zero-xrun run still had 30 deadline overruns and a 2.2 ms worst block,
+      and the device never starved. That is the trade in its cleanest form: the
+      host still takes the CPU away, and 3.25 periods of queue turned it from a
+      dropout into nothing. Every earlier configuration had overruns BECOME
+      xruns; this one separated them.
+
+  Where that leaves the default (not yet ratified -- an hour run is the missing
+  evidence): --periods 6 --output-queue-periods 4. And the missing instrument:
+  `queue min` reads 0.00 in every run that underran, because once a stream has
+  starved the minimum over the run is 0 by definition. The statistic that would
+  answer "how deep was the queue when the stall began" is a distribution (p1,
+  p50) of the occupancy, which does not exist yet.
 
 

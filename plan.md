@@ -853,8 +853,11 @@ golden test's whole premise is that our path and the core's `render` decode iden
   practical floor is 48 frames (1 ms)** — see §9.5 — so `alsa_raw` must verify the negotiated period
   rather than trust the request. Device period change ⇒ recompile off-thread + crossfade; instances
   are re-`Reset()` on a worker before handoff.
-- Engine algorithmic latency = I/O buffer + any declared node/PDC latency; target 64 samples (1.33 ms)
-  at 48 kHz on Pi 5.
+- Engine algorithmic latency = **I/O queue occupancy** + any declared node/PDC latency; target 64
+  samples (1.33 ms) at 48 kHz on Pi 5. Note the correction §9.5 item 8 measured: it is the *occupancy*
+  and not the buffer *size* that is in the signal path, so the ring can be made larger for free (it is
+  headroom for a burst) while the latency stays a separate, chosen number. Configuring a 4-period ring
+  to keep latency down was paying in the wrong currency.
 
 ### 9.3 Linux RT tuning checklist (shipped as `docs/tuning.md` + a `namchain-doctor` script)
 
@@ -1199,6 +1202,59 @@ number:
    parameter with a measured cost on both sides instead of an accident. Choosing that default is an
    open decision (§14), and the honest reading of this table is that the fix bought control, not a
    smaller number of dropouts.
+8. **The knob exists and has been swept, and the sweep changed what the knob means** (2026-09-14,
+   `cb5cc19`+, SSL 2+ Mk II, 4 x A2-Full, q=64, 300 s per run, pinned + self-scheduled). Full table and
+   evidence in `bench-results/queue-target-sweep.txt`; the shape of it:
+
+   | run | ring | cap | queue min..max / last (periods) | pb underruns | drops (cap) | block p99 | overruns |
+   |---|---|---|---|---|---|---|---|
+   | 4-period ring, no cap (the old fixed loop) | 4 | none | 0.00..3.98 / 2.00 | 7 | 9 (0) | 43.1 % | 11 |
+   | 4-period ring, cap 2 | 4 | 2 | 0.00..3.88 / 0.95 | 6 | 17 (17) | 38.9 % | 9 |
+   | 6-period ring, no cap | 6 | none | 0.27..5.88 / 3.12 | 1 | 0 | 46.8 % | 36 |
+   | 6-period ring, cap 2 | 6 | 2 | 0.00..5.98 / 1.17 | 9 | 25 (25) | 41.1 % | 30 |
+   | **6-period ring, cap 4** | 6 | 4 | 0.20..3.52 / 3.25 | **0** | **0** | 39.2 % | 30 |
+   | 4-period ring, cap 1 (90 s, fails immediately) | 4 | 1 | 0.00..3.98 / 0.36 | 2620 | 2696 | 47.7 % | 39 |
+
+   Four things came out of it, and the first two are corrections to this section's earlier reading:
+
+   - **The ring's size is the cushion, and it is not latency.** 4 -> 6 periods at no cap took playback
+     underruns from 7 to 1 per five minutes and drops from 9 to 0, at the same queue *level* (last 2.00
+     vs 3.12 periods). The ring is not in the signal path; only its contents are. The 4-period ring was
+     never too small for the audio, it was too small for the *recovery*: its ceiling sat close to the
+     level the queue naturally reaches, so a burst arriving near the top was refused, and a refusal is a
+     period of audio lost. This also corrects §9.2's "engine algorithmic latency = I/O buffer": the
+     buffer is a ceiling, the occupancy is the latency.
+   - **The cap bounds latency, and must not be set below the level the queue reaches by itself.** At
+     ring 6 the queue accumulates to ~3.1-3.3 periods unaided. Capping at 4 held it at 3.25 (4.7 ms
+     worst case) against 5.88 (7.8 ms) unbounded, with no measured underrun cost. Capping at 2 --
+     *below* the natural level -- produced the worst result of the six: 25 drops and 9 underruns. A cap
+     under the natural level does not trade latency for tolerance, it manufactures drops, and each drop
+     leaves the ring shallower for the next burst.
+   - **A cap of one period is a positive-feedback failure rather than a tight margin.** 2620 underruns
+     in 90 s, 29 per second, 2696 refusals. A 64-frame period is smaller than the device's own
+     consumption step (48-frame USB frames at 48 kHz), so the sample is nearly always above a
+     one-period cap even in a healthy stream: the loop refuses, the ring drains, the driver underruns,
+     and the recovery re-primes into the same cap. The floor is the period plus the device's step, not
+     the period.
+   - **The zero-xrun run still had 30 deadline overruns, which is the trade stated cleanly.** It
+     absorbed 30 blocks over the 1333.3 us deadline (block max 2.2 ms) and never starved the device,
+     because the queue sat 3.25 periods deep. Every earlier configuration had overruns *become* xruns;
+     this one separated the two, which is what the knob is for.
+
+   **Recommendation: `--periods 6 --output-queue-periods 4`** -- 0 xruns and 0 drops over five minutes,
+   a queue of ~3.25 periods (4.3 ms), worst case 3.52 (4.7 ms). Against the 4-period ring with no cap
+   that is seven fewer dropouts per five minutes for ~2 ms of extra monitoring latency. Not ratified
+   yet: an hour at this setting is the run that would settle it, and `queue min` reads 0.00 in every
+   run that underran, so the occupancy *distribution* (p1/p50) is the missing instrument.
+
+   Two bugs were found by building it, and both are worth more than the table. A cap applied to a
+   stream that is not running starves it of the write that would report and recover the xrun -- the
+   pointers freeze, "occupancy" reads full, and the loop refuses for ever while the report claims zero
+   underruns (measured: 2285 consecutive refusals, one real underrun, a report saying none) -- so the
+   cap now governs a `RUNNING` stream only. And the cap has to be established immediately before the
+   timed loop, because the bring-up path spends a period of the primed queue and the ring's contents
+   are conserved: a queue that starts a period short stays a period short for the whole run, which is
+   why `AudioBackend::prefill_output_queue` exists and why `prefill_frames` is reported.
 
 **A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
 but the run does not keep real time at it: RTF 1.333, i.e. it loses a third. Instrumenting the loop to
@@ -1587,7 +1643,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; **`AudioBackend` interface with `null` and `file` implemented and `pipewire` refused by name ✔ (§9.1) — the stream loop is now written once and runs against a device, a paced clock or a WAV, so `ctest -R soak_cli` exercises the timers, the gates and the oracle with no hardware**; **memory locking made safe and the block timer sized from the run — `MCL_FUTURE` plus a fixed 44 MB timer reserve aborted the `null` backend with `std::bad_alloc` under a finite `RLIMIT_MEMLOCK`, and `soak_cli` now reproduces that limit ✔ (§14.10)**; **multichannel WAV reader ✔**; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔**; **the loop's cadence and its output-queue policy — `sw_params` now sets `avail_min` to the period so `poll` wakes on the boundary the loop consumes at, and the one-period prime plus the resulting occupancy ratchet are diagnosed in §9.5 items 2 and 4** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **device-mode self-oracle ✔ — the run records the input it consumed and compares its output against a freshly compiled offline render of it, `max|diff| = 0` over 2 880 000 frames (§10.5.1)**; **1 h soak vs §1 criterion 3 — run, *not met*: chain p99 45.7 % and 0 render-path allocations hold; block p99 112.6 % and 1 driver xrun fail the current wording, for the output-queue reason in §9.5 item 4, not for engine or kernel-latency reasons**; allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference, and the ring occupancy measured and removed so the residual spread is reported rather than assumed (§9.5)**; **parity test green at release flags** |
+| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; **`AudioBackend` interface with `null` and `file` implemented and `pipewire` refused by name ✔ (§9.1) — the stream loop is now written once and runs against a device, a paced clock or a WAV, so `ctest -R soak_cli` exercises the timers, the gates and the oracle with no hardware**; **memory locking made safe and the block timer sized from the run — `MCL_FUTURE` plus a fixed 44 MB timer reserve aborted the `null` backend with `std::bad_alloc` under a finite `RLIMIT_MEMLOCK`, and `soak_cli` now reproduces that limit ✔ (§14.10)**; **multichannel WAV reader ✔**; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔**; **the loop's cadence and its output-queue policy — `sw_params` now sets `avail_min` to the period so `poll` wakes on the boundary the loop consumes at, and the one-period prime plus the resulting occupancy ratchet are diagnosed in §9.5 items 2 and 4**; **the output queue became a knob — `--output-queue-periods` caps the queue, `prefill_output_queue` establishes it before block 0, the xruns are split into capture overruns and playback underruns, and the first device soak with zero xruns and zero drops over five minutes is measured in §9.5 item 8 ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **device-mode self-oracle ✔ — the run records the input it consumed and compares its output against a freshly compiled offline render of it, `max|diff| = 0` over 2 880 000 frames (§10.5.1)**; **1 h soak vs §1 criterion 3 — run, *not met*: chain p99 45.7 % and 0 render-path allocations hold; block p99 112.6 % and 1 driver xrun fail the current wording, for the output-queue reason in §9.5 item 4, not for engine or kernel-latency reasons**; allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference, and the ring occupancy measured and removed so the residual spread is reported rather than assumed (§9.5)**; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |
@@ -1688,10 +1744,14 @@ and *not* assumed on a user's host (risk 11, §9.3).
 **Open decisions you may want to change** (each has a default in the plan): default warming policy mode
 (`balanced`); `fade_ms` default (5 ms) and `max_defer_ms` (15 ms); whether to accept LGPL
 `libasound`/JACK backends; whether §7.8 patch #3 (shared weights) is worth carrying a standing fork
-patch; project name (`namchain` is a placeholder); **the output queue's target occupancy**, which is now
-the latency-against-dropout-tolerance knob and the most consequential of these -- §9.5 item 7 measured
-what each end costs (1-2 periods queued: 41 % block p99 and 92 xruns/hour; a saturated ring: the same
-engine work reported as 112 % and 23 xruns/hour); and **whether `--cpu` defaults to pinning at all**, or
+patch; project name (`namchain` is a placeholder); **the output queue's cap and ring size**, which are
+now the latency-against-dropout-tolerance knob and the most consequential of these. §9.5 item 7
+measured what each end of the old loop cost (1-2 periods queued: 41 % block p99 and 92 xruns/hour; a
+saturated ring: the same engine work reported as 112 % and 23 xruns/hour); §9.5 item 8 swept the knob
+and found the shape of the trade -- the ring size is the cushion and is free, the cap is the latency
+and must sit at or above the level the queue reaches by itself -- with `--periods 6
+--output-queue-periods 4` as the measured recommendation (0 xruns and 0 drops in 5 min, ~4.3 ms of
+queue) still awaiting an hour-long confirmation; and **whether `--cpu` defaults to pinning at all**, or
 stays off until `namchain-doctor` can pick a core and report the IRQ mask it shares it with.
 
 ---

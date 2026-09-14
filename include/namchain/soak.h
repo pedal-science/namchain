@@ -73,6 +73,22 @@ struct SoakOptions
   unsigned capture_channels = 0;
   unsigned playback_channels = 0;
   unsigned device_periods = 4;
+  /// \brief Periods of already-processed audio the output ring is allowed to hold: the
+  /// latency/against-dropout-tolerance knob (§9.5 item 7).
+  ///
+  /// What this is, precisely, is a **cap**: the loop refuses a period that would take the ring past
+  /// it, so a burst -- the mechanism that fills the ring -- cannot buy latency beyond the number.
+  /// What it is *not* is a promise of that much cushion. The ring's contents are conserved (one period
+  /// produced per period played), so what a run actually holds is set before block 0 by
+  /// `AudioBackend::prefill_output_queue` and then spent by lateness; a target above the level a run
+  /// reaches simply never binds. Read the measured floor (SoakResult::playback_occupancy_min) for the
+  /// stall the device will absorb, and pick the target from that.
+  ///
+  /// 0 means no cap, which is what every measurement before this knob was taken with: the ring's
+  /// contents wander between empty and full and the cushion is whatever the run happened to hold when
+  /// it mattered. `alsa_raw` only: the other backends have no ring to hold anything in, and the CLI
+  /// refuses the combination rather than accepting a run that does not measure what it claims.
+  unsigned output_queue_periods = 0;
   /// The engine's rate, and therefore the rate the device is asked for and that every input file
   /// and model is checked against. Fixed rather than inferred: this is a 48 kHz engine at M1, and a
   /// harness that quietly follows whichever file it was handed cannot compare two runs.
@@ -253,12 +269,31 @@ struct SoakResult
   /// -- the oracle still validates every block it rendered -- but the audio has a gap exactly here,
   /// so it is a reported number and not a debug counter.
   uint64_t output_drops = 0;
+  /// The subset of \ref output_drops the queue target refused rather than the ring's capacity. Only
+  /// one of the two is the latency policy working; the other means the ring, not the target, was the
+  /// binding constraint.
+  uint64_t output_target_drops = 0;
+  /// The output-queue target in force, in periods; 0 when the run held none.
+  unsigned output_queue_periods = 0;
+  /// \brief Driver xruns by direction, summing exactly to \ref driver_xruns.
+  ///
+  /// The split is the difference between two problems. A capture overrun is the device having
+  /// produced a period the loop had not read yet: it is about how promptly the loop reads, and no
+  /// amount of output queue helps. A playback underrun is the output ring running dry, which is the
+  /// single event the queue target exists to prevent -- so the target can only be chosen against this
+  /// number, and the hour-long baseline's 92 unattributed xruns were not enough to choose with
+  /// (§9.5 item 7).
+  uint64_t capture_overruns = 0;
+  uint64_t playback_underruns = 0;
   /// Reads released while two or more periods were waiting: the loop had fallen a period behind. This
   /// is the mechanism that fills the output ring, so it is reported even when no period is dropped.
   uint64_t capture_bursts = 0;
   /// Frames read and discarded before the timed loop so it started from a known capture occupancy.
   /// Bring-up audio, not a dropped period.
   uint64_t settle_discarded_frames = 0;
+  /// Silence written into the output ring before the timed loop to establish \ref
+  /// output_queue_periods. The cost of the target, paid once, before anything is timed.
+  uint64_t prefill_frames = 0;
   /// Capture xruns the *gate* found rather than a read reporting them. A subset of driver_xruns().
   /// Without detecting these, an xrun freezes the hardware pointer and the gate waits for a period
   /// that cannot arrive, so the run ends in a stall timeout instead of counting a recoverable xrun.

@@ -81,6 +81,34 @@ unsigned clamp_to_bounds(unsigned requested, unsigned min, unsigned max);
 unsigned long long pcm_ring_frames(unsigned long long hw_ptr, unsigned long long appl_ptr,
                                    unsigned long long buffer_frames, bool capture);
 
+/// \brief Frames of silence to prime the playback ring with so the loop starts at its queue target.
+///
+/// At least one period, because the kernel's start threshold is one period (sw.start_threshold in
+/// `configure`): a prime of zero leaves the stream started-but-empty, which underruns immediately.
+/// \param queue_periods the target occupancy in periods; 0 or 1 both mean "one period", which is
+/// what every run before the target existed did.
+unsigned long long queue_prime_frames(unsigned long long period_frames, unsigned queue_periods);
+
+/// \brief Whether the loop may write a period now, given how full the playback ring already is.
+///
+/// This is the output-queue target's entire policy (§9.5 item 7), and it is a separate, pure function
+/// because the off-by-one in it decides whether the loop holds its queue or oscillates around it.
+///
+/// \param ring_frames the ring's contents *before* this write, as derived from the pointer pair.
+/// \param target_frames the occupancy to hold, in frames; 0 means no target, and every write is
+///        allowed (which is the behaviour every measurement before this knob existed was taken with).
+///
+/// The comparison is `<=`, not `<`, and that is the difference between a target the loop holds and
+/// one it half-drops into. The device consumes one period while the loop produces one, so a write
+/// made when the ring holds exactly the target leaves the ring holding the target again by the next
+/// iteration: the occupancy is conserved, and `== target` is a fixed point rather than a condition to
+/// refuse at. Refusing there instead would drop every other period for ever -- the ring falls one
+/// period, the next write refills it, and the one after refuses again -- which is 50 % of the audio
+/// gone to hold a queue that a `<=` holds for free. Above the target a refusal is the *correction*:
+/// each one lowers the ring by a period, so a queue that a burst pushed over the target comes back
+/// down in a bounded number of drops rather than staying there.
+bool queue_allows_write(unsigned long long ring_frames, unsigned long long target_frames);
+
 } // namespace alsa
 } // namespace namchain
 

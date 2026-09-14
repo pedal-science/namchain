@@ -260,6 +260,7 @@ public:
     raw.quantum = config.period_size;
     raw.periods = config.periods;
     raw.require_exact_period = config.require_exact_period;
+    raw.output_queue_periods = config.output_queue_periods;
 
     std::unique_ptr<AlsaRawDuplex> device = AlsaRawDuplex::open(raw, error);
     if (!device)
@@ -277,6 +278,7 @@ public:
     self->info_.capture_bytes_per_frame = source.capture_bytes_per_frame;
     self->info_.playback_bytes_per_frame = source.playback_bytes_per_frame;
     self->info_.period_exact = source.period_exact;
+    self->info_.output_queue_periods = source.output_queue_periods;
     self->info_.capture_name = source.capture_node;
     self->info_.playback_name = source.playback_node;
     // One buffer for playback plus one for capture is the floor the rings impose on any round trip.
@@ -321,14 +323,21 @@ public:
   {
     StreamQueueStats stats;
     stats.output_drops = device_->output_drops();
+    stats.output_target_drops = device_->output_target_drops();
+    stats.output_queue_periods = device_->info().output_queue_periods;
     stats.capture_bursts = device_->capture_bursts();
     stats.settle_discarded_frames = device_->settle_discarded_frames();
+    stats.prefill_frames = device_->prefill_frames();
     stats.gate_capture_xruns = device_->gate_capture_xruns();
     stats.occupancy_mismatches = device_->occupancy_mismatches();
+    stats.capture_overruns = device_->capture_overruns();
+    stats.playback_underruns = device_->playback_underruns();
     return stats;
   }
 
   uint64_t driver_xruns() const override { return device_->driver_xruns(); }
+
+  bool prefill_output_queue(std::string& error) override { return device_->fill_output_queue(error); }
 
   bool ring_occupancy(long long& capture_frames, long long& playback_frames) const override
   {

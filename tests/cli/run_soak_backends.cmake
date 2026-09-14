@@ -126,4 +126,27 @@ if(NOT _sched_out MATCHES "scheduling:[^\n]*cpu 0")
   message(FATAL_ERROR "the report did not say the thread was confined to cpu 0:\n--- stdout ---\n${_sched_out}")
 endif()
 
+# --- 7. the output-queue target is applied or refused, never silently ignored --------------------
+# The target is the latency/dropout trade (plan.md 9.5 item 7): it buys tolerance for the loop being
+# late by holding that much processed audio in the output ring. Only the ALSA backend has such a ring,
+# so asking any other backend for one is refused by name rather than accepted -- a run that reports a
+# latency it is not carrying is worse than one that will not start. Zero is not "a target of zero", it
+# is "no target", and it has to keep working, because that is what every earlier measurement used.
+execute_process(
+  COMMAND "${NAMCHAIN_SOAK}" --backend null --no-pacing --seconds 1 --periods 4 --output-queue-periods 2
+          --model "${NAMCHAIN_MODEL}" "${NAMCHAIN_INPUT}"
+  RESULT_VARIABLE _target_rc
+  OUTPUT_VARIABLE _target_out
+  ERROR_VARIABLE _target_err)
+if(NOT _target_rc EQUAL 2)
+  message(FATAL_ERROR "a queue target on a backend with no ring: expected exit 2, got ${_target_rc}\n--- stdout ---\n${_target_out}\n--- stderr ---\n${_target_err}")
+endif()
+if(NOT _target_err MATCHES "output ring")
+  message(FATAL_ERROR "the refusal did not name the missing output ring:\n--- stderr ---\n${_target_err}")
+endif()
+
+_run_and_expect_success("zero means no queue target, not a target of zero" 0
+  "${NAMCHAIN_SOAK}" --backend null --no-pacing --seconds 1 --periods 4 --output-queue-periods 0
+  --model "${NAMCHAIN_MODEL}" "${NAMCHAIN_INPUT}")
+
 message(STATUS "soak CLI and backend checks passed")

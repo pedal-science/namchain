@@ -219,6 +219,22 @@ unsigned long long pcm_ring_frames(unsigned long long hw_ptr, unsigned long long
                  : (appl_ptr + buffer_frames - hw_ptr) % buffer_frames;
 }
 
+unsigned long long queue_prime_frames(unsigned long long period_frames, unsigned queue_periods)
+{
+  const unsigned long long periods = queue_periods < 2 ? 1ull : static_cast<unsigned long long>(queue_periods);
+  return period_frames * periods;
+}
+
+bool queue_allows_write(unsigned long long ring_frames, unsigned long long target_frames)
+{
+  // No target is the pre-knob behaviour: the ring is the only bound, and the loop writes whenever the
+  // kernel reports room. Kept as the default so a measurement taken without the knob and one taken
+  // with it set to "none" are the same measurement.
+  if (target_frames == 0)
+    return true;
+  return ring_frames <= target_frames;
+}
+
 } // namespace alsa
 } // namespace namchain
 

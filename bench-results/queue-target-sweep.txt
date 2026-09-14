@@ -1,0 +1,113 @@
+Output-queue target sweep — 2026-09-14, `cb5cc19`+working tree, SSL 2+ Mk II (hw:2,0)
+========================================================================================
+
+What was asked
+--------------
+The knob is the latency-against-dropout trade, and it had to be measured before it could be
+defaulted (plan.md §9.5 item 7, §14). The question is not "does a queue help" -- that is arithmetic
+-- but "how much latency buys how much dropout tolerance, on this host, with this device", and
+"what does the knob do when it is set wrong".
+
+Setup
+-----
+4 x A2-Full (A2PlanarFull), q = 64 frames (1333.3 us), 48 kHz, 8 capture / 6 playback channels,
+`--self-oracle --oracle-window 5`, `SCHED_FIFO 80` + `--cpu 3` applied by the program itself, 300 s
+per run (one run is 90 s, marked). Non-RT kernel 7.0.0-1017-raspi, governor `performance`,
+`throttled=0x0`, load ~0.3. Every run has a `.txt` report, an `.env` with the machine state before
+and after, and a `.heartbeat`.
+
+Evidence files
+--------------
+  soak-5min-target0.txt/.env/.heartbeat          ring 4, no cap
+  soak-5min-target2.txt/.env/.heartbeat          ring 4, cap 2 periods
+  soak-5min-target3.txt/.env/.heartbeat          ring 4, cap 3 periods
+  soak-5min-ring6-nocap.txt/.env/.heartbeat      ring 6, no cap
+  soak-5min-ring6-cap2.txt/.env/.heartbeat       ring 6, cap 2 periods
+  soak-5min-target4-ring6.txt/.env/.heartbeat    ring 6, cap 4 periods
+  soak-90s-target1.txt/.env/.heartbeat           ring 4, cap 1 period (90 s: it fails immediately)
+
+The numbers
+-----------
+"queue" is the playback ring's contents sampled once per block, in periods of 64 frames. `min` is the
+worst instant of the run -- the stall the device could have absorbed at that moment -- `last` is where
+the run ended, which is the one that says whether the queue held or decayed. `underruns` are playback
+xruns (the ring ran dry: the event this knob exists to prevent), `overruns` are capture xruns (the
+device produced a period the loop had not read: an output queue cannot help, and it is reported
+separately for exactly that reason).
+
+  run                ring  cap   queue min..max  last   underruns  overruns  drops(target)  bursts  p99%  ovr
+  ----------------------------------------------------------------------------------------------------------
+  target0             4    none  0.00 .. 3.98    2.00       7         1        9  (0)      23     43.1   11
+  target2             4     2    0.00 .. 3.88    0.95       6         0       17 (17)      11     38.9    9
+  target3             4     3    0.00 .. 3.88    1.98       5         0       17 (10)      21     47.2   25
+  ring6-nocap         6    none  0.27 .. 5.88    3.12       1         0        0  (0)      16     46.8   36
+  ring6-cap2          6     2    0.00 .. 5.98    1.17       9         1       25 (25)      24     41.1   30
+  ring6-cap4          6     4    0.20 .. 3.52    3.25       0         0        0  (0)      19     39.2   30
+  target1 (90 s)      4     1    0.00 .. 3.98    0.36    2620         0     2696           47     47.7   39
+
+  p99%  = block p99 as a percentage of the 1333.3 us deadline (gate 50)
+  ovr   = blocks whose total exceeded the deadline
+  drops(target) = periods the loop refused to write; the bracket is how many of them the *cap* refused
+                  rather than the ring's own capacity
+
+What it says
+------------
+
+1. **The ring size is the cushion, and it is not latency.** Going from a 4-period to a 6-period ring
+   at no cap took playback underruns from 7 to 1 in five minutes and drops from 9 to 0, with the same
+   period size and the same queue *level* at the end (2.00 vs 3.12 periods). The ring is not in the
+   signal path; only its contents are. It is the headroom a burst needs in order to accumulate instead
+   of hitting a ceiling. The 4-period ring was never too small for the audio, it was too small for the
+   *recovery*: its ceiling (4 periods) sat close to the level the queue naturally reached (2-3.3), so
+   every burst that arrived near the top was refused -- and a refusal is a period of audio lost.
+
+2. **The cap bounds the latency and should not be set below the level the queue reaches on its own.**
+   At ring 6 the queue accumulates to ~3.1-3.3 periods by itself. Capping at 4 held it at 3.25 and
+   3.52 max (4.7 ms worst case) against 5.88 periods (7.8 ms) unbounded, with no measured underrun
+   cost (0 against 1, which is inside the noise of a 5-minute run). Capping at 2 -- *below* the level
+   the ring reaches -- produced 25 drops and 9 underruns, the worst of the six configurations. A cap
+   under the natural level does not trade latency for tolerance; it manufactures drops, and each drop
+   makes the ring shallower for the next burst.
+
+3. **A cap at one period is a positive-feedback failure, not a tight margin.** `target1` underran 2620
+   times in 90 seconds -- 29 per second -- with 2696 refusals. The reason is quantisation: a 64-frame
+   period is smaller than the device's own consumption step (48-frame USB frames at 48 kHz), so the
+   pre-write sample is nearly always *above* a one-period cap even in a healthy stream. The loop
+   therefore refuses, the ring drains, the driver underruns, and the recovery re-primes into the same
+   cap. The practical floor is not the period size; it is the period size plus the device's step.
+
+4. **The zero-xrun run still had 30 deadline overruns, and that is the whole point.** `ring6-cap4`
+   absorbed 30 blocks that exceeded the 1333.3 us deadline (block max 2.2 ms = 1.6 periods) and still
+   never starved the device, because the queue held it 3.25 periods deep. This is the trade in the
+   cleanest possible form: the host still takes the CPU away, and the queue is what turns that from a
+   dropout into nothing. Every previous configuration had deadline overruns *become* xruns; this one
+   separated the two.
+
+5. **The two bugs this measurement found are both worth more than the numbers.** A cap applied to a
+   stream that is not running starves it of the write that would report and recover the xrun: the
+   pointers freeze, "occupancy" reads full, and the loop refuses for ever while the report claims zero
+   underruns (measured: 2285 consecutive refusals, one real underrun, a report saying none). And the
+   target has to be established immediately before the timed loop, because the bring-up path spends a
+   period of the primed queue and the ring's contents are conserved -- a queue that starts a period
+   short stays a period short for the whole run. Both are in the code with the measurements that
+   found them.
+
+Recommendation
+--------------
+`--periods 6 --output-queue-periods 4`: 0 xruns and 0 drops over five minutes with a queue holding
+~3.25 periods (4.3 ms) and a worst case bounded at 3.52 (4.7 ms). Against the current 4-period ring
+and no cap that is 7 fewer playback underruns per five minutes for ~2 ms of extra monitoring latency,
+and it is the first configuration in this project's history with a zero-xrun device soak.
+
+Caveats, stated rather than buried
+----------------------------------
+- Five minutes each. The no-cap rate is ~1.4 underruns/min, so "0 in 5 min" is roughly e^-7 evidence,
+  not proof; an hour at `ring6-cap4` would settle it, and that is the next run to take.
+- `queue min` reads 0.00 in every run that had an underrun, which makes the floor useless as a
+  statistic there: once the stream has starved, the minimum over the run is 0 by definition. The
+  honest instrument is the *distribution* of the occupancy (p1/p50) and the depth at the instant a
+  stall begins, neither of which exists yet. `last` and `max` are what carry the argument above.
+- One host, one device, one period size. The quantisation floor in point 3 is a property of a 64-frame
+  period on high-speed USB, and a 48-frame period (1 ms) would have a different one.
+- The cap costs a `SNDRV_PCM_IOCTL_STATUS` per period when it is set; the default path is unchanged.
+  The render path stayed clean: 0 allocations, 0 frees, in every run.

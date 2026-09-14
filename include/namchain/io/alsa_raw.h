@@ -48,6 +48,24 @@ struct AlsaRawConfig
   /// to avoid. A latency measurement turns it on because it is the only route to a common timebase
   /// between the two streams.
   bool enable_timestamps = false;
+  /// \brief Periods of already-processed audio the playback ring is allowed to hold: the
+  /// latency-against-dropout-tolerance knob (§9.5 item 7).
+  ///
+  /// A **cap**, not a promise of cushion. The device plays from the ring, so its contents are the
+  /// stall the loop can absorb -- but the contents are conserved (one period produced per period
+  /// played), so the cap only binds a burst that tries to grow the queue, and how much a run actually
+  /// holds is whatever \ref fill_output_queue established before the loop was timed, spent one period
+  /// at a time by lateness. Measured at 64 frames: a cap of 3 periods held 1.4-2.1 periods, and a cap
+  /// of 1 period is below what this device needs at all -- it underran 1629 times in 20 s.
+  ///
+  /// 0 means no cap, which is the behaviour every measurement up to and including the first hour was
+  /// taken with: the loop writes whenever the kernel reports room, so the ring's contents wander
+  /// between empty and full and the cushion is whatever the run happened to be holding at the moment
+  /// it mattered.
+  ///
+  /// Must be less than \ref periods: a cap equal to the ring leaves no room for the period the policy
+  /// is deciding about, so the loop could never write at all.
+  unsigned output_queue_periods = 0;
 };
 
 struct AlsaRawInfo
@@ -70,6 +88,10 @@ struct AlsaRawInfo
   /// True when the driver agreed to record timestamps. Without this the status timestamps are all
   /// zero, which is why a measurement that wants to relate the two streams to one clock has to ask.
   bool timestamps_enabled = false;
+  /// The output-queue target actually in force, in periods; 0 when there is none. Echoed from the
+  /// configuration rather than recomputed, so that "the target the report states" and "the target the
+  /// write path enforces" are the same number and cannot drift apart.
+  unsigned output_queue_periods = 0;
   std::string capture_node;
   std::string playback_node;
 };
@@ -133,6 +155,25 @@ public:
   bool start(std::string& error);
   void stop();
 
+  /// \brief Write silence until the playback ring holds the configured queue target.
+  ///
+  /// Must be called after the stream is running and immediately before the loop that is going to be
+  /// timed, because the target cannot be established any earlier: the bring-up path (draining the
+  /// capture side, the first untimed cycle, the first waits) consumes a period of the primed queue
+  /// without writing anything back, and the ring's contents are otherwise conserved -- one period
+  /// produced per period played -- so a queue that starts a period short stays a period short for
+  /// ever. Measured: a target of 3 primed 192 frames and the timed loop then held 64..128, exactly one
+  /// period less than asked for, with zero bursts and zero drops to explain the difference.
+  ///
+  /// Only \ref AlsaRawConfig::output_queue_periods can fail this, and only if the device refuses to
+  /// take the frames.
+  bool fill_output_queue(std::string& error);
+
+  /// Frames of silence written by fill_output_queue(). Bring-up audio, like
+  /// settle_discarded_frames(): it is the latency the target costs, paid once, before anything is
+  /// timed, and reported so that "the queue was there from block 0" is a checkable statement.
+  uint64_t prefill_frames() const { return prefill_frames_; }
+
   /// Wait until the device has one period of capture available to read.
   ///
   /// Not "until some data is available". The difference is what `sw_params.avail_min` decides, and
@@ -176,19 +217,53 @@ public:
   /// because `delay` is the field that reads 544 frames against a 256-frame buffer at saturation
   /// and is therefore not fit to decide anything with yet.
   ///
+  /// When AlsaRawConfig::output_queue_periods is set there is a second refusal, checked *before* the
+  /// ring's own capacity: if the ring already holds more than the target, the period is dropped
+  /// without asking the kernel anything. The ring's capacity is then a safety net rather than the
+  /// policy, which is the point -- with a target the loop decides how much latency it is willing to
+  /// carry, and a burst that would have raised the queue instead loses a period (§9.5 item 7).
+  /// The two refusals are counted separately because they call for different responses.
+  ///
   /// \return frames written (== \p frames), 0 when there was no room so the period was dropped and
   /// counted as a drop, or -1 on a real error.
   int try_write_playback(const void* src, unsigned frames, std::string& error);
 
   /// Count of `-EPIPE` conditions. Every one is counted and reported; the engine never silently
-  /// re-prepares (plan.md §10.5.1).
+  /// re-prepares (plan.md §10.5.1). This is the sum of the two per-direction counts below, and the
+  /// sum is asserted against them rather than assumed.
+  ///
+  /// The direction is worth keeping separate because the two have almost nothing in common and only
+  /// one of them is a latency question:
+  ///
+  ///  - a **capture overrun** means the device produced a period the loop had not read yet. It is a
+  ///    function of how promptly the loop reads, and no amount of output queue helps it;
+  ///  - a **playback underrun** means the ring ran dry, which is exactly the event the output-queue
+  ///    target exists to prevent, and its count is the number a target has to be chosen against.
+  ///
+  /// Reported as one number until the hour-long baseline, where 92 xruns could not be attributed and
+  /// the whole question of what a queue target would buy turned on the split (§9.5 item 7).
   uint64_t driver_xruns() const { return driver_xruns_; }
   /// How many times recovery was performed (one per handled xrun, normally).
   uint64_t recoveries() const { return recoveries_; }
+  /// Capture overruns: the device produced a period before the loop read the last one.
+  uint64_t capture_overruns() const { return capture_xruns_; }
+  /// Playback underruns: the ring ran dry before the loop wrote the next period. This is the count
+  /// the output-queue target is chosen against.
+  uint64_t playback_underruns() const { return playback_xruns_; }
 
   /// Periods try_write_playback() found no room for. Each one is a period of output audio the loop
   /// chose to lose rather than block on. Zero is the only acceptable steady-state value.
   uint64_t output_drops() const { return output_drops_; }
+  /// \brief The subset of \ref output_drops refused by the queue target rather than by the kernel.
+  ///
+  /// The two refusals mean different things and have different fixes. "The kernel says the ring is
+  /// full" is the ring being the binding constraint, which with a target set should be impossible
+  /// (a target below the ring's capacity always leaves room for one more period) and therefore means
+  /// something else went wrong. "The target says this period would take the queue past what we chose
+  /// to hold" is the policy working: the audio is one period shorter and the latency did not grow.
+  uint64_t output_target_drops() const { return output_target_drops_; }
+  /// The queue target in force, in frames; 0 when there is none.
+  unsigned target_frames() const { return target_frames_; }
   /// Reads released while two or more periods were waiting. Zero means the loop never fell a period
   /// behind; a positive count is the mechanism that fills the playback ring, so it is reported even
   /// when the drop guard absorbs the consequence.
@@ -229,11 +304,20 @@ private:
   /// known occupancy rather than from however long the device ran before the loop was ready.
   bool drain_capture(std::string& error);
   int transfer(int fd, void* buf, unsigned frames, bool playback, int timeout_ms, std::string& error);
+  /// Print one queue-target decision when NAMCHAIN_QUEUE_DEBUG is set. Kept because the failure it
+  /// was written to find is invisible in every aggregate the report has: a target refusing a dead
+  /// stream shows up as a large drop count and a healthy xrun count, which is exactly backwards.
+  void queue_debug_trace(const AlsaRawOccupancy& occupancy, bool allowed);
 
   int capture_fd_ = -1;
   int playback_fd_ = -1;
   unsigned quantum_ = 64;
   unsigned periods_ = 4;
+  /// The queue target in periods as requested, held until the device says what a period really is.
+  unsigned requested_queue_periods_ = 0;
+  /// The queue target in frames, or 0 for none. Derived from requested_queue_periods_ once the device
+  /// has said what a period actually is (the requested quantum is not always granted).
+  unsigned target_frames_ = 0;
   std::vector<unsigned> format_preference_;
   bool enable_timestamps_ = false;
   unsigned capture_bytes_per_frame_ = 2;
@@ -243,11 +327,20 @@ private:
   /// Sink for drain_capture(), preallocated for the same reason and sized one period.
   std::vector<unsigned char> drain_buffer_;
   AlsaRawInfo info_;
+  /// NAMCHAIN_QUEUE_DEBUG, read once at open rather than per period: getenv in the write path would
+  /// be a libc call on every period, and a debug trace must not change the timing it is there to
+  /// explain.
+  bool queue_debug_ = false;
+  unsigned queue_debug_lines_ = 0;
   uint64_t driver_xruns_ = 0;
   uint64_t recoveries_ = 0;
   uint64_t output_drops_ = 0;
+  uint64_t output_target_drops_ = 0;
+  uint64_t capture_xruns_ = 0;
+  uint64_t playback_xruns_ = 0;
   uint64_t capture_bursts_ = 0;
   uint64_t settle_discarded_frames_ = 0;
+  uint64_t prefill_frames_ = 0;
   uint64_t gate_capture_xruns_ = 0;
   /// Mutable because query_occupancy() is const and this is a diagnostic it happens to compute.
   mutable uint64_t occupancy_mismatches_ = 0;

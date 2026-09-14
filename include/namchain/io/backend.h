@@ -51,6 +51,15 @@ struct BackendConfig
   /// Refuse a period size other than the one requested. On a device this is the guard against the
   /// silent rounding measured in §9.5.
   bool require_exact_period = true;
+  /// \brief Periods of already-processed audio the output ring is allowed to hold: the
+  /// latency-against-dropout-tolerance knob (§9.5 item 7).
+  ///
+  /// A **cap**, not a promise: the loop refuses a period that would take the ring past it, so a burst
+  /// cannot buy latency beyond the number. The ring's contents are conserved, so how much a run
+  /// actually holds is established by \ref AudioBackend::prefill_output_queue before the loop is timed
+  /// and spent by lateness afterwards. 0 means no cap, which is what every measurement before this
+  /// looked like. Must be less than \ref periods.
+  unsigned output_queue_periods = 0;
 };
 
 struct BackendInfo
@@ -70,6 +79,10 @@ struct BackendInfo
   unsigned playback_bytes_per_frame = 0;
   /// False when the backend could not give the requested period exactly.
   bool period_exact = false;
+  /// The output-queue target this backend is enforcing, in periods; 0 when it enforces none. Echoed
+  /// rather than re-read from the configuration so that the number a report states and the number the
+  /// write path acts on are the same one.
+  unsigned output_queue_periods = 0;
   std::string capture_name;
   std::string playback_name;
   /// The minimum a round trip through this backend can take, in frames: what its own buffers add
@@ -95,11 +108,30 @@ struct BackendInfo
 /// choosing to lose a period rather than wait for the device; `capture_bursts` is the loop having
 /// fallen a period behind; `settle_discarded_frames` is bring-up audio that the engine was never
 /// going to see. Zero, zero, and a small number is a healthy run (plan.md §9.5 item 4).
+///
+/// The device's own health counters travel with them because they are read at the same moment and
+/// answer the same question -- how much of this run's loss was the loop's decision and how much was
+/// the device's -- and because separating them is what a queue target has to be chosen against.
 struct StreamQueueStats
 {
   uint64_t output_drops = 0;
+  /// The subset of `output_drops` the queue target refused, as against the ring being full. The two
+  /// mean different things: a target refusal is the policy working (one period lost, latency held),
+  /// a ring-full refusal is the ring being the binding constraint, which a target below the ring's
+  /// capacity makes unreachable.
+  uint64_t output_target_drops = 0;
+  /// The output-queue target in force, in periods; 0 when there is none.
+  unsigned output_queue_periods = 0;
   uint64_t capture_bursts = 0;
   uint64_t settle_discarded_frames = 0;
+  /// \brief Silence written to establish \ref output_queue_periods before the timed loop started.
+  ///
+  /// The cushion cannot be built by the loop itself -- it produces one period of output per period of
+  /// input, so the ring only grows when a burst recovers a late period, which the target refuses -- and
+  /// the bring-up path spends a period of the primed queue. So the target is written in once, at the
+  /// last moment before the loop is timed and counted here, because "the queue was there from block 0"
+  /// has to be a checkable claim rather than a comment.
+  uint64_t prefill_frames = 0;
   /// Capture xruns the gate found rather than a read reporting them. A subset of driver_xruns(), and
   /// the interesting one: an xrun freezes the hardware pointer, so without this the gate waits for a
   /// period that can never arrive and the run dies of a stall it could have survived.
@@ -107,6 +139,15 @@ struct StreamQueueStats
   /// Samples where the backend's own idea of its queue disagreed with its pointer pair. Not a
   /// behaviour of the loop at all, but it is what says whether an occupancy figure can be trusted.
   uint64_t occupancy_mismatches = 0;
+  /// \brief Driver xruns by direction, and together they are driver_xruns() exactly.
+  ///
+  /// Kept apart because only one of them is a latency question: a capture overrun is the device
+  /// having produced a period the loop had not read yet (a function of how promptly the loop reads,
+  /// which an output queue cannot help), while a playback underrun is the output ring running dry --
+  /// precisely the event the queue target exists to prevent. The hour-long baseline reported 92
+  /// xruns as one number, and what a target would buy turned entirely on the split (§9.5 item 7).
+  uint64_t capture_overruns = 0;
+  uint64_t playback_underruns = 0;
 };
 
 /// \brief One full-duplex audio stream, whatever is behind it.
@@ -149,6 +190,11 @@ public:
   /// dropping converts an unbounded wait into a bounded, counted loss, and the count is what lets a
   /// gap in the audio be a reported number instead of an inference from percentiles.
   ///
+  /// A backend with a ring may also refuse on \ref BackendConfig::output_queue_periods, which is the
+  /// other half of the same decision: the ring's capacity answers "can this period go anywhere at
+  /// all", and the target answers "should this run carry another period of latency". The two refusals
+  /// are counted separately (see StreamQueueStats) because only the second is the policy working.
+  ///
   /// The default always writes: a backend with no ring cannot be full, and telling `file` to drop a
   /// period would silently remove audio from the output WAV.
   ///
@@ -161,6 +207,18 @@ public:
 
   /// Queue-control counters, where the backend has any. Zeroes for the backends with no rings.
   virtual StreamQueueStats queue_stats() const { return StreamQueueStats{}; }
+
+  /// \brief Bring the output queue up to its configured target, immediately before the timed loop.
+  ///
+  /// A no-op for every backend with no ring, and for a run with no target. It exists as a separate
+  /// step rather than being folded into `start` because the target has to be established *after* the
+  /// bring-up path, which spends part of whatever `start` primed: the ring's contents are conserved,
+  /// so a queue that begins a period short stays a period short (§9.5 item 7).
+  virtual bool prefill_output_queue(std::string& error)
+  {
+    (void)error;
+    return true;
+  }
 
   /// Unrecoverable breaks reported by whatever is underneath: ALSA `-EPIPE`, and nothing else.
   /// Always zero for the backends with no device, which is a fact about the measurement worth
