@@ -261,3 +261,78 @@ binary, same settings:
   it: it is reached by luck at bring-up and left as soon as the playback ring
   fills, which it does not recover from. The capture ring's minimum in the
   report is what tells you which branch you are on.
+
+  (Sections 7 and 8 below were written after the fix, and they replace the
+  "left branch" reading of the diagram: the left branch is now held by
+  construction rather than reached by luck.)
+
+
+7. REGIME 4 — THE BOUNDED QUEUE (what the loop does now)
+=======================================================
+
+  The fix is not a better settle phase; it is that the loop may no longer wait
+  for the device in the write. It asks whether the ring can take a period, and
+  if it cannot it drops the period and counts it. Three changes, one commit
+  each, all measured:
+
+    * try_write_playback: poll(POLLOUT) with a zero timeout, then write only if
+      the kernel says yes. A refusal is a dropped period -- a bounded, counted
+      loss of audio rather than an unbounded wait.
+    * wait_capture gates on the ring occupancy derived from the pointer pair,
+      and counts releases that find two periods waiting (the burst that used to
+      start the ratchet).
+    * bring-up drains the capture backlog, replacing each discarded period with
+      a silence period so the playback ring keeps exactly the prime it was
+      given.
+
+  The same 5-minute configuration as the runs above [m]:
+
+    before (regime 1/2)              after (regime 4)
+    write   p50   698 816 ns         write   p50     11 815 ns
+    block   p50 1 019 910 ns         block   p50    313 204 ns
+    block   p99    112.6 %           block   p99       50.4 %
+    chain   p99     45.7 %           chain   p99       48.6 %
+    playback ring 0..544             playback ring 0..255, mostly < 150
+    full-ring writes 224 239/225000  dropped periods 12/225 000
+    driver xruns 1                   driver xruns 15
+
+  The block time now describes the engine: read 3 us + chain 298 us + write
+  12 us = 313 us [m]. That is the whole point of the exercise, and it is the
+  difference between a number you can act on and one you cannot.
+
+
+8. THE REMAINING XRUNS ARE A TAIL, NOT THE QUEUE
+================================================
+
+  What is left after the fix is rare blocks that cost far more than p50. The
+  harness now records them, because a count of missed deadlines does not say
+  what to do about them [m], 4 x A2-Full, q=64:
+
+    render path  p50 300 us   p99 587 us   max 2 786 us of CPU
+    spikes       430 blocks using > 667 us of CPU, in 88 runs, over 90 s
+    shape        runs of 2-10 CONSECUTIVE blocks, not scattered singles
+    scheduling   100.0 % CPU over wall, 0 blocks lost to not being on CPU
+
+  Three readings of that, in order of how much they can be trusted:
+
+    1. It is not the engine's typical work. p50 is 300 us against a 1333 us
+       deadline and p99 is 44 %, so the engine has better than a 2x margin.
+    2. It is not preemption. CPU time equals wall time in the render path, and
+       no block lost measurable time to being descheduled. So an RT kernel does
+       not fix this by itself -- which is the opposite of what the p99 alone
+       would have suggested.
+    3. It is not proof that our code ran slowly either. Softirq work is charged
+       to whichever task the CPU was running, so an interrupt burst on the audio
+       core is indistinguishable from slow code in this measurement. Telling
+       those apart needs threadirqs or IRQ affinity, not a better timer.
+
+  Pinning the process to one core -- a documented tuning step that nothing in
+  this project had implemented -- halved it and did not remove it:
+
+    unpinned, 90 s    spikes 430 blocks/88 runs, overruns 47, drops 7
+    taskset -c 3      spikes 290 blocks/67 runs, overruns 25, drops 1
+
+  So the tail has (at least) two components: migration/sharing, which pinning
+  addresses, and something that survives being pinned, which is where IRQ
+  affinity or PREEMPT_RT is the next instrument rather than a faster DSP.
+

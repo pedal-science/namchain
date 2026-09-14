@@ -865,6 +865,12 @@ audio thread pinned to a dedicated core (workers and warm threads excluded; only
 IRQs are also moved); `vcgencmd get_throttled`/`measure_temp` in the health loop with a fan/Active
 Cooler mandatory for always-on low-latency use (G18).
 
+**Outstanding, and measured to matter (§9.5 item 6):** nothing in this project sets its own thread
+affinity yet -- the soak is pinned by `taskset` on the command line, and the engine does not pin at all.
+Pinning alone took the tail from 47 to 25 missed deadlines per 90 s in the same configuration, so the
+engine should do it for itself (and `namchain-doctor` should check it), and the `isolcpus`/IRQ-affinity
+half of the list above is untested.
+
 **Host target.** The assumed host is Linux with `PREEMPT_RT` and `threadirqs` *where the platform can
 supply one* — this Pi 500 can (`linux-image-rt-*`), and the checklist above is what we ship to make a
 stock kernel behave as well as it can. The engine must nevertheless be **correct on a non-RT kernel**:
@@ -1116,21 +1122,55 @@ number:
 4. **The output queue ratchets to full and has no restoring force** -- the one *design* fault this work
    exposed, and the reason the 1 h criterion-3 soak failed. Priming one period (item 2) starts the
    playback ring at one period of occupancy, but the loop then adds exactly one period per period the
-   device drains, so occupancy is a **conserved quantity**: any burst the capture gate allows (its test
-   is `delay >= period`, and `delay` arrives quantised in USB-frame steps, so a pass can leave `delay`
-   still above the threshold) pushes it up by a period, and nothing pulls it back down. The ceiling is
-   a fixed point, because a blocking write still delivers its period -- it just charges the wait to the
-   block. Measured after the cadence fix (`67a6ed7`), 300 s: `write` p50 **698 816 ns**, block p50
-   1 019 910 ns, block p99 **112.6 %** of the deadline, **224 239 of 225 000 blocks** writing into a
-   ring with less than a period of room -- while the engine's own `chain` p99 was **45.7 %** and the
-   self-oracle stayed exact. The fix is a **bounded output queue with an explicit policy**: never block
-   the RT thread on the device, and when the queue is above target, *choose* to drop or advance the
-   output timeline and re-align on the next device period. A longer settle phase at bring-up cannot do
-   it -- a settle phase chooses the initial occupancy, it cannot hold it.
-   - Open measurement question: the playback `delay` reads up to **544 frames against a 256-frame
-     buffer**, which a ring cannot hold. Until that is explained (URB in-flight frames, or the field not
-     meaning what we assume once saturated) occupancy is *evidence*, not a gate; the write-time
-     percentiles are the direct measurement, and they say the same thing.
+   device drains, so occupancy is a **conserved quantity**: any burst the capture gate allows pushes it
+   up by a period, and nothing pulls it back down. The ceiling is a fixed point, because a blocking
+   write still delivers its period -- it just charges the wait to the block. Measured after the cadence
+   fix (`67a6ed7`), 300 s: `write` p50 **698 816 ns**, block p50 1 019 910 ns, block p99 **112.6 %** of
+   the deadline, **224 239 of 225 000 blocks** writing into a ring with less than a period of room --
+   while the engine's own `chain` p99 was **45.7 %** and the self-oracle stayed exact.
+   - **Fixed 2026-09-14, in three parts** (`cb5cc19`, `dde1aa9`): the loop calls
+     `try_write_playback`, which asks the kernel's own `poll()` whether the ring can take a period and
+     **drops and counts the period if it cannot** instead of waiting for it; `wait_capture` gates on the
+     pointer-derived ring occupancy and counts releases that find two periods waiting; and bring-up
+     drains the capture backlog, replacing each discarded period with a silence period so the playback
+     ring is exactly as full as the one-period prime left it. Measured over 300 s: `write` p50 699 us ->
+     **11 815 ns**, block p50 1 019 910 -> **313 204 ns**, the playback ring 15..255 frames instead of
+     pinned at 256, and 12 dropped periods out of 225 000 rather than 224 239 blocked ones.
+   - **The 544-frames-against-256 anomaly is explained, and it was `delay` that was wrong.** Read
+     against `/proc/asound/card2/pcm0[cp]/sub0/status` while a stream ran: playback
+     `delay == (appl - hw) + 72` frames of USB in-flight audio, and capture `delay` carries an
+     intermittent `+48`, while `avail` agrees with the pointer pair in both directions at every one of
+     22 samples. So `delay` was never the ring occupancy, and the occupancy figures quoted before this
+     date were describing the wrong quantity. `ring_occupancy()` now derives the figure from the
+     pointers (`alsa::pcm_ring_frames`, unit-tested against those 22 samples), and
+     `StreamQueueStats::occupancy_mismatches` reports how often a backend's `delay` disagrees with it.
+5. **An xrun freezes `hw_ptr`, so a gate waiting on occupancy waits for ever.** Found at block 52 443
+   of an hour-long run: the soak died on `capture timed out after 2000 ms` with the capture ring frozen
+   at 13 frames. Nothing else could notice, because the gate is exactly what would have let a read
+   through, and a read is what reports `-EPIPE`. `wait_capture` now checks the PCM state, counts the
+   xrun, recovers, and carries the last state and ring occupancy in its timeout message, so the next
+   occurrence explains itself instead of ending a long run. **This is a stall the loop survives now**,
+   and it is counted separately (`gate_capture_xruns`) because a run that reports it is a different
+   claim from one that never met it.
+6. **What is left is a tail, and the tail is not the queue.** With the queue fixed, the failures are
+   isolated blocks that miss the deadline: 114 of 225 000 over 5 min, ~50 in 90 s, with the render path
+   costing **2.7-3.8 ms of CPU** where p50 is 300 us. Three facts, all measured, and the third is the
+   one that matters:
+   - The instrument is not the cost: a `CLOCK_THREAD_CPUTIME_ID` pair measures **333 ns**, against
+     300 us of work.
+   - The spikes arrive in **runs of consecutive blocks**, not scattered: typical groups of 2-10 blocks
+     (~3-13 ms), and in one 90 s run 430 such blocks formed 88 runs with one cluster every few
+     seconds. That is an external event or a shared-resource effect, not engine code.
+   - `cpu == wall` with **0 blocks losing time to not being on CPU** -- so this is *not* preemption, and
+     an RT kernel is not automatically the answer. **But it is not proof that our code ran slowly
+     either: softirq work is charged to whichever task the CPU was running**, so an IRQ burst on the
+     audio core appears as the engine's own CPU time. Distinguishing those two needs IRQ affinity or
+     `threadirqs`, not a better timer.
+   - **Pinning helps and is not yet implemented anywhere in the project.** `taskset -c 3` (the §9.3
+     checklist item) over the same 90 s: spikes 430 -> 290 blocks, runs 88 -> 67, deadline overruns
+     47 -> 25, drops 7 -> 1, bursts 18 -> 6. Half the tail, so the rest is not merely migration -- the
+     §9.3 list's `isolcpus`/IRQ-affinity half is still outstanding, and the engine does not yet set its
+     own thread affinity at all.
 
 **A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
 but the run does not keep real time at it: RTF 1.333, i.e. it loses a third. Instrumenting the loop to

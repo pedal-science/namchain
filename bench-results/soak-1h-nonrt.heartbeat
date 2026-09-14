@@ -1,0 +1,3 @@
+start       2026-09-14T16:45:37+01:00
+command     sudo -n chrt -f 80 taskset -c 3 ./build/namchain-soak --device hw:2,0 --capture-channels 8 --playback-channels 6 --quantum 64 --periods 4 --seconds 3600 --instances 4 --model build/generated/A2-Full.nam --input-channel 0 --output-channel 0 --self-oracle --oracle-window 5
+2026-09-14T16:45:37+01:00
