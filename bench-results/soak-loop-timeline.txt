@@ -1,0 +1,263 @@
+The soak loop's timeline, and the three regimes it has actually run in
+=====================================================================
+
+Configuration these numbers come from, unless stated otherwise:
+
+  device      SSL 2+ Mk II, card 2, hw:2,0, S32_LE
+  quantum     64 frames, 4 periods      ->  deadline T = 64/48000 = 1333.3 us
+  buffer      256 frames = 4 periods    ->  5.333 ms of ring, per direction
+  chain       4 x A2-Full (A2PlanarFull)
+  pacing      SCHED_FIFO 80, mlockall, performance governor, no throttling
+
+Every figure marked [m] below is measured. Figures marked [d] are derived from
+the cadence arithmetic and say so, because the interesting quantity in a
+healthy loop is the time the loop *does not* spend working.
+
+The measured phases [m], 120 s run, commit 67a6ed7:
+
+  read         2 888 ns   p50
+  chain      304 075 ns   p50        547 243 ns  p99   (41.0% of the deadline)
+  write      175 056 ns   p50
+  block      501 465 ns   p50      1 499 413 ns  p99   (112.4% of the deadline)
+  device wait 509 057 ns  p50      1 196 782 ns  p99
+  rings       capture 0..274 frames, playback 0..492 frames
+  driver xruns  1 in 120 s           RTF 0.9999
+
+The loop is: wait_capture -> read -> chain -> write -> wait_capture -> ...
+
+
+1. THE CYCLE, AND WHERE THE DEADLINE SITS
+=========================================
+
+One period, healthy (capture-paced). The loop's work is 482 us of the 1333 us
+period, and the remaining 851 us is spent waiting for the device to produce the
+next period. [d] for the split of the wait; [m] for the work.
+
+  t=0 is the moment the previous write returned.
+
+  us    0        200       400       600       800      1000      1200  1333
+        |---------|---------|---------|---------|---------|---------|-----|
+        |                                                               |
+        |<-------------------- wait_capture 851 us [d] ---------------->|
+        |                                                               |
+                                                                        ^
+                                                                        |
+        then the work, drawn here on its own line so it is visible:      |
+                                                                        |
+        +-- the work starts at the period boundary ----------------------+
+        |
+        v
+  us    0    100   200   300   400   500   600   700   800   900  1000  1100  1200  1333
+        |-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+        [rd][======= chain 304 us [m] =======][== write 175 us [m] ==]
+        |                                                                          |
+        +--- block = 501 us [m] = 37.6% of the deadline -------------------------+
+                                                                                   |
+                                                     deadline expires here ------+
+
+  The engine finishes 832 us before the deadline. This is the state the loop is
+  supposed to be in, and the state it is in now.
+
+  Note what the "block" measures: read + chain + write. The wait is deliberately
+  outside it, because measuring from the start of the wait would just report the
+  period length.
+
+
+2. WHERE THE XRUNS ARE, AND WHERE THEY ARE NOT
+==============================================
+
+There are three places a period can go wrong, and they are different failures.
+The diagram below is the *same* cycle, drawn against what the device is doing.
+
+  device capture      |P0       |P1       |P2       |P3       |P4       |
+  (produces 64/1333)   ^         ^         ^         ^         ^
+                       |         |         |         |         |
+  loop iteration 1 ----+---------+---------+---------+---------+----
+                       |         |         |         |         |
+     [wait][work]      |         |         |         |         |
+                       |         |         |         |         |
+  loop iteration 2 ------------+---------+---------+---------+------
+                               |         |         |         |
+     [wait][work]              |         |         |         |
+                               |         |         |         |
+  loop iteration 3 ----------------------+---------+---------+------
+                                         |         |         |
+     [wait][work]                        |         |         |
+                                         |         |         |
+  loop iteration 4 --------------------------------+---------+------
+                                                   |         |
+     [wait][work]                                  |         |
+                                                   |         |
+
+  A. THE PERIOD IS MET, AND THE NEXT ONE IS ALREADY HALF FULL.       <- healthy
+     The wakeup happens because the device said "another period is ready",
+     so the loop's work always starts at a period boundary. The wait absorbs
+     any jitter: a work phase that takes 600 us instead of 500 us simply
+     leaves 251 us less waiting. Nothing accumulates. This is why the loop can
+     hold RTF 0.9999 for an hour on a non-RT kernel.
+
+  B. THE PERIOD IS MET, BUT THE WORK FINISHED LATE.                  <- xrun risk
+     If the work exceeds 1333 us the loop starts the next period already
+     behind. The device meanwhile has kept producing. That is the only route
+     to a *capture* overrun, and it is a statement about the engine, not the
+     device.
+
+  C. THE WRITE HAD NOWHERE TO PUT THE PERIOD.                        <- xrun risk
+     The playback ring is a queue that the device drains at the same 64/1333.
+     If the loop writes when the ring has less than a period of room, the
+     write blocks. That is not the engine failing, but it does consume the
+     period's slack, and if it consumes enough of it the loop misses a wakeup
+     and we are in B.
+
+  Measured today: 1 driver xrun in 120 s, and its likely home is C drifting
+  into B. 23 in the hour-long run of regime 1 below, where C was permanent.
+
+
+3. REGIME 1 — PACED BY THE PLAYBACK RING (the hour that failed)
+==============================================================
+
+What the device saw, and what the loop did. This is the *old* code, before
+sw_params was issued: poll woke on a threshold that was not a period.
+
+  period:        P0        P1        P2        P3        P4        P5
+  capture ring:  |---------|---------|---------|---------|---------|----
+                 ^
+                 one late period leaves 64 frames here, and they never leave
+
+  iteration 1    [w][rd][chain 295 us][------- write blocks 699 us -------]
+  iteration 2     [rd][chain 295 us][------ write blocks 699 us -------]
+  iteration 3      [rd][chain 295 us][----- write blocks 699 us ------]
+  iteration 4       [rd][chain 295 us][---- write blocks 699 us ----]
+
+  device wait   p50      8 241 ns   [m]   <- never waits: the backlog satisfies
+                                             "a period is available" for ever
+  write         p50    698 986 ns   [m]   <- and so the write becomes the clock
+  block         p50    993 167 ns   [m]      8 + 2.6 + 295 + 699 = 1005 us [d]
+  block         p99  1 500 704 ns   [m]   = 112.55% of the deadline
+  driver xruns          23 / hour   [m]
+  RTF                   0.9999      [m]   <- real time held: the ring is the clock
+
+  Why it is self-sustaining and does not recover: the capture ring holds a
+  backlog, so `poll` returns immediately for ever. The loop free-runs until the
+  playback ring is full, and then every write waits for the device to drain a
+  period -- up to a full period, 699 us on average. The loop reads exactly one
+  period per period, so the backlog neither grows nor shrinks. It is a fixed
+  point, and it cost ~10.7 ms of round-trip latency (one capture buffer plus one
+  playback buffer) that nothing would ever have given back.
+
+  The tell, and the reason the instrumentation now exists: identical engine work
+  (chain 295 us), completely different percentiles, and no way to tell from the
+  percentiles which state the loop was in.
+
+
+4. REGIME 2 — PACED BY THE DEVICE, UNTIL THE PLAYBACK RING FILLS
+================================================================
+
+This is the state after the cadence fix, and the 5-minute confirmation run is
+what it actually does -- which is *not* simply "healthy". Two runs of the same
+binary, same settings:
+
+  120 s run   device wait p50   509 us   write p50   175 us   xruns 1
+              capture 0..274          playback 0..492        block p99 112.4%
+  300 s run   device wait p50  9 463 ns  write p50 698 816 ns  xruns 1
+              capture 0..263          playback 0..544        block p99 112.6%
+
+  So the capture side no longer latches -- its minimum is 0 in both runs, so it
+  returns to empty and the gate does block again:
+
+  capture ring:  |---|===|---|===|---|===|0|---|===|---|===|---|===|----
+                 ^   ^   ^   ^   ^   ^
+                 drains to zero between periods: no permanent capture backlog
+
+  but the *playback* ring saturates and stays saturated, and the write's wait
+  for room is what fills the block time:
+
+  iteration   [rd][chain 300][------------ write blocks 699 us ------------]
+              ^                 ^
+              the gate let this  the playback ring has < 1 period of room, so
+              one through early   the write waits for the device to drain one
+
+  device wait    p50        9 463 ns [m]   <- half the blocks no longer wait at
+  device wait    p99    1 198 059 ns [m]      all: the ring oscillates
+  write          p50      698 816 ns [m]
+  block          p50    1 019 910 ns [m]
+  block          p99    1 501 170 ns [m]   = 112.59% of the deadline
+  chain          p99      609 686 ns [m]   =  45.73% of the deadline
+  driver xruns              1 / 300 s [m]  <- against 23 in the hour before the
+  RTF                      0.9999     [m]     fix, and 1 in the 120 s run too
+
+  What this shows, honestly: the cadence fix removed the *capture* half of the
+  latch and left the xrun count essentially at the noise floor (1 per run), but
+  it did not stop the loop being paced by a saturated playback ring -- it just
+  moved which ring does it. 224 239 of 225 000 blocks wrote into a ring with
+  less than a period of room, so roughly 700 us of every period is the write
+  waiting for the device, and that is inside the reported block time.
+
+  The likely reason it gets there, and the thing to fix next: at bring-up the
+  capture ring already holds a period or two, so the gate lets the first few
+  iterations through immediately; each writes a period, and the playback ring
+  fills to 256 within four iterations. The device then drains one period per
+  period while the loop writes one per period, so the occupancy is a fixed
+  point -- it never comes back down. A settle phase before the timed loop
+  (read and discard capture until the ring is below a period, and wait for the
+  playback ring to have room) would start the loop from a known low occupancy
+  instead of hoping it finds one.
+
+
+5. REGIME 3 — THE FIX I GOT WRONG (kept, because it is instructive)
+==================================================================
+
+  The first attempt gated on "has a period of *production* happened since my
+  last read", which sounds stricter and is in fact rate-deficient: production
+  continues while the engine works, so that time is spent twice.
+
+        |<---------- wait for 64 NEW frames since last read 1333 us [d] --------->|
+        [rd][chain 304][write 175]
+        |                                                                        |
+        +---------------------- cycle = 1637 us, against a 1333 us period [d] ---+
+
+  cycle 1637 us > period 1333 us  ->  the loop consumes 64 frames per 1637 us
+  while the device produces 64 per 1333 us  ->  it falls behind by 18%, for ever.
+
+  RTF               1.1749        [m]     <- the run took 352 s to do 300 s
+  driver xruns      39 170 / 5 min [m]
+  block p99         139.26%       [m]     <- and the block looked *worse*, not
+                                             better, because the ring filled
+  first overrun     block 22      [m]
+
+  The lesson the diagram makes plain: there are two clocks in this system -- the
+  device's period and the loop's work -- and a correctness argument has to be
+  about the first one. Both of my first two attempts argued about the second.
+
+
+6. SUMMARY, AS ONE PICTURE
+==========================
+
+                          is the loop woken by the device's period?
+                                     |                    |
+                                    yes                   no
+                                     |                    |
+                    +----------------+----------------+   |
+                    |                                 |   |
+        does the work fit in the period?               |   |
+                    |                 |               |   |
+                   yes                no              |   |
+                    |                 |               |   |
+                    v                 v               v   v
+              +-----------+   +--------------+   +-----------------+
+              |  HEALTHY  |   | capture over-|   | paced by the    |
+              |           |   | run (=xrun), |   | playback ring:  |
+              | block 38% |   | engine's     |   | write blocks,   |
+              | chain 41% |   | fault        |   | block = work +  |
+              | 1 xrun /  |   |              |   | ring wait       |
+              | 2 min     |   |              |   |                 |
+              +-----------+   +--------------+   +-----------------+
+               seen for 120 s    not yet seen       regime 1 and, over
+               after the fix,                      5 minutes, regime 2
+               not since                           23 xruns/hour before
+                                                   the fix, 1 after
+
+  The left branch exists and has been measured, but nothing keeps the loop in
+  it: it is reached by luck at bring-up and left as soon as the playback ring
+  fills, which it does not recover from. The capture ring's minimum in the
+  report is what tells you which branch you are on.
