@@ -156,6 +156,47 @@ TEST_CASE("opening a device that does not exist fails cleanly")
   CHECK_FALSE(error.empty());
 }
 
+TEST_CASE("ring occupancy comes from the pointers, and matches the kernel's own avail")
+{
+  // Fixtures read from /proc/asound/card2/pcm0[cp]/sub0/status while a stream ran on the SSL 2+ Mk
+  // II, buffer 256 frames. Each triple is (hw_ptr, appl_ptr, the kernel's `avail`), and they are
+  // worth keeping as a test for three reasons: the raw pointers run far past the buffer length (up
+  // to 87 616 against a 256-frame ring), so the modulo has to be taken on the subtraction rather
+  // than on each pointer; `avail` is an independent check in both directions; and the field that
+  // disagrees, `delay`, is in the same snapshot to show why it is not the one to use.
+  struct Sample
+  {
+    unsigned long long hw_ptr;
+    unsigned long long appl_ptr;
+    long long avail;
+  };
+  const Sample capture[] = {{7177, 7168, 9},   {15170, 15168, 2},  {23235, 23232, 3},
+                            {31276, 31232, 44}, {39294, 39232, 62}, {47311, 47296, 15},
+                            {55328, 55296, 32}, {63321, 63296, 25}, {71338, 71296, 42},
+                            {79403, 79360, 43}, {87420, 87360, 60}};
+  for (const Sample& s : capture)
+    CHECK(namchain::alsa::pcm_ring_frames(s.hw_ptr, s.appl_ptr, 256, true) ==
+          static_cast<unsigned long long>(s.avail));
+
+  // Playback has the opposite polarity, and `avail` there is the *room*, i.e. buffer - ring.
+  const Sample playback[] = {{7225, 7360, 121},  {15218, 15424, 50}, {23283, 23488, 51},
+                             {31324, 31488, 92}, {39342, 39488, 110}, {47359, 47552, 63},
+                             {55352, 55552, 56}, {63393, 63552, 97},  {71434, 71616, 74},
+                             {79475, 79616, 115}, {87468, 87616, 108}};
+  for (const Sample& s : playback)
+    CHECK(namchain::alsa::pcm_ring_frames(s.hw_ptr, s.appl_ptr, 256, false) ==
+          256ull - static_cast<unsigned long long>(s.avail));
+
+  // The case a per-pointer modulo gets wrong: appl_ptr has wrapped past a buffer boundary while
+  // hw_ptr has not, so the pointers are in different buffer epochs. 205 frames are queued; reducing
+  // each pointer first yields 141, which is still inside the ring and would have been believed.
+  CHECK(namchain::alsa::pcm_ring_frames(23283, 23488, 256, false) == 205);
+
+  // Degenerate inputs are answered rather than divided by.
+  CHECK(namchain::alsa::pcm_ring_frames(1000, 1000, 256, false) == 0);
+  CHECK(namchain::alsa::pcm_ring_frames(1000, 1000, 0, true) == 0);
+}
+
 TEST_CASE("an invalid channel count is rejected before touching the device")
 {
   namchain::AlsaRawConfig config;

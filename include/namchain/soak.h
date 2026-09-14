@@ -127,6 +127,34 @@ struct SoakResult
   /// write waited for; this one is the render path alone, and on a device whose playback ring runs
   /// near-full it is the difference between a measurement of the engine and one of the queue.
   uint64_t chain_p99_ns = 0;
+  /// Phase tails. The p99s say which phase is *usually* slow; the maxes say which one produced the
+  /// handful of blocks that missed the deadline. That distinction decides whether a deadline overrun
+  /// is the engine's fault or the host's: a chain max below the deadline with a read or write max
+  /// above it is a syscall or a scheduling excursion, and the engine never missed anything.
+  uint64_t chain_max_ns = 0;
+  uint64_t read_p99_ns = 0;
+  uint64_t read_max_ns = 0;
+  uint64_t write_p99_ns = 0;
+  uint64_t write_max_ns = 0;
+  /// \brief The render path's own CPU time, as against the wall time above.
+  ///
+  /// `chain_max_ns` is wall time, so it counts the process being descheduled as if it were the
+  /// engine working. These separate the two, and they are what decides whether a deadline overrun is
+  /// something to optimise or something to schedule:
+  ///
+  ///  - `chain_cpu_max_ns` below the deadline while `chain_max_ns` is above it means the engine never
+  ///    needed more than a period of CPU, and the blocks that missed were the host taking the CPU
+  ///    away. That is the RT-kernel question, not a DSP one.
+  ///  - `chain_cpu_max_ns` above the deadline would be the engine genuinely too slow, which is a
+  ///    different fix.
+  ///
+  /// `chain_stall_blocks` counts blocks that lost at least \ref stall_threshold_ns of their render
+  /// path to not being on CPU, which is the event that turns into an xrun.
+  uint64_t chain_cpu_max_ns = 0;
+  uint64_t chain_cpu_ns = 0;
+  uint64_t chain_wall_ns = 0;
+  uint64_t chain_stall_blocks = 0;
+  static constexpr uint64_t stall_threshold_ns = 500000;
   uint64_t wait_p99_ns = 0;
   uint64_t wait_max_ns = 0;
   uint64_t p50_ns = 0;
@@ -192,6 +220,10 @@ struct SoakResult
   /// Frames read and discarded before the timed loop so it started from a known capture occupancy.
   /// Bring-up audio, not a dropped period.
   uint64_t settle_discarded_frames = 0;
+  /// Capture xruns the *gate* found rather than a read reporting them. A subset of driver_xruns().
+  /// Without detecting these, an xrun freezes the hardware pointer and the gate waits for a period
+  /// that cannot arrive, so the run ends in a stall timeout instead of counting a recoverable xrun.
+  uint64_t gate_capture_xruns = 0;
   /// Samples where the backend's delay disagreed with its own pointer pair. Non-zero means an
   /// occupancy figure from that backend cannot be used as evidence until it is explained.
   uint64_t occupancy_mismatches = 0;

@@ -207,6 +207,18 @@ PcmFormat pcm_format(unsigned format)
   }
 }
 
+unsigned long long pcm_ring_frames(unsigned long long hw_ptr, unsigned long long appl_ptr,
+                                   unsigned long long buffer_frames, bool capture)
+{
+  if (buffer_frames == 0)
+    return 0;
+  // Subtract the raw values. Doing it as (appl % buffer) - (hw % buffer) is wrong whenever the two
+  // pointers fall in different buffer epochs, and wrong by a multiple of the buffer length, which is
+  // exactly the kind of error that looks plausible in a report.
+  return capture ? (hw_ptr + buffer_frames - appl_ptr) % buffer_frames
+                 : (appl_ptr + buffer_frames - hw_ptr) % buffer_frames;
+}
+
 } // namespace alsa
 } // namespace namchain
 

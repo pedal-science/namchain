@@ -61,6 +61,26 @@ bool params_single_value(const struct snd_pcm_hw_params& params, unsigned param,
 /// Clamp `requested` into [min, max], which is what the kernel does to a too-small period.
 unsigned clamp_to_bounds(unsigned requested, unsigned min, unsigned max);
 
+/// \brief Frames actually sitting in a PCM ring, derived from the pointer pair ALSA reports.
+///
+/// This is the way to ask how full a ring is, and `status.delay` is not. On the SSL 2+ Mk II the
+/// playback delay counts the frames already handed to the USB host controller as well as the ring
+/// contents -- a constant +72 frames in a sample taken three times via /proc/asound, and larger when
+/// the ring is busy -- and the capture delay carries an intermittent +48. That is how a 256-frame
+/// ring came to report 544 frames of "occupancy" (plan.md §9.5). `status.avail` agrees with this
+/// figure in both directions at every sample taken, and is what poll() readiness is computed from.
+///
+/// The kernel's \p hw_ptr and \p appl_ptr run up to an internal boundary rather than wrapping at the
+/// buffer length, so the difference is taken modulo \p buffer_frames. Getting that wrong is easy and
+/// silent -- reducing each pointer first and then subtracting is not the same as subtracting the raw
+/// values when they sit in different buffer epochs -- which is why this is a tested function rather
+/// than an expression inline in the ioctl wrapper.
+///
+/// \param capture selects the direction the pointers describe: capture counts `hw - appl`, playback
+/// `appl - hw`. \return the ring contents in frames, in `[0, buffer_frames)`.
+unsigned long long pcm_ring_frames(unsigned long long hw_ptr, unsigned long long appl_ptr,
+                                   unsigned long long buffer_frames, bool capture);
+
 } // namespace alsa
 } // namespace namchain
 

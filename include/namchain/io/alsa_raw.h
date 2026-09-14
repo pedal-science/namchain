@@ -196,6 +196,12 @@ public:
   /// Frames read and discarded before the timed loop to establish a known-empty capture ring.
   /// This is bring-up audio the engine was never going to process, not a dropped period.
   uint64_t settle_discarded_frames() const { return settle_discarded_frames_; }
+  /// Capture overruns found by the *gate* rather than by a read returning `-EPIPE`. These are xruns
+  /// that would otherwise have stalled the loop for its whole timeout, because an xrun freezes the
+  /// hardware pointer and the gate is the only thing waiting on it. Counted separately from
+  /// driver_xruns() only so the report can distinguish "the read told us" from "the gate found a
+  /// dead stream": both are driver xruns and both are included in driver_xruns().
+  uint64_t gate_capture_xruns() const { return gate_capture_xruns_; }
   /// Samples where `status.delay` disagreed with the pointer-derived ring occupancy. On this device
   /// that is *expected* for playback and never happens for capture: playback delay carries the
   /// driver's in-flight offset (see AlsaRawOccupancy). Kept as a counter because "the field we were
@@ -242,6 +248,7 @@ private:
   uint64_t output_drops_ = 0;
   uint64_t capture_bursts_ = 0;
   uint64_t settle_discarded_frames_ = 0;
+  uint64_t gate_capture_xruns_ = 0;
   /// Mutable because query_occupancy() is const and this is a diagnostic it happens to compute.
   mutable uint64_t occupancy_mismatches_ = 0;
 };

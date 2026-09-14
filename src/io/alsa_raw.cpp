@@ -27,6 +27,22 @@ std::string errno_text(const std::string& what)
   return what + ": " + std::strerror(errno);
 }
 
+/// \brief The message a capture-gate timeout carries.
+///
+/// "capture timed out" alone cannot distinguish a device that stopped delivering from a gate that
+/// stopped being satisfiable, and a timeout is what ends a long soak -- so the last state and ring
+/// occupancy the gate saw, and how many xruns it recovered, travel with the error. The ring figure
+/// matters most: an xrun freezes the pointer, so a ring that stopped growing is the signature.
+std::string timeout_text(int timeout_ms, int state, long long ring, uint64_t gate_xruns)
+{
+  std::string text = "capture timed out after " + std::to_string(timeout_ms) + " ms (last state " +
+                     std::to_string(state) + ", ring " + std::to_string(ring) + " frames";
+  if (gate_xruns > 0)
+    text += ", " + std::to_string(gate_xruns) + " capture xruns recovered at the gate";
+  text += ")";
+  return text;
+}
+
 bool parse_card_device(const std::string& text, unsigned& card, unsigned& device)
 {
   unsigned c = 0;
@@ -352,20 +368,24 @@ bool AlsaRawDuplex::prime_playback(std::string& error)
 
 bool AlsaRawDuplex::drain_capture(std::string& error)
 {
-  // Settle the capture side before the playback stream exists. The device has been producing since
-  // capture START, and however many periods accumulated in that window are periods the loop would
-  // otherwise read back-to-back -- and, because it writes one period per read, write back-to-back
-  // into a playback ring that was primed with exactly one. That burst is the first step of the
-  // ratchet in plan.md §9.5 item 4: each backlog period becomes an extra queued period, the ring
-  // reaches its ceiling, and the write's wait for space becomes the reported block time for ever
-  // after. Draining here makes the timed loop's starting occupancy a known number instead of
-  // however long bring-up took.
+  // Settle the capture side before the timed loop. The device produces from capture START, and
+  // however many periods accumulated before the loop was ready would otherwise be read back to back
+  // -- and, because the loop writes one period per read, written back to back into a playback ring
+  // that was primed with exactly one. That burst is the first step of the ratchet in plan.md §9.5
+  // item 4: each backlog period becomes an extra queued period, the ring reaches its ceiling, and
+  // the write's wait for space then becomes the reported block time for ever after. Draining here
+  // makes the loop's starting occupancy a known number instead of however long bring-up took.
   //
-  // Discarding is correct rather than lossy: these are frames captured before the engine had a
-  // graph to run them through. They are counted so the report can say how many.
+  // Each discarded period is replaced with a period of silence on the playback side. That is not
+  // cosmetic: the ring was primed with one period and nothing else feeds it while this runs, so
+  // discarding without writing would drain the prime and hand the loop an empty ring. With the
+  // replacement the ring is exactly as full as the prime left it, and the discarded audio is
+  // bring-up capture the engine never had a graph for. It is counted so the report can say how much.
   //
-  // The bound is the ring itself: a backlog cannot exceed one buffer, so a couple of periods of
-  // slack over that is already more iterations than the device can have produced.
+  // Both streams must already be running before this is called. An earlier version drained between
+  // capture START and playback START, which leaves the capture stream running with no playback
+  // stream beside it -- on a device whose capture endpoint takes implicit feedback from playback,
+  // that is a stream behaving unlike the one the loop will see.
   const unsigned max_blocks = info_.period_size == 0 ? 0 : info_.buffer_size / info_.period_size + 2;
   for (unsigned i = 0; i < max_blocks; ++i)
   {
@@ -377,12 +397,17 @@ bool AlsaRawDuplex::drain_capture(std::string& error)
       return true;
     if (read_capture(drain_buffer_.data(), info_.period_size, 1000, ignored) < 0)
     {
-      // A read failure here is not fatal: the loop's own gate and the xrun counter handle a device
-      // that will not give us a period. Leaving the backlog is the old behaviour, not a new fault.
+      // Not fatal: the loop's own gate and the xrun counter handle a device that will not give us a
+      // period. Leaving the backlog is the old behaviour, not a new fault.
       error.clear();
       return true;
     }
     settle_discarded_frames_ += info_.period_size;
+    if (write_playback(prime_silence_.data(), info_.period_size, 1000, ignored) < 0)
+    {
+      error.clear();
+      return true;
+    }
   }
   return true;
 }
@@ -394,20 +419,6 @@ bool AlsaRawDuplex::start(std::string& error)
     error = errno_text("capture PREPARE failed");
     return false;
   }
-
-  // Capture starts first, alone, so the backlog it accumulated between PREPARE and here can be
-  // discard-read before the playback ring is primed. Doing it the other way round means the settle
-  // reads have to be accompanied by writes to keep the playback stream alive, which adds exactly
-  // the periods the settle is trying to remove.
-  if (::ioctl(capture_fd_, SNDRV_PCM_IOCTL_START) < 0)
-  {
-    error = errno_text("capture START failed");
-    return false;
-  }
-
-  if (!drain_capture(error))
-    return false;
-
   if (::ioctl(playback_fd_, SNDRV_PCM_IOCTL_PREPARE) < 0)
   {
     error = errno_text("playback PREPARE failed");
@@ -420,6 +431,12 @@ bool AlsaRawDuplex::start(std::string& error)
   // write's wait for space became the clock in the first measurement round (§9.5 item 2).
   if (!prime_playback(error))
     return false;
+
+  if (::ioctl(capture_fd_, SNDRV_PCM_IOCTL_START) < 0)
+  {
+    error = errno_text("capture START failed");
+    return false;
+  }
 
   // The priming write above may already have reached the kernel's start threshold, in which case
   // the stream is RUNNING and START reports EBADFD. That is success, not failure -- but confirm it
@@ -436,7 +453,8 @@ bool AlsaRawDuplex::start(std::string& error)
       return false;
     }
   }
-  return true;
+
+  return drain_capture(error);
 }
 
 void AlsaRawDuplex::stop()
@@ -525,6 +543,11 @@ int AlsaRawDuplex::read_capture(void* dst, unsigned frames, int timeout_ms, std:
 bool AlsaRawDuplex::wait_capture(int timeout_ms, std::string& error)
 {
   const auto started = std::chrono::steady_clock::now();
+  // Reported in the timeout message. "capture timed out" on its own cannot distinguish a device that
+  // stopped delivering from a gate that stopped being satisfiable, and the timeout is what ends a
+  // long soak -- so the state and the ring that produced it travel with the error.
+  int last_state = SNDRV_PCM_STATE_OPEN;
+  long long last_ring = -1;
 
   for (;;)
   {
@@ -538,15 +561,41 @@ bool AlsaRawDuplex::wait_capture(int timeout_ms, std::string& error)
     // RTF 1.175 and 39 170 xruns in five minutes, against RTF 0.9999 for this one.
     AlsaRawOccupancy status;
     std::string ignored;
-    if (query_occupancy(true, status, ignored) &&
-        status.ring_frames >= static_cast<long long>(info_.period_size))
+    if (query_occupancy(true, status, ignored))
     {
-      // A release with two periods already waiting means the loop is a period behind and will read
-      // twice almost together. Counting it is the whole diagnostic for the ratchet in §9.5 item 4:
-      // the burst is what turns one late period into a permanently full playback ring.
-      if (status.ring_frames >= static_cast<long long>(2 * info_.period_size))
-        ++capture_bursts_;
-      return true;
+      last_state = status.state;
+      last_ring = status.ring_frames;
+      // An xrun on the capture stream stops the hardware pointer advancing, so the gate below would
+      // wait for a period that can never arrive: the stream is dead, not slow. This is the one place
+      // the loop can notice, because the gate is exactly what would have let a read through, and a
+      // read is what reports -EPIPE. Without this the soak aborts on a two-second "capture timed
+      // out" -- observed at block 52 443 of an hour-long run, with the ring frozen at 13 frames --
+      // which is a stall the run could have survived and reported instead of dying of.
+      if (status.state == SNDRV_PCM_STATE_XRUN)
+      {
+        ++driver_xruns_;
+        ++gate_capture_xruns_;
+        last_state = status.state;
+        last_ring = status.ring_frames;
+        recover(capture_fd_, false);
+        continue; // re-check against the remaining timeout, now on a prepared stream
+      }
+      if (status.state == SNDRV_PCM_STATE_SUSPENDED || status.state == SNDRV_PCM_STATE_DISCONNECTED)
+      {
+        error = std::string("capture stream is ") +
+                (status.state == SNDRV_PCM_STATE_SUSPENDED ? "suspended" : "disconnected");
+        return false;
+      }
+
+      if (status.ring_frames >= static_cast<long long>(info_.period_size))
+      {
+        // A release with two periods already waiting means the loop is a period behind and will read
+        // twice almost together. Counting it is the whole diagnostic for the ratchet in §9.5 item 4:
+        // the burst is what turns one late period into a permanently full playback ring.
+        if (status.ring_frames >= static_cast<long long>(2 * info_.period_size))
+          ++capture_bursts_;
+        return true;
+      }
     }
 
     const auto elapsed =
@@ -554,7 +603,7 @@ bool AlsaRawDuplex::wait_capture(int timeout_ms, std::string& error)
     const int remaining = timeout_ms - static_cast<int>(elapsed);
     if (remaining <= 0)
     {
-      error = "capture timed out after " + std::to_string(timeout_ms) + " ms";
+      error = timeout_text(timeout_ms, last_state, last_ring, gate_capture_xruns_);
       return false;
     }
 
@@ -566,7 +615,7 @@ bool AlsaRawDuplex::wait_capture(int timeout_ms, std::string& error)
     const int ready = ::poll(&pfd, 1, remaining);
     if (ready == 0)
     {
-      error = "capture timed out after " + std::to_string(timeout_ms) + " ms";
+      error = timeout_text(timeout_ms, last_state, last_ring, gate_capture_xruns_);
       return false;
     }
     if (ready < 0)
@@ -657,9 +706,7 @@ bool AlsaRawDuplex::query_occupancy(bool capture, AlsaRawOccupancy& out, std::st
   // the old occupancy figure could exceed the ring it was describing. Capture has no such offset.
   if (info_.buffer_size != 0)
   {
-    const unsigned long long buffer = info_.buffer_size;
-    out.ring_frames = static_cast<long long>(capture ? (out.hw_ptr + buffer - out.appl_ptr) % buffer
-                                                     : (out.appl_ptr + buffer - out.hw_ptr) % buffer);
+    out.ring_frames = static_cast<long long>(alsa::pcm_ring_frames(out.hw_ptr, out.appl_ptr, info_.buffer_size, capture));
     if (out.ring_frames != out.delay_frames)
       ++occupancy_mismatches_;
   }

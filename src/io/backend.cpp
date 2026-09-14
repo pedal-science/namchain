@@ -323,6 +323,7 @@ public:
     stats.output_drops = device_->output_drops();
     stats.capture_bursts = device_->capture_bursts();
     stats.settle_discarded_frames = device_->settle_discarded_frames();
+    stats.gate_capture_xruns = device_->gate_capture_xruns();
     stats.occupancy_mismatches = device_->occupancy_mismatches();
     return stats;
   }

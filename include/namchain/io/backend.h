@@ -100,6 +100,10 @@ struct StreamQueueStats
   uint64_t output_drops = 0;
   uint64_t capture_bursts = 0;
   uint64_t settle_discarded_frames = 0;
+  /// Capture xruns the gate found rather than a read reporting them. A subset of driver_xruns(), and
+  /// the interesting one: an xrun freezes the hardware pointer, so without this the gate waits for a
+  /// period that can never arrive and the run dies of a stall it could have survived.
+  uint64_t gate_capture_xruns = 0;
   /// Samples where the backend's own idea of its queue disagreed with its pointer pair. Not a
   /// behaviour of the loop at all, but it is what says whether an occupancy figure can be trusted.
   uint64_t occupancy_mismatches = 0;

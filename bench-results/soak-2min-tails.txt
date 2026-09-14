@@ -1,0 +1,33 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 256 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+chain:            4 x build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/214, playback min/max 0/240 frames (5 blocks wrote into a full playback ring)
+queue control:    1 output drops (gate <= 0), 6 capture bursts
+capture xruns:    3 found by the gate (a subset of the driver xruns below: an
+                  xrun freezes hw_ptr, so without this the loop stalls instead)
+occupancy check:  179954 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           90000
+audio:            120.000 s in 120.011 s wall (RTF 1.0001)
+deadline:         1333333 ns
+split (p50):      read 2926 ns, chain 298704 ns, write 10945 ns
+split (tail):     read p99 6426 max 73518, chain p99 587297 max 2785635, write p99 14870 max 2157541 ns
+chain p99:        587297 ns (44.05% of deadline)
+device wait:      p50 1176077 ns, p99 1199484 ns, max 2747486 ns
+block time:       p50 312798 ns, p99 602927 ns, max 4569026 ns
+p99/deadline:     45.22% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+bring-up xruns:   1 (before the measured loop)
+first overrun at: block 13507 of 90000
+deadline overruns:53
+driver xruns:     9
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           FAIL

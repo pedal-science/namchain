@@ -40,6 +40,7 @@ void usage()
                "                       (default 60; the input has to be kept to re-render it)\n"
                "  --sample-rate N      engine rate in Hz (default 48000)\n"
                "  --max-p99-percent X  gate on p99 block time, %% of deadline (default 50)\n"
+               "  --max-output-drops N  gate on periods dropped for want of output room (default 0)\n"
                "  --json               print a JSON summary instead of text\n"
                "stream mode (a backend drives the loop a period at a time):\n"
                "  --backend KIND       alsa_raw (default), null, or file. With null or file no\n"
@@ -64,6 +65,7 @@ int main(int argc, char** argv)
 {
   namchain::SoakOptions options;
   double max_p99_percent = 50.0;
+  unsigned long long max_output_drops = 0;
   bool json = false;
   std::string model_path;
   std::string input_path;
@@ -92,6 +94,8 @@ int main(int argc, char** argv)
       options.oracle_window_seconds = std::atof(argv[++i]);
     else if (arg == "--max-p99-percent" && i + 1 < argc)
       max_p99_percent = std::atof(argv[++i]);
+    else if (arg == "--max-output-drops" && i + 1 < argc)
+      max_output_drops = std::strtoull(argv[++i], nullptr, 10);
     else if (arg == "--backend" && i + 1 < argc)
     {
       if (!namchain::parse_backend_kind(argv[++i], options.backend))
@@ -204,8 +208,12 @@ int main(int argc, char** argv)
   // The acceptance criterion, as a machine-checkable gate rather than a judgement call.
   const bool p99_gate = result.p99_percent_of_deadline <= max_p99_percent;
   const bool overrun_gate = result.deadline_overruns == 0 && result.driver_xruns == 0;
+  // A dropped period is 1.33 ms of audio removed from the output, chosen by us rather than by the
+  // driver. It is strictly better than the blocking write it replaces -- the engine keeps its
+  // deadline -- but it is still an audible discontinuity, so the default gate is zero.
+  const bool drop_gate = result.output_drops <= max_output_drops;
   const bool oracle_gate = !result.oracle.checked || result.oracle.match;
-  const bool pass = p99_gate && overrun_gate && oracle_gate;
+  const bool pass = p99_gate && overrun_gate && drop_gate && oracle_gate;
 
   if (json)
   {
@@ -221,6 +229,20 @@ int main(int argc, char** argv)
     j["rtf"] = result.rtf;
     j["deadline_ns"] = result.deadline_ns;
     j["block_ns"] = {{"p50", result.p50_ns}, {"p99", result.p99_ns}, {"max", result.max_ns}};
+    j["phase_ns"] = {{"read_p50", result.read_p50_ns},
+                     {"read_p99", result.read_p99_ns},
+                     {"read_max", result.read_max_ns},
+                     {"chain_p50", result.chain_p50_ns},
+                     {"chain_p99", result.chain_p99_ns},
+                     {"chain_max", result.chain_max_ns},
+                     {"write_p50", result.write_p50_ns},
+                     {"write_p99", result.write_p99_ns},
+                     {"write_max", result.write_max_ns}};
+    j["render_path_cpu_ns"] = {{"max", result.chain_cpu_max_ns},
+                               {"total", result.chain_cpu_ns},
+                               {"wall_total", result.chain_wall_ns},
+                               {"stall_blocks", result.chain_stall_blocks},
+                               {"stall_threshold_ns", namchain::SoakResult::stall_threshold_ns}};
     j["p99_percent_of_deadline"] = result.p99_percent_of_deadline;
     j["max_lateness_ms"] = result.max_lateness_ms;
     j["device_wait_ns"] = {{"p50", result.wait_p50_ns}, {"p99", result.wait_p99_ns}, {"max", result.wait_max_ns}};
@@ -258,6 +280,11 @@ int main(int argc, char** argv)
           {"playback_max", result.playback_occupancy_max},
           {"playback_last", result.playback_occupancy_last},
           {"playback_full_blocks", result.playback_full_blocks}};
+      j["device"]["queue"] = {{"output_drops", result.output_drops},
+                              {"capture_bursts", result.capture_bursts},
+                              {"settle_discarded_frames", result.settle_discarded_frames},
+                              {"gate_capture_xruns", result.gate_capture_xruns},
+                              {"occupancy_mismatches", result.occupancy_mismatches}};
     }
     if (result.oracle.checked)
     {
@@ -299,6 +326,22 @@ int main(int argc, char** argv)
           std::printf(" (%llu blocks wrote into a full playback ring)",
                       static_cast<unsigned long long>(result.playback_full_blocks));
         std::printf("\n");
+        // The loop's own decisions, next to the occupancy that provoked them. A drop is audio the
+        // run chose to lose rather than block for, so it is the one number here that a listener
+        // would hear; the burst count is the mechanism that leads to one.
+        std::printf("queue control:    %llu output drops (gate <= %llu), %llu capture bursts\n",
+                    static_cast<unsigned long long>(result.output_drops), max_output_drops,
+                    static_cast<unsigned long long>(result.capture_bursts));
+        if (result.settle_discarded_frames > 0)
+          std::printf("settle:           discarded %llu frames of bring-up capture (before block 0)\n",
+                      static_cast<unsigned long long>(result.settle_discarded_frames));
+        if (result.gate_capture_xruns > 0)
+          std::printf("capture xruns:    %llu found by the gate (a subset of the driver xruns below: an\n"
+                      "                  xrun freezes hw_ptr, so without this the loop stalls instead)\n",
+                      static_cast<unsigned long long>(result.gate_capture_xruns));
+        if (result.occupancy_mismatches > 0)
+          std::printf("occupancy check:  %llu samples where delay disagreed with the pointer pair\n",
+                      static_cast<unsigned long long>(result.occupancy_mismatches));
       }
     }
     else
@@ -322,6 +365,17 @@ int main(int argc, char** argv)
                   static_cast<unsigned long long>(result.chain_p50_ns),
                   static_cast<unsigned long long>(result.write_p50_ns));
     if (result.stream_mode)
+      // Where the tail lives. A chain max under the deadline with a read or write max over it says
+      // the engine finished every block and the outliers were syscalls or the host descheduling it
+      // -- which is the difference between "make the DSP faster" and "get an RT kernel".
+      std::printf("split (tail):     read p99 %llu max %llu, chain p99 %llu max %llu, write p99 %llu max %llu ns\n",
+                  static_cast<unsigned long long>(result.read_p99_ns),
+                  static_cast<unsigned long long>(result.read_max_ns),
+                  static_cast<unsigned long long>(result.chain_p99_ns),
+                  static_cast<unsigned long long>(result.chain_max_ns),
+                  static_cast<unsigned long long>(result.write_p99_ns),
+                  static_cast<unsigned long long>(result.write_max_ns));
+    if (result.stream_mode)
       // The engine's own p99, separately from the block time. The block time includes whatever the
       // write waited for, and on this device the playback ring is close to full nearly always, so the
       // write's wait for room is charged to the "block" -- which turns a statement about the engine
@@ -337,6 +391,23 @@ int main(int argc, char** argv)
                   static_cast<unsigned long long>(result.wait_p50_ns),
                   static_cast<unsigned long long>(result.wait_p99_ns),
                   static_cast<unsigned long long>(result.wait_max_ns));
+    if (result.stream_mode)
+    {
+      const double cpu_pct =
+        result.chain_wall_ns == 0
+          ? 0.0
+          : 100.0 * static_cast<double>(result.chain_cpu_ns) / static_cast<double>(result.chain_wall_ns);
+      std::printf("render path cpu:  p99 wall vs cpu is the deadline question: cpu max %llu ns, "
+                  "wall max %llu ns\n",
+                  static_cast<unsigned long long>(result.chain_cpu_max_ns),
+                  static_cast<unsigned long long>(result.chain_max_ns));
+      std::printf("                  %.2f s of CPU over %.2f s of wall in the render path (%.1f%%), "
+                  "%llu blocks lost >= %.1f ms to not being on CPU\n",
+                  static_cast<double>(result.chain_cpu_ns) / 1e9,
+                  static_cast<double>(result.chain_wall_ns) / 1e9, cpu_pct,
+                  static_cast<unsigned long long>(result.chain_stall_blocks),
+                  static_cast<double>(namchain::SoakResult::stall_threshold_ns) / 1e6);
+    }
     std::printf("block time:       p50 %llu ns, p99 %llu ns, max %llu ns\n",
                 static_cast<unsigned long long>(result.p50_ns), static_cast<unsigned long long>(result.p99_ns),
                 static_cast<unsigned long long>(result.max_ns));

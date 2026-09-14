@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <ctime>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -251,6 +252,10 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   long long playback_occupancy_last = 0;
   uint64_t playback_full_blocks = 0;
   uint64_t output_drops = 0;
+  uint64_t chain_cpu_max = 0;
+  uint64_t chain_cpu_total = 0;
+  uint64_t chain_wall_total = 0;
+  uint64_t chain_stall_blocks = 0;
   const auto start = Clock::now();
   for (uint64_t block = 0; block < total_blocks; ++block)
   {
@@ -264,19 +269,10 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     const auto tw0 = Clock::now();
     if (!device->wait_capture(2000, error))
     {
-      // Name the block and the ring state. A stall here aborts an hour-long run, and "capture timed
-      // out" alone cannot say whether it was the first period after a drop, a device that stopped
-      // delivering, or a gate that stopped being satisfied (which is what the ring figures answer).
+      // Name the block. The backend's own timeout message carries the device state and ring
+      // occupancy it saw, because reading the rings here would report the state *after* the stop.
       device->stop();
-      std::string state;
-      long long capture_frames = -1;
-      long long playback_frames = -1;
-      if (device->ring_occupancy(capture_frames, playback_frames))
-        state = " at block " + std::to_string(block) + " with capture ring " + std::to_string(capture_frames) +
-                " and playback ring " + std::to_string(playback_frames) + " frames";
-      else
-        state = " at block " + std::to_string(block);
-      return fail(error + state);
+      return fail(error + " at block " + std::to_string(block));
     }
     const auto tw1 = Clock::now();
     wait_timer.record(
@@ -290,6 +286,9 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     }
     const auto t1 = Clock::now();
     read_timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+    struct timespec chain_cpu0;
+    struct timespec chain_cpu1;
+    ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &chain_cpu0);
     {
       // The engine's render path lives here. The read and write either side of it are the
       // backend's own syscalls and are deliberately outside the scope (namchain/rt_check.h).
@@ -317,6 +316,22 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     }
     const auto t2 = Clock::now();
     chain_timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count()));
+    // Wall time and CPU time for the same span. The difference is the host taking the CPU away, and
+    // separating them is what makes "the engine missed a deadline" and "the process was descheduled"
+    // different claims instead of one number that cannot tell them apart.
+    ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &chain_cpu1);
+    {
+      const uint64_t chain_wall =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
+      const uint64_t chain_cpu =
+        static_cast<uint64_t>(chain_cpu1.tv_sec - chain_cpu0.tv_sec) * 1000000000ull +
+        static_cast<uint64_t>(chain_cpu1.tv_nsec - chain_cpu0.tv_nsec);
+      chain_wall_total += chain_wall;
+      chain_cpu_total += chain_cpu;
+      chain_cpu_max = std::max(chain_cpu_max, chain_cpu);
+      if (chain_wall > chain_cpu + SoakResult::stall_threshold_ns)
+        ++chain_stall_blocks;
+    }
 
     // Sampled before the write, and after the timed section is closed: what decides whether the write
     // can proceed immediately is how much room the playback ring has *now*, not after the period we
@@ -435,12 +450,17 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.playback_occupancy_max = playback_occupancy_max;
   result.playback_occupancy_last = playback_occupancy_last;
   result.playback_full_blocks = playback_full_blocks;
+  result.chain_cpu_max_ns = chain_cpu_max;
+  result.chain_cpu_ns = chain_cpu_total;
+  result.chain_wall_ns = chain_wall_total;
+  result.chain_stall_blocks = chain_stall_blocks;
   result.output_drops = output_drops;
   {
     const StreamQueueStats stats = device->queue_stats();
     result.capture_bursts = stats.capture_bursts;
     result.occupancy_mismatches = stats.occupancy_mismatches;
     result.settle_discarded_frames = stats.settle_discarded_frames;
+    result.gate_capture_xruns = stats.gate_capture_xruns;
     // Two counters, one event: the loop counts the zero the backend returned and the backend counts
     // the refusal it decided. They cannot legitimately differ, so a difference is a bug in one of
     // them and is reported rather than averaged away.
@@ -456,9 +476,14 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.startup_driver_xruns = startup_xruns;
   result.deadline_ns = deadline_ns;
   result.read_p50_ns = read_timer.p50_ns();
+  result.read_p99_ns = read_timer.p99_ns();
+  result.read_max_ns = read_timer.max_ns();
   result.chain_p50_ns = chain_timer.p50_ns();
   result.chain_p99_ns = chain_timer.p99_ns();
+  result.chain_max_ns = chain_timer.max_ns();
   result.write_p50_ns = write_timer.p50_ns();
+  result.write_p99_ns = write_timer.p99_ns();
+  result.write_max_ns = write_timer.max_ns();
   result.wait_p50_ns = wait_timer.p50_ns();
   result.wait_p99_ns = wait_timer.p99_ns();
   result.wait_max_ns = wait_timer.max_ns();
