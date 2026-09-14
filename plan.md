@@ -138,7 +138,13 @@ for an hour and nothing else. As of 2026-09-13 that item is also the *re*-run: t
 killed 15 minutes in by the OS upgrade's reboot, and the toolchain changed underneath the build, so M1
 exit now reads "rebuilt and re-verified on GCC 15 / kernel 7.0, then one clean hour". A soak run's
 output belongs in `bench-results/`, never `/tmp`: the reboot took the JSON, the log and the evidence
-file with it, and a lost hour is indistinguishable from an hour that was never spent.
+file with it, and a lost hour is indistinguishable from an hour that was never spent. **The heartbeat
+taught the same lesson a second way, on 2026-09-14:** the job wrote timestamps in a background subshell
+and killed it with `$!`, but the capture and the next command shared a line, so `$!` went into that
+command's environment instead of the shell's, `kill` was given no argument and did nothing, and the
+writer outlived the soak by 17 hours -- 975 extra timestamps in the evidence file, which had to be
+trimmed back to the run window before it meant anything. Evidence writers must be killed by a recorded
+PID (`trap ... EXIT`, or a PID file), never by a variable that only *usually* holds one.
 
 ---
 
