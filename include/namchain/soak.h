@@ -1,7 +1,9 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "namchain/io/backend.h"
 
@@ -155,6 +157,29 @@ struct SoakResult
   uint64_t chain_wall_ns = 0;
   uint64_t chain_stall_blocks = 0;
   static constexpr uint64_t stall_threshold_ns = 500000;
+  /// \brief The few blocks whose render path cost the most CPU, in order.
+  ///
+  /// A count of missed deadlines says a tail exists; it says nothing about what the tail *is*. If the
+  /// slow blocks are spread randomly it is contention or memory behaviour, if they cluster at a fixed
+  /// period it is something else on the machine, and if they are all in the first seconds it is
+  /// warm-up. Those three need different fixes, and the block index is what tells them apart.
+  static constexpr unsigned slow_block_count = 5;
+  struct SlowBlock
+  {
+    uint64_t block = 0;
+    uint64_t chain_cpu_ns = 0;
+    uint64_t chain_wall_ns = 0;
+  };
+  std::array<SlowBlock, slow_block_count> slow_blocks{};
+  /// \brief Every block whose render path used more than half a period of CPU, in order.
+  ///
+  /// The top five say a tail exists; this says what shape it is. Measured on 2026-09-14, the slow
+  /// blocks arrive as runs of ~10 consecutive blocks (~15 ms) roughly every 27 s, and that is a
+  /// completely different problem from isolated slow blocks -- one is an external event, the other
+  /// would be the engine. Grouping these into bursts is what makes the hour's data say which.
+  /// Capped so a pathological run cannot exhaust memory.
+  static constexpr size_t max_spikes = 4096;
+  std::vector<SlowBlock> chain_spikes;
   uint64_t wait_p99_ns = 0;
   uint64_t wait_max_ns = 0;
   uint64_t p50_ns = 0;

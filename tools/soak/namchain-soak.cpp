@@ -243,6 +243,16 @@ int main(int argc, char** argv)
                                {"wall_total", result.chain_wall_ns},
                                {"stall_blocks", result.chain_stall_blocks},
                                {"stall_threshold_ns", namchain::SoakResult::stall_threshold_ns}};
+    {
+      nlohmann::json slow = nlohmann::json::array();
+      for (const namchain::SoakResult::SlowBlock& s : result.slow_blocks)
+      {
+        if (s.chain_cpu_ns == 0)
+          continue;
+        slow.push_back({{"block", s.block}, {"chain_cpu_ns", s.chain_cpu_ns}, {"chain_wall_ns", s.chain_wall_ns}});
+      }
+      j["slow_blocks"] = slow;
+    }
     j["p99_percent_of_deadline"] = result.p99_percent_of_deadline;
     j["max_lateness_ms"] = result.max_lateness_ms;
     j["device_wait_ns"] = {{"p50", result.wait_p50_ns}, {"p99", result.wait_p99_ns}, {"max", result.wait_max_ns}};
@@ -407,6 +417,69 @@ int main(int argc, char** argv)
                   static_cast<double>(result.chain_wall_ns) / 1e9, cpu_pct,
                   static_cast<unsigned long long>(result.chain_stall_blocks),
                   static_cast<double>(namchain::SoakResult::stall_threshold_ns) / 1e6);
+      {
+        std::printf("slowest blocks:   ");
+        bool any = false;
+        for (const namchain::SoakResult::SlowBlock& s : result.slow_blocks)
+        {
+          if (s.chain_cpu_ns == 0)
+            continue;
+          std::printf("%sblock %llu cpu %llu ns (wall %llu ns)", any ? ", " : "", 
+                      static_cast<unsigned long long>(s.block),
+                      static_cast<unsigned long long>(s.chain_cpu_ns),
+                      static_cast<unsigned long long>(s.chain_wall_ns));
+          any = true;
+        }
+        std::printf("%s\n", any ? "" : "none recorded");
+      }
+      // Group the over-half-a-period blocks into runs. Isolated spikes and short bursts of them have
+      // different causes, and the run length plus the spacing is what identifies which one this is.
+      if (!result.chain_spikes.empty())
+      {
+        std::printf("cpu spike bursts: %zu blocks over half a period of CPU, in ",
+                    result.chain_spikes.size());
+        struct Burst
+        {
+          uint64_t first = 0;
+          uint64_t last = 0;
+          uint64_t max_cpu = 0;
+        };
+        std::vector<Burst> bursts;
+        for (const namchain::SoakResult::SlowBlock& s : result.chain_spikes)
+        {
+          if (!bursts.empty() && s.block <= bursts.back().last + 2)
+          {
+            bursts.back().last = s.block;
+            bursts.back().max_cpu = std::max(bursts.back().max_cpu, s.chain_cpu_ns);
+          }
+          else
+          {
+            bursts.push_back(Burst{s.block, s.block, s.chain_cpu_ns});
+          }
+        }
+        std::printf("%zu runs", bursts.size());
+        if (bursts.size() > 1)
+        {
+          uint64_t min_gap = UINT64_MAX;
+          uint64_t max_gap = 0;
+          for (size_t i = 1; i < bursts.size(); ++i)
+          {
+            const uint64_t gap = bursts[i].first - bursts[i - 1].first;
+            min_gap = std::min(min_gap, gap);
+            max_gap = std::max(max_gap, gap);
+          }
+          std::printf("; runs start every %llu..%llu blocks (%.1f..%.1f s at 48 k/64)",
+                      static_cast<unsigned long long>(min_gap), static_cast<unsigned long long>(max_gap),
+                      static_cast<double>(min_gap) * 64.0 / 48000.0, static_cast<double>(max_gap) * 64.0 / 48000.0);
+        }
+        std::printf("\n");
+        for (size_t i = 0; i < bursts.size() && i < 8; ++i)
+          std::printf("                  run at block %llu..%llu (%llu long), worst %llu ns of CPU\n",
+                      static_cast<unsigned long long>(bursts[i].first),
+                      static_cast<unsigned long long>(bursts[i].last),
+                      static_cast<unsigned long long>(bursts[i].last - bursts[i].first + 1),
+                      static_cast<unsigned long long>(bursts[i].max_cpu));
+      }
     }
     std::printf("block time:       p50 %llu ns, p99 %llu ns, max %llu ns\n",
                 static_cast<unsigned long long>(result.p50_ns), static_cast<unsigned long long>(result.p99_ns),

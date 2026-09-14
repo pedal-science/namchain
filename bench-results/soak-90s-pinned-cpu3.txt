@@ -1,0 +1,43 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 256 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+chain:            4 x build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/240, playback min/max 0/252 frames (4 blocks wrote into a full playback ring)
+queue control:    1 output drops (gate <= 0), 6 capture bursts
+capture xruns:    1 found by the gate (a subset of the driver xruns below: an
+                  xrun freezes hw_ptr, so without this the loop stalls instead)
+occupancy check:  135365 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           67500
+audio:            90.000 s in 90.000 s wall (RTF 1.0000)
+deadline:         1333333 ns
+split (p50):      read 2981 ns, chain 300168 ns, write 11944 ns
+split (tail):     read p99 5518 max 37555, chain p99 454112 max 2566469, write p99 15740 max 440908 ns
+chain p99:        454112 ns (34.06% of deadline)
+device wait:      p50 1174614 ns, p99 1197966 ns, max 3648342 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 2566981 ns, wall max 2566469 ns
+                  20.87 s of CPU over 20.87 s of wall in the render path (100.0%), 0 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 10911 cpu 2566981 ns (wall 2566469 ns), block 10913 cpu 2497296 ns (wall 2500580 ns), block 10914 cpu 2349630 ns (wall 2345876 ns), block 10912 cpu 2301814 ns (wall 2299524 ns), block 49308 cpu 2167944 ns (wall 2173283 ns)
+cpu spike bursts: 290 blocks over half a period of CPU, in 67 runs; runs start every 3..14469 blocks (0.0..19.3 s at 48 k/64)
+                  run at block 0..0 (1 long), worst 734852 ns of CPU
+                  run at block 141..141 (1 long), worst 835296 ns of CPU
+                  run at block 3231..3231 (1 long), worst 1060333 ns of CPU
+                  run at block 10237..10237 (1 long), worst 691074 ns of CPU
+                  run at block 10352..10352 (1 long), worst 729018 ns of CPU
+                  run at block 10423..10423 (1 long), worst 821889 ns of CPU
+                  run at block 10508..10508 (1 long), worst 698630 ns of CPU
+                  run at block 10559..10559 (1 long), worst 931518 ns of CPU
+block time:       p50 315556 ns, p99 470668 ns, max 2791691 ns
+p99/deadline:     35.30% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+bring-up xruns:   1 (before the measured loop)
+first overrun at: block 10911 of 67500
+deadline overruns:25
+driver xruns:     5
+result:           FAIL

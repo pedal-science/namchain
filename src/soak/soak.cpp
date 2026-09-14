@@ -32,6 +32,13 @@ namespace
 
 using Clock = std::chrono::steady_clock;
 
+/// Nanoseconds in a `timespec`, signed so that a difference of two of them is a plain subtraction
+/// rather than modular arithmetic that happens to come out right.
+int64_t timespec_ns(const struct timespec& t)
+{
+  return static_cast<int64_t>(t.tv_sec) * 1000000000LL + static_cast<int64_t>(t.tv_nsec);
+}
+
 /// Oracle comparison is quadratic-ish in memory (the whole rendered output is retained), so a
 /// multi-hour soak must not ask for it. Timing-only runs are unaffected.
 constexpr double kMaxOracleSeconds = 300.0;
@@ -256,6 +263,8 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   uint64_t chain_cpu_total = 0;
   uint64_t chain_wall_total = 0;
   uint64_t chain_stall_blocks = 0;
+  std::array<SoakResult::SlowBlock, SoakResult::slow_block_count> slowest{};
+  std::vector<SoakResult::SlowBlock> chain_spikes;
   const auto start = Clock::now();
   for (uint64_t block = 0; block < total_blocks; ++block)
   {
@@ -323,14 +332,30 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     {
       const uint64_t chain_wall =
         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
-      const uint64_t chain_cpu =
-        static_cast<uint64_t>(chain_cpu1.tv_sec - chain_cpu0.tv_sec) * 1000000000ull +
-        static_cast<uint64_t>(chain_cpu1.tv_nsec - chain_cpu0.tv_nsec);
+      const uint64_t chain_cpu = static_cast<uint64_t>(timespec_ns(chain_cpu1) - timespec_ns(chain_cpu0));
       chain_wall_total += chain_wall;
       chain_cpu_total += chain_cpu;
       chain_cpu_max = std::max(chain_cpu_max, chain_cpu);
       if (chain_wall > chain_cpu + SoakResult::stall_threshold_ns)
         ++chain_stall_blocks;
+      // Keep the five worst render-path CPU blocks. Cheap (a comparison per block) and it is the
+      // difference between knowing a tail exists and knowing what it is.
+      if (chain_cpu > slowest[SoakResult::slow_block_count - 1].chain_cpu_ns)
+      {
+        SoakResult::SlowBlock entry;
+        entry.block = block;
+        entry.chain_cpu_ns = chain_cpu;
+        entry.chain_wall_ns = chain_wall;
+        unsigned at = SoakResult::slow_block_count - 1;
+        while (at > 0 && slowest[at - 1].chain_cpu_ns < entry.chain_cpu_ns)
+        {
+          slowest[at] = slowest[at - 1];
+          --at;
+        }
+        slowest[at] = entry;
+      }
+      if (chain_cpu * 2 > deadline_ns && chain_spikes.size() < SoakResult::max_spikes)
+        chain_spikes.push_back({block, chain_cpu, chain_wall});
     }
 
     // Sampled before the write, and after the timed section is closed: what decides whether the write
@@ -454,6 +479,8 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.chain_cpu_ns = chain_cpu_total;
   result.chain_wall_ns = chain_wall_total;
   result.chain_stall_blocks = chain_stall_blocks;
+  result.slow_blocks = slowest;
+  result.chain_spikes = std::move(chain_spikes);
   result.output_drops = output_drops;
   {
     const StreamQueueStats stats = device->queue_stats();
