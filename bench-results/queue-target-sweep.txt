@@ -45,6 +45,16 @@ separately for exactly that reason).
   ring6-cap4          6     4    0.20 .. 3.52    3.25       0         0        0  (0)      19     39.2   30
   target1 (90 s)      4     1    0.00 .. 3.98    0.36    2620         0     2696           47     47.7   39
 
+  3600 s continuations of the two ends of that table, same configuration:
+
+  run                ring  cap   queue min..max  last   underruns  overruns  drops(target)  bursts  p99%  ovr
+  ----------------------------------------------------------------------------------------------------------
+  1 h, 4-ring, no cap (the 2026-09-14 baseline, 9aa25e6)   0.00 .. 3.98  2.00    ~80       12        69      234  41.2  981
+  1 h, ring6-cap4     6     4    0.00 .. 5.98    3.59       8         0       34 (34)     225     37.6  204
+
+  (The baseline's 92 xruns were not split by direction when it was taken; its 12 gate-detected capture
+  xruns are a lower bound on the capture share, so its playback share is at most 80.)
+
   p99%  = block p99 as a percentage of the 1333.3 us deadline (gate 50)
   ovr   = blocks whose total exceeded the deadline
   drops(target) = periods the loop refused to write; the bracket is how many of them the *cap* refused
@@ -81,7 +91,8 @@ What it says
    never starved the device, because the queue held it 3.25 periods deep. This is the trade in the
    cleanest possible form: the host still takes the CPU away, and the queue is what turns that from a
    dropout into nothing. Every previous configuration had deadline overruns *become* xruns; this one
-   separated the two.
+   separated the two. The hour repeats it at scale: 204 deadline overruns, 8 xruns, and a slowest render
+   path of 2.12 ms -- the same tail as the baseline's, absorbed 92 % of the time instead of 0 %.
 
 5. **The two bugs this measurement found are both worth more than the numbers.** A cap applied to a
    stream that is not running starves it of the write that would report and recover the xrun: the
@@ -94,15 +105,40 @@ What it says
 
 Recommendation
 --------------
-`--periods 6 --output-queue-periods 4`: 0 xruns and 0 drops over five minutes with a queue holding
-~3.25 periods (4.3 ms) and a worst case bounded at 3.52 (4.7 ms). Against the current 4-period ring
-and no cap that is 7 fewer playback underruns per five minutes for ~2 ms of extra monitoring latency,
-and it is the first configuration in this project's history with a zero-xrun device soak.
+`--periods 6 --output-queue-periods 4`. Over an hour it held a queue of 3.59 periods (4.8 ms) and
+reported **8 playback underruns and 0 capture overruns**, against the 4-period ring with no cap that
+this project ran for an hour on 2026-09-14 and got 92 xruns from (at least 12 of them capture, so at
+most 80 playback). Deadline overruns fell 981 -> 204 of 2 700 000 blocks, block p99 41.2 % -> 37.6 %,
+chain p99 39.7 % -> 36.4 %, and the render path stayed at 0 allocations and 0 descheduled blocks.
+
+**And the five-minute version of this run said zero, which is why the hour was worth taking.** `ring6-cap4`
+had 0 underruns and 0 drops in 5 minutes and 8 underruns and 34 drops in 60; the five-minute figure was
+luck, and the caveat below was the right one to write before the hour existed. The honest reading of the
+recommendation is therefore "about one dropout every seven minutes, on a non-RT kernel, with the tail
+unchanged" -- not "dropout-free".
+
+What that leaves
+----------------
+The tail itself did not move: the hour's slowest render paths are the same 2.1 ms (1.6 periods) as
+before, the spikes still arrive in runs (4096+ blocks in 1987 runs, the cap hit again), `cpu == wall`
+with 0 blocks descheduled, and the device wait still reaches 4.8 ms. So the queue changed the
+*consequence* of the tail and not the tail. Three ways forward, in the order the evidence puts them:
+
+  1. **Keep the queue's floor up.** The 8 underruns are stalls that arrived when the queue was near the
+     bottom of its sawtooth, not when it was at its mean (`last` 3.59 periods, worst case 5.98). The
+     missing instrument is the occupancy *distribution* -- and then a floor controller, which can only
+     work by inserting a period of silence rather than by producing audio it does not have. That is a
+     deliberate, fadable gap instead of a driver-level underrun, and it is a design decision (§14).
+  2. **Make each dropout inaudible** -- the `rt::SpliceFader` and the dropped-period edit kind in
+     §10.3. This is the half the user asked for and the cheap half: it costs no latency.
+  3. **Fix the host** -- IRQ affinity and the RT kernel. The tail is unchanged by anything in this
+     layer: `cpu == wall` and 0 descheduled blocks rule out preemption, which leaves interrupt work
+     charged to our own CPU time as the candidate, and that is the experiment nobody has run.
 
 Caveats, stated rather than buried
 ----------------------------------
-- Five minutes each. The no-cap rate is ~1.4 underruns/min, so "0 in 5 min" is roughly e^-7 evidence,
-  not proof; an hour at `ring6-cap4` would settle it, and that is the next run to take.
+- Five-minute runs are not evidence about a rate near 0.1/min: the 0-xrun configuration above became 8
+  in an hour. Only the hour rows of the table above should be quoted for a dropout rate.
 - `queue min` reads 0.00 in every run that had an underrun, which makes the floor useless as a
   statistic there: once the stream has starved, the minimum over the run is 0 by definition. The
   honest instrument is the *distribution* of the occupancy (p1/p50) and the depth at the instant a
@@ -111,3 +147,6 @@ Caveats, stated rather than buried
   period on high-speed USB, and a 48-frame period (1 ms) would have a different one.
 - The cap costs a `SNDRV_PCM_IOCTL_STATUS` per period when it is set; the default path is unchanged.
   The render path stayed clean: 0 allocations, 0 frees, in every run.
+- The 4-period-ring baseline hour was taken on an older tree under `sudo chrt`/`taskset` rather than
+  the program's own `SCHED_FIFO`/affinity, and its xruns are not split by direction. It is a fair
+  comparison for the queue and a rough one for everything else.

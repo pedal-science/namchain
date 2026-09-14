@@ -425,11 +425,29 @@ binary, same settings:
       dropout into nothing. Every earlier configuration had overruns BECOME
       xruns; this one separated them.
 
-  Where that leaves the default (not yet ratified -- an hour run is the missing
-  evidence): --periods 6 --output-queue-periods 4. And the missing instrument:
-  `queue min` reads 0.00 in every run that underran, because once a stream has
-  starved the minimum over the run is 0 by definition. The statistic that would
-  answer "how deep was the queue when the stall began" is a distribution (p1,
-  p50) of the occupancy, which does not exist yet.
+  Where that leaves the default (not yet ratified): --periods 6 --output-queue-periods 4. The hour
+  taken at it [m], against the hour of section 8:
+
+                   4-ring, no cap       6-ring, cap 4
+    underruns      <= 80 (92 total)     8
+    overruns       >= 12                0
+    drops          69                   34
+    queue last     2.00 periods         3.59 periods (4.8 ms)
+    block p99      41.19 %              37.58 %
+    chain p99      39.72 %              36.39 %
+    overruns       981                  204
+
+  **And the 5-minute version of that run said 0 xruns and 0 drops.** It was luck, and the hour is
+  why the five-minute numbers are not quoted as rates anywhere above. What the hour also shows is
+  that the tail did not move: the slowest render paths are the same 2.1 ms, the spikes still arrive
+  in capped runs, cpu == wall with 0 descheduled blocks, and the device wait still reaches 4.8 ms.
+  The queue changed the CONSEQUENCE of the tail, not the tail -- which is the honest summary of
+  everything sections 7-9 measured.
+
+  Two instruments are missing and both are named rather than implied: the occupancy DISTRIBUTION
+  (p1/p50), because `queue min` reads 0.00 in every run that underran once, and the occupancy at
+  the instant a stall begins. A floor controller -- the only mechanism that can hold a floor the
+  loop has no audio to fill -- needs both, and the fade of section 10.3's splice mechanism is what
+  makes each remaining dropout inaudible without paying latency for it.
 
 
