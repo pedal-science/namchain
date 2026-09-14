@@ -336,3 +336,23 @@ binary, same settings:
   addresses, and something that survives being pinned, which is where IRQ
   affinity or PREEMPT_RT is the next instrument rather than a faster DSP.
 
+  THE HOUR, for scale [m]. 3600 s, 4 x A2-Full, q=64, pinned, non-RT kernel:
+
+    RTF                    0.9999      render-path CPU   836 s per 3600 s (23 %)
+    block p50 / p99        315 / 549 us                    = 41.19 % of deadline
+    chain p50 / p99        300 / 530 us                    = 39.72 % of deadline
+    descheduled blocks     0           render-path alloc 0
+    oracle                 exact, 240 000 frames
+    deadline overruns      981 of 2 700 000 blocks (0.036 %)
+    driver xruns           92          dropped periods   69
+    CPU spike runs         1117 over the hour (one per 3.2 s), capped at 4096 blocks
+
+  Compare the hour before the fix (23 xruns, block p99 112.55 %, 805 415
+  deadline overruns): 821x fewer missed deadlines, and *four times as many
+  audible dropouts*. Both numbers are real and they are the same trade. The old
+  loop kept ~4 periods (5.3 ms) of output queued, which is bad latency and a
+  good jitter cushion; the fixed loop keeps 1-2. The queue is no longer a
+  runaway, so that occupancy is now a knob -- and picking its default is a
+  product decision with a measured cost at both ends, not a bug to fix.
+
+

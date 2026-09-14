@@ -865,11 +865,13 @@ audio thread pinned to a dedicated core (workers and warm threads excluded; only
 IRQs are also moved); `vcgencmd get_throttled`/`measure_temp` in the health loop with a fan/Active
 Cooler mandatory for always-on low-latency use (G18).
 
-**Outstanding, and measured to matter (§9.5 item 6):** nothing in this project sets its own thread
-affinity yet -- the soak is pinned by `taskset` on the command line, and the engine does not pin at all.
-Pinning alone took the tail from 47 to 25 missed deadlines per 90 s in the same configuration, so the
-engine should do it for itself (and `namchain-doctor` should check it), and the `isolcpus`/IRQ-affinity
-half of the list above is untested.
+**Outstanding, and measured to matter (§9.5 item 6):** `namchain::rt::apply_scheduling()` now sets
+`SCHED_FIFO` and thread affinity from inside the program and reports what it was granted (`2c3cdd4`),
+which closes the "the engine does not pin at all" half of the gap. Pinning alone took the tail from 47
+to 25 missed deadlines per 90 s in the same configuration, so the default `--cpu` is still an open
+choice (§14) and `namchain-doctor` should check it. The `isolcpus`/IRQ-affinity half of the list above
+is untested: the engine is confined to a core, but IRQs and other processes are not moved off it, and
+that is where the rest of the tail is.
 
 **Host target.** The assumed host is Linux with `PREEMPT_RT` and `threadirqs` *where the platform can
 supply one* — this Pi 500 can (`linux-image-rt-*`), and the checklist above is what we ship to make a
@@ -1166,11 +1168,37 @@ number:
      either: softirq work is charged to whichever task the CPU was running**, so an IRQ burst on the
      audio core appears as the engine's own CPU time. Distinguishing those two needs IRQ affinity or
      `threadirqs`, not a better timer.
-   - **Pinning helps and is not yet implemented anywhere in the project.** `taskset -c 3` (the §9.3
-     checklist item) over the same 90 s: spikes 430 -> 290 blocks, runs 88 -> 67, deadline overruns
-     47 -> 25, drops 7 -> 1, bursts 18 -> 6. Half the tail, so the rest is not merely migration -- the
-     §9.3 list's `isolcpus`/IRQ-affinity half is still outstanding, and the engine does not yet set its
-     own thread affinity at all.
+   - **Pinning helps and is measured.** `taskset -c 3` over the same 90 s: spikes 430 -> 290 blocks, runs
+     88 -> 67, deadline overruns 47 -> 25, drops 7 -> 1, bursts 18 -> 6. Half the tail, so the rest is not
+     merely migration -- the §9.3 list's `isolcpus`/IRQ-affinity half is still outstanding. As of
+     `2c3cdd4` the **engine sets its own** `SCHED_FIFO` and affinity and reports what it was granted, so
+     this is no longer a property of the command line that launched it.
+7. **The one-hour non-RT baseline, and the trade the fix bought** (`9aa25e6`, pinned, 4 x A2-Full, q=64,
+   3600 s = 2 700 000 blocks):
+
+   | | before (`67a6ed7`, latched) | after the queue fix |
+   |---|---|---|
+   | RTF | 0.9999 | **0.9999** |
+   | block p50 | 993 167 ns | **315 613 ns** |
+   | block p99 | 112.55 % | **41.19 %** |
+   | chain p50 / p99 | 295 204 / 547 243 ns | 300 501 / 529 612 ns |
+   | render-path CPU | not measured | **836.3 s of CPU per 3600 s of audio (23 % of one core)** |
+   | descheduled blocks | not measured | **0** |
+   | deadline overruns | 805 415 | **981** |
+   | driver xruns | 23 | **92** |
+   | dropped periods | n/a (it blocked instead) | 69 |
+   | oracle | exact, 2 880 000 frames | exact, 240 000-frame window |
+
+   The engine holds real time for an hour at 23 % of one core, never loses the CPU, and gets 821x fewer
+   missed deadlines. **And it is audibly worse: 92 xruns plus 69 dropped periods in the hour, against 23
+   xruns before.** That is not a regression to be hidden, it is the trade being taken deliberately:
+   the old loop kept the playback ring at its ceiling, which is ~5.3 ms of output latency and, for
+   exactly that reason, a four-period cushion against host jitter. The fixed loop keeps 1-2 periods
+   queued, so the same jitter now reaches the device. **Occupancy stopped being a runaway and became a
+   tunable**: the queue policy can hold a chosen target, which makes latency-against-dropout-tolerance a
+   parameter with a measured cost on both sides instead of an accident. Choosing that default is an
+   open decision (§14), and the honest reading of this table is that the fix bought control, not a
+   smaller number of dropouts.
 
 **A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
 but the run does not keep real time at it: RTF 1.333, i.e. it loses a third. Instrumenting the loop to
@@ -1495,7 +1523,7 @@ measured in M0's remainder.
 
 | Metric | Target (Pi 5 class, 48 kHz, q=64) | Status |
 |---|---|---|
-| Concurrent audible A2-Full (8ch) | ≥ 4, p99 ≤ 50 % deadline, 0 xruns/1 h | **engine work met, one-hour gate not met**: 4 × A2-Full in series gives chain p99 45.7 % of the deadline and 0 render-path allocations over 5 min, but the 1 h run of 2026-09-13 failed the gate as currently worded (block p99 112.6 %, 1 driver xrun) because the loop blocked in `write` on a saturated playback ring -- diagnosed in §9.5 item 4, fix in progress, gate wording being re-decided from those numbers |
+| Concurrent audible A2-Full (8ch) | ≥ 4, p99 ≤ 50 % deadline, 0 xruns/1 h | **engine work met, host tail not**: the one-hour run of 2026-09-14 held RTF 0.9999 at 23 % of one core with chain p99 39.72 %, block p99 41.19 %, 0 render-path allocations and an exact oracle -- and still failed the gate as worded, with 92 driver xruns and 69 dropped periods driven by ~1100 bursts of host interference that the engine neither caused nor can schedule around (§9.5 item 7). The queue cause of the 09-13 failure is fixed (`cb5cc19`); this is a different failure with a different fix, and the gate wording is an open decision (§14) |
 | Concurrent audible A2-Lite (3ch) | ≥ 12 | **met** (17 at 50 %) |
 | Resident switchable instances | ≥ 16 (≥ 64 if RAM allows) | **RAM supports ≥ 64**; switching itself is M3 |
 | Switch ready-time (p99, warm set) | ≤ 5 ms, zero click | M3 |
@@ -1660,7 +1688,11 @@ and *not* assumed on a user's host (risk 11, §9.3).
 **Open decisions you may want to change** (each has a default in the plan): default warming policy mode
 (`balanced`); `fade_ms` default (5 ms) and `max_defer_ms` (15 ms); whether to accept LGPL
 `libasound`/JACK backends; whether §7.8 patch #3 (shared weights) is worth carrying a standing fork
-patch; project name (`namchain` is a placeholder).
+patch; project name (`namchain` is a placeholder); **the output queue's target occupancy**, which is now
+the latency-against-dropout-tolerance knob and the most consequential of these -- §9.5 item 7 measured
+what each end costs (1-2 periods queued: 41 % block p99 and 92 xruns/hour; a saturated ring: the same
+engine work reported as 112 % and 23 xruns/hour); and **whether `--cpu` defaults to pinning at all**, or
+stays off until `namchain-doctor` can pick a core and report the IRQ mask it shares it with.
 
 ---
 
