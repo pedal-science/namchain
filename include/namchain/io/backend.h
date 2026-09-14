@@ -88,6 +88,23 @@ struct BackendInfo
   bool needs_bringup_cycle = false;
 };
 
+/// \brief How the loop's queue control behaved, for the backends that can say.
+///
+/// These are the three numbers that tell a *paced* loop from a *blocked* one, and they are collected
+/// in one place because they are read together and mean nothing apart. `output_drops` is the loop
+/// choosing to lose a period rather than wait for the device; `capture_bursts` is the loop having
+/// fallen a period behind; `settle_discarded_frames` is bring-up audio that the engine was never
+/// going to see. Zero, zero, and a small number is a healthy run (plan.md §9.5 item 4).
+struct StreamQueueStats
+{
+  uint64_t output_drops = 0;
+  uint64_t capture_bursts = 0;
+  uint64_t settle_discarded_frames = 0;
+  /// Samples where the backend's own idea of its queue disagreed with its pointer pair. Not a
+  /// behaviour of the loop at all, but it is what says whether an occupancy figure can be trusted.
+  uint64_t occupancy_mismatches = 0;
+};
+
 /// \brief One full-duplex audio stream, whatever is behind it.
 ///
 /// Deliberately byte-oriented and direction-symmetric, matching what the ioctls actually do: the
@@ -120,6 +137,27 @@ public:
   /// Write exactly \p frames from \p src. Same sizing rule, playback direction.
   virtual int write_playback(const void* src, unsigned frames, int timeout_ms, std::string& error) = 0;
 
+  /// \brief Write \p frames only if they can go now; return 0 (a dropped period) if they cannot.
+  ///
+  /// This exists because a loop that *may* block in the write cannot bound its own latency: on the
+  /// SSL, an hour of identical 295 us engine work was reported as 993 us blocks, of which 699 us was
+  /// the write waiting for space in a saturated playback ring (§9.5 item 4). Asking first and
+  /// dropping converts an unbounded wait into a bounded, counted loss, and the count is what lets a
+  /// gap in the audio be a reported number instead of an inference from percentiles.
+  ///
+  /// The default always writes: a backend with no ring cannot be full, and telling `file` to drop a
+  /// period would silently remove audio from the output WAV.
+  ///
+  /// \return frames written, 0 when the period was dropped for want of room, or -1 on a real error.
+  virtual int try_write_playback(const void* src, unsigned frames, std::string& error)
+  {
+    const int written = write_playback(src, frames, 1000, error);
+    return written < 0 ? -1 : written;
+  }
+
+  /// Queue-control counters, where the backend has any. Zeroes for the backends with no rings.
+  virtual StreamQueueStats queue_stats() const { return StreamQueueStats{}; }
+
   /// Unrecoverable breaks reported by whatever is underneath: ALSA `-EPIPE`, and nothing else.
   /// Always zero for the backends with no device, which is a fact about the measurement worth
   /// reporting rather than a reason to omit the field (§10.5.1).
@@ -134,6 +172,11 @@ public:
   /// unmistakable here -- which is the whole reason it cost an hour to find (plan.md §9.5).
   ///
   /// \return false when there is no ring to report, which is every backend that is not a device.
+  ///
+  /// Deliberately the ring's contents and not the driver's `delay`: on the SSL 2+ Mk II the playback
+  /// delay also counts the frames already handed to the USB host controller, so it reported 544
+  /// frames for a 256-frame ring. `StreamQueueStats::occupancy_mismatches` says how often a backend's
+  /// own delay field disagreed with the pointer pair behind this figure.
   virtual bool ring_occupancy(long long& /*capture_frames*/, long long& /*playback_frames*/) const { return false; }
 
   /// Flush anything buffered. A no-op for every backend that is not `file`, where it writes the

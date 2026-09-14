@@ -272,6 +272,7 @@ bool AlsaRawDuplex::configure(int fd, bool capture, const char* direction, std::
     capture_bytes_per_frame_ = info_.capture_bytes_per_frame;
     playback_bytes_per_frame_ = info_.playback_bytes_per_frame;
     prime_silence_.assign(static_cast<size_t>(info_.buffer_size) * playback_bytes_per_frame_, 0);
+    drain_buffer_.assign(static_cast<size_t>(info_.period_size) * capture_bytes_per_frame_, 0);
   }
   else if (info_.sample_format != chosen_format)
   {
@@ -349,6 +350,43 @@ bool AlsaRawDuplex::prime_playback(std::string& error)
   return true;
 }
 
+bool AlsaRawDuplex::drain_capture(std::string& error)
+{
+  // Settle the capture side before the playback stream exists. The device has been producing since
+  // capture START, and however many periods accumulated in that window are periods the loop would
+  // otherwise read back-to-back -- and, because it writes one period per read, write back-to-back
+  // into a playback ring that was primed with exactly one. That burst is the first step of the
+  // ratchet in plan.md §9.5 item 4: each backlog period becomes an extra queued period, the ring
+  // reaches its ceiling, and the write's wait for space becomes the reported block time for ever
+  // after. Draining here makes the timed loop's starting occupancy a known number instead of
+  // however long bring-up took.
+  //
+  // Discarding is correct rather than lossy: these are frames captured before the engine had a
+  // graph to run them through. They are counted so the report can say how many.
+  //
+  // The bound is the ring itself: a backlog cannot exceed one buffer, so a couple of periods of
+  // slack over that is already more iterations than the device can have produced.
+  const unsigned max_blocks = info_.period_size == 0 ? 0 : info_.buffer_size / info_.period_size + 2;
+  for (unsigned i = 0; i < max_blocks; ++i)
+  {
+    AlsaRawOccupancy status;
+    std::string ignored;
+    if (!query_occupancy(true, status, ignored))
+      return true; // nothing to drain if the device will not tell us what it holds
+    if (status.ring_frames < static_cast<long long>(info_.period_size))
+      return true;
+    if (read_capture(drain_buffer_.data(), info_.period_size, 1000, ignored) < 0)
+    {
+      // A read failure here is not fatal: the loop's own gate and the xrun counter handle a device
+      // that will not give us a period. Leaving the backlog is the old behaviour, not a new fault.
+      error.clear();
+      return true;
+    }
+    settle_discarded_frames_ += info_.period_size;
+  }
+  return true;
+}
+
 bool AlsaRawDuplex::start(std::string& error)
 {
   if (::ioctl(capture_fd_, SNDRV_PCM_IOCTL_PREPARE) < 0)
@@ -356,6 +394,20 @@ bool AlsaRawDuplex::start(std::string& error)
     error = errno_text("capture PREPARE failed");
     return false;
   }
+
+  // Capture starts first, alone, so the backlog it accumulated between PREPARE and here can be
+  // discard-read before the playback ring is primed. Doing it the other way round means the settle
+  // reads have to be accompanied by writes to keep the playback stream alive, which adds exactly
+  // the periods the settle is trying to remove.
+  if (::ioctl(capture_fd_, SNDRV_PCM_IOCTL_START) < 0)
+  {
+    error = errno_text("capture START failed");
+    return false;
+  }
+
+  if (!drain_capture(error))
+    return false;
+
   if (::ioctl(playback_fd_, SNDRV_PCM_IOCTL_PREPARE) < 0)
   {
     error = errno_text("playback PREPARE failed");
@@ -363,18 +415,11 @@ bool AlsaRawDuplex::start(std::string& error)
   }
 
   // Playback must not be STARTed empty: the stream underruns immediately and the ioctl itself
-  // returns -EPIPE (observed on the PCM2902). Prime the whole ring with silence first -- this is
-  // what aplay does, and it is also what makes the kernel's start threshold reachable. The cost is
-  // that the I/O latency floor is one buffer; tightening that with sw_params thresholds is a
-  // deliberate follow-up, not an accident.
+  // returns -EPIPE (observed on the PCM2902). One period of silence is enough to reach the kernel's
+  // start threshold (sw.start_threshold), and deliberately not a whole ring -- filling it is how the
+  // write's wait for space became the clock in the first measurement round (§9.5 item 2).
   if (!prime_playback(error))
     return false;
-
-  if (::ioctl(capture_fd_, SNDRV_PCM_IOCTL_START) < 0)
-  {
-    error = errno_text("capture START failed");
-    return false;
-  }
 
   // The priming write above may already have reached the kernel's start threshold, in which case
   // the stream is RUNNING and START reports EBADFD. That is success, not failure -- but confirm it
@@ -494,8 +539,15 @@ bool AlsaRawDuplex::wait_capture(int timeout_ms, std::string& error)
     AlsaRawOccupancy status;
     std::string ignored;
     if (query_occupancy(true, status, ignored) &&
-        status.delay_frames >= static_cast<long long>(info_.period_size))
+        status.ring_frames >= static_cast<long long>(info_.period_size))
+    {
+      // A release with two periods already waiting means the loop is a period behind and will read
+      // twice almost together. Counting it is the whole diagnostic for the ratchet in §9.5 item 4:
+      // the burst is what turns one late period into a permanently full playback ring.
+      if (status.ring_frames >= static_cast<long long>(2 * info_.period_size))
+        ++capture_bursts_;
       return true;
+    }
 
     const auto elapsed =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
@@ -532,6 +584,48 @@ int AlsaRawDuplex::write_playback(const void* src, unsigned frames, int timeout_
   return transfer(playback_fd_, const_cast<void*>(src), frames, true, timeout_ms, error);
 }
 
+int AlsaRawDuplex::try_write_playback(const void* src, unsigned frames, std::string& error)
+{
+  // Ask the kernel whether the ring can take a period *now*, and do not wait if it cannot. This is
+  // the same readiness condition the blocking path would sleep on (avail_min is one period, set in
+  // configure()), so a "yes" here means the transfer below cannot block, and a "no" is exactly the
+  // state that used to cost 699 us of every period (plan.md §9.5 item 4).
+  struct pollfd pfd;
+  pfd.fd = playback_fd_;
+  pfd.events = POLLOUT;
+  pfd.revents = 0;
+
+  const int ready = ::poll(&pfd, 1, 0);
+  if (ready == 0)
+  {
+    ++output_drops_;
+    return 0;
+  }
+  if (ready < 0)
+  {
+    if (errno == EINTR)
+    {
+      ++output_drops_;
+      return 0;
+    }
+    error = errno_text("poll failed for playback");
+    return -1;
+  }
+
+  const int written = transfer(playback_fd_, const_cast<void*>(src), frames, true, 1000, error);
+  if (written < 0)
+    return -1;
+  if (written != static_cast<int>(frames))
+  {
+    // Room for a period was advertised and then not delivered. Partial delivery cannot be dropped
+    // quietly (it is half a period of audio in the ring), so this is an error rather than a drop.
+    error = "playback took " + std::to_string(written) + " of " + std::to_string(frames) +
+            " frames after POLLOUT reported room for a period";
+    return -1;
+  }
+  return written;
+}
+
 bool AlsaRawDuplex::query_occupancy(bool capture, AlsaRawOccupancy& out, std::string& error) const
 {
   const int fd = capture ? capture_fd_ : playback_fd_;
@@ -552,9 +646,27 @@ bool AlsaRawDuplex::query_occupancy(bool capture, AlsaRawOccupancy& out, std::st
   }
 
   out.delay_frames = static_cast<long long>(status.delay);
+  out.avail_frames = static_cast<long long>(status.avail);
   out.hw_ptr = static_cast<unsigned long long>(status.hw_ptr);
   out.appl_ptr = static_cast<unsigned long long>(status.appl_ptr);
   out.state = static_cast<int>(status.state);
+
+  // The pointer pair is the authority on how much is in the ring; `delay` is not. On the SSL 2+
+  // Mk II, playback `delay` is the pointer gap plus the frames already in the USB host controller's
+  // hands (a constant +72 frames in a measured sample, larger when the ring is full), which is why
+  // the old occupancy figure could exceed the ring it was describing. Capture has no such offset.
+  if (info_.buffer_size != 0)
+  {
+    const unsigned long long buffer = info_.buffer_size;
+    out.ring_frames = static_cast<long long>(capture ? (out.hw_ptr + buffer - out.appl_ptr) % buffer
+                                                     : (out.appl_ptr + buffer - out.hw_ptr) % buffer);
+    if (out.ring_frames != out.delay_frames)
+      ++occupancy_mismatches_;
+  }
+  else
+  {
+    out.ring_frames = out.delay_frames;
+  }
   out.tstamp_ns = static_cast<long long>(status.tstamp.tv_sec) * 1000000000LL + status.tstamp.tv_nsec;
   out.audio_tstamp_ns =
     static_cast<long long>(status.audio_tstamp.tv_sec) * 1000000000LL + status.audio_tstamp.tv_nsec;

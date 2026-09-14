@@ -312,6 +312,21 @@ public:
     return device_->write_playback(src, frames, timeout_ms, error);
   }
 
+  int try_write_playback(const void* src, unsigned frames, std::string& error) override
+  {
+    return device_->try_write_playback(src, frames, error);
+  }
+
+  StreamQueueStats queue_stats() const override
+  {
+    StreamQueueStats stats;
+    stats.output_drops = device_->output_drops();
+    stats.capture_bursts = device_->capture_bursts();
+    stats.settle_discarded_frames = device_->settle_discarded_frames();
+    stats.occupancy_mismatches = device_->occupancy_mismatches();
+    return stats;
+  }
+
   uint64_t driver_xruns() const override { return device_->driver_xruns(); }
 
   bool ring_occupancy(long long& capture_frames, long long& playback_frames) const override
@@ -323,8 +338,11 @@ public:
       return false;
     if (!device_->query_occupancy(false, playback, ignored))
       return false;
-    capture_frames = capture.delay_frames;
-    playback_frames = playback.delay_frames;
+    // ring_frames, not delay_frames: the driver's playback delay includes the frames already in the
+    // USB host controller's hands, which is how this figure once reported 544 frames of occupancy
+    // for a 256-frame ring (see AlsaRawOccupancy). The pointer pair is what the ring holds.
+    capture_frames = capture.ring_frames;
+    playback_frames = playback.ring_frames;
     return true;
   }
 

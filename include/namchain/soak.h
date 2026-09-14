@@ -182,6 +182,19 @@ struct SoakResult
   /// Blocks whose playback ring was at or above the buffer length: the loop was writing into a full
   /// ring, which is the state that turns the write's wait for space into reported block time.
   uint64_t playback_full_blocks = 0;
+  /// Periods the loop dropped rather than wait for room in the output ring. The engine is unaffected
+  /// -- the oracle still validates every block it rendered -- but the audio has a gap exactly here,
+  /// so it is a reported number and not a debug counter.
+  uint64_t output_drops = 0;
+  /// Reads released while two or more periods were waiting: the loop had fallen a period behind. This
+  /// is the mechanism that fills the output ring, so it is reported even when no period is dropped.
+  uint64_t capture_bursts = 0;
+  /// Frames read and discarded before the timed loop so it started from a known capture occupancy.
+  /// Bring-up audio, not a dropped period.
+  uint64_t settle_discarded_frames = 0;
+  /// Samples where the backend's delay disagreed with its own pointer pair. Non-zero means an
+  /// occupancy figure from that backend cannot be used as evidence until it is explained.
+  uint64_t occupancy_mismatches = 0;
   unsigned chain_instances = 0;
   std::string chain_model;
   /// The concrete C++ type the factory returned (e.g. A2PlanarFull vs A2FastModel<8>). A timing

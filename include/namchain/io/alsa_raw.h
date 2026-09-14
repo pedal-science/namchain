@@ -86,7 +86,21 @@ struct AlsaRawOccupancy
   /// For playback: frames written but not yet played. For capture: frames the device has produced
   /// that the application has not read. Either way, it is the gap between the application pointer
   /// and the hardware pointer, which is exactly what has to be removed from a delay measurement.
+  ///
+  /// **Not to be used as the ring occupancy.** On the SSL 2+ Mk II the driver's playback `delay` is
+  /// the pointer gap *plus the frames already handed to the USB host controller*, measured as a
+  /// constant +72 frames (1.5 ms) at three separate instants via `/proc/asound/card2/pcm0p/sub0/status`,
+  /// and larger when the ring is full -- which is how a 256-frame ring came to report 544 frames of
+  /// "occupancy". Capture has no such offset: `delay == hw_ptr - appl_ptr` exactly, at every sample.
   long long delay_frames = 0;
+  /// The true ring occupancy, derived from the pointer pair and therefore free of the driver's
+  /// in-flight offset: `appl - hw` for playback, `hw - appl` for capture, modulo the buffer.
+  /// This is the field to pace, gate and report with.
+  long long ring_frames = 0;
+  /// `status.avail`: room to write (playback) or frames to read (capture). Agrees with the pointer
+  /// pair in both directions on this device, unlike delay, and is what the kernel's own poll()
+  /// readiness is computed from -- so it is the authority the non-blocking write relies on.
+  long long avail_frames = 0;
   /// The pointers behind the delay, for diagnostics. Both are ring offsets, not absolute counters,
   /// so they are only meaningful next to the buffer size.
   unsigned long long hw_ptr = 0;
@@ -130,6 +144,11 @@ public:
   ///
   /// The gate is checked against the device's own pointer rather than trusting the wakeup, so the
   /// cadence holds even if a driver wakes early.
+  ///
+  /// The gate is rate-correct but not burst-free: it releases whenever a period is waiting, so a
+  /// backlog of two periods releases two reads almost together and therefore two writes. That burst
+  /// is how one late period used to turn into a permanently full playback ring (§9.5 item 4), so
+  /// every release that finds two or more periods waiting is counted -- see capture_bursts().
   bool wait_capture(int timeout_ms, std::string& error);
 
   /// Read exactly \p frames into \p dst, waiting up to \p timeout_ms. Returns frames transferred,
@@ -143,11 +162,47 @@ public:
   /// Write exactly \p frames from \p src. Same sizing rule as read_capture().
   int write_playback(const void* src, unsigned frames, int timeout_ms, std::string& error);
 
+  /// \brief Write \p frames only if the ring can take them *now*; drop the period if it cannot.
+  ///
+  /// The whole point is that this never waits. A blocking write is not a failure of the engine, but
+  /// it *is* the queue deciding the block time: on the SSL, an hour of identical 295 us engine work
+  /// was reported as 993 us blocks because 699 us of every period was the write waiting for space
+  /// (§9.5 item 4). A loop that can block in the write cannot keep a bound on its own deadline,
+  /// and it stalls long enough for the capture ring to accumulate the backlog that makes the next
+  /// write worse. Asking "is there room for a period" and dropping when there is not converts an
+  /// unbounded wait into a bounded, counted one: the caller knows it lost a period, and can say so.
+  ///
+  /// The question is put to the kernel's own poll() rather than computed from `status.delay`,
+  /// because `delay` is the field that reads 544 frames against a 256-frame buffer at saturation
+  /// and is therefore not fit to decide anything with yet.
+  ///
+  /// \return frames written (== \p frames), 0 when there was no room so the period was dropped and
+  /// counted as a drop, or -1 on a real error.
+  int try_write_playback(const void* src, unsigned frames, std::string& error);
+
   /// Count of `-EPIPE` conditions. Every one is counted and reported; the engine never silently
   /// re-prepares (plan.md §10.5.1).
   uint64_t driver_xruns() const { return driver_xruns_; }
   /// How many times recovery was performed (one per handled xrun, normally).
   uint64_t recoveries() const { return recoveries_; }
+
+  /// Periods try_write_playback() found no room for. Each one is a period of output audio the loop
+  /// chose to lose rather than block on. Zero is the only acceptable steady-state value.
+  uint64_t output_drops() const { return output_drops_; }
+  /// Reads released while two or more periods were waiting. Zero means the loop never fell a period
+  /// behind; a positive count is the mechanism that fills the playback ring, so it is reported even
+  /// when the drop guard absorbs the consequence.
+  uint64_t capture_bursts() const { return capture_bursts_; }
+  /// Frames read and discarded before the timed loop to establish a known-empty capture ring.
+  /// This is bring-up audio the engine was never going to process, not a dropped period.
+  uint64_t settle_discarded_frames() const { return settle_discarded_frames_; }
+  /// Samples where `status.delay` disagreed with the pointer-derived ring occupancy. On this device
+  /// that is *expected* for playback and never happens for capture: playback delay carries the
+  /// driver's in-flight offset (see AlsaRawOccupancy). Kept as a counter because "the field we were
+  /// about to control the loop with disagrees with the pointers" is a fact the report should state
+  /// rather than an implementation detail, and because a change in this number would mean the
+  /// driver's behaviour changed under us. Measured to settle the 544-against-256 question in §9.5.
+  uint64_t occupancy_mismatches() const { return occupancy_mismatches_; }
 
   /// \brief Read the ring occupancy and pointers for one direction.
   ///
@@ -164,6 +219,9 @@ private:
   /// \param playback when true the ring is re-primed with silence after the xrun.
   void recover(int fd, bool playback);
   bool prime_playback(std::string& error);
+  /// Read and discard capture until less than one period is waiting, so the timed loop starts from a
+  /// known occupancy rather than from however long the device ran before the loop was ready.
+  bool drain_capture(std::string& error);
   int transfer(int fd, void* buf, unsigned frames, bool playback, int timeout_ms, std::string& error);
 
   int capture_fd_ = -1;
@@ -176,9 +234,16 @@ private:
   unsigned playback_bytes_per_frame_ = 2;
   /// Silence used to prime the playback ring; preallocated so recovery does not allocate.
   std::vector<unsigned char> prime_silence_;
+  /// Sink for drain_capture(), preallocated for the same reason and sized one period.
+  std::vector<unsigned char> drain_buffer_;
   AlsaRawInfo info_;
   uint64_t driver_xruns_ = 0;
   uint64_t recoveries_ = 0;
+  uint64_t output_drops_ = 0;
+  uint64_t capture_bursts_ = 0;
+  uint64_t settle_discarded_frames_ = 0;
+  /// Mutable because query_occupancy() is const and this is a diagnostic it happens to compute.
+  mutable uint64_t occupancy_mismatches_ = 0;
 };
 
 /// Resolve "hw:4,0", "4,0" or a "/dev/snd/..." path to a PCM device node.

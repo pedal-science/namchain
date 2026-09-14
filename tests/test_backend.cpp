@@ -250,6 +250,34 @@ TEST_CASE("the null backend hands back silence and discards what is written")
   backend->stop();
 }
 
+TEST_CASE("a backend with no ring never drops a period")
+{
+  // try_write_playback is how the loop bounds its own latency, and its whole safety argument rests on
+  // the default being "always write": a backend with no ring cannot be full, and a dropped period
+  // from `file` would silently remove audio from the output WAV instead of failing. So the default
+  // has to be checked rather than assumed, and it has to report no drops.
+  namchain::BackendConfig config;
+  config.sample_rate = 48000;
+  config.period_size = 64;
+  config.realtime_paced = false; // no reason to wait in a unit test
+
+  std::string error;
+  std::unique_ptr<namchain::AudioBackend> backend =
+    namchain::open_backend(config, namchain::BackendKind::Null, error);
+  REQUIRE(backend != nullptr);
+  REQUIRE(backend->start(error));
+
+  std::vector<unsigned char> silence(64u * 4u, 0);
+  CHECK(backend->try_write_playback(silence.data(), 64, error) == 64);
+  CHECK(backend->try_write_playback(silence.data(), 64, error) == 64);
+
+  const namchain::StreamQueueStats stats = backend->queue_stats();
+  CHECK(stats.output_drops == 0);
+  CHECK(stats.capture_bursts == 0);
+  CHECK(stats.settle_discarded_frames == 0);
+  backend->stop();
+}
+
 TEST_CASE("a requested backend that does not exist fails by name")
 {
   namchain::BackendConfig config;

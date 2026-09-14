@@ -250,6 +250,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   long long playback_occupancy_max = 0;
   long long playback_occupancy_last = 0;
   uint64_t playback_full_blocks = 0;
+  uint64_t output_drops = 0;
   const auto start = Clock::now();
   for (uint64_t block = 0; block < total_blocks; ++block)
   {
@@ -263,8 +264,19 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     const auto tw0 = Clock::now();
     if (!device->wait_capture(2000, error))
     {
+      // Name the block and the ring state. A stall here aborts an hour-long run, and "capture timed
+      // out" alone cannot say whether it was the first period after a drop, a device that stopped
+      // delivering, or a gate that stopped being satisfied (which is what the ring figures answer).
       device->stop();
-      return fail(error);
+      std::string state;
+      long long capture_frames = -1;
+      long long playback_frames = -1;
+      if (device->ring_occupancy(capture_frames, playback_frames))
+        state = " at block " + std::to_string(block) + " with capture ring " + std::to_string(capture_frames) +
+                " and playback ring " + std::to_string(playback_frames) + " frames";
+      else
+        state = " at block " + std::to_string(block);
+      return fail(error + state);
     }
     const auto tw1 = Clock::now();
     wait_timer.record(
@@ -333,11 +345,19 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
       }
     }
 
-    if (device->write_playback(playback_buffer.data(), info.period_size, 1000, error) < 0)
+    // Ask whether the ring can take a period rather than blocking until it can. A blocking write is
+    // what made an hour of 295 us engine work report a 993 us block time, and it also stalls the loop
+    // long enough for the capture ring to build the backlog that makes the next write worse (plan.md
+    // §9.5 item 4). A refusal is a dropped period: a real, counted loss of audio, which is a bounded
+    // and reportable outcome where an unbounded wait is not.
+    const int written = device->try_write_playback(playback_buffer.data(), info.period_size, error);
+    if (written < 0)
     {
       device->stop();
       return fail(error);
     }
+    if (written == 0)
+      ++output_drops;
     const auto t3 = Clock::now();
     write_timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count()));
     const uint64_t block_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t0).count());
@@ -415,6 +435,19 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.playback_occupancy_max = playback_occupancy_max;
   result.playback_occupancy_last = playback_occupancy_last;
   result.playback_full_blocks = playback_full_blocks;
+  result.output_drops = output_drops;
+  {
+    const StreamQueueStats stats = device->queue_stats();
+    result.capture_bursts = stats.capture_bursts;
+    result.occupancy_mismatches = stats.occupancy_mismatches;
+    result.settle_discarded_frames = stats.settle_discarded_frames;
+    // Two counters, one event: the loop counts the zero the backend returned and the backend counts
+    // the refusal it decided. They cannot legitimately differ, so a difference is a bug in one of
+    // them and is reported rather than averaged away.
+    if (stats.output_drops != output_drops)
+      return fail("output-drop accounting disagrees: the loop counted " + std::to_string(output_drops) +
+                  ", the backend counted " + std::to_string(stats.output_drops));
+  }
 
   result.blocks = timer.blocks();
   result.frames = timer.blocks() * info.period_size;
