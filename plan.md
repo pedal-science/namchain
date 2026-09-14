@@ -859,6 +859,17 @@ audio thread pinned to a dedicated core (workers and warm threads excluded; only
 IRQs are also moved); `vcgencmd get_throttled`/`measure_temp` in the health loop with a fan/Active
 Cooler mandatory for always-on low-latency use (G18).
 
+**Host target.** The assumed host is Linux with `PREEMPT_RT` and `threadirqs` *where the platform can
+supply one* — this Pi 500 can (`linux-image-rt-*`), and the checklist above is what we ship to make a
+stock kernel behave as well as it can. The engine must nevertheless be **correct on a non-RT kernel**:
+this box has already held RTF 0.9999 and a sample-exact self-oracle for an hour under a stock
+`PREEMPT_DYNAMIC` kernel, and every failure seen so far has been a control-loop bug that an RT kernel
+would not have touched (§9.5). RT buys margin against the *tail* — wakeup jitter, long kernel critical
+sections, a desktop waking up — and is worth having, but **no acceptance criterion may depend on it**,
+because we cannot require it of a user's host. The escalation path for a device with neither an RT
+kernel nor a quiet one is a dedicated (non-Linux) RTOS; that is deliberately deferred and recorded in
+§14, and it is the reason the I/O layer is an interface (§9.1) rather than ALSA calls in the engine.
+
 ### 9.4 Platform constraints carried into the design
 
 - **iOS: no runtime-loaded node plugins** (G17) ⇒ the ABI is designed now so third-party DSP is
@@ -1096,6 +1107,24 @@ number:
 3. **The first block after START overran in every configuration, passthrough included** -- it is the
    initial fill of an empty capture ring, not a real-time property. Bring-up is now untimed and its
    xruns reported separately, rather than being discarded or mistaken for load.
+4. **The output queue ratchets to full and has no restoring force** -- the one *design* fault this work
+   exposed, and the reason the 1 h criterion-3 soak failed. Priming one period (item 2) starts the
+   playback ring at one period of occupancy, but the loop then adds exactly one period per period the
+   device drains, so occupancy is a **conserved quantity**: any burst the capture gate allows (its test
+   is `delay >= period`, and `delay` arrives quantised in USB-frame steps, so a pass can leave `delay`
+   still above the threshold) pushes it up by a period, and nothing pulls it back down. The ceiling is
+   a fixed point, because a blocking write still delivers its period -- it just charges the wait to the
+   block. Measured after the cadence fix (`67a6ed7`), 300 s: `write` p50 **698 816 ns**, block p50
+   1 019 910 ns, block p99 **112.6 %** of the deadline, **224 239 of 225 000 blocks** writing into a
+   ring with less than a period of room -- while the engine's own `chain` p99 was **45.7 %** and the
+   self-oracle stayed exact. The fix is a **bounded output queue with an explicit policy**: never block
+   the RT thread on the device, and when the queue is above target, *choose* to drop or advance the
+   output timeline and re-align on the next device period. A longer settle phase at bring-up cannot do
+   it -- a settle phase chooses the initial occupancy, it cannot hold it.
+   - Open measurement question: the playback `delay` reads up to **544 frames against a 256-frame
+     buffer**, which a ring cannot hold. Until that is explained (URB in-flight frames, or the field not
+     meaning what we assume once saturated) occupancy is *evidence*, not a gate; the write-time
+     percentiles are the direct measurement, and they say the same thing.
 
 **A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
 but the run does not keep real time at it: RTF 1.333, i.e. it loses a third. Instrumenting the loop to
@@ -1340,10 +1369,16 @@ frames, 4 × A2-Full, through the device.
 **This section previously contained estimates. These are measurements.** Host: Raspberry Pi 500
 (BCM2712, 4× Cortex-A76 @ 2.4 GHz), Ubuntu 24.04 / kernel 6.8.0-1064-raspi at the time of
 measurement (§0 records the 2026-09-13 upgrade to 26.04 / 7.0.0-1017-raspi, which every number below
-predates), `performance` governor,
-40 °C, `throttled=0x0`. Engine configuration: 48 kHz, `NAM_ENABLE_A2_FAST=ON`, `double` samples,
-single-threaded, `-O3`, 2 s of audio × 10 iterations, RTF excludes `Reset()`/prewarm. Produced by
-`namchain-bench` and cross-checked against the core's own `benchmodel_bufsize` (agreement within 2 %).
+predates), `performance` governor, 40 °C, `throttled=0x0`. Engine configuration: 48 kHz,
+`NAM_ENABLE_A2_FAST=ON`, `double` samples, single-threaded, `-O3`, 2 s of audio × 10 iterations, RTF
+excludes `Reset()`/prewarm. Produced by `namchain-bench` and cross-checked against the core's own
+`benchmodel_bufsize` (agreement within 2 %).
+
+**These numbers are the `a2_fast` kernels and therefore conservative.** They were measured before the
+PR #313 planar kernels (§7.8) were on by default on AArch64, and the table was not re-run afterwards:
+the effect is visible in the device soak, where 4 × A2-Full in series now costs **chain p50 ≈ 300 µs**,
+against the 4 × 142.6 µs = 570 µs this table implies. Re-running `namchain-bench` through the planar
+path is an M2 cleanup; until then read this table as a floor on cost, not the current cost.
 
 | Model | q | p50 µs | p99 µs | max µs | RTF | p99 % of deadline | instances at 50 % | at 100 % |
 |---|---|---|---|---|---|---|---|---|
@@ -1414,7 +1449,7 @@ measured in M0's remainder.
 
 | Metric | Target (Pi 5 class, 48 kHz, q=64) | Status |
 |---|---|---|
-| Concurrent audible A2-Full (8ch) | ≥ 4, p99 ≤ 50 % deadline, 0 xruns/1 h | **met on p99 and on xruns for 30 s through the compiler (34.95 % with 4 in series, 0 xruns, §11); 1 h still to run** |
+| Concurrent audible A2-Full (8ch) | ≥ 4, p99 ≤ 50 % deadline, 0 xruns/1 h | **engine work met, one-hour gate not met**: 4 × A2-Full in series gives chain p99 45.7 % of the deadline and 0 render-path allocations over 5 min, but the 1 h run of 2026-09-13 failed the gate as currently worded (block p99 112.6 %, 1 driver xrun) because the loop blocked in `write` on a saturated playback ring -- diagnosed in §9.5 item 4, fix in progress, gate wording being re-decided from those numbers |
 | Concurrent audible A2-Lite (3ch) | ≥ 12 | **met** (17 at 50 %) |
 | Resident switchable instances | ≥ 16 (≥ 64 if RAM allows) | **RAM supports ≥ 64**; switching itself is M3 |
 | Switch ready-time (p99, warm set) | ≤ 5 ms, zero click | M3 |
@@ -1478,7 +1513,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; **`AudioBackend` interface with `null` and `file` implemented and `pipewire` refused by name ✔ (§9.1) — the stream loop is now written once and runs against a device, a paced clock or a WAV, so `ctest -R soak_cli` exercises the timers, the gates and the oracle with no hardware**; **memory locking made safe and the block timer sized from the run — `MCL_FUTURE` plus a fixed 44 MB timer reserve aborted the `null` backend with `std::bad_alloc` under a finite `RLIMIT_MEMLOCK`, and `soak_cli` now reproduces that limit ✔ (§14.10)**; **multichannel WAV reader ✔**; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **device-mode self-oracle ✔ — the run records the input it consumed and compares its output against a freshly compiled offline render of it, `max|diff| = 0` (§10.5.1)**; **1 h soak meeting §1 criterion 3 in full** (zero driver-reported xruns, p99 ≤ 50 % deadline, max < deadline, no throttle flags, first 60 s sample-identical to the offline render of the same input); allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference, and the ring occupancy measured and removed so the residual spread is reported rather than assumed (§9.5)**; **parity test green at release flags** |
+| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; **`AudioBackend` interface with `null` and `file` implemented and `pipewire` refused by name ✔ (§9.1) — the stream loop is now written once and runs against a device, a paced clock or a WAV, so `ctest -R soak_cli` exercises the timers, the gates and the oracle with no hardware**; **memory locking made safe and the block timer sized from the run — `MCL_FUTURE` plus a fixed 44 MB timer reserve aborted the `null` backend with `std::bad_alloc` under a finite `RLIMIT_MEMLOCK`, and `soak_cli` now reproduces that limit ✔ (§14.10)**; **multichannel WAV reader ✔**; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔**; **the loop's cadence and its output-queue policy — `sw_params` now sets `avail_min` to the period so `poll` wakes on the boundary the loop consumes at, and the one-period prime plus the resulting occupancy ratchet are diagnosed in §9.5 items 2 and 4** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **device-mode self-oracle ✔ — the run records the input it consumed and compares its output against a freshly compiled offline render of it, `max|diff| = 0` over 2 880 000 frames (§10.5.1)**; **1 h soak vs §1 criterion 3 — run, *not met*: chain p99 45.7 % and 0 render-path allocations hold; block p99 112.6 % and 1 driver xrun fail the current wording, for the output-queue reason in §9.5 item 4, not for engine or kernel-latency reasons**; allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference, and the ring occupancy measured and removed so the residual spread is reported rather than assumed (§9.5)**; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |
@@ -1560,10 +1595,21 @@ Critical path to the headline claim is **M0 → M1 → M2 → M3**; M4–M7 add 
     unseen. Residual: on a host whose hard limit is below the working set, `mlockall` fails and the
     soak reports that as a caveat — the measurement then includes page faults, which is why the report
     prints the lock status next to the percentiles instead of assuming it.
+11. **Host RT capability is not ours to choose.** A user's machine may offer no PREEMPT_RT kernel and no
+    way to quiet it, and this box is the exception rather than the rule (the Pi can run
+    `linux-image-rt-*`; a laptop cannot be told to stop running the desktop). Mitigation, and the reason
+    §9.3 states it as policy: nothing above the I/O layer may depend on kernel latency behaviour, the
+    loop must degrade by *choosing* a discontinuity rather than by blocking, and the acceptance criteria
+    are written against engine work and driver-reported xruns so that they mean the same thing on both
+    kinds of host. Deferred decision: if a device we want to support can have neither an RT kernel nor a
+    quiet one, the fallback is a dedicated non-Linux RTOS, which would cost us ALSA/USB-class
+    compliance and the current I/O layer — the `AudioBackend` interface (§9.1) is what keeps that door
+    open, and this is deliberately not being decided now.
 
 **Assumptions** — engine runs at 48 kHz internally; graphs are DAGs; permissive-only dependencies (with
 the ALSA note in §4.3); no UI in this project; `.nam` files are user-supplied, not redistributed; Linux
-is the reference platform for RT behaviour.
+is the reference platform for RT behaviour, with PREEMPT_RT assumed available on the reference device
+and *not* assumed on a user's host (risk 11, §9.3).
 
 **Open decisions you may want to change** (each has a default in the plan): default warming policy mode
 (`balanced`); `fade_ms` default (5 ms) and `max_defer_ms` (15 ms); whether to accept LGPL
