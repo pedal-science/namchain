@@ -16,6 +16,7 @@
 #include "namchain/offline.h"
 #include "namchain/pcm.h"
 #include "namchain/rt_check.h"
+#include "namchain/rt/scheduling.h"
 #include "namchain/telemetry.h"
 #include "namchain/wav.h"
 
@@ -225,6 +226,13 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   // Last, so that the model, the plan and every stream buffer are covered by MCL_CURRENT -- see
   // lock_process_memory.
   const bool memory_locked = options.backend != BackendKind::File && lock_process_memory();
+
+  // Ask for the thread's scheduling and read back what was granted. Done here rather than left to a
+  // `chrt`/`taskset` on the command line: the plan has listed this since §9.3, the measurement then
+  // depends on how the binary happened to be launched, and pinning alone was worth half the tail
+  // (§9.5 item 6). A refusal is reported, not fatal -- an unprivileged run is a different claim, not
+  // a broken one.
+  const rt::SchedulingState scheduling = rt::apply_scheduling(options.rt_priority, options.cpu);
 
   // Start the stream only now that everything it needs is in memory. `start` primes the playback
   // ring and lets the device run, so the time between it and the first wait_capture is time the
@@ -437,6 +445,10 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.backend = backend_kind_name(options.backend);
   result.first_overrun_block = first_overrun_block;
   result.memory_locked = memory_locked;
+  result.scheduling = rt::describe_scheduling(scheduling);
+  result.rt_priority_held = scheduling.priority_applied;
+  result.cpu_pinned = scheduling.affinity_applied;
+  result.running_cpu = scheduling.cpu;
   result.device_period_size = info.period_size;
   result.device_buffer_size = info.buffer_size;
   result.chain_instances = options.model.empty() ? 0u : std::max(1u, options.instances);

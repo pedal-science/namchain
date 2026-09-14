@@ -41,6 +41,9 @@ void usage()
                "  --sample-rate N      engine rate in Hz (default 48000)\n"
                "  --max-p99-percent X  gate on p99 block time, %% of deadline (default 50)\n"
                "  --max-output-drops N  gate on periods dropped for want of output room (default 0)\n"
+               "  --rt-priority N  request SCHED_FIFO at this priority, applied by the program (default 80,\n"
+               "                   0 to leave the policy alone); a refusal is reported, not fatal\n"
+               "  --cpu N          confine the loop thread to one CPU (default: leave the affinity alone)\n"
                "  --json               print a JSON summary instead of text\n"
                "stream mode (a backend drives the loop a period at a time):\n"
                "  --backend KIND       alsa_raw (default), null, or file. With null or file no\n"
@@ -66,6 +69,8 @@ int main(int argc, char** argv)
   namchain::SoakOptions options;
   double max_p99_percent = 50.0;
   unsigned long long max_output_drops = 0;
+  int rt_priority = 80;
+  int cpu = -1;
   bool json = false;
   std::string model_path;
   std::string input_path;
@@ -96,6 +101,10 @@ int main(int argc, char** argv)
       max_p99_percent = std::atof(argv[++i]);
     else if (arg == "--max-output-drops" && i + 1 < argc)
       max_output_drops = std::strtoull(argv[++i], nullptr, 10);
+    else if (arg == "--rt-priority" && i + 1 < argc)
+      rt_priority = std::atoi(argv[++i]);
+    else if (arg == "--cpu" && i + 1 < argc)
+      cpu = std::atoi(argv[++i]);
     else if (arg == "--backend" && i + 1 < argc)
     {
       if (!namchain::parse_backend_kind(argv[++i], options.backend))
@@ -168,8 +177,7 @@ int main(int argc, char** argv)
       return 2;
     }
     if (!positionals.empty())
-      input_path = positionals[0];
-    // The offline path builds its graph from the positional path rather than from the option, so
+      input_path = positionals[0];    // The offline path builds its graph from the positional path rather than from the option, so
     // the two are kept equal here instead of being allowed to drift apart.
     if (!options.model.empty())
       model_path = options.model;
@@ -198,6 +206,11 @@ int main(int argc, char** argv)
     return 2;
   }
 
+  // The scheduling requests are applied by the program itself, so they travel in the options rather
+  // than being a property of how the process was launched.
+  options.rt_priority = rt_priority;
+  options.cpu = cpu;
+
   const namchain::SoakResult result = namchain::run_soak(model_path, input_path, options);
   if (!result.ok)
   {
@@ -222,6 +235,12 @@ int main(int argc, char** argv)
     j["input"] = input_path;
     j["quantum"] = options.quantum;
     j["realtime_paced"] = options.realtime_paced;
+    j["scheduling"] = {{"description", result.scheduling},
+                       {"rt_priority_held", result.rt_priority_held},
+                       {"cpu_pinned", result.cpu_pinned},
+                       {"running_cpu", result.running_cpu},
+                       {"requested_priority", options.rt_priority},
+                       {"requested_cpu", options.cpu}};
     j["blocks"] = result.blocks;
     j["frames"] = result.frames;
     j["audio_seconds"] = result.audio_seconds;
@@ -320,6 +339,8 @@ int main(int argc, char** argv)
       std::printf("sample format:    %s (%u bytes/sample)\n", result.device_sample_format.c_str(),
                   result.device_bytes_per_sample);
       std::printf("mlockall:         %s\n", result.memory_locked ? "locked" : "FAILED (measurement includes page faults)");
+      std::printf("scheduling:       %s%s\n", result.scheduling.c_str(),
+                  result.rt_priority_held ? "" : "  <- NOT real-time: this run says so rather than assuming");
       if (result.chain_instances > 0)
         std::printf("chain:            %u x %s\n", result.chain_instances, result.chain_model.c_str());
       if (!result.model_type.empty())
@@ -436,8 +457,9 @@ int main(int argc, char** argv)
       // different causes, and the run length plus the spacing is what identifies which one this is.
       if (!result.chain_spikes.empty())
       {
-        std::printf("cpu spike bursts: %zu blocks over half a period of CPU, in ",
-                    result.chain_spikes.size());
+        std::printf("cpu spike bursts: %zu blocks over half a period of CPU%s, in ",
+                    result.chain_spikes.size(),
+                    result.chain_spikes.size() >= namchain::SoakResult::max_spikes ? " (capped: there were more)" : "");
         struct Burst
         {
           uint64_t first = 0;

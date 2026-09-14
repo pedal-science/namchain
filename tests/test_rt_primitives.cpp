@@ -12,6 +12,7 @@
 
 #include "namchain/rt/arena.h"
 #include "namchain/rt/reclaimer.h"
+#include "namchain/rt/scheduling.h"
 #include "namchain/rt/spsc_ring.h"
 #include "namchain/rt_check.h"
 
@@ -324,4 +325,39 @@ TEST_CASE("reclaimer retire and advance_epoch allocate nothing")
   reclaimer.advance_epoch();
   CHECK(reclaimer.collect() == 1u);
   CHECK(g_freed.load() == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling: what the thread asked for and what it holds
+// ---------------------------------------------------------------------------
+TEST_CASE("scheduling state can be read back, and a refusal is reported rather than assumed")
+{
+  // This is deliberately side-effect free so it can run anywhere, including an unprivileged CI
+  // container. The one thing it must never do is let a run claim real-time priority it does not
+  // have -- which is why the state is read from the kernel after the request rather than remembered.
+  const namchain::rt::SchedulingState before = namchain::rt::current_scheduling();
+  CHECK(before.cpu_count >= 1);
+  CHECK_FALSE(namchain::rt::describe_scheduling(before).empty());
+
+  // Asking for nothing changes nothing, and says so: neither request counts as applied.
+  const namchain::rt::SchedulingState unchanged = namchain::rt::apply_scheduling(0, -1);
+  CHECK_FALSE(unchanged.affinity_applied);
+  CHECK_FALSE(unchanged.priority_applied);
+  CHECK(unchanged.cpu_count >= 1);
+
+  // A CPU index this build cannot name is refused with a reason instead of being masked into a
+  // CPU_SET that writes past the end of its mask. No privilege and no side effect are involved.
+  const namchain::rt::SchedulingState bogus = namchain::rt::apply_scheduling(0, 100000);
+  CHECK_FALSE(bogus.affinity_applied);
+  CHECK_FALSE(bogus.detail.empty());
+
+  // SCHED_FIFO needs privilege, so both outcomes are legitimate here (CI is unprivileged, the Pi is
+  // not). What is checked is the invariant that the report matches the state: if it says it holds
+  // real-time priority then the kernel's own answer must be a real-time policy at that priority.
+  const namchain::rt::SchedulingState rt = namchain::rt::apply_scheduling(80, -1);
+  CHECK(rt.realtime == (rt.policy == SCHED_FIFO || rt.policy == SCHED_RR));
+  if (rt.priority_applied)
+    CHECK(rt.policy == SCHED_FIFO);
+  else
+    CHECK_FALSE(rt.detail.empty());
 }

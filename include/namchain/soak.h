@@ -77,6 +77,14 @@ struct SoakOptions
   /// and model is checked against. Fixed rather than inferred: this is a 48 kHz engine at M1, and a
   /// harness that quietly follows whichever file it was handed cannot compare two runs.
   unsigned sample_rate = 48000;
+  /// Requested `SCHED_FIFO` priority for the thread that runs the loop, applied by the program. 0
+  /// leaves the scheduling policy alone. Applied and then read back, because being refused RT
+  /// priority is a fact about the run (§9.3, and the reason this is no longer left to `chrt`).
+  int rt_priority = 80;
+  /// Requested CPU for the thread that runs the loop, or -1 to leave the affinity alone. Pinning
+  /// halved the deadline-miss tail in the same configuration, so it belongs in the program rather
+  /// than in the command line that happened to launch it (§9.5 item 6).
+  int cpu = -1;
 };
 
 struct OracleResult
@@ -205,6 +213,12 @@ struct SoakResult
   std::string backend;
   /// Whether mlockall succeeded: without it the measurement includes page-fault stalls.
   bool memory_locked = false;
+  /// What the loop thread's scheduling actually was, read back after asking. A run that was refused
+  /// `SCHED_FIFO` is a different measurement from one that held it, so it is reported and not assumed.
+  std::string scheduling;
+  bool rt_priority_held = false;
+  bool cpu_pinned = false;
+  int running_cpu = -1;
   /// Index of the first block that exceeded the deadline; UINT64_MAX if none. Distinguishes a
   /// startup transient from steady-state overload, which need very different responses.
   uint64_t first_overrun_block = UINT64_MAX;

@@ -126,6 +126,7 @@ add_library(namchain OBJECT
   src/rt/rt_check.cpp
   src/rt/arena.cpp
   src/rt/reclaimer.cpp
+  src/rt/scheduling.cpp
   src/graph/plan.cpp
   src/graph/reference.cpp
   src/graph/rig.cpp

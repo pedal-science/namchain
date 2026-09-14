@@ -104,4 +104,26 @@ endif()
 _run_and_expect_success("pipewire backend is refused" 2
   "${NAMCHAIN_SOAK}" --backend pipewire --no-pacing --seconds 1 "${NAMCHAIN_MODEL}" "${NAMCHAIN_INPUT}")
 
+# --- 6. the program applies its own scheduling, and says what it got ----------------------------
+# Until 2026-09-14 nothing in this project set SCHED_FIFO or thread affinity: the soak was run under
+# an externally applied `chrt`/`taskset`, so the measurement depended on a command line no user would
+# type, and plan.md 9.3 described code that did not exist. Pinning alone was worth half the
+# deadline-miss tail, so the engine does it itself now and reports the state it actually holds.
+#
+# The assertion is about the *report*, not about privilege: CI runs unprivileged, where the priority
+# request is refused, and this machine is not. Both are legitimate. What is not legitimate is a run
+# that claims a real-time thread it does not have. `--cpu 0` works either way, because affinity needs
+# no privilege.
+execute_process(
+  COMMAND "${NAMCHAIN_SOAK}" --backend null --no-pacing --seconds 1 --cpu 0 --model "${NAMCHAIN_MODEL}"
+  RESULT_VARIABLE _sched_rc
+  OUTPUT_VARIABLE _sched_out
+  ERROR_VARIABLE _sched_err)
+if(NOT _sched_rc EQUAL 0)
+  message(FATAL_ERROR "scheduling run: expected exit 0, got ${_sched_rc}\n--- stdout ---\n${_sched_out}\n--- stderr ---\n${_sched_err}")
+endif()
+if(NOT _sched_out MATCHES "scheduling:[^\n]*cpu 0")
+  message(FATAL_ERROR "the report did not say the thread was confined to cpu 0:\n--- stdout ---\n${_sched_out}")
+endif()
+
 message(STATUS "soak CLI and backend checks passed")
