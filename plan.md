@@ -1316,6 +1316,34 @@ number:
    that fade is §10.3's mechanism and is the next piece, and until it lands the insertion count is the
    price of the floor stated in the open.
 
+   **The first long run of it found the placement rule, and found it the hard way.** `--periods 6
+   --output-queue-periods 5 --output-queue-floor-periods 4`, 900 s
+   (`bench-results/queue-floor.txt`, `soak-15min-floor4.*`): **0 xruns**, `p1 3.73`, `p50 3.94`, and 3
+   of 675 000 blocks below one period -- and **71 insertions against 71 drops**. That equality is the
+   finding, not a coincidence: with the cap one period above the floor and the queue's median sitting
+   between them, the two controls lock into a **limit cycle** -- the queue touches the ceiling, the cap
+   refuses a period, that leaves the next post-write level under the floor, the controller inserts a
+   period of silence, and the queue is straight back at the ceiling. One stall becomes a sustained
+   oscillation with an audible hole at each half-cycle: 142 audible events in 15 minutes, against the
+   ~2 underruns the un-floored configuration would have produced in the same time at the same cap. Zero
+   xruns was real and was bought at the wrong price.
+
+   So the rule is symmetric, and it is the same rule for both bounds: the queue's level is set by the
+   ring, the bursts and the stalls -- a post-write median of ~3.9 periods here -- and
+
+     * the **cap** must sit **above** that band, or it refuses ordinary bursts (a refusal is a period of
+       audio skipped);
+     * the **floor** must sit **below** it, or it fires on ordinary dips (an insertion is 1.33 ms of
+       audio delayed).
+
+    Both mistakes produce the same class of artefact, an audible hole, which is why the occupancy
+    distribution had to come first: without it the band is invisible and the bounds get placed inside
+    it. Both bounds are *excursion* corrections and neither can be made free by placing it well -- a
+    well-placed pair keeps the corrections rare, but "rare" over an hour is still tens of events. The way
+    out is not a better placement, it is making each hole inaudible: **`rt::SpliceFader` and the
+    dropped-period edit kind of §10.3, which measuring the floor promoted from a nicety to the critical
+    path.**
+
 **A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
 but the run does not keep real time at it: RTF 1.333, i.e. it loses a third. Instrumenting the loop to
 separate **device wait** from **work** shows where the time goes:

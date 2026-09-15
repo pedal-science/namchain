@@ -444,10 +444,20 @@ binary, same settings:
   The queue changed the CONSEQUENCE of the tail, not the tail -- which is the honest summary of
   everything sections 7-9 measured.
 
-  Two instruments are missing and both are named rather than implied: the occupancy DISTRIBUTION
+  Two instruments were missing and both are named rather than implied: the occupancy DISTRIBUTION
   (p1/p50), because `queue min` reads 0.00 in every run that underran once, and the occupancy at
-  the instant a stall begins. A floor controller -- the only mechanism that can hold a floor the
-  loop has no audio to fill -- needs both, and the fade of section 10.3's splice mechanism is what
-  makes each remaining dropout inaudible without paying latency for it.
+  the instant a stall begins. The first of those now exists -- the harness keeps a histogram of the
+  per-block occupancy, one bin per frame, and reports p1/p50 plus the count of blocks whose queue
+  held less than one period, which IS the exposure window: a stall arriving in one of those blocks
+  is an underrun and a stall arriving anywhere else is absorbed. First run of it, ring 6 / cap 4,
+  20 s: p1 2.75, p50 2.94 periods, 0 of 15 000 blocks below one period, against a min of 2.05 --
+  the run's floor and its level, separated at last.
+
+  And the mechanism that can hold a floor is in too: --output-queue-floor-periods inserts a period
+  of silence when the queue falls below it. The reason it is the right shape is what an underrun
+  costs -- the driver stops the stream and recovery discards the WHOLE ring and slips the timeline
+  -- against which a period of inserted silence (1.33 ms, no slip) is the cheaper mistake. It is
+  deliberately the *audible* version of that fix: silence at both ends of the insert, counted and
+  reported in milliseconds, until the splice fade of section 10.3 makes it inaudible.
 
 
