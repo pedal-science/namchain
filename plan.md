@@ -1316,33 +1316,44 @@ number:
    that fade is §10.3's mechanism and is the next piece, and until it lands the insertion count is the
    price of the floor stated in the open.
 
-   **The first long run of it found the placement rule, and found it the hard way.** `--periods 6
-   --output-queue-periods 5 --output-queue-floor-periods 4`, 900 s
-   (`bench-results/queue-floor.txt`, `soak-15min-floor4.*`): **0 xruns**, `p1 3.73`, `p50 3.94`, and 3
-   of 675 000 blocks below one period -- and **71 insertions against 71 drops**. That equality is the
-   finding, not a coincidence: with the cap one period above the floor and the queue's median sitting
-   between them, the two controls lock into a **limit cycle** -- the queue touches the ceiling, the cap
-   refuses a period, that leaves the next post-write level under the floor, the controller inserts a
-   period of silence, and the queue is straight back at the ceiling. One stall becomes a sustained
-   oscillation with an audible hole at each half-cycle: 142 audible events in 15 minutes, against the
-   ~2 underruns the un-floored configuration would have produced in the same time at the same cap. Zero
-   xruns was real and was bought at the wrong price.
+   **Both bounds placed inside the band squeeze the queue, and that is the placement rule's origin.**
+   `--periods 6 --output-queue-periods 5 --output-queue-floor-periods 4`, 900 s: **0 xruns**, `p1 3.73`,
+   `p50 3.94`, 3 of 675 000 blocks below one period -- and **71 insertions against 71 drops**. That
+   equality is mechanical rather than a coincidence: the controller fires when the *post*-write queue is
+   under 4 periods and the cap refuses when the *pre*-write queue is over 4, so pre <= 256 and post >= 256
+   pins the queue into a one-period band (pre = 192, post = 256) and every excursion across either edge is
+   corrected -- 142 audible events in 15 minutes. So, for both bounds, and derived rather than fitted:
 
-   So the rule is symmetric, and it is the same rule for both bounds: the queue's level is set by the
-   ring, the bursts and the stalls -- a post-write median of ~3.9 periods here -- and
-
-     * the **cap** must sit **above** that band, or it refuses ordinary bursts (a refusal is a period of
-       audio skipped);
+     * the **cap** must sit **above** the band the queue actually occupies, or it refuses ordinary
+       bursts (a refusal is a period of audio skipped);
      * the **floor** must sit **below** it, or it fires on ordinary dips (an insertion is 1.33 ms of
-       audio delayed).
+       audio delayed);
+     * and the two must be **at least a couple of periods apart**, or the queue is squeezed between
+       them and both fire constantly.
 
-    Both mistakes produce the same class of artefact, an audible hole, which is why the occupancy
-    distribution had to come first: without it the band is invisible and the bounds get placed inside
-    it. Both bounds are *excursion* corrections and neither can be made free by placing it well -- a
-    well-placed pair keeps the corrections rare, but "rare" over an hour is still tens of events. The way
-    out is not a better placement, it is making each hole inaudible: **`rt::SpliceFader` and the
-    dropped-period edit kind of §10.3, which measuring the floor promoted from a nicety to the critical
-    path.**
+    The band is invisible without the occupancy distribution, which is why that instrument came first.
+
+    **And the floor earns its place, which a balanced A/B settled.** A single hour at
+    `--output-queue-periods 4 --output-queue-floor-periods 2` looked like a timing regression (chain p99
+    51.81 % against 36.39 %, 874 deadline overruns against 204) and like the floor was spending its
+    insertions as extra cap drops (65 insertions, 79 drops against 0 and 34). Re-running the comparison
+    as **A B B A** -- two configurations, four 900 s runs, drift cancelling between the arms --
+    (`bench-results/queue-floor.txt`) reversed both readings: chain p99 **34.02 % with the floor against
+    35.92 % without**, and drops **16.0 against 13.0 per arm with completely overlapping ranges**. The
+    design also measured its own noise: the *same* configuration swung 38.65 % -> 33.19 % between its two
+    runs, 5.5 points against a 1.9-point effect, so no single run of that comparison can be believed in
+    either direction. What the floor really does is halve the exposure -- blocks holding under one period,
+    **24.5 -> 10.0 per 675 000**, consistent in both orderings -- for about 40 inserted periods per hour
+    (53 ms of inserted silence). The underrun difference (3.0 -> 1.5 per 15 min) is suggestive at n=2 per
+    arm; the exposure difference is the stronger evidence because it measures the mechanism rather than a
+    rare event.
+
+    So the floor ships **off** by default (its cost is audible today), and **with `rt::SpliceFader` of
+    §10.3 it should be enabled** -- 40 inaudible 1.33 ms gaps per hour against ~6 underruns per hour,
+    each of which discards the whole queued ring and slips the timeline. That is the trade the floor
+    exists to offer, and the fade is what makes it a good one, which is why measuring it promoted the
+    fade from a nicety to the critical path. The ring's size remains the only lever that reduces exposure
+    with no hole at all; the bounds only decide which holes a run gets when it fails.
 
 **A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
 but the run does not keep real time at it: RTF 1.333, i.e. it loses a third. Instrumenting the loop to

@@ -1,0 +1,59 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 384 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            4 x build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/271, playback min/max 5/381 (last 216) frames (3 blocks wrote into a full playback ring)
+                  playback queue 0.08..5.95 periods (last 3.38); the floor is the stall the device
+                  absorbs without starving: 0.08 periods = 0.104 ms
+                  p1 2.64, p50 3.19 periods; 63 of 2700000 blocks held less than one
+                  period (0.00 %), which is the window a stall has to miss
+queue target:     4 periods = 5.333 ms: a cap on the ring's contents, so a burst
+                  cannot buy latency beyond it. Not a promise of cushion -- the
+                  floor held above is the number to read
+queue floor:      2 periods after each write, so 1 periods = 1.333 ms at the worst
+                  instant; held by inserting silence 65 times (4160 frames =
+                  86.667 ms of audio delayed rather than skipped, each one audible without a splice fade)
+queue control:    79 output drops (not gated: each refusal is the target's trade), 352 capture bursts
+                  79 of those drops were the queue target refusing a period that
+                  would have raised the ring past 4 periods; 0 were the ring itself
+                  being full
+queue prefill:    8 frames of silence written before block 0 to bring the ring
+                  to its target (0.167 ms of output latency, paid once)
+occupancy check:  10786688 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           2700000
+audio:            3600.000 s in 3599.720 s wall (RTF 0.9999)
+deadline:         1333333 ns
+split (p50):      read 2945 ns, chain 298112 ns, write 14630 ns
+split (tail):     read p99 7630 max 82871, chain p99 690780 max 2142135, write p99 22926 max 1931081 ns
+chain p99:        690780 ns (51.81% of deadline)
+device wait:      p50 1174651 ns, p99 1194966 ns, max 4996548 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 2146296 ns, wall max 2142135 ns
+                  844.98 s of CPU over 844.99 s of wall in the render path (100.0%), 1 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 203416 cpu 2146296 ns (wall 2142135 ns), block 2346304 cpu 1904407 ns (wall 1901875 ns), block 718015 cpu 1902093 ns (wall 1897582 ns), block 195734 cpu 1881444 ns (wall 1878930 ns), block 195735 cpu 1873945 ns (wall 1867375 ns)
+cpu spike bursts: 4096 blocks over half a period of CPU (capped: there were more), in 1136 runs; runs start every 3..20160 blocks (0.0..26.9 s at 48 k/64)
+                  run at block 0..0 (1 long), worst 685611 ns of CPU
+                  run at block 486..486 (1 long), worst 706537 ns of CPU
+                  run at block 1218..1218 (1 long), worst 684111 ns of CPU
+                  run at block 1420..1420 (1 long), worst 703667 ns of CPU
+                  run at block 1516..1516 (1 long), worst 706908 ns of CPU
+                  run at block 1842..1842 (1 long), worst 772537 ns of CPU
+                  run at block 2084..2084 (1 long), worst 725852 ns of CPU
+                  run at block 2111..2111 (1 long), worst 717074 ns of CPU
+block time:       p50 316074 ns, p99 719446 ns, max 2579453 ns
+p99/deadline:     53.96% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+first overrun at: block 26468 of 2700000
+deadline overruns:874
+driver xruns:     3
+  by direction:   0 capture overruns, 3 playback underruns
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           FAIL

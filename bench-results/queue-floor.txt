@@ -1,87 +1,126 @@
-The output-queue floor: what it fixes, and the limit cycle it makes when placed wrong
-====================================================================================
+The output-queue floor: what it fixes, how to place it, and whether it earns its place
+=====================================================================================
 
-2026-09-15, `7a4d3dc`, SSL 2+ Mk II (hw:2,0), 4 x A2-Full, q = 64 (1333.3 us), 48 kHz,
+2026-09-15, `7a4d3dc`/`43dd110`, SSL 2+ Mk II (hw:2,0), 4 x A2-Full, q = 64 (1333.3 us), 48 kHz,
 `SCHED_FIFO 80` + `--cpu 3`, non-RT kernel 7.0.0-1017-raspi. Evidence:
-soak-15min-floor4.{txt,env,heartbeat} (900 s) and soak-1h-cap4-floor2.* (3600 s).
+soak-15min-floor4.*, soak-1h-cap4-floor2.*, soak-ab-{a1,b1,b2,a2}.*, and the comparison hours
+soak-1h-ring6-cap4.* in queue-target-sweep.txt.
 
 What was added
 --------------
-Two things, because §9.5 item 8 had ended on a missing instrument and a mechanism it
-could not supply.
+Two things, because §9.5 item 8 had ended on a missing instrument and a mechanism it could not supply.
 
-  1. The occupancy DISTRIBUTION. The harness now keeps a histogram of the per-block
-     queue occupancy, one bin per frame, clamped into the ring's length, and reports
-     p1/p50 in periods plus the count of blocks whose queue held less than one period.
-     That last number is the exposure window, and it is the one `min` could never give:
-     `playback_occupancy_min` is 0 in every run that underran once, so it describes the
-     worst run rather than the typical one. 3 KB per run, exact percentiles, no sorting.
+  1. The occupancy DISTRIBUTION. The harness keeps a histogram of the per-block queue occupancy, one
+     bin per frame, clamped into the ring's length, and reports p1/p50 in periods plus the count of
+     blocks whose queue held less than one period. That last number is the exposure window, and it is
+     what `min` could never give: `playback_occupancy_min` is 0 in every run that underran once, so it
+     describes the worst run rather than the typical one. 3 KB per run, exact percentiles, no sorting.
 
-  2. The FLOOR CONTROLLER (`--output-queue-floor-periods N`): after each successful
-     write, if the queue is below the floor, insert a period of silence. The reasoning
-     is what an underrun actually costs -- the driver stops the stream, and recovery
-     `PREPARE`s it, which discards the WHOLE queued ring and slips the timeline by an
-     arbitrary amount. A period of inserted silence costs 1.33 ms and slips nothing. So
-     the choice is not "dropout or not" but "one bounded gap now or the entire queue
-     later". Enforced after a write, so asking for N buys N-1 periods of worst-instant
-     tolerance; the report prints both numbers so the off-by-one cannot be misread.
+  2. The FLOOR CONTROLLER (`--output-queue-floor-periods N`): after each successful write, if the queue
+     is below the floor, insert a period of silence. The reasoning is what an underrun actually costs --
+     the driver stops the stream and recovery `PREPARE`s it, which discards the WHOLE queued ring and
+     slips the timeline by an arbitrary amount -- against which a period of inserted silence (1.33 ms,
+     no slip) is the cheaper mistake. Enforced after a write, so asking for N buys N-1 periods of
+     worst-instant tolerance; the report prints both numbers so the off-by-one cannot be misread.
 
-Why the band matters
---------------------
-The natural level of the queue is what it is: for a 6-period ring at q=64 this host
-holds a post-write median of about 3.9 periods, and it *climbs* there because a capture
-burst is a second write and only a refusal sheds a period. Both controls are corrections
-for excursions from that band, and the rule that came out of measuring them is symmetric:
+Why the band matters, and why the instrument had to come first
+--------------------------------------------------------------
+The queue's level is set by the ring, the bursts and the stalls: for a 6-period ring at q=64 this host
+holds a post-write median near 3 periods, and it *climbs* there because a capture burst is a second
+write and only a refusal sheds a period. Both controls correct excursions from that band, and both a
+correction and its absence cost something:
 
-    the CAP must sit ABOVE the band   -- otherwise it refuses ordinary bursts, and a
-                                         refusal is a period of audio skipped.
-    the FLOOR must sit BELOW the band  -- otherwise it fires on ordinary dips, and an
-                                         insertion is 1.33 ms of audio delayed.
+    the CAP refuses ordinary bursts if it sits inside the band  -- a refusal skips a period of audio
+    the FLOOR fires on ordinary dips if it sits inside the band  -- an insertion delays one
 
-Both mistakes produce the same class of artefact, an audible hole, so the placement is
-not a detail. The instrument in (1) is what makes the band visible at all.
+Neither bound is free, so the placement is not a detail, and the band is invisible without the
+distribution instrument. That is why (1) came first and is not a nicety.
 
-The first run: floor INSIDE the band, and a limit cycle
-------------------------------------------------------
-`--periods 6 --output-queue-periods 5 --output-queue-floor-periods 4`, 900 s. Cap and
-floor one period apart, with the queue's median sitting between them.
+The first long run: both bounds inside the band, and a squeezed queue
+--------------------------------------------------------------------
+`--periods 6 --output-queue-periods 5 --output-queue-floor-periods 4`, 900 s. Floor and cap one period
+apart, with the queue's median sitting between them:
 
-  driver xruns            0        (0 playback underruns, 0 capture overruns)
-  queue                   min 0.86, last 3.88 periods; p1 3.73, p50 3.94
-  blocks below 1 period   3 of 675 000   (0.0004 %)
+  driver xruns            0
+  queue                   p1 3.73, p50 3.94 periods; 3 of 675 000 blocks below one period
   floor tolerance         3 periods = 4.000 ms at the worst instant
-  floor insertions        71        (4544 frames = 94.667 ms of inserted silence)
-  output drops            71        (all cap refusals)
-  deadline overruns       55        chain p99 36.25 %, block p99 37.70 %
-  RTF 0.9999, oracle exact over 240 000 frames
+  floor insertions        71   (94.667 ms of inserted silence)
+  output drops            71   (all cap refusals)
 
-**71 insertions and 71 drops.** That is not a coincidence and it is the finding: at this
-placement the cap and the floor are locked in a limit cycle. The queue touches the
-ceiling, the cap refuses a period (a drop, minus one period), that leaves the next
-post-write level under the floor, the controller inserts a period of silence (plus one
-period), and the queue is straight back at the ceiling. One stall becomes a sustained
-oscillation with an audible hole at each half-cycle.
+**71 and 71** is a mechanical consequence of the placement rather than a coincidence. The controller
+fires when the post-write queue is under 4 periods and the cap refuses when the pre-write queue is over
+4, so the queue is *squeezed into a one-period band*: pre <= 256 frames and post >= 256 frames means
+pre = 192 and post = 256, and every excursion across either edge is corrected. One correction per block
+per edge is what "squeezed" looks like: 142 audible events in 15 minutes. Zero xruns, bought at a price
+a listener would pay for.
 
-So the controller did exactly what it was asked and made the audio *worse*: 142 audible
-events in 15 minutes, against roughly 2 underruns that the un-floored configuration would
-have produced in the same time at the same cap (the measured rate is 8 per hour). Zero
-xruns is real, and it was bought at the wrong price.
+Placement rule, derived rather than fitted:
 
-The correction, and the next run
---------------------------------
-Place both bounds outside the band: `--periods 6 --output-queue-periods 4
---output-queue-floor-periods 2` -- the cap above the measured p50 of 2.94 periods
-pre-write, the floor well below it, one hour, against the hour at the same cap with no
-floor (`soak-1h-ring6-cap4`: 8 playback underruns, 34 drops, 0 insertions). What that
-run has to show is the floor earning its place: underruns down, insertions small, drops
-unchanged.
+    keep the bounds at least a couple of periods apart, and both OUTSIDE the band
+    the queue actually occupies -- the cap above it, the floor below it.
 
-And the conclusion that does not depend on the outcome
------------------------------------------------------
-Both controls work by creating a bounded hole -- a drop skips a period, an insertion
-delays one -- so *any* configuration that corrects often is audible, whatever the bounds
-are set to. A well-placed pair keeps the corrections rare, but "rare" over an hour is
-still tens of events. The way out is not a better placement: it is making each hole
-inaudible, which is `rt::SpliceFader` and the dropped-period edit kind in plan.md §10.3.
-That work was scoped as a nicety while the queue was the story; measuring the floor is
-what promoted it to the critical path.
+The balanced A/B: does the floor earn its place?
+------------------------------------------------
+The hour at `--output-queue-periods 4 --output-queue-floor-periods 2` (both bounds outside the band)
+reported 3 playback underruns against 8 for the same cap with no floor -- and also 65 insertions
+against 0, 79 drops against 34, and a *timing* regression: chain p99 51.81 % against 36.39 %, block p99
+53.96 % against 37.58 %, deadline overruns 874 against 204. The environment samples looked clean
+(`loadavg` 0.29 then 0.24, `throttled=0x0`, 41-44 'C) and the overruns were spread across the whole
+hour, but all phases were worse -- read, chain *and* write -- and the controller only touches the write
+path. A single run cannot separate host drift from a knob.
+
+So the comparison was re-run as a balanced design: the two configurations as **A B B A**, 900 s per
+run, same cap of 4 periods, nothing else on the machine. Linear drift cancels between the arms.
+
+  arm                     a1      b1      b2      a2     |  A mean   B mean
+  floor periods            0       2       2       0     |     0        2
+  ---------------------------------------------------------------------------
+  queue p1 (periods)     2.70    2.77    2.77    2.78    |   2.74     2.77
+  queue p50              3.06    2.94    3.03    3.11    |   3.09     2.99
+  blocks < 1 period       30      11       9      19     |   24.5     10.0   (of 675 000)
+  floor insertions         0      10      10       0     |    0       10
+  output drops            18      14      18       8     |   13.0     16.0
+  capture bursts          71      30      33      39     |   55       31.5
+  playback underruns       4       1       2       2     |    3.0      1.5
+  capture overruns         0       0       0       0     |    0        0
+  chain p99 (% deadline) 38.65   34.29   33.74   33.19   |   35.92    34.02
+  block p99 (% deadline) 40.05   35.60   35.02   34.54   |   37.30    35.31
+
+Three readings:
+
+  1. **The timing regression was the host, not the floor.** With drift cancelled, the floor arm is
+     *faster*: chain p99 34.02 % against 35.92 %, block p99 35.31 % against 37.30 %. And the design
+     measures its own noise: the same configuration swung 38.65 % -> 33.19 % between a1 and a2, a
+     5.5-point spread, against a 1.9-point difference between the arms. Any single run of this
+     comparison can manufacture or hide the effect completely, which is why it was run as A B B A.
+  2. **The floor halves the exposure, which is the mechanism working.** Blocks holding less than one
+     period: 30 and 19 without it, 11 and 9 with it -- 24.5 against 10.0 per 675 000 blocks, consistent
+     in both directions and in both orderings. The queue's p1 barely moves (2.74 against 2.77) because
+     the controller is holding the *bottom tail*, not the level: what it removes is exactly the blocks
+     that were closest to starving.
+  3. **The floor does not increase drops.** 13.0 against 16.0 per 900 s with ranges that overlap
+     completely (8-18 both ways), so the "insertions are spent as cap drops" reading of the single hour
+     was drift, not mechanism. Insertions cost about 10 per 900 s = 40 per hour = 53 ms of inserted
+     silence per hour, against roughly 12 -> 6 playback underruns per hour.
+
+Verdict, and the honest limits of it
+------------------------------------
+The floor controller does what it was built to do: it halves the exposure to starvation, roughly halves
+a small underrun rate, does not increase drops, and does not cost latency. It is not free -- 40
+inserted periods per hour, each one 1.33 ms of silence and each one audible without a splice fade.
+
+The numbers are small enough that the *underrun* difference is suggestive rather than established (n=2
+per arm, 3.0 against 1.5 events per 15 minutes), and the exposure difference is the stronger evidence
+because it measures the mechanism rather than a rare event. Two things would settle it and neither is
+done: a longer balanced design, and the occupancy at the instant a stall begins.
+
+What to do with it:
+
+  * **Ship it off by default** (it is), because the cost is audible today.
+  * **With the splice fade of plan.md §10.3, enable it**: 40 inaudible 1.33 ms gaps per hour against
+    ~6 underruns per hour, each of which discards the whole queued ring and slips the timeline. That is
+    the trade the floor exists to offer, and the fade is what makes it a good one.
+  * **Place the bounds as the rule says** -- at least a couple of periods apart and outside the band.
+    Adjacent bounds squeeze the queue into a one-period band and correct every block.
+  * The ring's size remains the only lever that reduces exposure without any hole at all; the bounds
+    only decide which holes you get when it fails.
