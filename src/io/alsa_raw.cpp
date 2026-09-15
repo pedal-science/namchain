@@ -321,6 +321,8 @@ bool AlsaRawDuplex::configure(int fd, bool capture, const char* direction, std::
     playback_bytes_per_frame_ = info_.playback_bytes_per_frame;
     prime_silence_.assign(static_cast<size_t>(info_.buffer_size) * playback_bytes_per_frame_, 0);
     drain_buffer_.assign(static_cast<size_t>(info_.period_size) * capture_bytes_per_frame_, 0);
+    last_frame_.assign(playback_bytes_per_frame_, 0);
+    hold_period_.assign(static_cast<size_t>(info_.period_size) * playback_bytes_per_frame_, 0);
     // The target in frames, now that a period is a known number rather than a request. `info_` carries
     // it in periods too: the write path needs the frames and the report needs the periods, and
     // deriving either from the other at the point of use is how the two come to disagree.
@@ -747,7 +749,10 @@ bool AlsaRawDuplex::wait_capture(int timeout_ms, std::string& error)
 
 int AlsaRawDuplex::write_playback(const void* src, unsigned frames, int timeout_ms, std::string& error)
 {
-  return transfer(playback_fd_, const_cast<void*>(src), frames, true, timeout_ms, error);
+  const int written = transfer(playback_fd_, const_cast<void*>(src), frames, true, timeout_ms, error);
+  if (written == static_cast<int>(frames))
+    remember_last_frame(src, frames);
+  return written;
 }
 
 int AlsaRawDuplex::try_write_playback(const void* src, unsigned frames, std::string& error)
@@ -828,6 +833,7 @@ int AlsaRawDuplex::try_write_playback(const void* src, unsigned frames, std::str
             " frames after POLLOUT reported room for a period";
     return -1;
   }
+  remember_last_frame(src, frames);
   // After the signal, never before: the controller's job is to notice that the queue is short once this
   // period is in it, so its decision is made on the occupancy the loop actually produced.
   if (floor_frames_ != 0)
@@ -852,6 +858,15 @@ void AlsaRawDuplex::queue_debug_trace(const AlsaRawOccupancy& occupancy, bool al
                allowed ? "write" : "refuse");
 }
 
+void AlsaRawDuplex::remember_last_frame(const void* src, unsigned frames)
+{
+  if (frames == 0 || last_frame_.empty())
+    return;
+  const unsigned char* bytes = static_cast<const unsigned char*>(src);
+  std::memcpy(last_frame_.data(), bytes + static_cast<size_t>(frames - 1) * playback_bytes_per_frame_,
+              playback_bytes_per_frame_);
+}
+
 void AlsaRawDuplex::maintain_output_floor()
 {
   // One period at a time, and only while the queue is still short. A stall that cost two periods is
@@ -873,7 +888,21 @@ void AlsaRawDuplex::maintain_output_floor()
     // A whole period, not the deficit: everything above this writes period-sized buffers, and a partial
     // period would leave the queue at a level that is not a whole number of periods -- a state nothing
     // else in this file has to reason about.
-    if (write_playback(prime_silence_.data(), info_.period_size, 1000, ignored) < 0)
+    //
+    // The payload is the last frame written, repeated, not silence. That is what lets the loop's splice
+    // bridge leave from the right place: the bridge is anchored on the last sample it emitted, and a
+    // hold continues that sample, where silence would step to zero first and leave a click the bridge
+    // cannot reach. Measured with plan.md §10.3's continuity rule: a held entry is a break in *slope*
+    // (about a tenth of the signal's first difference), a silence entry is a step in *value*.
+    const void* payload = prime_silence_.data();
+    if (!last_frame_.empty() && hold_period_.size() == static_cast<size_t>(info_.period_size) * playback_bytes_per_frame_)
+    {
+      for (unsigned f = 0; f < info_.period_size; ++f)
+        std::memcpy(hold_period_.data() + static_cast<size_t>(f) * playback_bytes_per_frame_, last_frame_.data(),
+                    playback_bytes_per_frame_);
+      payload = hold_period_.data();
+    }
+    if (write_playback(payload, info_.period_size, 1000, ignored) < 0)
       return;
     ++floor_insertions_;
     floor_inserted_frames_ += info_.period_size;

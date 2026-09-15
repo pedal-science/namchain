@@ -126,6 +126,7 @@ add_library(namchain OBJECT
   src/rt/rt_check.cpp
   src/rt/arena.cpp
   src/rt/reclaimer.cpp
+  src/rt/splice_fader.cpp
   src/rt/scheduling.cpp
   src/graph/plan.cpp
   src/graph/reference.cpp
@@ -255,7 +256,8 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_nodes.cpp
     tests/test_rig.cpp
     tests/test_latency.cpp
-    tests/test_glitch.cpp)
+    tests/test_glitch.cpp
+    tests/test_splice_fader.cpp)
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")

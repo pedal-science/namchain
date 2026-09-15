@@ -286,6 +286,8 @@ public:
   uint64_t floor_insertions() const { return floor_insertions_; }
   /// The same in frames, which must equal `floor_insertions() * period_size`; asserted by the soak.
   uint64_t floor_inserted_frames() const { return floor_inserted_frames_; }
+  /// Remember the last frame of a period the device took, for the next insertion to hold.
+  void remember_last_frame(const void* src, unsigned frames);
   /// Reads released while two or more periods were waiting. Zero means the loop never fell a period
   /// behind; a positive count is the mechanism that fills the playback ring, so it is reported even
   /// when the drop guard absorbs the consequence.
@@ -354,6 +356,11 @@ private:
   std::vector<unsigned char> prime_silence_;
   /// Sink for drain_capture(), preallocated for the same reason and sized one period.
   std::vector<unsigned char> drain_buffer_;
+  /// The last frame of playback actually written, and one period of that frame repeated. An inserted
+  /// period holds the last frame rather than silence, because the loop's splice bridge leaves from the
+  /// last sample it emitted: a hold continues that sample, where silence would step to zero first.
+  std::vector<unsigned char> last_frame_;
+  std::vector<unsigned char> hold_period_;
   AlsaRawInfo info_;
   /// NAMCHAIN_QUEUE_DEBUG, read once at open rather than per period: getenv in the write path would
   /// be a libc call on every period, and a debug trace must not change the timing it is there to

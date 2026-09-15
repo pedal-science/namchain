@@ -230,6 +230,12 @@ public:
   /// Queue-control counters, where the backend has any. Zeroes for the backends with no rings.
   virtual StreamQueueStats queue_stats() const { return StreamQueueStats{}; }
 
+  /// \brief Insertions so far, where the backend has a floor controller; 0 otherwise.
+  ///
+  /// Read once per period by a loop that is bridging splices, which is why it is its own accessor rather
+  /// than a call to queue_stats(): the loop only needs to know whether the number changed.
+  virtual uint64_t floor_insertions() const { return 0; }
+
   /// \brief Bring the output queue up to its configured target, immediately before the timed loop.
   ///
   /// A no-op for every backend with no ring, and for a run with no target. It exists as a separate

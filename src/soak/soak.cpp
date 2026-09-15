@@ -1,5 +1,7 @@
 #include "namchain/soak.h"
 
+#include "namchain/rt/splice_fader.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -173,6 +175,16 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   }
 
   const PcmFormat pcm_format = info.format;
+  // The splice bridge's two buffers: the engine's output stays pristine for the oracle, and the emitted
+  // copy is what gets bridged and encoded. Only allocated when asked for.
+  const unsigned bridge_frames = static_cast<unsigned>(
+    std::llround(std::max(0.0, options.splice_fade_ms) * static_cast<double>(info.sample_rate) / 1000.0));
+  rt::SpliceFader fader(1, bridge_frames);
+  std::vector<float> mono_emit(static_cast<size_t>(info.period_size), 0.0f);
+  uint64_t bridges_for_drops = 0;
+  uint64_t bridges_for_insertions = 0;
+  uint64_t insertions_seen = device->floor_insertions();
+
   std::vector<float> mono_in(static_cast<size_t>(info.period_size), 0.0f);
   std::vector<float> mono_out(static_cast<size_t>(info.period_size), 0.0f);
 
@@ -350,13 +362,23 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
 
         plan->execute(mono_in.data(), mono_out.data(), static_cast<int>(info.period_size));
 
+        // The splice repair, applied to the *emitted* copy only. `mono_out` is what the oracle compares
+        // against the offline render, so a repair that altered it would make "the engine is exact" and
+        // "the emitted signal is continuous" the same claim instead of two independent ones.
+        const float* emitted = mono_out.data();
+        if (fader.enabled())
+        {
+          fader.apply(mono_out.data(), mono_emit.data(), info.period_size);
+          emitted = mono_emit.data();
+        }
+
         // Start from silence every block: the passthrough copy only fills one channel, and a device
         // with 6 playback channels would otherwise be sent whatever was left in the buffer.
         std::fill(playback_buffer.begin(), playback_buffer.end(), 0);
         for (unsigned i = 0; i < info.period_size; ++i)
           pcm_encode(
             playback_buffer.data() + (static_cast<size_t>(i) * info.playback_channels + out_ch) * width, pcm_format,
-            mono_out[i]);
+            emitted[i]);
       }
     }
     const auto t2 = Clock::now();
@@ -451,6 +473,23 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     }
     if (written == 0)
       ++output_drops;
+    // Arm the bridge for the *next* period, which is the first one that can do anything about it: the
+    // period just refused is not in the ring, and the inserted one was written by the backend.
+    if (fader.enabled())
+    {
+      const uint64_t insertions_now = device->floor_insertions();
+      if (written == 0)
+      {
+        fader.arm(rt::SpliceFader::Cause::Dropped);
+        ++bridges_for_drops;
+      }
+      else if (insertions_now != insertions_seen)
+      {
+        fader.arm(rt::SpliceFader::Cause::Inserted);
+        ++bridges_for_insertions;
+      }
+      insertions_seen = insertions_now;
+    }
     const auto t3 = Clock::now();
     write_timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count()));
     const uint64_t block_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t0).count());
@@ -553,6 +592,10 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.chain_spikes = std::move(chain_spikes);
   result.output_drops = output_drops;
   result.output_queue_periods = info.output_queue_periods;
+  result.splice_bridge_frames = fader.enabled() ? fader.fade_frames() : 0;
+  result.splice_bridges = fader.fades();
+  result.splice_bridges_for_drops = bridges_for_drops;
+  result.splice_bridges_for_insertions = bridges_for_insertions;
   result.output_queue_floor_periods = info.output_queue_floor_periods;
   {
     const StreamQueueStats stats = device->queue_stats();

@@ -98,6 +98,14 @@ struct SoakOptions
   /// arbitrary slip. 0 disables the controller; must be at most \ref output_queue_periods and less than
   /// \ref device_periods. `alsa_raw` only, like the cap.
   unsigned output_queue_floor_periods = 0;
+  /// \brief Length of the splice bridge in milliseconds; 0 disables it.
+  ///
+  /// A dropped period leaves a 64-frame hole, and an inserted one arrives mid-signal, so both put a step
+  /// in the emitted waveform. The bridge leaves from the last emitted sample *and its slope* and reaches
+  /// the signal over this window, which removes the click without the engine's output being touched at
+  /// all -- the oracle still compares the pristine render (plan.md §10.3). One period (1.33 ms at q=64)
+  /// is the measured shortest window that satisfies the detector's continuity rule.
+  double splice_fade_ms = 0.0;
   /// The engine's rate, and therefore the rate the device is asked for and that every input file
   /// and model is checked against. Fixed rather than inferred: this is a 48 kHz engine at M1, and a
   /// harness that quietly follows whichever file it was handed cannot compare two runs.
@@ -305,6 +313,14 @@ struct SoakResult
   /// audio delayed rather than skipped, and audible without a splice fade.
   uint64_t floor_insertions = 0;
   uint64_t floor_inserted_frames = 0;
+  /// \brief Splice bridges armed, and what armed them: a refused period, or an inserted one.
+  ///
+  /// The repair is applied to the emitted signal and never to the engine's output, so these counts and
+  /// the oracle's exactness are independent facts about the same run.
+  unsigned splice_bridge_frames = 0;
+  uint64_t splice_bridges = 0;
+  uint64_t splice_bridges_for_drops = 0;
+  uint64_t splice_bridges_for_insertions = 0;
   /// \brief Driver xruns by direction, summing exactly to \ref driver_xruns.
   ///
   /// The split is the difference between two problems. A capture overrun is the device having

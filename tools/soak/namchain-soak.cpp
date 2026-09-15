@@ -64,6 +64,10 @@ void usage()
                "                       N periods, so it never reaches the driver's underrun. Costs 1.33 ms\n"
                "                       of inserted audio each time and no timeline slip, where an underrun\n"
                "                       discards the whole queued ring. Default 0 (off); must be <= the cap\n"
+               "  --splice-fade-ms X   bridge a dropped or inserted period over X ms, leaving from the\n"
+               "                       last emitted sample and its slope so the splice is not a click\n"
+               "                       (default 0: off). Applied to the emitted signal only, so the oracle\n"
+               "                       still checks the engine's pristine output\n"
                "  --model FILE         run this .nam between capture and playback\n"
                "  --instances N        chain N copies of the model (default 1)\n"
                "  --graph FILE         run this rig instead: a JSON graph of nodes and connections\n"
@@ -142,6 +146,8 @@ int main(int argc, char** argv)
       options.output_queue_periods = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--output-queue-floor-periods" && i + 1 < argc)
       options.output_queue_floor_periods = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (arg == "--splice-fade-ms" && i + 1 < argc)
+      options.splice_fade_ms = std::atof(argv[++i]);
     else if (arg == "--model" && i + 1 < argc)
       options.model = argv[++i];
     else if (arg == "--graph" && i + 1 < argc)
@@ -368,6 +374,10 @@ int main(int argc, char** argv)
                               {"occupancy_mismatches", result.occupancy_mismatches}};
       j["device"]["xruns_by_direction"] = {{"capture_overruns", result.capture_overruns},
                                            {"playback_underruns", result.playback_underruns}};
+      j["device"]["splice_repair"] = {{"bridge_frames", result.splice_bridge_frames},
+                                      {"bridges", result.splice_bridges},
+                                      {"for_drops", result.splice_bridges_for_drops},
+                                      {"for_insertions", result.splice_bridges_for_insertions}};
     }
     if (result.oracle.checked)
     {
@@ -498,6 +508,22 @@ int main(int argc, char** argv)
                       static_cast<unsigned long long>(result.floor_insertions),
                       static_cast<unsigned long long>(result.floor_inserted_frames), inserted_ms,
                       result.floor_insertions == 0 ? "never needed" : "each one audible without a splice fade");
+        }
+        if (result.splice_bridge_frames > 0)
+        {
+          // The repair, and the two facts that keep it honest: it acts on the emitted signal, and the
+          // engine's output is still compared sample for sample against the offline render.
+          std::printf("splice repair:    %u-frame bridge (%.3f ms) armed %llu times: %llu dropped periods,\n"
+                      "                  %llu inserted ones. Applied to the emitted signal only -- the oracle\n"
+                      "                  below still compares the engine's pristine output\n",
+                      result.splice_bridge_frames,
+                      options.sample_rate == 0
+                        ? 0.0
+                        : 1e3 * static_cast<double>(result.splice_bridge_frames) /
+                            static_cast<double>(options.sample_rate),
+                      static_cast<unsigned long long>(result.splice_bridges),
+                      static_cast<unsigned long long>(result.splice_bridges_for_drops),
+                      static_cast<unsigned long long>(result.splice_bridges_for_insertions));
         }
         // The loop's own decisions, next to the occupancy that provoked them. A drop is audio the
         // run chose to lose rather than block for, so it is the one number here that a listener

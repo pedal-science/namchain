@@ -1,0 +1,105 @@
+The splice bridge: how the detector picked the shape, and what is left
+======================================================================
+
+2026-09-15, `rt::SpliceFader` + `--splice-fade-ms`, on top of `7a4d3dc`/`43dd110`. Evidence:
+tests/test_splice_fader.cpp (the derivation, as tests), soak-5min-bridge.* (the wiring on hardware),
+and the queue work it follows in queue-floor.txt / queue-target-sweep.txt.
+
+What the artefact is
+--------------------
+Two things put a step in the emitted waveform, and both are period-sized holes:
+
+  * a DROPPED period -- the queue cap or the ring refused a write. The ring is a FIFO of period-sized
+    buffers, so skipping an append means the device plays out(k-1) and then out(k+1): a 64-frame jump,
+    1.33 ms of missing signal, a step big enough to hear as a click above a few hundred hertz.
+  * an INSERTED period -- the floor controller keeping the queue off the bottom. The step is at its
+    entry, where a payload arrives mid-signal without continuing it.
+
+Neither can be repaired where it happens: by the time the decision is made the previous period is
+already in the ring, and queued audio cannot be rewritten. So the repair happens on the way out, on the
+periods that follow, and it is a **loop policy rather than a model property** -- it acts on the emitted
+copy of the signal, which is what lets the engine's output stay untouched and the oracle stay exact.
+
+The detector picked the shape, and rejected three others
+-------------------------------------------------------
+plan.md §10.3 requires the glitch detector to exist before the transition machinery it judges, and this
+is that order being used: `tests/test_splice_fader.cpp` builds the emitted stream twice -- spliced raw,
+and spliced then repaired -- and runs `glitch::analyse` over the join. The oracle for a repair is the
+*raw* spliced signal, since neither is more faithful than the other (a drop loses 64 frames and no fade
+brings them back); what the repair buys is continuity, so continuity is what is measured.
+
+Three shapes looked reasonable and all three were rejected by the rule, with numbers:
+
+  * **hold the last sample.** The first difference at the join is zero and the continuity rule measures
+    a *second* difference, so a hold scores |d| -- the signal's own first difference. On a 997 Hz tone at
+    0.4 that is 0.052 against a 0.0136 limit: 3.8x over, and 7.7x the reference it is compared with.
+  * **decaying extrapolation**, `a1 + d*(1-w)`. Zeroes the second difference at the join and puts it all
+    back at the next sample, because the slope collapses from d to zero in one step: measured 0.0521,
+    no better than the hold.
+  * **a 5 ms crossfade.** Holds the value for its first samples and attenuates the signal for 5 ms, which
+    is a swell, not a repair -- and it still fails, for the hold's reason.
+
+Matching **value and slope** is what makes both differences small. The bridge is a cubic Hermite:
+
+    d  = a1 - a0                    the slope the device was last travelling at
+    xs = x1 - x0                    the slope the new signal starts with
+    e0 = (a1 + d) - x0              value mismatch, against the *continuation* rather than a hold
+    m0 = (d - xs) * (K-1)           slope mismatch
+    y[i] = x[i] + e0*h00(t) + m0*h10(t),   t = i/(K-1)
+
+with h00, h10 the Hermite bases. The value at the join is `a1 + d`, not `a1`: that single sample of
+extrapolation is what makes the second difference *exactly zero* there, which is the best score the rule
+admits. What is left is the two mismatches, taken smoothly to zero over K frames, so the residual is
+~|e0|/K^2 + |m0|/K.
+
+The window length, measured rather than chosen
+----------------------------------------------
+The one free parameter is K, and the detector bounds it. Worst second difference inside the bridge, on
+the same 997 Hz tone, against a reference of 0.0068 and a limit (kappa = 2) of 0.0136:
+
+    K =   4    16     32     64      128     240
+        0.0477 0.0213 0.0142 0.0097  0.0082  0.0079
+
+Longer is monotonically better for continuity, and worse for the signal: the offset that does the
+bridging is held for the whole window, so a long window is a long swell. K = 64 -- **one period, the
+quantum the whole system is already built around** -- is the shortest window that passes, with about
+30 % margin, and it is the default the tests pin. The window-length test exists because the first
+version of the code recomputed the mismatches on *every* period of the bridge instead of freezing them
+at its start, which re-injected the mismatch each period and left the offset never reaching zero. That
+bug was invisible at K = 64 (a single period) and showed up only at K = 240, which is why the test
+compares a short window with a long one.
+
+What is left: the entry of an inserted period
+---------------------------------------------
+The bridge repairs the *exit* of an insertion and cannot reach its entry, because the loop never writes
+that period -- the backend does. The backend's payload is now the last frame written, repeated, rather
+than silence, which turns a step in *value* into a break in *slope*: measured on a 313 Hz tone, the
+entry step falls from 0.4 (silence) to under 0.05 (a hold), and the worst second difference in the
+window falls by more than 4x. The rule is still tripped, and the test asserts that rather than pretending
+otherwise. Closing it means the backend writing a *bridged* payload using the same two Hermite terms --
+a backend change, not a loop one, and the named remainder of this repair.
+
+On the device
+-------------
+`--periods 6 --output-queue-periods 3 --output-queue-floor-periods 2 --splice-fade-ms 1.333`, 300 s,
+4 x A2-Full, pinned and self-scheduled (`soak-5min-bridge.*`):
+
+    splice repair    64-frame bridge (1.333 ms) armed 6 times: 3 dropped periods, 3 inserted ones
+    driver xruns     0   (0 playback underruns, 0 capture overruns)
+    output drops     3      floor insertions  3      capture bursts  1
+    queue            p1 1.59, p50 1.94 periods; 3 of 225 000 blocks below one period
+    render path      0 allocations, 0 frees, 0 blocks descheduled
+    oracle           match, max|diff| = 0 over 240 000 frames
+
+Both splice causes are exercised, and the oracle is exact in the same run: the bridge repaired the
+emitted signal and the engine's own output was untouched. Six bridges in five minutes is what the
+configuration produces; the block p99 in this run (49.9 %) is higher than the A/B's 34-37 % and is host
+drift, not the bridge -- six bridges of 64 samples cannot register against a 1333 us deadline, and the
+A/B in queue-floor.txt measured exactly that kind of drift at 5.5 points on the same configuration.
+
+Two claims that stay independent
+--------------------------------
+The bridge writes `mono_emit`; the oracle keeps comparing `mono_out`. So "the engine is sample-exact
+against the offline render" and "the emitted signal is continuous" are separate measurements of the same
+run rather than one measurement used twice -- which is the only reason the faded run can still be quoted
+as evidence about the engine at all.

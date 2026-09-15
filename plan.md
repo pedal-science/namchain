@@ -1348,12 +1348,14 @@ number:
     arm; the exposure difference is the stronger evidence because it measures the mechanism rather than a
     rare event.
 
-    So the floor ships **off** by default (its cost is audible today), and **with `rt::SpliceFader` of
-    §10.3 it should be enabled** -- 40 inaudible 1.33 ms gaps per hour against ~6 underruns per hour,
-    each of which discards the whole queued ring and slips the timeline. That is the trade the floor
-    exists to offer, and the fade is what makes it a good one, which is why measuring it promoted the
-    fade from a nicety to the critical path. The ring's size remains the only lever that reduces exposure
-    with no hole at all; the bounds only decide which holes a run gets when it fails.
+    So the floor ships **off** by default, and **with `rt::SpliceFader` of §10.3 it should be enabled**:
+    40 bridged 1.33 ms gaps per hour against ~6 underruns per hour, each of which discards the whole
+    queued ring and slips the timeline. That is the trade the floor exists to offer, and the bridge is
+    what makes it a good one -- which is why measuring the floor promoted the bridge from a nicety to the
+    critical path, and why the bridge is now implemented rather than specified. Its remaining limit is
+    named there: the *entry* of an inserted period is a slope break the loop cannot reach, because the
+    loop does not write that period. The ring's size remains the only lever that reduces exposure with no
+    hole at all; the bounds only decide which holes a run gets when it fails.
 
 **A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
 but the run does not keep real time at it: RTF 1.333, i.e. it loses a third. Instrumenting the loop to
@@ -1461,31 +1463,53 @@ Torture render: 60 s, 500 randomised edits, all node types and transition classe
 44.1/48/96 kHz. Plus a **state-continuity** test: warm-started `nc.nam` output vs. always-on output
 < −60 dBFS (this directly validates §7.4).
 
-**The second splice source: a dropped output period, and why the fade belongs at the loop.** §9.5 item 8
-made the output queue a knob, and a cap refuses a period when it would exceed the target. That refusal
-is not free: the ring is a FIFO of period-sized buffers, so skipping an append means the device plays
-`out(k−1)` and then `out(k+1)` -- a jump of 64 frames in the waveform, which at 48 kHz is 1.33 ms of
-missing signal and, for anything above a few hundred hertz, a step large enough to hear as a click.
+**The second splice source: a dropped or inserted period, and the bridge that repairs it.** §9.5
+item 8 made the output queue a knob, and both of its controls put a hole in the emitted waveform: a *cap*
+refuses a period, and the ring is a FIFO of period-sized buffers, so the device plays `out(k-1)` and then
+`out(k+1)` -- a 64-frame jump, 1.33 ms of missing signal, a step a listener hears as a click; a *floor*
+inserts a period, and the step is at its entry. Neither can be repaired where it happens (the previous
+period is already in the ring, and queued audio cannot be rewritten), so the repair is a **loop policy**
+applied to the emitted copy between the render plan and the write -- which is what keeps it independent of
+the oracle: the bridge writes `mono_emit` while the oracle keeps comparing the pristine `mono_out`, so
+"the engine is sample-exact" and "the emitted signal is continuous" are two measurements of one run.
 
-The fade that hides it cannot be applied where the model edits are: nothing is known about a drop until
-after the previous period has been written into the ring, and rewriting queued audio is not a thing. The
-workable shape is a **fade-in on the period after the drop**: hold the last sample written, and over `M`
-samples (a few ms, equal-power) glide from that held value into the real signal, so the step becomes a
-short slew instead of a discontinuity. The phase jump survives -- it is a 1.33 ms hole in the audio --
-but 1.33 ms is bounded and a slew is not a click. This makes the fade a **loop policy, not a model
-property**: it is applied to the interleaved output buffer between the render plan and
-`write_playback`, needs one sample of state per channel and an armed flag, and belongs in a reusable
-`rt::SpliceFader` rather than in the backend, because the backend is what *decides* to drop and the loop
-is what must answer for it.
+`rt::SpliceFader` is implemented and `--splice-fade-ms` wires it into the loop, and the shape was **chosen
+by the detector, not by preference** -- it rejected three reasonable ones first, each with a number on a
+997 Hz tone at amplitude 0.4 against a reference second difference of 0.0068 and a kappa = 2 limit of
+0.0136:
 
-Order matters and is already honoured: **the detector exists before the machinery** (§10.3's continuity
-criterion 1 is exactly the test -- max `d2` inside a window against `κ·M` outside it -- and a drop is
-another edit window). The wiring that is missing is that nothing currently feeds a device-loop drop into
-the detector's timeline: the soak counts drops but never re-renders the spliced output to measure what
-they did to the waveform. Adding a dropped-period edit kind to the timeline plus the `SpliceFader` is
-one piece of work in two halves, and the `--periods 6 --output-queue-periods 4` configuration of §9.5
-item 8 (0 drops in 5 minutes) is the configuration in which it can be *tested* rather than merely
-needed.
+  * **hold the last sample**: the first difference at the join is zero and the rule measures a *second*
+    difference, so a hold scores the signal's own first difference -- 0.052, 3.8x over the limit.
+  * **decaying extrapolation** `a1 + d*(1-w)`: zeroes the join and puts it all back at the next sample,
+    because the slope collapses from `d` to zero in one step -- 0.0521, no better.
+  * **a 5 ms crossfade**: holds the value for its first samples and ducks the signal for 5 ms. A swell,
+    not a repair, and it fails for the hold's reason.
+
+What works is matching **value and slope**: a cubic Hermite leaving from `a1 + d` (one sample of
+extrapolation, which makes the join's second difference exactly zero -- the best score the rule admits)
+with the value mismatch `(a1 + d) - x0` and the slope mismatch `(d - xs)*(K-1)` taken smoothly to zero
+over `K` frames. The residual is ~|e0|/K^2 + |m0|/K, and the window length is measured rather than
+chosen: 4 -> 0.0477, 16 -> 0.0213, 32 -> 0.0142, **64 -> 0.0097**, 128 -> 0.0082, 240 -> 0.0079. Long
+windows are better for continuity and worse for the signal (the bridging offset is held for the whole
+window), so the default is **K = 64, one period** -- the quantum the system is already built around, and
+the shortest window that passes. Measured on the device (`soak-5min-bridge`, cap 3 + floor 2 + a 1.33 ms
+bridge, 300 s): **6 bridges armed, 3 for dropped periods and 3 for inserted ones, 0 driver xruns, 0
+render-path allocations, and the oracle still exact over 240 000 frames** -- the bridge repaired the
+splices and the engine's own output was untouched, in the same run.
+
+**The window-length test exists because it caught a real bug, and it is worth naming:** the first version
+recomputed the two mismatches on every period of the bridge instead of freezing them at its start, which
+re-injected the mismatch each period so the offset never reached zero. At K = 64 (a single period) that
+is invisible; at K = 240 it showed up immediately. The lesson is the same one §9.5 keeps teaching -- a
+parameter that looks cosmetic (`K`) can be the only thing that exercises a code path.
+
+**What remains: the entry of an inserted period.** The bridge reaches the exit and cannot reach the entry,
+because the loop never writes that period. The backend's payload is now the last frame written, repeated,
+rather than silence -- measured: the entry step falls from 0.4 (silence) to under 0.05 (a hold), and the
+worst second difference in the window falls by more than 4x -- but a hold is a break in *slope* where
+silence was a step in *value*, so the continuity rule is still tripped and the test asserts that rather
+than pretending otherwise. Closing it means the backend writing a *bridged* payload from the same two
+Hermite terms: a backend change, and the named remainder of this repair.
 
 ### 10.4 RT-safety tests
 
