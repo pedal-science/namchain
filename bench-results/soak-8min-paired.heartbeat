@@ -1,0 +1,13 @@
+start       2026-09-15T19:47:47+01:00
+command     taskset -c 3 ./build/namchain-soak --device hw:2,0 --capture-channels 8 --playback-channels 6 --quantum 64 --periods 6 --output-queue-periods 2 --output-queue-floor-periods 2 --splice-fade-ms 1.333 --splice-verify --seconds 480 --instances 4 --model build/generated/A2-Full.nam --input-channel 0 --output-channel 0 --rt-priority 80 --cpu 3
+2026-09-15T19:47:47+01:00
+2026-09-15T19:48:47+01:00
+2026-09-15T19:49:47+01:00
+2026-09-15T19:50:47+01:00
+2026-09-15T19:51:47+01:00
+2026-09-15T19:52:47+01:00
+2026-09-15T19:53:47+01:00
+2026-09-15T19:54:47+01:00
+2026-09-15T19:55:47+01:00
+end         2026-09-15T19:55:47+01:00
+exit        1

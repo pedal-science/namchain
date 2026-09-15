@@ -339,6 +339,10 @@ struct SoakResult
   uint64_t splice_verified = 0;
   double splice_worst_d2 = 0.0;
   double splice_reference_d2 = 0.0;
+  /// The same window on the *raw* splice, from the same splices, judged against itself. Both halves of
+  /// the comparison come from one run, so the repair's effect is measured rather than inferred.
+  double splice_raw_d2 = 0.0;
+  double splice_raw_reference_d2 = 0.0;
   bool splice_verify_evaluated = false;
   /// Set when the detector refused to judge -- a span too short for its guard, say. Reported because a
   /// verifier that silently judges nothing is indistinguishable from one that found nothing wrong.

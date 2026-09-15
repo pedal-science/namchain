@@ -1535,6 +1535,23 @@ Two things it taught immediately, both worth keeping:
     when the preceding five periods are splice-free, and reports the count it *did* judge. In the
     measured configurations splices are sparse enough (13 per 900 s at cap 4) that the spans are real.
 
+**And the third thing it taught is a limit of the repair itself, which is now reported rather than
+discovered in the ratios** (`bench-results/splice-bridge-verify.txt`). Cap 2 with the floor at the same
+level -- the squeezed-queue configuration §9.5 item 9 already warns about -- armed the bridge **236 841
+times in 480 s, once every two blocks**, and the 457 splices with a clean enough neighbourhood to judge
+came out **worse** repaired than raw (0.3277 -> 0.3717). The reason is structural: the bridge assumes
+clean audio either side of *one* splice, and when splices arrive every other block the repair overlaps
+itself into a chain of bridges, each bridging the previous one's output. So the repair has a duty-cycle
+limit -- above roughly 5 % of blocks it is not repairing anything -- and the tool now says so.
+
+**What is still not verified on device is the repaired splice's continuity for a real isolated splice.**
+This session's sane configurations (cap 3 and cap 4, 6-period ring) produced **0 drops in 20 and 15
+minutes**, against 13-18 per 900 s in the afternoon, so the drop rate is strongly session-dependent and
+the instrument had nothing to judge. It judged 955 and then 457 splices in the two pathological regimes,
+which is what showed up both its own guard bug (a deferred recording judged a block where no bridge was
+acting) and the duty-cycle limit above. The run that closes this needs no code change: cap 4 with
+`--splice-verify` for an hour in a session with occasional real drops.
+
 
 ### 10.4 RT-safety tests
 

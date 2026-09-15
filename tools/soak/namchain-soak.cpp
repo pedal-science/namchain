@@ -380,8 +380,10 @@ int main(int argc, char** argv)
       j["device"]["xruns_by_direction"] = {{"capture_overruns", result.capture_overruns},
                                            {"playback_underruns", result.playback_underruns}};
       j["device"]["splice_measured"] = {{"judged", result.splice_verified},
-                                        {"worst_d2", result.splice_worst_d2},
-                                        {"reference_d2", result.splice_reference_d2}};
+                                        {"emitted_d2", result.splice_worst_d2},
+                                        {"reference_d2", result.splice_reference_d2},
+                                        {"raw_d2", result.splice_raw_d2},
+                                        {"raw_reference_d2", result.splice_raw_reference_d2}};
       j["device"]["splice_repair"] = {{"bridge_frames", result.splice_bridge_frames},
                                       {"bridges", result.splice_bridges},
                                       {"for_drops", result.splice_bridges_for_drops},
@@ -540,16 +542,36 @@ int main(int argc, char** argv)
                  result.splice_verified == 0)
           std::printf("splice measured:  %llu splices happened and none was judged\n",
                       static_cast<unsigned long long>(result.splice_bridges + result.output_drops));
+        // A bridge that fires on a large fraction of blocks is not repairing isolated splices, it is
+        // part of a loop that is thrashing -- and then the repair is meaningless, because its whole
+        // design assumes clean audio either side of one splice. Measured: at cap 2 with the floor at the
+        // same level, the bridge was armed 236 841 times in 480 s (one per two blocks) and the emitted
+        // signal was *worse* than the raw one, a chain of overlapping bridges. Said out loud rather than
+        // left for the reader to notice in the ratios.
+        if (result.splice_bridges > 0 && result.blocks > 0 &&
+            result.splice_bridges * 20 > result.blocks)
+          std::printf("splice repair:    WARNING: armed %llu times in %llu blocks -- above 5 %%, so this is\n"
+                      "                  not isolated repair but a thrashing configuration; the measured\n"
+                      "                  numbers below describe a chain of bridges, not a splice\n",
+                      static_cast<unsigned long long>(result.splice_bridges),
+                      static_cast<unsigned long long>(result.blocks));
         if (result.splice_verify_evaluated)
+        {
           // Measured on the audio this run produced, not on a test tone: the largest second difference
-          // inside the splice window against the largest the surrounding signal produces. The window is
-          // the 16 samples after the join; the reference comes from 256 frames before it and 48 after.
-          std::printf("splice measured:  %llu splices judged on the emitted signal: worst second difference\n"
-                      "                  %.6f against a reference of %.6f (%.1fx)%s\n",
-                      static_cast<unsigned long long>(result.splice_verified), result.splice_worst_d2,
-                      result.splice_reference_d2,
-                      result.splice_reference_d2 > 0.0 ? result.splice_worst_d2 / result.splice_reference_d2 : 0.0,
-                      result.splice_bridge_frames == 0 ? "  <- no bridge: this is the raw splice" : "");
+          // inside the splice window against the largest the surrounding signal produces. Both the raw
+          // and the emitted number come from the same splices, which is what makes them a pair.
+          const double ratio = result.splice_reference_d2 > 0.0
+                                 ? result.splice_worst_d2 / result.splice_reference_d2
+                                 : 0.0;
+          const double raw_ratio = result.splice_raw_reference_d2 > 0.0
+                                     ? result.splice_raw_d2 / result.splice_raw_reference_d2
+                                     : 0.0;
+          std::printf("splice measured:  %llu splices judged on the emitted signal (reference %.6f):\n"
+                      "                  raw %.6f (%.1fx) -> emitted %.6f (%.1fx)%s\n",
+                      static_cast<unsigned long long>(result.splice_verified), result.splice_reference_d2,
+                      result.splice_raw_d2, raw_ratio, result.splice_worst_d2, ratio,
+                      result.splice_bridge_frames == 0 ? "   [no bridge: both are the raw splice]" : "");
+        }
         // The loop's own decisions, next to the occupancy that provoked them. A drop is audio the
         // run chose to lose rather than block for, so it is the one number here that a listener
         // would hear; the burst count is the mechanism that leads to one. The gate is spelled out

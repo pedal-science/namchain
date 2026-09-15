@@ -188,6 +188,8 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   uint64_t result_splice_verified = 0;
   double result_splice_worst_d2 = 0.0;
   double result_splice_reference_d2 = 0.0;
+  double result_splice_raw_d2 = 0.0;
+  double result_splice_raw_reference_d2 = 0.0;
   bool result_splice_verify_evaluated = false;
   std::string result_splice_verify_error;
   uint64_t insertions_seen = device->floor_insertions();
@@ -505,7 +507,12 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     // the bridge off the same span is the raw splice, which is what makes the two arms paired.
     if (written == 0)
     {
-      splice_pending = true;
+      // Judged only if the history the detector will use as reference is itself splice-free. That has
+      // to be decided *here*: the span must be recorded on the next block, which is the one the bridge
+      // repairs. Deferring the recording until the neighbourhood looks settled instead records a later
+      // block where no bridge is acting -- measured: 955 "judged" splices whose raw and emitted second
+      // differences were identical to six decimals, because both spans were the same untouched signal.
+      splice_pending = blocks_since_splice >= kSpliceHistoryPeriods;
       blocks_since_splice = 0;
     }
     else
@@ -536,7 +543,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     // is the bridge -- which is what makes this a paired measurement and not a comparison of two runs.
     if (options.splice_verify && info.period_size > 0 && splice_history_frames > 0)
     {
-      if (splice_pending && written != 0 && blocks_since_splice > kSpliceHistoryPeriods)
+      if (splice_pending && written != 0)
       {
         const size_t join = splice_history_frames - info.period_size;
         std::copy(emit_history.begin(), emit_history.begin() + static_cast<long>(join), splice_span_post.begin());
@@ -568,6 +575,18 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
           {
             result_splice_worst_d2 = report.max_edit_d2;
             result_splice_reference_d2 = report.reference_d2;
+          }
+          // And the same window on the *raw* splice, judged against itself. That is the paired half of
+          // the comparison: both numbers come from one splice, so the repair's effect is measured rather
+          // than inferred across two runs whose splices are never the same.
+          std::string raw_error;
+          const glitch::Report raw_report = glitch::analyse(splice_span_pre.data(), splice_span_pre.data(),
+                                                            splice_span_pre.data(), splice_history_frames, edits,
+                                                            splice_options, raw_error);
+          if (raw_error.empty() && raw_report.continuity_evaluated)
+          {
+            result_splice_raw_d2 = std::max(result_splice_raw_d2, raw_report.max_edit_d2);
+            result_splice_raw_reference_d2 = std::max(result_splice_raw_reference_d2, raw_report.reference_d2);
           }
           ++result_splice_verified;
           result_splice_verify_evaluated = true;
@@ -696,6 +715,8 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.splice_verified = result_splice_verified;
   result.splice_worst_d2 = result_splice_worst_d2;
   result.splice_reference_d2 = result_splice_reference_d2;
+  result.splice_raw_d2 = result_splice_raw_d2;
+  result.splice_raw_reference_d2 = result_splice_raw_reference_d2;
   result.splice_verify_evaluated = result_splice_verify_evaluated;
   result.splice_verify_error = result_splice_verify_error;
   result.output_queue_floor_periods = info.output_queue_floor_periods;

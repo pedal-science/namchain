@@ -1,0 +1,62 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 384 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            4 x build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/90, playback min/max 110/200 (last 182) frames
+                  playback queue 1.72..3.12 periods (last 2.84); the floor is the stall the device
+                  absorbs without starving: 1.72 periods = 2.292 ms
+                  p1 2.66, p50 2.94 periods; 0 of 675000 blocks held less than one
+                  period (0.00 %), which is the window a stall has to miss
+queue target:     4 periods = 5.333 ms: a cap on the ring's contents, so a burst
+                  cannot buy latency beyond it. Not a promise of cushion -- the
+                  floor held above is the number to read
+queue floor:      2 periods after each write, so 1 periods = 1.333 ms at the worst
+                  instant; held by inserting silence 0 times (0 frames =
+                  0.000 ms of audio delayed rather than skipped, never needed)
+splice repair:    64-frame bridge (1.333 ms) armed 0 times: 0 dropped periods,
+                  0 inserted ones. Applied to the emitted signal only -- the oracle
+                  below still compares the engine's pristine output
+queue control:    0 output drops (not gated: each refusal is the target's trade), 0 capture bursts
+                  0 of those drops were the queue target refusing a period that
+                  would have raised the ring past 4 periods; 0 were the ring itself
+                  being full
+queue prefill:    8 frames of silence written before block 0 to bring the ring
+                  to its target (0.167 ms of output latency, paid once)
+occupancy check:  2700558 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           675000
+audio:            900.000 s in 899.906 s wall (RTF 0.9999)
+deadline:         1333333 ns
+split (p50):      read 3093 ns, chain 315009 ns, write 15147 ns
+split (tail):     read p99 5852 max 39330, chain p99 562739 max 1645530, write p99 19964 max 87175 ns
+chain p99:        562739 ns (42.21% of deadline)
+device wait:      p50 1154497 ns, p99 1185615 ns, max 1474321 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 1621166 ns, wall max 1645530 ns
+                  219.56 s of CPU over 220.20 s of wall in the render path (99.7%), 12 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 260967 cpu 1621166 ns (wall 1645530 ns), block 33149 cpu 1402260 ns (wall 1421930 ns), block 44948 cpu 1304166 ns (wall 1325373 ns), block 622777 cpu 1230423 ns (wall 1266096 ns), block 667860 cpu 1219278 ns (wall 1244888 ns)
+cpu spike bursts: 3635 blocks over half a period of CPU, in 1061 runs; runs start every 3..22508 blocks (0.0..30.0 s at 48 k/64)
+                  run at block 0..0 (1 long), worst 866259 ns of CPU
+                  run at block 2328..2332 (5 long), worst 861833 ns of CPU
+                  run at block 2338..2341 (4 long), worst 922389 ns of CPU
+                  run at block 2350..2350 (1 long), worst 727871 ns of CPU
+                  run at block 2355..2355 (1 long), worst 693186 ns of CPU
+                  run at block 10425..10425 (1 long), worst 674352 ns of CPU
+                  run at block 10428..10429 (2 long), worst 915500 ns of CPU
+                  run at block 10442..10444 (3 long), worst 817797 ns of CPU
+block time:       p50 333342 ns, p99 585110 ns, max 1686735 ns
+p99/deadline:     43.88% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+first overrun at: block 33149 of 675000
+deadline overruns:3
+driver xruns:     0
+  by direction:   0 capture overruns, 0 playback underruns
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           FAIL

@@ -1,0 +1,71 @@
+The splice bridge on the device: what was measured, and what could not be
+=========================================================================
+
+2026-09-15 evening, `1cfa27d`+working tree. Evidence: soak-20min-paired.*, soak-8min-paired.*,
+soak-20min-paired-sparse.*, soak-ab2-{a1,b1,b2}.*, soak-5min-bridge.* (afternoon),
+soak-1h-ring6-cap4.* and the A/B in queue-floor.txt.
+
+The question this was meant to answer
+-------------------------------------
+The bridge is verified at the unit level: `tests/test_splice_fader.cpp` runs plan §10.3's own detector
+over a raw splice and a repaired one and reports the numbers by which the shape was chosen (a hold
+scores 0.052, a decaying extrapolation 0.0521, the Hermite bridge 0.0097 against a limit of 0.0136).
+What that leaves open is whether the *loop* repairs the *device's* splices -- so `--splice-verify` was
+built to judge each splice on the emitted audio, with the raw splice as its oracle, in the same run.
+
+It is a paired design: for one splice the verifier builds two spans over the same real emitted history,
+the second differing only in the period the bridge repaired. Both are analysed over the same window,
+so "raw 0.33 -> emitted 0.01" would be one measurement of one splice rather than a comparison of two
+runs whose splices are never the same.
+
+What it found instead
+---------------------
+Three regimes were measured, and none of them produced the measurement it was built for:
+
+  * **A sane configuration produces no splices at all, in this session.** Cap 3 and cap 4 with a
+    6-period ring, 20 and 15 minutes each, no floor: **0 drops, 0 xruns, 0 bridges**. The same cap-4
+    configuration produced 13-18 drops per 900 s this afternoon, so the drop rate is strongly
+    session-dependent and this session was a clean one. There was nothing to judge.
+  * **Dense splices cannot be judged, and the verifier says so rather than guessing.** With drops
+    forced every four blocks (cap 1, 858 splices in 60 s) the "reference" region is made of other
+    clicks: the reference rose to 0.0918 and the worst to 0.3362. The numbers describe the
+    configuration, not the repair. The verifier now judges a splice only when the preceding five
+    periods are splice-free, and reports how many it judged.
+  * **A thrashing configuration is not repaired by a bridge, and that is a real finding.** Cap 2 with
+    the floor at the same level is the squeezed-queue configuration the earlier work warned about
+    (bounds one period apart), and it armed the bridge **236 841 times in 480 s -- once every two
+    blocks**. 457 splices had a clean enough neighbourhood to judge, and they came out
+    **raw 0.3277 -> emitted 0.3717**: the emitted signal was *worse*. The reason is structural rather
+    than a bug: the bridge assumes clean audio either side of one splice, and when splices arrive
+    every other block the repair overlaps itself into a chain of bridges, each one bridging the
+    previous one's output. The repair has a duty-cycle limit, and above roughly 5 % of blocks it is
+    not repairing anything.
+
+The last of those is now reported by the tool: a run whose bridge fires on more than 5 % of blocks
+prints a warning saying that the numbers below describe a chain of bridges rather than a splice, so
+the failure cannot be read as a measurement.
+
+Where that leaves the claim
+---------------------------
+Verified:
+  * the shape, by the detector, with the numbers that chose it (unit level);
+  * the wiring, on the device -- the bridge arms on real dropped and inserted periods, and the oracle
+    stays exact (`max|diff| = 0` over 240 000 frames) in the same runs, with 0 render-path allocations;
+  * the passthrough, by construction: an unarmed bridge copies, so a run that enables it and has no
+    splices is bit-identical to one that never did.
+Not verified on device:
+  * the repaired splice's continuity *on a real isolated splice*, because no sane configuration in
+    this session produced one. The instrument for it exists, is paired, and is exercised -- it judged
+    955 and then 457 splices -- but only in regimes where the answer is "this configuration is not
+    the one to judge".
+
+The run to take next, and the reason it is a run rather than a change: cap 4 with `--splice-verify` on,
+for an hour, **in a session that behaves like this afternoon's** (13-18 drops per 900 s). Then the
+verifier has a dozen isolated splices with clean neighbourhoods, and the paired raw-versus-emitted
+numbers are the evidence the bridge deserves. Nothing in the code needs to change to take it.
+
+Also in this session: the balanced A/B of "cap 4 alone" against "cap 4 + floor 2 + a 1.33 ms bridge"
+was started as A B B A and **stopped after three arms, all three with 0 drops, 0 insertions, 0 xruns
+and 0 bridges**. With every arm an empty event set there was nothing for a fourth to add, and the
+honest reading of the three is not "the arms are equal" but "this session could not distinguish
+them". Its files are kept as soak-ab2-{a1,b1,b2}.*, and the a2 arm was deliberately not run.
