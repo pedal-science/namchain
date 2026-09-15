@@ -1511,6 +1511,31 @@ silence was a step in *value*, so the continuity rule is still tripped and the t
 than pretending otherwise. Closing it means the backend writing a *bridged* payload from the same two
 Hermite terms: a backend change, and the named remainder of this repair.
 
+**And the repair is judged on the device's own audio, not only on a test tone.** §10.3 above says the
+detector must exist before the machinery, and this is the wiring that was missing: `--splice-verify`
+records the last five periods the device actually heard, and when a period is refused it builds two
+spans over the same real history -- one ending in the engine's raw output for the period after the
+splice, one ending in what was emitted -- and runs `glitch::analyse` over the pair. The raw span is the
+oracle and the emitted span is the signal under judgement, so the difference between them is *only* the
+bridge: a paired measurement inside a single run, not a comparison of two runs. It costs the timed
+section nothing (recorded after it, analysed after the run) and it reports the largest second difference
+inside the splice window against the largest the surrounding signal produces, with the ratio.
+
+Two things it taught immediately, both worth keeping:
+
+  * **The detector's guard is a model transition's guard.** Its default is 5 ms either side of an edit,
+    which is wider than a one-period span, so `analyse` *rejects* rather than judging -- and the first
+    version of the verifier swallowed that rejection and reported nothing, which is indistinguishable
+    from finding nothing wrong. It now carries the error out in the report. The guard is derived from
+    the span instead: the settled signal after the window is 48 frames, so the guard is 48 frames.
+  * **A splice can only be judged where it has a settled neighbourhood.** With drops forced every four
+    blocks (a deliberately pathological cap, 858 splices in 60 s) the "reference" rose to 0.09 and the
+    worst to 0.38 -- numbers that describe other clicks, not this repair, because the window that is
+    supposed to be reference material contains more splices. The verifier therefore judges a splice only
+    when the preceding five periods are splice-free, and reports the count it *did* judge. In the
+    measured configurations splices are sparse enough (13 per 900 s at cap 4) that the spans are real.
+
+
 ### 10.4 RT-safety tests
 
 `clang -fsanitize=realtime` on the render path in CI; a global `operator new`/`free`/

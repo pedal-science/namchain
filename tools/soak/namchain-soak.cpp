@@ -68,6 +68,9 @@ void usage()
                "                       last emitted sample and its slope so the splice is not a click\n"
                "                       (default 0: off). Applied to the emitted signal only, so the oracle\n"
                "                       still checks the engine's pristine output\n"
+               "  --splice-verify      judge each splice on the emitted signal with the glitch detector,\n"
+               "                       against the raw splice as its oracle (needs no bridge; with the\n"
+               "                       bridge off this measures the click itself)\n"
                "  --model FILE         run this .nam between capture and playback\n"
                "  --instances N        chain N copies of the model (default 1)\n"
                "  --graph FILE         run this rig instead: a JSON graph of nodes and connections\n"
@@ -148,6 +151,8 @@ int main(int argc, char** argv)
       options.output_queue_floor_periods = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--splice-fade-ms" && i + 1 < argc)
       options.splice_fade_ms = std::atof(argv[++i]);
+    else if (arg == "--splice-verify")
+      options.splice_verify = true;
     else if (arg == "--model" && i + 1 < argc)
       options.model = argv[++i];
     else if (arg == "--graph" && i + 1 < argc)
@@ -374,6 +379,9 @@ int main(int argc, char** argv)
                               {"occupancy_mismatches", result.occupancy_mismatches}};
       j["device"]["xruns_by_direction"] = {{"capture_overruns", result.capture_overruns},
                                            {"playback_underruns", result.playback_underruns}};
+      j["device"]["splice_measured"] = {{"judged", result.splice_verified},
+                                        {"worst_d2", result.splice_worst_d2},
+                                        {"reference_d2", result.splice_reference_d2}};
       j["device"]["splice_repair"] = {{"bridge_frames", result.splice_bridge_frames},
                                       {"bridges", result.splice_bridges},
                                       {"for_drops", result.splice_bridges_for_drops},
@@ -525,6 +533,23 @@ int main(int argc, char** argv)
                       static_cast<unsigned long long>(result.splice_bridges_for_drops),
                       static_cast<unsigned long long>(result.splice_bridges_for_insertions));
         }
+        if (!result.splice_verify_error.empty())
+          std::printf("splice measured:  the detector could not judge the splices: %s\n",
+                      result.splice_verify_error.c_str());
+        else if (options.splice_verify && result.splice_bridges + result.output_drops > 0 &&
+                 result.splice_verified == 0)
+          std::printf("splice measured:  %llu splices happened and none was judged\n",
+                      static_cast<unsigned long long>(result.splice_bridges + result.output_drops));
+        if (result.splice_verify_evaluated)
+          // Measured on the audio this run produced, not on a test tone: the largest second difference
+          // inside the splice window against the largest the surrounding signal produces. The window is
+          // the 16 samples after the join; the reference comes from 256 frames before it and 48 after.
+          std::printf("splice measured:  %llu splices judged on the emitted signal: worst second difference\n"
+                      "                  %.6f against a reference of %.6f (%.1fx)%s\n",
+                      static_cast<unsigned long long>(result.splice_verified), result.splice_worst_d2,
+                      result.splice_reference_d2,
+                      result.splice_reference_d2 > 0.0 ? result.splice_worst_d2 / result.splice_reference_d2 : 0.0,
+                      result.splice_bridge_frames == 0 ? "  <- no bridge: this is the raw splice" : "");
         // The loop's own decisions, next to the occupancy that provoked them. A drop is audio the
         // run chose to lose rather than block for, so it is the one number here that a listener
         // would hear; the burst count is the mechanism that leads to one. The gate is spelled out

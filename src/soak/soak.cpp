@@ -1,10 +1,12 @@
 #include "namchain/soak.h"
 
+#include "namchain/glitch.h"
 #include "namchain/rt/splice_fader.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <memory>
@@ -183,7 +185,32 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   std::vector<float> mono_emit(static_cast<size_t>(info.period_size), 0.0f);
   uint64_t bridges_for_drops = 0;
   uint64_t bridges_for_insertions = 0;
+  uint64_t result_splice_verified = 0;
+  double result_splice_worst_d2 = 0.0;
+  double result_splice_reference_d2 = 0.0;
+  bool result_splice_verify_evaluated = false;
+  std::string result_splice_verify_error;
   uint64_t insertions_seen = device->floor_insertions();
+
+  // The splice verifier's state: what the device has actually heard (post-bridge), so that the span it
+  // judges is the real one. Five periods leaves 256 frames of settled signal to the left of the join and
+  // 48 to the right, which is what the detector needs to derive a reference and to check convergence.
+  constexpr unsigned kSpliceHistoryPeriods = 5;
+  constexpr unsigned kSpliceWindowFrames = 8;
+  const size_t splice_history_frames = static_cast<size_t>(kSpliceHistoryPeriods) * info.period_size;
+  std::vector<float> emit_history(splice_history_frames, 0.0f);
+  std::vector<float> splice_span_pre(splice_history_frames, 0.0f);
+  std::vector<float> splice_span_post(splice_history_frames, 0.0f);
+  bool splice_pending = false;
+  /// Blocks since the last splice. A span has to be *settled* either side of the splice for the detector
+  /// to derive a reference and check convergence, so a splice whose neighbourhood contains another splice
+  /// cannot be judged -- and judging it anyway reports a reference made of clicks. Measured with forced
+  /// drops (one every four blocks): the "reference" rose to 0.09 and the worst to 0.38, which says
+  /// nothing about the repair. Judged only when the preceding history is splice-free.
+  uint64_t blocks_since_splice = kSpliceHistoryPeriods;
+  /// What the bridge actually emitted this block, for the verifier. Set inside the render scope and read
+  /// after it, which is why it is a pointer to one of the two mono buffers rather than a copy.
+  const float* emitted_now = nullptr;
 
   std::vector<float> mono_in(static_cast<size_t>(info.period_size), 0.0f);
   std::vector<float> mono_out(static_cast<size_t>(info.period_size), 0.0f);
@@ -371,6 +398,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
           fader.apply(mono_out.data(), mono_emit.data(), info.period_size);
           emitted = mono_emit.data();
         }
+        emitted_now = emitted;
 
         // Start from silence every block: the passthrough copy only fills one channel, and a device
         // with 6 playback channels would otherwise be sent whatever was left in the buffer.
@@ -473,6 +501,17 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     }
     if (written == 0)
       ++output_drops;
+    // A refused period is the splice the verifier judges, whether or not a bridge will repair it: with
+    // the bridge off the same span is the raw splice, which is what makes the two arms paired.
+    if (written == 0)
+    {
+      splice_pending = true;
+      blocks_since_splice = 0;
+    }
+    else
+    {
+      ++blocks_since_splice;
+    }
     // Arm the bridge for the *next* period, which is the first one that can do anything about it: the
     // period just refused is not in the ring, and the inserted one was written by the backend.
     if (fader.enabled())
@@ -489,6 +528,64 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
         ++bridges_for_insertions;
       }
       insertions_seen = insertions_now;
+    }
+
+    // The splice verifier. The span's last period is "the one after the splice": the raw engine output
+    // for the paired oracle, and what was actually emitted for the signal under judgement. Everything
+    // before it is the same real emitted history in both, so the only difference between the two spans
+    // is the bridge -- which is what makes this a paired measurement and not a comparison of two runs.
+    if (options.splice_verify && info.period_size > 0 && splice_history_frames > 0)
+    {
+      if (splice_pending && written != 0 && blocks_since_splice > kSpliceHistoryPeriods)
+      {
+        const size_t join = splice_history_frames - info.period_size;
+        std::copy(emit_history.begin(), emit_history.begin() + static_cast<long>(join), splice_span_post.begin());
+        std::copy(emit_history.begin(), emit_history.begin() + static_cast<long>(join), splice_span_pre.begin());
+        std::copy(emitted_now, emitted_now + info.period_size, splice_span_post.begin() + static_cast<long>(join));
+        std::copy(mono_out.begin(), mono_out.end(), splice_span_pre.begin() + static_cast<long>(join));
+
+        const size_t window_end = join + std::min<size_t>(kSpliceWindowFrames, info.period_size);
+        std::vector<glitch::Edit> edits;
+        edits.push_back({join, window_end});
+        glitch::Options splice_options;
+        splice_options.sample_rate = static_cast<double>(info.sample_rate);
+        // The detector refuses an edit that leaves no settled region inside the span, and its default
+        // guard is 5 ms -- a *model transition's* guard, and wider than a one-period span. The guard here
+        // is what actually stands between the splice and the settled signal, which is the tail of the
+        // same period, so it is derived from the span rather than assumed: 48 frames of settled signal
+        // follow the window, and the guard is set to exactly that.
+        splice_options.guard_ms = info.sample_rate == 0 || splice_history_frames <= window_end
+                                    ? 0.0
+                                    : 1000.0 * static_cast<double>(splice_history_frames - window_end) /
+                                        static_cast<double>(info.sample_rate);
+        std::string splice_error;
+        const glitch::Report report = glitch::analyse(splice_span_post.data(), splice_span_pre.data(),
+                                                      splice_span_pre.data(), splice_history_frames, edits,
+                                                      splice_options, splice_error);
+        if (splice_error.empty() && report.continuity_evaluated)
+        {
+          if (report.max_edit_d2 > result_splice_worst_d2)
+          {
+            result_splice_worst_d2 = report.max_edit_d2;
+            result_splice_reference_d2 = report.reference_d2;
+          }
+          ++result_splice_verified;
+          result_splice_verify_evaluated = true;
+        }
+        else if (!splice_error.empty() && result_splice_verify_error.empty())
+        {
+          // Never silent: a verifier that cannot judge is a fact about the run, not an absence of one.
+          result_splice_verify_error = splice_error;
+        }
+        splice_pending = false;
+      }
+      if (written != 0 && emit_history.size() >= info.period_size)
+      {
+        std::memmove(emit_history.data(), emit_history.data() + info.period_size,
+                     static_cast<size_t>(splice_history_frames - info.period_size) * sizeof(float));
+        std::copy(emitted_now, emitted_now + info.period_size,
+                  emit_history.begin() + static_cast<long>(splice_history_frames - info.period_size));
+      }
     }
     const auto t3 = Clock::now();
     write_timer.record(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count()));
@@ -596,6 +693,11 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.splice_bridges = fader.fades();
   result.splice_bridges_for_drops = bridges_for_drops;
   result.splice_bridges_for_insertions = bridges_for_insertions;
+  result.splice_verified = result_splice_verified;
+  result.splice_worst_d2 = result_splice_worst_d2;
+  result.splice_reference_d2 = result_splice_reference_d2;
+  result.splice_verify_evaluated = result_splice_verify_evaluated;
+  result.splice_verify_error = result_splice_verify_error;
   result.output_queue_floor_periods = info.output_queue_floor_periods;
   {
     const StreamQueueStats stats = device->queue_stats();

@@ -106,6 +106,14 @@ struct SoakOptions
   /// all -- the oracle still compares the pristine render (plan.md §10.3). One period (1.33 ms at q=64)
   /// is the measured shortest window that satisfies the detector's continuity rule.
   double splice_fade_ms = 0.0;
+  /// \brief Verify each repair on the device's own audio, by running the glitch detector over the
+  /// emitted signal either side of a splice (plan.md §10.3's "dropped-period edit kind").
+  ///
+  /// The unit test proves the bridge on a synthetic tone; this proves it on the signal the run actually
+  /// produced, in the same run, against the raw splice as the oracle -- the paired comparison the
+  /// detector was built to make. Records the last few emitted periods and analyses after the timed
+  /// section, so it costs the measurement nothing.
+  bool splice_verify = false;
   /// The engine's rate, and therefore the rate the device is asked for and that every input file
   /// and model is checked against. Fixed rather than inferred: this is a 48 kHz engine at M1, and a
   /// harness that quietly follows whichever file it was handed cannot compare two runs.
@@ -321,6 +329,20 @@ struct SoakResult
   uint64_t splice_bridges = 0;
   uint64_t splice_bridges_for_drops = 0;
   uint64_t splice_bridges_for_insertions = 0;
+  /// \brief Splices the detector judged on the emitted signal, and the numbers it returned.
+  ///
+  /// `splice_worst_d2` is the largest second difference inside the judged window -- the click, measured
+  /// on real audio rather than on a test tone -- and `splice_reference_d2` is the largest the signal
+  /// itself produces outside it, which is what the number has to be read against. With the bridge off,
+  /// these are the numbers for the raw splice, which is what makes the comparison paired rather than
+  /// cross-run.
+  uint64_t splice_verified = 0;
+  double splice_worst_d2 = 0.0;
+  double splice_reference_d2 = 0.0;
+  bool splice_verify_evaluated = false;
+  /// Set when the detector refused to judge -- a span too short for its guard, say. Reported because a
+  /// verifier that silently judges nothing is indistinguishable from one that found nothing wrong.
+  std::string splice_verify_error;
   /// \brief Driver xruns by direction, summing exactly to \ref driver_xruns.
   ///
   /// The split is the difference between two problems. A capture overrun is the device having
