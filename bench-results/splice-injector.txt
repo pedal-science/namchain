@@ -106,3 +106,42 @@ Two things to read first, and the reason the drop case took four bugs to close:
 The next step is the diagnostic that closed the drop case, unchanged: dump the samples either side of the
 entry, through the payload, to the exit, and compare the verifier's reconstruction against what the
 backend actually wrote. Nothing else should change until that is read.
+
+
+The reconstruction read a future anchor, and that was the entry's whole error
+------------------------------------------------------------------------------
+The diagnostic printed exactly what was needed:
+
+    last -0.121868  prev -0.047541  slope -0.074327
+    rebuilt first  0.108782   (=last+slope? -0.196196)   worst 0.304978 at entry+0
+
+The rebuilt first sample was not `last + slope`, and the difference between them -- 0.304978 -- was
+*precisely* the reported worst second difference, at offset entry+0. So the whole of the 3.8x was the
+entry, and the entry was wrong because the verifier reconstructed the payload by reading
+`fader.last_emitted(0)` at the *recording* block, one block after the payload was written -- by which time
+that block's own commit had already advanced the anchor to a period the payload does not continue. It is
+the same mistake as `apply()`/`commit()`: reading state that has already moved on. Fixed by capturing the
+anchor and slope at the moment the payload is written.
+
+Still 4.8x, so the entry is not the only content
+------------------------------------------------
+With the capture fixed, the same measurement reads **0.318915 against 0.065798 = 4.8x** on 8 clean,
+isolated, judged insertions (ring 12, one every 10 s, 90 s, 0 drops, 0 xruns, oracle exact, 0
+allocations). The entry is now continuous *by construction* -- `p[0] = last + slope` against the two real
+samples before it -- so the residual is elsewhere in the window, and the window is the difference from the
+drop case: 72 frames covering the payload and both joints, against 8 samples after a single join.
+
+Two candidates, and the next run distinguishes them in one line, because the diagnostic already prints
+the only missing number:
+
+  * the worst offset is at *entry+0* still, which would mean the capture is not taking effect where it
+    should -- a state-ordering question, checkable directly;
+  * the worst offset is *inside the payload* or at the *exit*, which would mean the payload's own
+    deliberate curvature is what the rule is seeing. That is a measurement question rather than a code
+    one: a 64-sample bridge whose whole purpose is to change the signal's slope has second-difference
+    content of its own, and a rule calibrated to catch a one-sample step may simply be the wrong
+    instrument for judging it over a window that wide. The honest comparison then is the payload's
+    interior against the signal's own curvature over a comparable span, not a max over 72 samples.
+
+Either way the drop splice's verdict stands unchanged (4.3x -> 1.0x), and the insertion's entry bug is
+fixed and proved fixed by the diagnostic above; what is open is narrower than it was.

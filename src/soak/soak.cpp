@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdio>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -216,6 +217,8 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
                                            static_cast<double>(info.period_size)));
   uint64_t injected_insertions = 0;
   bool insert_pending = false;
+  float insert_anchor = 0.0f;
+  float insert_slope = 0.0f;
   // The spans are sized for the widest case, an insertion: history + payload + the period after it.
   const size_t splice_span_frames = splice_history_frames + 2 * info.period_size;
   std::vector<float> insert_payload(static_cast<size_t>(info.period_size), 0.0f);
@@ -564,6 +567,13 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
         }
         ++injected_insertions;
         insert_pending = true;
+        // Captured *here*, where the payload was written, and not read later: the fader's anchor advances
+        // with every committed period, so by the time the span is recorded the anchor is a period in the
+        // future and the reconstruction no longer describes the payload. That mistake is exactly what the
+        // diagnostic showed -- a rebuilt first sample of 0.108782 where the signal said -0.196196, a
+        // difference of 0.304978, which was the whole of the reported 3.8x.
+        insert_anchor = fader.last_emitted(0);
+        insert_slope = fader.last_slope(0);
         // The period after the payload must leave from the payload's flat end, which is the value the
         // anchor already holds.
         if (fader.enabled())
@@ -636,8 +646,8 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
         // is the whole point, since the entry is the joint the loop cannot repair for itself.
         const size_t entry = splice_history_frames;
         const size_t exit = splice_history_frames + info.period_size;
-        const float last = fader.last_emitted(0);
-        const float slope = fader.last_slope(0);
+        const float last = insert_anchor;
+        const float slope = insert_slope;
         for (unsigned i = 0; i < info.period_size; ++i)
           insert_payload[i] = rt::splice_insert_sample(last, slope, i, info.period_size);
         std::copy(emit_history.begin(), emit_history.end(), splice_span_post.begin());
@@ -648,6 +658,30 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
         std::copy(mono_out.begin(), mono_out.end(), splice_span_pre.begin() + static_cast<long>(exit));
 
         const size_t window_end = exit + std::min<size_t>(kSpliceWindowFrames, info.period_size);
+        if (std::getenv("NAMCHAIN_INSERT_DEBUG") != nullptr && insertions_verified < 3)
+        {
+          const float h1 = splice_span_post[entry - 1];
+          const float h0 = splice_span_post[entry - 2];
+          std::fprintf(stderr,
+                       "[insert] last %.6f prev %.6f slope %.6f | rebuilt first %.6f (=last+slope? %.6f) "
+                       "| second %+.6f | last-of-payload %.6f | exit %.6f (raw %.6f) | exit+1 %.6f\n",
+                       h1, h0, h1 - h0, splice_span_post[entry], h1 + (h1 - h0), splice_span_post[entry + 1],
+                       splice_span_post[exit - 1], splice_span_post[exit], splice_span_pre[exit],
+                       splice_span_post[exit + 1]);
+          const auto worst = [&](const std::vector<float>& v, size_t from, size_t to) {
+            double w = 0.0;
+            long long at = 0;
+            for (size_t n = from > 2 ? from : 2; n < to; ++n)
+            {
+              const double d = std::fabs(static_cast<double>(v[n]) - 2.0 * v[n - 1] + v[n - 2]);
+              if (d > w) { w = d; at = static_cast<long long>(n) - static_cast<long long>(entry); }
+            }
+            return std::make_pair(w, at);
+          };
+          const auto w = worst(splice_span_post, entry, window_end + 2);
+          std::fprintf(stderr, "[insert] worst %.6f at entry%+lld  (payload window %zu frames)\n", w.first,
+                       w.second, window_end - entry);
+        }
         std::vector<glitch::Edit> edits;
         edits.push_back({entry, window_end});
         glitch::Options insert_options;
