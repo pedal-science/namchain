@@ -1,0 +1,98 @@
+irqbalance at start: inactive
+irq 1    0-3
+irq 10   0-3
+irq 108  0-3
+irq 11   0-3
+irq 110  0-3
+irq 12   0-3
+irq 121  0-3
+irq 127  0-3
+irq 13   0-3
+irq 133  0-3
+irq 138  0-3
+irq 14   0-3
+irq 142  0-3
+irq 15   0-3
+irq 160  0-3
+irq 163  0-3
+irq 164  0-3
+irq 165  0-3
+irq 166  0-3
+irq 167  0-3
+irq 168  0-3
+irq 169  0-3
+irq 170  0-3
+irq 171  0-3
+irq 172  0-3
+irq 173  0-3
+irq 174  0-3
+irq 175  0-3
+irq 176  0-3
+irq 177  0-3
+irq 178  0-3
+irq 179  0-3
+irq 180  0-3
+irq 181  0-3
+irq 182  0-3
+irq 183  0-3
+irq 184  0-3
+irq 185  0-3
+irq 186  0-3
+irq 2    0-3
+irq 22   0-3
+irq 23   0-3
+irq 24   0-3
+irq 25   0-3
+irq 3    0-3
+irq 32   0
+irq 33   1
+irq 34   2
+irq 35   3
+irq 36   0-3
+irq 37   0-3
+irq 38   0-3
+irq 4    0-3
+irq 40   0-3
+irq 5    0-3
+irq 6    0-3
+irq 7    0-3
+irq 8    0-3
+irq 9    0-3
+steerable IRQs: 59, of which target cpu 3: 0
+restored
+
+RESULT OF THIS RUN: no intervention took place. Four arms, one configuration.
+----------------------------------------------------------------------------
+The script defined its mask helpers *after* the loop that used them, and named one `expand` -- which
+collides with /usr/bin/expand, so bash ran the external tab-expander on "0-3" instead of the function
+(stderr: `expand: 0-3: No such file or directory`, 59 times). No IRQ's smp_affinity_list was rewritten.
+
+The recorded per-run cpu 3 interrupt counts prove it rather than leaving it to be inferred:
+
+    a1 (intended: on)   291428
+    b1 (intended: off)  291769
+    b2 (intended: off)  291116
+    a2 (intended: on)   291251
+
+Identical across arms, so the two "off" arms were "on" arms. The host was left untouched: the trap's
+restore_all does not use the broken helper, and a re-check against the saved masks reports 0 differences
+across all 59 steerable IRQs.
+
+What the four runs are, then, is four samples of the *same* configuration, and they are worth keeping for
+exactly that -- they measure how much this host moves on its own, with nothing changed between them:
+
+    arm   chain p99 (% deadline)   block p99   deadline overruns   driver xruns   cpu3 interrupts
+    a1    55.12                    57.39 %     47                  4              291 428
+    b1    51.18                    53.14 %     12                  1              291 769
+    b2    58.44                    60.92 %     121                 7              291 116
+    a2    46.30                    48.35 %     17                  0              291 251
+
+chain p99 spans 46.3 - 58.4 % between two arms of the *same* arm (a1 and a2), an 8.8-point spread, and
+deadline overruns span 12 - 121 -- a factor of ten. That is the session variance that has made every
+comparison in this thread hard to trust, measured here with nothing varying but time, and it is the same
+magnitude as the effects I have been trying to attribute.
+
+To actually run the intervention: rename the helper (expand_list), define it before its first use, and
+re-check that the B arms' cpu3_delta falls well below the A arms' before believing any timing difference
+between them. The delta is what caught this failure, which is the argument for recording the state a
+manipulation claims to have changed.
