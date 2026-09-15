@@ -66,6 +66,20 @@ struct AlsaRawConfig
   /// Must be less than \ref periods: a cap equal to the ring leaves no room for the period the policy
   /// is deciding about, so the loop could never write at all.
   unsigned output_queue_periods = 0;
+  /// \brief Periods of queue below which the loop inserts a period of silence to hold the floor.
+  ///
+  /// The other end of the same trade as \ref output_queue_periods, and the answer to a problem the cap
+  /// cannot solve: the queue is not renewable, because the loop produces one period per period, so once
+  /// the queue is short only *something other than the signal* can refill it. Without this, a short
+  /// queue ends in a playback underrun, and an underrun stops the stream and recovery discards the
+  /// whole queued ring -- measured at 8 per hour for a configuration whose 5-minute runs had none.
+  /// With it, the cost is one period (1.33 ms) of inserted silence per shortfall and the timeline is
+  /// preserved rather than skipped.
+  ///
+  /// 0 disables the controller. Must be at most \ref output_queue_periods when that is set, and less
+  /// than \ref periods. The inserted period is silence today, which is audible at both ends without a
+  /// splice fade (plan.md §10.3); the counter is reported so the cost can be weighed before that lands.
+  unsigned output_queue_floor_periods = 0;
 };
 
 struct AlsaRawInfo
@@ -92,6 +106,8 @@ struct AlsaRawInfo
   /// configuration rather than recomputed, so that "the target the report states" and "the target the
   /// write path enforces" are the same number and cannot drift apart.
   unsigned output_queue_periods = 0;
+  /// The output-queue floor actually in force, in periods; 0 when there is no controller.
+  unsigned output_queue_floor_periods = 0;
   std::string capture_node;
   std::string playback_node;
 };
@@ -264,6 +280,12 @@ public:
   uint64_t output_target_drops() const { return output_target_drops_; }
   /// The queue target in force, in frames; 0 when there is none.
   unsigned target_frames() const { return target_frames_; }
+  /// Periods of silence the floor controller has inserted to keep the queue off the bottom. Each one is
+  /// 1.33 ms at q=64, audible without a splice fade, and the timeline cost of not underrunning: an
+  /// underrun discards the whole queued ring in recovery, so a period is the cheaper mistake.
+  uint64_t floor_insertions() const { return floor_insertions_; }
+  /// The same in frames, which must equal `floor_insertions() * period_size`; asserted by the soak.
+  uint64_t floor_inserted_frames() const { return floor_inserted_frames_; }
   /// Reads released while two or more periods were waiting. Zero means the loop never fell a period
   /// behind; a positive count is the mechanism that fills the playback ring, so it is reported even
   /// when the drop guard absorbs the consequence.
@@ -308,6 +330,9 @@ private:
   /// was written to find is invisible in every aggregate the report has: a target refusing a dead
   /// stream shows up as a large drop count and a healthy xrun count, which is exactly backwards.
   void queue_debug_trace(const AlsaRawOccupancy& occupancy, bool allowed);
+  /// Write silence while the queue is below floor_frames_. Called after a successful write, so the
+  /// decision is made on the occupancy the loop just produced rather than on a stale one.
+  void maintain_output_floor();
 
   int capture_fd_ = -1;
   int playback_fd_ = -1;
@@ -318,6 +343,9 @@ private:
   /// The queue target in frames, or 0 for none. Derived from requested_queue_periods_ once the device
   /// has said what a period actually is (the requested quantum is not always granted).
   unsigned target_frames_ = 0;
+  /// The queue floor in frames, or 0 for no controller; from requested_floor_periods_.
+  unsigned floor_frames_ = 0;
+  unsigned requested_floor_periods_ = 0;
   std::vector<unsigned> format_preference_;
   bool enable_timestamps_ = false;
   unsigned capture_bytes_per_frame_ = 2;
@@ -336,6 +364,8 @@ private:
   uint64_t recoveries_ = 0;
   uint64_t output_drops_ = 0;
   uint64_t output_target_drops_ = 0;
+  uint64_t floor_insertions_ = 0;
+  uint64_t floor_inserted_frames_ = 0;
   uint64_t capture_xruns_ = 0;
   uint64_t playback_xruns_ = 0;
   uint64_t capture_bursts_ = 0;

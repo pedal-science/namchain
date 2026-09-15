@@ -1283,6 +1283,38 @@ number:
    timed loop, because the bring-up path spends a period of the primed queue and the ring's contents
    are conserved: a queue that starts a period short stays a period short for the whole run, which is
    why `AudioBackend::prefill_output_queue` exists and why `prefill_frames` is reported.
+9. **The occupancy distribution, and a floor the loop can hold** (2026-09-15). Item 8 ended on a missing
+   instrument and an open mechanism, and this is both.
+
+   The instrument is a **histogram of the per-block occupancy**, one bin per frame and clamped into the
+   ring's length, which makes the percentiles exact rather than extrapolated and costs 3 KB for an hour
+   (`histogram_percentile`, nearest rank, tested). It answers the question `min` cannot: `min` is 0 in
+   every run that underran once, so it describes the worst run and not the typical one, and says nothing
+   about where a stall arrived. Two new figures in the report, both in periods: `p1`/`p50`, and the
+   **count of blocks whose queue held less than one period** -- the exposure window, since a stall that
+   arrives in one of those is an underrun and a stall that arrives anywhere else is absorbed. The first
+   run of it, `--periods 6 --output-queue-periods 4`, 20 s: `p1 2.75, p50 2.94`, and **0 of 15 000
+   blocks below one period**, against a `min` of 2.05 -- the floor and the level, separated at last.
+
+   The mechanism is a **floor controller** (`--output-queue-floor-periods N`): after each successful
+   write, if the queue is below the floor, insert a period of silence. The reasoning is in
+   `alsa::queue_needs_top_up` and it rests on what an underrun actually costs -- the driver stops the
+   stream and recovery `PREPARE`s it, which discards **the whole queued ring** and slips the timeline by
+   an arbitrary amount. A period of inserted silence costs 1.33 ms and slips nothing. So the choice is
+   not "dropout or not", it is "one bounded gap now or the entire queue later", and the controller makes
+   the first choice available. It is bounded at two insertions per write (a controller that spins in the
+   render path would be a worse fault than the dropout), it cannot block -- the configuration refuses a
+   floor at or above the ring's length, so a queue below the floor always leaves room for a period, which
+   is why the room check in the policy is a guard rather than a live path -- and it counts what it did
+   (`floor_insertions`, reported with the milliseconds of audio delayed rather than skipped).
+
+   **Semantics, stated because the off-by-one is the whole meaning:** the floor is enforced *after* a
+   write, so the guaranteed worst-instant tolerance is `floor - 1` periods -- the queue drains a period
+   between the write and the next one, and it is the instant before a write that a stall finds. Asking
+   for `N` therefore buys `N - 1` periods of stall tolerance, and `p1`/`min` in the report are that
+   figure rather than the configured one. Inserted silence is audible at both ends without a splice fade;
+   that fade is §10.3's mechanism and is the next piece, and until it lands the insertion count is the
+   price of the floor stated in the open.
 
 **A negotiated period is necessary but not sufficient.** The SSL *accepts* a 16-frame period (floor 6),
 but the run does not keep real time at it: RTF 1.333, i.e. it loses a third. Instrumenting the loop to

@@ -123,6 +123,25 @@ std::unique_ptr<AlsaRawDuplex> AlsaRawDuplex::open(const AlsaRawConfig& config, 
     return nullptr;
   }
   self->requested_queue_periods_ = config.output_queue_periods;
+  // The floor controller's configuration is checked here rather than at the first short queue, where a
+  // contradictory pair would show up as inserted silence the cap then refuses to make room for.
+  if (config.output_queue_floor_periods != 0)
+  {
+    if (config.output_queue_floor_periods >= self->periods_)
+    {
+      error = "output queue floor of " + std::to_string(config.output_queue_floor_periods) +
+              " periods does not fit a ring of " + std::to_string(self->periods_) + " periods";
+      return nullptr;
+    }
+    if (config.output_queue_periods != 0 && config.output_queue_floor_periods > config.output_queue_periods)
+    {
+      error = "output queue floor of " + std::to_string(config.output_queue_floor_periods) +
+              " periods is above the cap of " + std::to_string(config.output_queue_periods) +
+              " periods; the controller would insert silence the cap exists to refuse";
+      return nullptr;
+    }
+  }
+  self->requested_floor_periods_ = config.output_queue_floor_periods;
   self->queue_debug_ = std::getenv("NAMCHAIN_QUEUE_DEBUG") != nullptr;
   self->format_preference_ = config.format_preference;
   self->enable_timestamps_ = config.enable_timestamps;
@@ -309,7 +328,12 @@ bool AlsaRawDuplex::configure(int fd, bool capture, const char* direction, std::
                        ? 0
                        : static_cast<unsigned>(
                            alsa::queue_prime_frames(info_.period_size, requested_queue_periods_));
+    floor_frames_ = requested_floor_periods_ == 0
+                      ? 0
+                      : static_cast<unsigned>(
+                          alsa::queue_prime_frames(info_.period_size, requested_floor_periods_));
     info_.output_queue_periods = requested_queue_periods_;
+    info_.output_queue_floor_periods = requested_floor_periods_;
   }
   else if (info_.sample_format != chosen_format)
   {
@@ -513,7 +537,14 @@ void AlsaRawDuplex::stop()
 
 bool AlsaRawDuplex::fill_output_queue(std::string& error)
 {
-  if (target_frames_ == 0 || info_.buffer_size == 0)
+  if (info_.buffer_size == 0 || info_.period_size == 0)
+    return true;
+  // Whichever end of the trade is configured decides what the timed loop starts with: a cap is a level
+  // to hold, and a floor is a level to be at least. With both, the cap is the higher of the two --
+  // starting at the floor when a cap was asked for would leave the run below the level it was told to
+  // hold, and the controller would then be inserting silence from block 0 for no reason.
+  const unsigned target = std::max(target_frames_, floor_frames_);
+  if (target == 0)
     return true;
   // A short loop rather than one write, because the thing being chased is a queue the device is
   // draining: the deficit is measured again each time instead of being written once and hoped for.
@@ -529,16 +560,16 @@ bool AlsaRawDuplex::fill_output_queue(std::string& error)
       error = "cannot read the playback ring to establish the output queue: " + ignored;
       return false;
     }
-    if (occupancy.ring_frames >= static_cast<long long>(target_frames_))
+    if (occupancy.ring_frames >= static_cast<long long>(target))
       return true;
-    const long long missing = static_cast<long long>(target_frames_) - occupancy.ring_frames;
+    const long long missing = static_cast<long long>(target) - occupancy.ring_frames;
     const long long room = static_cast<long long>(info_.buffer_size) - occupancy.ring_frames;
     const unsigned chunk = static_cast<unsigned>(std::min(missing, std::max(0LL, room)));
     if (chunk == 0)
       return true; // the ring is as full as it can be, which is a different report's problem
     if (write_playback(prime_silence_.data(), chunk, 1000, ignored) < 0)
     {
-      error = "could not establish the output queue of " + std::to_string(target_frames_) + " frames: " + ignored;
+      error = "could not establish the output queue of " + std::to_string(target) + " frames: " + ignored;
       return false;
     }
     prefill_frames_ += chunk;
@@ -797,6 +828,10 @@ int AlsaRawDuplex::try_write_playback(const void* src, unsigned frames, std::str
             " frames after POLLOUT reported room for a period";
     return -1;
   }
+  // After the signal, never before: the controller's job is to notice that the queue is short once this
+  // period is in it, so its decision is made on the occupancy the loop actually produced.
+  if (floor_frames_ != 0)
+    maintain_output_floor();
   return written;
 }
 
@@ -815,6 +850,34 @@ void AlsaRawDuplex::queue_debug_trace(const AlsaRawOccupancy& occupancy, bool al
                queue_debug_lines_, occupancy.ring_frames, occupancy.avail_frames, occupancy.state,
                occupancy.hw_ptr, occupancy.appl_ptr, target_frames_,
                allowed ? "write" : "refuse");
+}
+
+void AlsaRawDuplex::maintain_output_floor()
+{
+  // One period at a time, and only while the queue is still short. A stall that cost two periods is
+  // covered by two insertions, which is the honest meaning of catching up here: the loop cannot produce
+  // audio it never received, so the timeline is preserved by delaying it rather than by skipping it.
+  //
+  // Bounded at two attempts: the device drains a period every 1333 us and an insertion costs
+  // microseconds, so needing more than two means something other than a short queue is wrong -- and a
+  // controller that spins inside the render path would be a worse fault than the dropout it prevents.
+  for (unsigned attempt = 0; attempt < 2; ++attempt)
+  {
+    AlsaRawOccupancy occupancy;
+    std::string ignored;
+    if (!query_occupancy(false, occupancy, ignored))
+      return;
+    if (!alsa::queue_needs_top_up(static_cast<unsigned long long>(occupancy.ring_frames), floor_frames_,
+                                  info_.period_size, info_.buffer_size))
+      return;
+    // A whole period, not the deficit: everything above this writes period-sized buffers, and a partial
+    // period would leave the queue at a level that is not a whole number of periods -- a state nothing
+    // else in this file has to reason about.
+    if (write_playback(prime_silence_.data(), info_.period_size, 1000, ignored) < 0)
+      return;
+    ++floor_insertions_;
+    floor_inserted_frames_ += info_.period_size;
+  }
 }
 
 bool AlsaRawDuplex::query_occupancy(bool capture, AlsaRawOccupancy& out, std::string& error) const

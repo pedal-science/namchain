@@ -272,3 +272,33 @@ TEST_CASE("an invalid channel count is rejected before touching the device")
 }
 
 #endif // __linux__
+
+TEST_CASE("the floor controller tops up only when the queue is short and a period fits")
+{
+  // The other end of the cap's policy (plan.md §9.5 item 9). A short queue can only be refilled by
+  // something other than the signal, so the decision has to be exactly "short, and a whole period fits"
+  // -- an insertion that does not fit would block in the write, which is the one thing the loop may not
+  // do, and an insertion that happens when the queue is *not* short is latency added for nothing.
+  const unsigned long long period = 64;
+  const unsigned long long buffer = 384; // a 6-period ring
+  const unsigned long long floor = 3 * period;
+
+  CHECK(namchain::alsa::queue_needs_top_up(0, floor, period, buffer));
+  CHECK(namchain::alsa::queue_needs_top_up(period, floor, period, buffer));
+  CHECK(namchain::alsa::queue_needs_top_up(floor - 1, floor, period, buffer));
+  CHECK_FALSE(namchain::alsa::queue_needs_top_up(floor, floor, period, buffer)); // at the floor: done
+  CHECK_FALSE(namchain::alsa::queue_needs_top_up(floor + period, floor, period, buffer));
+
+  // No floor means no controller, which is what keeps the default path exactly the path every earlier
+  // measurement took.
+  CHECK_FALSE(namchain::alsa::queue_needs_top_up(0, 0, period, buffer));
+
+  // Room is the condition that keeps the insertion from blocking. It is a guard rather than a live path:
+  // the configuration refuses a floor at or above the ring's length, so a queue below the floor always
+  // leaves room for a period -- which is exactly why the controller can never block in the write. The
+  // case is still pinned here, because "cannot happen" is a claim and this is what makes it one.
+  const unsigned long long greedy_floor = buffer;                       // more than the ring can hold
+  CHECK(namchain::alsa::queue_needs_top_up(buffer - period, greedy_floor, period, buffer)); // fits exactly
+  CHECK_FALSE(namchain::alsa::queue_needs_top_up(buffer - period + 1, greedy_floor, period, buffer));
+  CHECK_FALSE(namchain::alsa::queue_needs_top_up(0, floor, period, 0)); // no ring at all
+}

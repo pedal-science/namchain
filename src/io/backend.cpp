@@ -261,6 +261,7 @@ public:
     raw.periods = config.periods;
     raw.require_exact_period = config.require_exact_period;
     raw.output_queue_periods = config.output_queue_periods;
+    raw.output_queue_floor_periods = config.output_queue_floor_periods;
 
     std::unique_ptr<AlsaRawDuplex> device = AlsaRawDuplex::open(raw, error);
     if (!device)
@@ -279,6 +280,7 @@ public:
     self->info_.playback_bytes_per_frame = source.playback_bytes_per_frame;
     self->info_.period_exact = source.period_exact;
     self->info_.output_queue_periods = source.output_queue_periods;
+    self->info_.output_queue_floor_periods = source.output_queue_floor_periods;
     self->info_.capture_name = source.capture_node;
     self->info_.playback_name = source.playback_node;
     // One buffer for playback plus one for capture is the floor the rings impose on any round trip.
@@ -325,6 +327,9 @@ public:
     stats.output_drops = device_->output_drops();
     stats.output_target_drops = device_->output_target_drops();
     stats.output_queue_periods = device_->info().output_queue_periods;
+    stats.output_queue_floor_periods = device_->info().output_queue_floor_periods;
+    stats.floor_insertions = device_->floor_insertions();
+    stats.floor_inserted_frames = device_->floor_inserted_frames();
     stats.capture_bursts = device_->capture_bursts();
     stats.settle_discarded_frames = device_->settle_discarded_frames();
     stats.prefill_frames = device_->prefill_frames();

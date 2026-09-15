@@ -109,6 +109,32 @@ unsigned long long queue_prime_frames(unsigned long long period_frames, unsigned
 /// down in a bounded number of drops rather than staying there.
 bool queue_allows_write(unsigned long long ring_frames, unsigned long long target_frames);
 
+/// \brief Whether the output queue is short enough that a period of silence should be inserted.
+///
+/// The floor controller's entire policy (§9.5 item 9). A cap bounds the queue from above; this is the
+/// other end, and it exists because the queue is not renewable: the loop produces one period per period,
+/// so once the queue is short only *something other than the signal* can refill it. Measured on this
+/// host, the alternative is worse than it looks -- a playback underrun makes the driver stop the
+/// stream, and recovery re-`PREPARE`s it, which discards **the whole queued ring** rather than one
+/// period. So the choice is between inserting 1.33 ms of silence now and losing the entire queue plus
+/// a timeline slip at an arbitrary later moment.
+///
+/// \param ring_frames the ring's contents, from the pointer pair, at the moment of the decision.
+/// \param floor_frames the level to hold, in frames; 0 means no controller, and the decision is false.
+/// \param period_frames the period, in frames.
+/// \param buffer_frames the ring's capacity, in frames.
+///
+/// The room condition is what keeps the insertion from blocking: a write is only safe when the ring can
+/// take a whole period, and the check is here rather than at the write so the arithmetic is testable.
+/// Given the configuration validation -- a floor below the ring's length -- a short queue always leaves
+/// room for a period, so this is a guard rather than a live path. That is worth knowing in itself: it is
+/// why the controller can never block in the write, which is the one thing the render path may not do.
+/// Insertion continues while the queue is short, so a single late burst of stalls can be covered by more
+/// than one period -- but only as many as there were blocks missed, which is what "catching up" means
+/// here: the timeline is preserved and the audio is delayed, rather than the audio being skipped.
+bool queue_needs_top_up(unsigned long long ring_frames, unsigned long long floor_frames,
+                        unsigned long long period_frames, unsigned long long buffer_frames);
+
 } // namespace alsa
 } // namespace namchain
 

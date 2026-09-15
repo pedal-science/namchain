@@ -60,6 +60,10 @@ void usage()
                "                       whenever the kernel has room). A cap, not a cushion -- what a run\n"
                "                       actually holds is measured and printed. Must be less than --periods,\n"
                "                       and wants a ring with headroom above it (plan.md 9.5 item 8)\n"
+               "  --output-queue-floor-periods N  insert a period of silence when the queue falls below\n"
+               "                       N periods, so it never reaches the driver's underrun. Costs 1.33 ms\n"
+               "                       of inserted audio each time and no timeline slip, where an underrun\n"
+               "                       discards the whole queued ring. Default 0 (off); must be <= the cap\n"
                "  --model FILE         run this .nam between capture and playback\n"
                "  --instances N        chain N copies of the model (default 1)\n"
                "  --graph FILE         run this rig instead: a JSON graph of nodes and connections\n"
@@ -136,6 +140,8 @@ int main(int argc, char** argv)
       options.device_periods = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--output-queue-periods" && i + 1 < argc)
       options.output_queue_periods = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (arg == "--output-queue-floor-periods" && i + 1 < argc)
+      options.output_queue_floor_periods = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (arg == "--model" && i + 1 < argc)
       options.model = argv[++i];
     else if (arg == "--graph" && i + 1 < argc)
@@ -227,11 +233,12 @@ int main(int argc, char** argv)
   // Refused by name rather than ignored. Only the ALSA backend has an output ring to hold a queue in,
   // and a run that reports a latency it is not actually carrying is worse than one that will not
   // start -- the whole point of the knob is that the number is a stated trade (plan.md §9.5 item 7).
-  if (options.output_queue_periods != 0 && options.backend != namchain::BackendKind::AlsaRaw)
+  if ((options.output_queue_periods != 0 || options.output_queue_floor_periods != 0) &&
+      options.backend != namchain::BackendKind::AlsaRaw)
   {
     std::fprintf(stderr,
-                 "error: --output-queue-periods only applies to --backend alsa_raw; the %s backend has no\n"
-                 "       output ring to hold a queue in, so the target would be reported and not applied\n",
+                 "error: the output-queue settings only apply to --backend alsa_raw; the %s backend has no\n"
+                 "       output ring to hold a queue in, so they would be reported and not applied\n",
                  namchain::backend_kind_name(options.backend));
     return 2;
   }
@@ -342,10 +349,18 @@ int main(int argc, char** argv)
           {"playback_min", result.playback_occupancy_min},
           {"playback_max", result.playback_occupancy_max},
           {"playback_last", result.playback_occupancy_last},
+          {"playback_p1", result.playback_occupancy_p1},
+          {"playback_p50", result.playback_occupancy_p50},
+          {"capture_p1", result.capture_occupancy_p1},
+          {"capture_p50", result.capture_occupancy_p50},
+          {"playback_below_period_blocks", result.playback_below_period_blocks},
           {"playback_full_blocks", result.playback_full_blocks}};
       j["device"]["queue"] = {{"output_drops", result.output_drops},
                               {"output_target_drops", result.output_target_drops},
                               {"output_queue_periods", result.output_queue_periods},
+                              {"output_queue_floor_periods", result.output_queue_floor_periods},
+                              {"floor_insertions", result.floor_insertions},
+                              {"floor_inserted_frames", result.floor_inserted_frames},
                               {"capture_bursts", result.capture_bursts},
                               {"settle_discarded_frames", result.settle_discarded_frames},
                               {"prefill_frames", result.prefill_frames},
@@ -422,6 +437,19 @@ int main(int argc, char** argv)
                       static_cast<double>(result.playback_occupancy_last) / frames_per_period,
                       static_cast<double>(result.playback_occupancy_min) / frames_per_period,
                       static_cast<double>(result.playback_occupancy_min) * ms_per_frame);
+          // The distribution, which is the instrument the min/max pair cannot be: `min` is 0 in any run
+          // that underran once, so it says nothing about a run that did not, and nothing about where the
+          // stalls arrived. p1 is the floor asked properly; the below-one-period count is the exposure.
+          std::printf("                  p1 %.2f, p50 %.2f periods; %llu of %llu blocks held less than one\n"
+                      "                  period (%.2f %%), which is the window a stall has to miss\n",
+                      static_cast<double>(result.playback_occupancy_p1) / frames_per_period,
+                      static_cast<double>(result.playback_occupancy_p50) / frames_per_period,
+                      static_cast<unsigned long long>(result.playback_below_period_blocks),
+                      static_cast<unsigned long long>(result.blocks),
+                      result.blocks == 0
+                        ? 0.0
+                        : 100.0 * static_cast<double>(result.playback_below_period_blocks) /
+                            static_cast<double>(result.blocks));
         }
         // The cap, in the unit a listener cares about, and the line that says where the numbers that
         // matter are. The trade is stated before the figures that trade produced.
@@ -446,6 +474,30 @@ int main(int argc, char** argv)
         {
           std::printf("queue target:     none: the loop writes whenever the kernel has room, so how much audio\n"
                       "                  is queued -- and so the stall it can absorb -- is whatever the run holds\n");
+        }
+        if (result.output_queue_floor_periods > 0)
+        {
+          const double inserted_ms = options.sample_rate == 0
+                                       ? 0.0
+                                       : 1e3 * static_cast<double>(result.floor_inserted_frames) /
+                                           static_cast<double>(options.sample_rate);
+          // The floor is enforced *after* a write, which is the whole meaning of the number: the queue
+          // drains a period between the write and the next one, and a stall finds the instant before a
+          // write, so asking for N buys N-1 periods of tolerance. Printed as both so the arithmetic
+          // cannot be misread for a guarantee it is not.
+          std::printf("queue floor:      %u periods after each write, so %u periods = %.3f ms at the worst\n"
+                      "                  instant; held by inserting silence %llu times (%llu frames =\n"
+                      "                  %.3f ms of audio delayed rather than skipped, %s)\n",
+                      result.output_queue_floor_periods,
+                      result.output_queue_floor_periods == 0 ? 0 : result.output_queue_floor_periods - 1,
+                      result.output_queue_floor_periods == 0 || options.sample_rate == 0
+                        ? 0.0
+                        : 1e3 * static_cast<double>(result.output_queue_floor_periods - 1) *
+                            static_cast<double>(result.device_period_size) /
+                            static_cast<double>(options.sample_rate),
+                      static_cast<unsigned long long>(result.floor_insertions),
+                      static_cast<unsigned long long>(result.floor_inserted_frames), inserted_ms,
+                      result.floor_insertions == 0 ? "never needed" : "each one audible without a splice fade");
         }
         // The loop's own decisions, next to the occupancy that provoked them. A drop is audio the
         // run chose to lose rather than block for, so it is the one number here that a listener

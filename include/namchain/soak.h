@@ -89,6 +89,15 @@ struct SoakOptions
   /// it mattered. `alsa_raw` only: the other backends have no ring to hold anything in, and the CLI
   /// refuses the combination rather than accepting a run that does not measure what it claims.
   unsigned output_queue_periods = 0;
+  /// \brief Periods of queue below which the loop inserts silence to hold the floor.
+  ///
+  /// What a cap cannot do. The queue is not renewable -- the loop produces one period per period -- so
+  /// once it is short only something other than the signal can refill it, and the alternative is a
+  /// playback underrun whose recovery discards the *whole* queued ring. So the timeline is preserved by
+  /// delaying it: a period of silence costs 1.33 ms and no slip, where an underrun costs the ring plus an
+  /// arbitrary slip. 0 disables the controller; must be at most \ref output_queue_periods and less than
+  /// \ref device_periods. `alsa_raw` only, like the cap.
+  unsigned output_queue_floor_periods = 0;
   /// The engine's rate, and therefore the rate the device is asked for and that every input file
   /// and model is checked against. Fixed rather than inferred: this is a 48 kHz engine at M1, and a
   /// harness that quietly follows whichever file it was handed cannot compare two runs.
@@ -265,6 +274,21 @@ struct SoakResult
   /// Blocks whose playback ring was at or above the buffer length: the loop was writing into a full
   /// ring, which is the state that turns the write's wait for space into reported block time.
   uint64_t playback_full_blocks = 0;
+  /// \brief Percentiles of the playback queue's contents, in frames, sampled once per block.
+  ///
+  /// The instrument §9.5 item 8 found missing. `playback_occupancy_min` reads 0 in every run that
+  /// underran once -- the minimum over a run whose stream starved is 0 by definition -- so it cannot say
+  /// how close a run that did *not* starve came, and it cannot say where the stalls arrived. p1 is that
+  /// question asked properly ("1 % of blocks had less than this queued") and p50 is the level the run
+  /// actually held.
+  long long playback_occupancy_p1 = 0;
+  long long playback_occupancy_p50 = 0;
+  long long capture_occupancy_p1 = 0;
+  long long capture_occupancy_p50 = 0;
+  /// Blocks whose playback queue held less than one period: the exposure window, in counts rather than
+  /// percentiles. A stall arriving in one of these blocks is an underrun; a stall arriving anywhere else
+  /// is absorbed. This is the number a floor is chosen against.
+  uint64_t playback_below_period_blocks = 0;
   /// Periods the loop dropped rather than wait for room in the output ring. The engine is unaffected
   /// -- the oracle still validates every block it rendered -- but the audio has a gap exactly here,
   /// so it is a reported number and not a debug counter.
@@ -275,6 +299,12 @@ struct SoakResult
   uint64_t output_target_drops = 0;
   /// The output-queue target in force, in periods; 0 when the run held none.
   unsigned output_queue_periods = 0;
+  /// The output-queue floor in force, in periods; 0 when no controller ran.
+  unsigned output_queue_floor_periods = 0;
+  /// Periods of silence the floor controller inserted, and the same in frames. Each is one period of
+  /// audio delayed rather than skipped, and audible without a splice fade.
+  uint64_t floor_insertions = 0;
+  uint64_t floor_inserted_frames = 0;
   /// \brief Driver xruns by direction, summing exactly to \ref driver_xruns.
   ///
   /// The split is the difference between two problems. A capture overrun is the device having
@@ -322,6 +352,20 @@ struct SoakResult
 
   OracleResult oracle;
 };
+
+/// \brief The nearest-rank percentile of a histogram, in the histogram's own units.
+///
+/// Reported statistics have to be pinned down somewhere: "p1" is three different numbers depending on
+/// whether the rank is floor, ceil or interpolated, and the difference is exactly the value a floor
+/// would be chosen against. This is the nearest-rank definition -- the smallest bin whose cumulative
+/// count reaches `ceil(percentile/100 * samples)` -- so `p1` means "at least 1 % of samples were at or
+/// below this", which is the sentence the report makes.
+///
+/// \param counts bin populations, ascending in the quantity being measured.
+/// \param bins number of bins; \p counts must hold at least this many.
+/// \param samples total samples; 0 returns bin 0 rather than dividing by nothing.
+/// \param percentile in (0, 100].
+long long histogram_percentile(const uint64_t* counts, size_t bins, uint64_t samples, double percentile);
 
 /// \brief Run a bounded soak over one model and report timing and correctness.
 ///

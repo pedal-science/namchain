@@ -60,6 +60,15 @@ struct BackendConfig
   /// and spent by lateness afterwards. 0 means no cap, which is what every measurement before this
   /// looked like. Must be less than \ref periods.
   unsigned output_queue_periods = 0;
+  /// \brief Periods of queue below which a period of silence is inserted to hold the floor.
+  ///
+  /// The other end of the same trade, and the answer to a problem a cap cannot solve: the queue is not
+  /// renewable (one period produced per period played), so only something other than the signal can
+  /// refill it. Without it a short queue ends in a playback underrun, and recovery from an underrun
+  /// discards the *whole* queued ring -- so a period of inserted silence is the cheaper mistake. 0
+  /// disables it; must be at most \ref output_queue_periods and less than \ref periods. The inserted
+  /// period is silence today, audible at both ends without a splice fade (plan.md §10.3).
+  unsigned output_queue_floor_periods = 0;
 };
 
 struct BackendInfo
@@ -83,6 +92,8 @@ struct BackendInfo
   /// rather than re-read from the configuration so that the number a report states and the number the
   /// write path acts on are the same one.
   unsigned output_queue_periods = 0;
+  /// The output-queue floor this backend is enforcing, in periods; 0 when it enforces none.
+  unsigned output_queue_floor_periods = 0;
   std::string capture_name;
   std::string playback_name;
   /// The minimum a round trip through this backend can take, in frames: what its own buffers add
@@ -122,6 +133,17 @@ struct StreamQueueStats
   uint64_t output_target_drops = 0;
   /// The output-queue target in force, in periods; 0 when there is none.
   unsigned output_queue_periods = 0;
+  /// The output-queue floor in force, in periods; 0 when there is no controller.
+  unsigned output_queue_floor_periods = 0;
+  /// \brief Periods of silence the floor controller inserted to keep the queue off the bottom.
+  ///
+  /// Each one is 1.33 ms at q=64 and is audible without a splice fade, so this is the price of the
+  /// floor and it belongs next to the xruns it prevented: an underrun discards the whole queued ring in
+  /// recovery, so a period of silence is the cheaper mistake -- but it is not free, and a controller
+  /// that inserts constantly is a configuration stating that its floor is too high for its host.
+  uint64_t floor_insertions = 0;
+  /// The same in frames: must equal `floor_insertions * period_size`, and the soak asserts it.
+  uint64_t floor_inserted_frames = 0;
   uint64_t capture_bursts = 0;
   uint64_t settle_discarded_frames = 0;
   /// \brief Silence written to establish \ref output_queue_periods before the timed loop started.

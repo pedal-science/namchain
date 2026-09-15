@@ -241,3 +241,25 @@ TEST_CASE("soak reports errors instead of crashing")
   CHECK_FALSE(refused.ok);
   CHECK(refused.error.find("bounded") != std::string::npos);
 }
+
+TEST_CASE("the occupancy percentile is nearest-rank, because the report makes a claim about it")
+{
+  // "p1 = 2 periods" is read by whoever chooses a floor, so the definition has to be one sentence and
+  // true. This is nearest rank: the smallest bin whose cumulative count reaches ceil(q/100 * n). The
+  // off-by-one matters exactly at the decision: with 100 samples and a p1 of 3, five samples at 0 and
+  // ninety-five at 10 must report 0 (one sample is at or below it), not 10.
+  const uint64_t counts[11] = {5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 95};
+  CHECK(namchain::histogram_percentile(counts, 11, 100, 1.0) == 0);
+  CHECK(namchain::histogram_percentile(counts, 11, 100, 5.0) == 0);   // exactly the 5th sample
+  CHECK(namchain::histogram_percentile(counts, 11, 100, 6.0) == 10);  // one past them
+  CHECK(namchain::histogram_percentile(counts, 11, 100, 50.0) == 10);
+  CHECK(namchain::histogram_percentile(counts, 11, 100, 100.0) == 10);
+
+  // Degenerate inputs answer rather than divide by nothing, and an all-zero histogram reports its last
+  // bin rather than walking off the end.
+  CHECK(namchain::histogram_percentile(counts, 11, 0, 1.0) == 0);
+  CHECK(namchain::histogram_percentile(nullptr, 11, 100, 1.0) == 0);
+  CHECK(namchain::histogram_percentile(counts, 0, 100, 1.0) == 0);
+  const uint64_t empty[3] = {0, 0, 0};
+  CHECK(namchain::histogram_percentile(empty, 3, 10, 50.0) == 2);
+}

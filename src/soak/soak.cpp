@@ -114,6 +114,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   config.realtime_paced = options.realtime_paced;
   config.require_exact_period = true; // §9.5: a silently rounded quantum is not acceptable
   config.output_queue_periods = options.output_queue_periods;
+  config.output_queue_floor_periods = options.output_queue_floor_periods;
 
   std::string error;
   std::unique_ptr<AudioBackend> device = open_backend(config, options.backend, error);
@@ -273,6 +274,17 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   rt_reset_counters();
   uint64_t first_overrun_block = std::numeric_limits<uint64_t>::max();
   bool occupancy_seen = false;
+  // A histogram rather than a sample series. The occupancy is a whole number of frames in
+  // [0, buffer_size], so one bin per value is *exact* -- no sorting, no reservoir, no extrapolation, and
+  // 3 KB instead of the 11 MB a u32 per block would cost for an hour. Allocated here, before mlockall
+  // has to cover it, and only when the backend reports a ring at all.
+  std::vector<uint64_t> capture_occupancy_histogram;
+  std::vector<uint64_t> playback_occupancy_histogram;
+  if (info.buffer_size > 0)
+  {
+    capture_occupancy_histogram.assign(static_cast<size_t>(info.buffer_size) + 1, 0);
+    playback_occupancy_histogram.assign(static_cast<size_t>(info.buffer_size) + 1, 0);
+  }
   long long capture_occupancy_min = 0;
   long long capture_occupancy_max = 0;
   long long capture_occupancy_last = 0;
@@ -280,6 +292,8 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   long long playback_occupancy_max = 0;
   long long playback_occupancy_last = 0;
   uint64_t playback_full_blocks = 0;
+  uint64_t playback_below_period_blocks = 0;
+  uint64_t occupancy_samples = 0;
   uint64_t output_drops = 0;
   uint64_t chain_cpu_max = 0;
   uint64_t chain_cpu_total = 0;
@@ -402,6 +416,23 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
         playback_occupancy_max = std::max(playback_occupancy_max, playback_frames);
         capture_occupancy_last = capture_frames;
         playback_occupancy_last = playback_frames;
+        // Clamped rather than assumed in range: the driver reports avail past the end of the ring on a
+        // stream that is not running (see AlsaRawDuplex::try_write_playback), so an out-of-range sample
+        // is a real possibility and a bucket at the end is a better answer than a corrupted histogram.
+        const auto bucket = [](long long frames, size_t bins) {
+          if (frames < 0)
+            return size_t{0};
+          const size_t at = static_cast<size_t>(frames);
+          return at < bins ? at : bins - 1;
+        };
+        if (!capture_occupancy_histogram.empty())
+        {
+          ++capture_occupancy_histogram[bucket(capture_frames, capture_occupancy_histogram.size())];
+          ++playback_occupancy_histogram[bucket(playback_frames, playback_occupancy_histogram.size())];
+          occupancy_samples += 1;
+          if (playback_frames < static_cast<long long>(info.period_size))
+            ++playback_below_period_blocks;
+        }
         if (playback_frames + static_cast<long long>(info.period_size) > static_cast<long long>(info.buffer_size))
           ++playback_full_blocks;
       }
@@ -501,6 +532,19 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.playback_occupancy_max = playback_occupancy_max;
   result.playback_occupancy_last = playback_occupancy_last;
   result.playback_full_blocks = playback_full_blocks;
+  result.playback_below_period_blocks = playback_below_period_blocks;
+  result.playback_occupancy_p1 =
+    histogram_percentile(playback_occupancy_histogram.data(), playback_occupancy_histogram.size(),
+                         occupancy_samples, 1.0);
+  result.playback_occupancy_p50 =
+    histogram_percentile(playback_occupancy_histogram.data(), playback_occupancy_histogram.size(),
+                         occupancy_samples, 50.0);
+  result.capture_occupancy_p1 =
+    histogram_percentile(capture_occupancy_histogram.data(), capture_occupancy_histogram.size(),
+                         occupancy_samples, 1.0);
+  result.capture_occupancy_p50 =
+    histogram_percentile(capture_occupancy_histogram.data(), capture_occupancy_histogram.size(),
+                         occupancy_samples, 50.0);
   result.chain_cpu_max_ns = chain_cpu_max;
   result.chain_cpu_ns = chain_cpu_total;
   result.chain_wall_ns = chain_wall_total;
@@ -509,6 +553,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.chain_spikes = std::move(chain_spikes);
   result.output_drops = output_drops;
   result.output_queue_periods = info.output_queue_periods;
+  result.output_queue_floor_periods = info.output_queue_floor_periods;
   {
     const StreamQueueStats stats = device->queue_stats();
     result.capture_bursts = stats.capture_bursts;
@@ -516,6 +561,14 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     result.settle_discarded_frames = stats.settle_discarded_frames;
     result.gate_capture_xruns = stats.gate_capture_xruns;
     result.output_target_drops = stats.output_target_drops;
+    result.floor_insertions = stats.floor_insertions;
+    result.floor_inserted_frames = stats.floor_inserted_frames;
+    // One event, two counters. A controller that wrote a partial period would break the second's
+    // meaning, so the relation is checked rather than assumed.
+    if (result.floor_inserted_frames != result.floor_insertions * info.period_size)
+      return fail("floor-insertion accounting disagrees: " + std::to_string(result.floor_insertions) +
+                  " insertions but " + std::to_string(result.floor_inserted_frames) + " frames at " +
+                  std::to_string(info.period_size) + " frames per period");
     result.prefill_frames = prefill_frames;
     result.capture_overruns = stats.capture_overruns - startup_stats.capture_overruns;
     result.playback_underruns = stats.playback_underruns - startup_stats.playback_underruns;
@@ -913,6 +966,26 @@ SoakResult run_soak(const std::string& model_path, const std::string& input_wav_
   }
 
   return result;
+}
+
+long long histogram_percentile(const uint64_t* counts, size_t bins, uint64_t samples, double percentile)
+{
+  if (counts == nullptr || bins == 0 || samples == 0)
+    return 0;
+  const double clamped = percentile < 0.0 ? 0.0 : (percentile > 100.0 ? 100.0 : percentile);
+  // Nearest rank: the smallest bin whose cumulative count reaches the rank. An empty rank (0 % of 0) is
+  // not possible here because `samples == 0` returned above, and `rank` is at least 1.
+  uint64_t rank = static_cast<uint64_t>(std::ceil(clamped * static_cast<double>(samples) / 100.0));
+  if (rank == 0)
+    rank = 1;
+  uint64_t seen = 0;
+  for (size_t i = 0; i < bins; ++i)
+  {
+    seen += counts[i];
+    if (seen >= rank)
+      return static_cast<long long>(i);
+  }
+  return static_cast<long long>(bins - 1);
 }
 
 } // namespace namchain

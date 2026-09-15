@@ -235,6 +235,18 @@ bool queue_allows_write(unsigned long long ring_frames, unsigned long long targe
   return ring_frames <= target_frames;
 }
 
+bool queue_needs_top_up(unsigned long long ring_frames, unsigned long long floor_frames,
+                        unsigned long long period_frames, unsigned long long buffer_frames)
+{
+  if (floor_frames == 0 || period_frames == 0)
+    return false;
+  if (ring_frames >= floor_frames)
+    return false;
+  // Only if a whole period fits. `<=` because a write of exactly the remaining room is the case where
+  // the ring ends up full, and refusing that would leave the queue permanently a period short.
+  return ring_frames + period_frames <= buffer_frames;
+}
+
 } // namespace alsa
 } // namespace namchain
 
