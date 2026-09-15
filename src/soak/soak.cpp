@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
@@ -204,12 +206,21 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   std::vector<float> splice_span_pre(splice_history_frames, 0.0f);
   std::vector<float> splice_span_post(splice_history_frames, 0.0f);
   bool splice_pending = false;
+  /// The injector's schedule in blocks, and what it has done.
+  const uint64_t inject_every_blocks =
+    options.inject_splice_seconds <= 0.0 || info.sample_rate == 0 || info.period_size == 0
+      ? 0
+      : static_cast<uint64_t>(std::llround(options.inject_splice_seconds *
+                                           static_cast<double>(info.sample_rate) /
+                                           static_cast<double>(info.period_size)));
+  uint64_t injected_splices = 0;
   /// Blocks since the last splice. A span has to be *settled* either side of the splice for the detector
   /// to derive a reference and check convergence, so a splice whose neighbourhood contains another splice
   /// cannot be judged -- and judging it anyway reports a reference made of clicks. Measured with forced
   /// drops (one every four blocks): the "reference" rose to 0.09 and the worst to 0.38, which says
   /// nothing about the repair. Judged only when the preceding history is splice-free.
-  uint64_t blocks_since_splice = kSpliceHistoryPeriods;
+  uint64_t blocks_since_disturbance = kSpliceHistoryPeriods;
+  uint64_t xruns_seen = device->driver_xruns();
   /// What the bridge actually emitted this block, for the verifier. Set inside the render scope and read
   /// after it, which is why it is a pointer to one of the two mono buffers rather than a copy.
   const float* emitted_now = nullptr;
@@ -495,14 +506,30 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     // long enough for the capture ring to build the backlog that makes the next write worse (plan.md
     // §9.5 item 4). A refusal is a dropped period: a real, counted loss of audio, which is a bounded
     // and reportable outcome where an unbounded wait is not.
-    const int written = device->try_write_playback(playback_buffer.data(), info.period_size, error);
+    // The injector's block: lose this period on purpose, exactly as a refusal loses it. Nothing is
+    // offered to the backend, so neither its drop counter nor the loop's moves -- an injected splice is
+    // not a refusal and is counted separately.
+    const bool inject_now = inject_every_blocks > 0 && block > 0 && (block % inject_every_blocks) == 0;
+    const int written =
+      inject_now ? 0 : device->try_write_playback(playback_buffer.data(), info.period_size, error);
     if (written < 0)
     {
       device->stop();
       return fail(error);
     }
     if (written == 0)
-      ++output_drops;
+    {
+      if (inject_now)
+        ++injected_splices;
+      else
+        ++output_drops;
+    }
+    else if (fader.enabled() && emitted_now != nullptr)
+    {
+      // The period was taken, so this is what the device has now heard. A refused or injected period is
+      // not, and the next repair must still leave from the one before it.
+      fader.commit(emitted_now, info.period_size);
+    }
     // A refused period is the splice the verifier judges, whether or not a bridge will repair it: with
     // the bridge off the same span is the raw splice, which is what makes the two arms paired.
     if (written == 0)
@@ -512,12 +539,25 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
       // repairs. Deferring the recording until the neighbourhood looks settled instead records a later
       // block where no bridge is acting -- measured: 955 "judged" splices whose raw and emitted second
       // differences were identical to six decimals, because both spans were the same untouched signal.
-      splice_pending = blocks_since_splice >= kSpliceHistoryPeriods;
-      blocks_since_splice = 0;
+      splice_pending = blocks_since_disturbance >= kSpliceHistoryPeriods;
+      blocks_since_disturbance = 0;
     }
     else
     {
-      ++blocks_since_splice;
+      ++blocks_since_disturbance;
+    }
+    // An xrun discards the ring and re-primes it, which puts a discontinuity of its own into the emitted
+    // stream -- and the detector's window reaches two samples back into the history to measure a step at
+    // a boundary, so a recovery there becomes the "reference". Measured: a run with 12 refusals and 9
+    // underruns judged 33 splices whose raw and emitted numbers were both ~0.27, which is the recovery
+    // and not the splice. A recovery counts as a disturbance for the guard, exactly as a splice does.
+    {
+      const uint64_t xruns_now = device->driver_xruns();
+      if (xruns_now != xruns_seen)
+      {
+        blocks_since_disturbance = 0;
+        xruns_seen = xruns_now;
+      }
     }
     // Arm the bridge for the *next* period, which is the first one that can do anything about it: the
     // period just refused is not in the ring, and the inserted one was written by the backend.
@@ -712,6 +752,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.splice_bridges = fader.fades();
   result.splice_bridges_for_drops = bridges_for_drops;
   result.splice_bridges_for_insertions = bridges_for_insertions;
+  result.injected_splices = injected_splices;
   result.splice_verified = result_splice_verified;
   result.splice_worst_d2 = result_splice_worst_d2;
   result.splice_reference_d2 = result_splice_reference_d2;

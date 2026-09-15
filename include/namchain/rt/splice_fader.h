@@ -100,9 +100,20 @@ public:
   /// unconditionally; when the fader is not armed the copy is exact and the path is bit-for-bit what it
   /// would have been without the fader.
   ///
-  /// Not const, and deliberately: the last emitted samples are the anchor the *next* repair leaves from,
-  /// so emitting is what records them. RT-safe: no allocation, no locks, no syscalls.
+  /// **Computing a period and emitting one are different events, and this does not record that it
+  /// happened.** The anchor the next repair leaves from is what the *device* last heard, and a period
+  /// that was refused was never heard: a loop that let apply() move the anchor would bridge from the
+  /// last thing it *computed* rather than the last thing it *played*. Measured on the device, one
+  /// evening of confusing results and a debug trace: the bridge left from 0.1331 when the device's last
+  /// sample was -0.0513, which is a step the repair was supposed to remove. The unit tests could not
+  /// see it because they never refuse a period -- which is exactly why the on-device verifier exists.
+  /// Call commit() once the period is known to have been taken.
+  ///
+  /// RT-safe: no allocation, no locks, no syscalls.
   void apply(const float* in, float* out, unsigned frames);
+
+  /// Record `emitted` as the audio the device has heard, for the next repair to leave from.
+  void commit(const float* emitted, unsigned frames);
 
   /// The last sample emitted, per channel. What the next arm(Dropped) will anchor on.
   float last_emitted(unsigned channel) const

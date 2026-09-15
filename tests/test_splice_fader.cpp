@@ -81,6 +81,7 @@ TEST_CASE("a raw dropped period trips the continuity rule and the repaired one d
     if (at == kJoin)
       fader.arm(namchain::rt::SpliceFader::Cause::Dropped);
     fader.apply(raw.data() + at, repaired.data() + at, frames);
+    fader.commit(repaired.data() + at, frames);
   }
   CHECK(fader.fades() == 1);
 
@@ -136,6 +137,7 @@ TEST_CASE("an inserted period is repaired the same way, and silence is the worse
       if (at == arm_at)
         fader.arm(namchain::rt::SpliceFader::Cause::Dropped);
       fader.apply(in.data() + at, out.data() + at, frames);
+      fader.commit(out.data() + at, frames);
     }
     return out;
   };
@@ -203,6 +205,8 @@ TEST_CASE("the bridge window is long enough to smooth the mismatch and short eno
       if (at == kJoin)
         fader.arm(namchain::rt::SpliceFader::Cause::Dropped);
       fader.apply(raw.data() + at, out.data() + at, frames);
+      fader.commit(out.data() + at, frames);
+      fader.commit(out.data() + at, frames);
     }
     return out;
   };
@@ -237,6 +241,8 @@ TEST_CASE("the fader passes through exactly when nothing is armed, and tracks it
   const std::vector<float> in{0.1f, -0.1f, 0.2f, -0.2f, 0.3f, -0.3f, 0.4f, -0.4f};
   std::vector<float> out(in.size(), 0.0f);
   fader.apply(in.data(), out.data(), 4);
+  fader.commit(out.data(), 4);
+  fader.commit(out.data(), 4);
   CHECK(out == in);
   CHECK(fader.last_emitted(0) == doctest::Approx(0.4f));
   CHECK(fader.last_emitted(1) == doctest::Approx(-0.4f));
@@ -247,12 +253,22 @@ TEST_CASE("the fader passes through exactly when nothing is armed, and tracks it
   std::vector<float> one(4, 0.5f);
   std::vector<float> emitted(4, 0.0f);
   long_fade.apply(one.data(), emitted.data(), 4); // anchor 0.5
+  long_fade.commit(emitted.data(), 4);
   CHECK(long_fade.last_emitted(0) == doctest::Approx(0.5f));
   long_fade.arm(namchain::rt::SpliceFader::Cause::Dropped);
   CHECK(long_fade.remaining() == 16);
   std::vector<float> zeros(4, 0.0f);
   long_fade.apply(zeros.data(), emitted.data(), 4);
   CHECK(emitted[0] == doctest::Approx(0.5f)); // leaves from the anchor, not from the input
+  // Emitted but *not* committed: nothing took this period, so the device has still only heard the
+  // anchor, and the next repair must leave from 0.5 rather than from the sample just computed. This is
+  // the bug the on-device verifier found -- a refused period moved the anchor forward and the bridge
+  // left from a sample the device had never played.
+  CHECK(long_fade.last_emitted(0) == doctest::Approx(0.5f));
+  long_fade.commit(emitted.data(), 4);
+  // The anchor is now the last sample that period emitted -- which is not zero, because the bridge is
+  // still ramping through it.
+  CHECK(long_fade.last_emitted(0) == doctest::Approx(emitted[3]));
   CHECK(long_fade.armed());                   // 12 samples of ramp left
   CHECK(long_fade.fades() == 1);
 
@@ -269,5 +285,7 @@ TEST_CASE("the fader passes through exactly when nothing is armed, and tracks it
   CHECK(off.fades() == 0);
   std::vector<float> passthrough(4, 0.0f);
   off.apply(one.data(), passthrough.data(), 4);
+  off.commit(passthrough.data(), 4);
+  off.commit(passthrough.data(), 4);
   CHECK(passthrough == one);
 }

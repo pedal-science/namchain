@@ -1,0 +1,62 @@
+The splice injector: it found a real bug immediately, and the aggregate question is still open
+=============================================================================================
+
+2026-09-15 late evening, working tree on top of `5b011e7`. Evidence: soak-60s-injected.*,
+soak-8min-paired.*, soak-20min-paired.*, and the earlier soak-5min-bridge.*.
+
+Why the injector exists
+-----------------------
+The repair can only be judged on an *isolated* splice with clean audio either side, and a real session
+cannot be asked to produce one: the same cap-4 configuration gave 13-18 drops per 900 s one afternoon
+and **zero in 50 minutes** the next evening. Waiting for the bad afternoon is not an experiment.
+`--inject-splice-every S` loses one output period on a schedule instead, exactly as a refusal loses it
+(the ring drains, the engine still renders), so the geometry the bridge sees is the real one and the
+injected count is reported separately from real drops. It is the device-path version of §10.3's "500
+randomised edits" torture render.
+
+What it found, first run: the bridge was anchored on periods the device never heard
+-------------------------------------------------------------------------------------
+The debug trace over one injected splice, before the fix:
+
+    device's last emitted sample (raw[255])          -0.0513
+    the bridge's first emitted sample (emitted[256])  0.1331     <- should have been -0.0211
+    raw step it was supposed to remove                0.162
+
+`rt::SpliceFader::apply()` advanced the anchor -- the sample the next repair leaves from -- for every
+period it *computed*. But a period that is then refused or injected is never written, so the device
+never hears it, and the next bridge was leaving from the last thing the loop *computed* rather than the
+last thing it *played*. With 12 refusals and 29 injections in a minute, that is most of the repairs
+anchored in the wrong place.
+
+The unit tests could not see this: they hand the fader every period, so computing and writing are the
+same event there. **This is the strongest argument yet for the on-device verifier existing** -- the
+detector chose the repair's shape, and the device found the loop's mistake.
+
+Fixed by splitting the two events: `apply()` computes and `commit()` records, and the loop commits only
+when the write was taken. Both are now pinned by tests, including one that emits without committing and
+asserts the anchor has *not* moved.
+
+What is still open
+------------------
+The fix is correct and tested, but it did **not** change the on-device aggregate: an injected run after
+it still reports the emitted window maximum as no better than the raw one.
+
+    soak-60s-injected: 29 injected + 12 refused = 41 repairs armed, 30 judged
+                       raw 0.269303 (3.8x)  ->  emitted 0.363202 (5.2x)
+
+That is the opposite of the unit-level result (raw 0.288 -> emitted 0.0097 on a tone), and the
+discrepancy is not yet explained. The one thing ruled out is the anchor: the diagnostic that showed the
+wrong anchor before the fix was not actually compiled into the run after it, so the sample-level
+behaviour post-fix has not been observed -- only the aggregate, which is still wrong. The next step is
+therefore specific rather than exploratory: re-run the offset-and-samples trace (worst index for each
+span, plus the samples either side of the join) on a post-fix injected run, and see whether the window
+maximum sits at the join -- where the fix should now put it at zero -- or at a later sample inside the
+window, where the bridge's own early curvature would be the explanation. Nothing else should be changed
+until that is read.
+
+Two other limits are already recorded and do not need re-measuring: the detector's guard is a model
+transition's 5 ms and must be derived from the span, and a splice is only judgeable when the preceding
+five periods are splice-free -- which now also excludes *recoveries*, because an xrun discards and
+re-primes the ring and could otherwise sit inside the window the detector uses as reference (measured:
+a run with 9 underruns judged 33 splices at ~0.27 in both spans, which was the recovery and not the
+splice).

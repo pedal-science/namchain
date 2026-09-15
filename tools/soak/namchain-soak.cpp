@@ -68,6 +68,9 @@ void usage()
                "                       last emitted sample and its slope so the splice is not a click\n"
                "                       (default 0: off). Applied to the emitted signal only, so the oracle\n"
                "                       still checks the engine's pristine output\n"
+               "  --inject-splice-every S  DIAGNOSTIC: lose one output period every S seconds, so the\n"
+               "                       repair can be judged on isolated splices in a session that\n"
+               "                       produces none. Reported separately from real drops\n"
                "  --splice-verify      judge each splice on the emitted signal with the glitch detector,\n"
                "                       against the raw splice as its oracle (needs no bridge; with the\n"
                "                       bridge off this measures the click itself)\n"
@@ -153,6 +156,8 @@ int main(int argc, char** argv)
       options.splice_fade_ms = std::atof(argv[++i]);
     else if (arg == "--splice-verify")
       options.splice_verify = true;
+    else if (arg == "--inject-splice-every" && i + 1 < argc)
+      options.inject_splice_seconds = std::atof(argv[++i]);
     else if (arg == "--model" && i + 1 < argc)
       options.model = argv[++i];
     else if (arg == "--graph" && i + 1 < argc)
@@ -379,6 +384,8 @@ int main(int argc, char** argv)
                               {"occupancy_mismatches", result.occupancy_mismatches}};
       j["device"]["xruns_by_direction"] = {{"capture_overruns", result.capture_overruns},
                                            {"playback_underruns", result.playback_underruns}};
+      j["device"]["splice_injected"] = {{"periods", result.injected_splices},
+                                        {"every_seconds", options.inject_splice_seconds}};
       j["device"]["splice_measured"] = {{"judged", result.splice_verified},
                                         {"emitted_d2", result.splice_worst_d2},
                                         {"reference_d2", result.splice_reference_d2},
@@ -542,6 +549,14 @@ int main(int argc, char** argv)
                  result.splice_verified == 0)
           std::printf("splice measured:  %llu splices happened and none was judged\n",
                       static_cast<unsigned long long>(result.splice_bridges + result.output_drops));
+        if (result.injected_splices > 0)
+          // Said first, and in the same block as the measured numbers, because a reader who takes an
+          // injected rate for a real one has been misled by the report rather than by the run.
+          std::printf("splice inject:    %llu periods lost deliberately (one every %.3f s), beside %llu\n"
+                      "                  refused by the queue: the measured numbers below are of the\n"
+                      "                  injected ones, which is the point -- they are isolated\n",
+                      static_cast<unsigned long long>(result.injected_splices),
+                      options.inject_splice_seconds, static_cast<unsigned long long>(result.output_drops));
         // A bridge that fires on a large fraction of blocks is not repairing isolated splices, it is
         // part of a loop that is thrashing -- and then the repair is meaningless, because its whole
         // design assumes clean audio either side of one splice. Measured: at cap 2 with the floor at the

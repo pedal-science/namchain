@@ -102,12 +102,16 @@ void SpliceFader::apply(const float* in, float* out, unsigned frames)
     }
   }
 
-  // The anchors for the *next* repair are what this period actually emitted, not what arrived. After a
-  // drop, a period that emitted nothing leaves them where the device last heard audio.
-  for (unsigned c = 0; c < channels; ++c)
+}
+
+void SpliceFader::commit(const float* emitted, unsigned frames)
+{
+  if (emitted == nullptr || frames == 0 || channels_ == 0)
+    return;
+  for (unsigned c = 0; c < channels_; ++c)
   {
-    const float newest = out[static_cast<size_t>(frames - 1) * channels + c];
-    previous_[c] = frames >= 2 ? out[static_cast<size_t>(frames - 2) * channels + c] : anchor_[c];
+    const float newest = emitted[static_cast<size_t>(frames - 1) * channels_ + c];
+    previous_[c] = frames >= 2 ? emitted[static_cast<size_t>(frames - 2) * channels_ + c] : anchor_[c];
     anchor_[c] = newest;
   }
 }

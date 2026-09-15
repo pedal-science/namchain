@@ -106,6 +106,17 @@ struct SoakOptions
   /// all -- the oracle still compares the pristine render (plan.md §10.3). One period (1.33 ms at q=64)
   /// is the measured shortest window that satisfies the detector's continuity rule.
   double splice_fade_ms = 0.0;
+  /// \brief Lose one output period deliberately every this many seconds; 0 disables the injector.
+  ///
+  /// A **diagnostic, never a product feature.** The repair can only be judged on an *isolated* splice
+  /// with clean audio either side, and a real session cannot be asked to produce one: the same
+  /// configuration gave 13-18 drops per 900 s one afternoon and zero in 50 minutes the next evening.
+  /// Waiting for the bad afternoon is not an experiment, so the injector supplies the splice instead --
+  /// the device-path version of §10.3's "500 randomised edits" torture render rather than waiting for
+  /// real ones. The period is lost exactly as a refusal loses it (the ring drains, the engine still
+  /// renders), so the geometry the bridge sees is the real one, and the injected count is reported
+  /// separately so it can never be read as a real drop.
+  double inject_splice_seconds = 0.0;
   /// \brief Verify each repair on the device's own audio, by running the glitch detector over the
   /// emitted signal either side of a splice (plan.md §10.3's "dropped-period edit kind").
   ///
@@ -336,6 +347,9 @@ struct SoakResult
   /// itself produces outside it, which is what the number has to be read against. With the bridge off,
   /// these are the numbers for the raw splice, which is what makes the comparison paired rather than
   /// cross-run.
+  /// Periods lost to the injector rather than to a refusal. Reported next to the real drops so the one
+  /// can never be mistaken for the other.
+  uint64_t injected_splices = 0;
   uint64_t splice_verified = 0;
   double splice_worst_d2 = 0.0;
   double splice_reference_d2 = 0.0;
