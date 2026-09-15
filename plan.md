@@ -1544,13 +1544,25 @@ clean audio either side of *one* splice, and when splices arrive every other blo
 itself into a chain of bridges, each bridging the previous one's output. So the repair has a duty-cycle
 limit -- above roughly 5 % of blocks it is not repairing anything -- and the tool now says so.
 
-**What is still not verified on device is the repaired splice's continuity for a real isolated splice.**
-This session's sane configurations (cap 3 and cap 4, 6-period ring) produced **0 drops in 20 and 15
-minutes**, against 13-18 per 900 s in the afternoon, so the drop rate is strongly session-dependent and
-the instrument had nothing to judge. It judged 955 and then 457 splices in the two pathological regimes,
-which is what showed up both its own guard bug (a deferred recording judged a block where no bridge was
-acting) and the duty-cycle limit above. The run that closes this needs no code change: cap 4 with
-`--splice-verify` for an hour in a session with occasional real drops.
+**And the repair is now verified on the device's own audio, by the injector.** `--inject-splice-every S`
+loses one output period on a schedule, exactly as a refusal loses it, because a real session cannot be
+asked to produce isolated splices: the same cap-4 configuration gave 13-18 drops per 900 s one afternoon
+and **0 in fifty minutes** the next evening. Injecting them makes it a laboratory measurement instead of
+a wait, and 29 injected splices in 60 s came out **raw 0.301792 (4.3x the signal's own reference) ->
+bridged 0.064053 (1.0x)** -- the repaired splice's worst second difference now equals the audio's own
+worst curvature elsewhere in the span, so by the detector's measure the splice is no longer
+distinguishable from the signal, with the oracle still exact and 0 render-path allocations in the same
+run. Nothing in the loop needed changing to get there.
+
+**Four bugs had to be found first, and all four were found by the verifier rather than by the unit
+tests:** its guard did not fit the span; its spacing guard deferred a recording to a block where no
+bridge was acting (955 "judged" splices whose raw and emitted numbers were identical to six decimals);
+its span omitted the last period the device had heard, which inverted the whole comparison (the bridge
+was being measured against the period before the one it continues); and `rt::SpliceFader::apply()`
+advanced the anchor for periods the loop then refused, so the bridge left from the last thing it
+*computed* rather than the last thing it *played* -- invisible by construction in a unit test, which
+hands the fader every period. `apply()` and `commit()` are now separate events. Evidence:
+`bench-results/splice-injector.txt`.
 
 
 ### 10.4 RT-safety tests

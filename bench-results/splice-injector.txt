@@ -36,27 +36,41 @@ Fixed by splitting the two events: `apply()` computes and `commit()` records, an
 when the write was taken. Both are now pinned by tests, including one that emits without committing and
 asserts the anchor has *not* moved.
 
-What is still open
-------------------
-The fix is correct and tested, but it did **not** change the on-device aggregate: an injected run after
-it still reports the emitted window maximum as no better than the raw one.
+Resolved: the span was skipping the period the device last heard
+---------------------------------------------------------------
+The regression trace answered it, and the fault was in the verifier's geometry, not in the bridge.
+`join` was placed *at* the history's last period instead of after it, so the span was four periods of
+history followed by the period after the splice -- and the period the device had actually heard last,
+sitting at the history's tail, was overwritten by the new one and left out. The bridge, which correctly
+continues that period, was therefore being measured against the period *before* it, and it looked worse
+than the raw splice because it was bridging to the wrong neighbour. The trace said so directly: the
+bridge's first emitted sample was `history_last + slope` to five decimals of the anchor it was supposed
+to have, while the samples either side showed a step against a period it did not continue.
 
-    soak-60s-injected: 29 injected + 12 refused = 41 repairs armed, 30 judged
-                       raw 0.269303 (3.8x)  ->  emitted 0.363202 (5.2x)
+With the span corrected -- the whole history, then the period after the splice -- 29 injected splices in
+60 s, one every 2 s, with 12 real refusals alongside:
 
-That is the opposite of the unit-level result (raw 0.288 -> emitted 0.0097 on a tone), and the
-discrepancy is not yet explained. The one thing ruled out is the anchor: the diagnostic that showed the
-wrong anchor before the fix was not actually compiled into the run after it, so the sample-level
-behaviour post-fix has not been observed -- only the aggregate, which is still wrong. The next step is
-therefore specific rather than exploratory: re-run the offset-and-samples trace (worst index for each
-span, plus the samples either side of the join) on a post-fix injected run, and see whether the window
-maximum sits at the join -- where the fix should now put it at zero -- or at a later sample inside the
-window, where the bridge's own early curvature would be the explanation. Nothing else should be changed
-until that is read.
+    raw splice   0.301792   = 4.3x the signal's own reference
+    bridged      0.064053   = 1.0x the signal's own reference
 
-Two other limits are already recorded and do not need re-measuring: the detector's guard is a model
-transition's 5 ms and must be derived from the span, and a splice is only judgeable when the preceding
-five periods are splice-free -- which now also excludes *recoveries*, because an xrun discards and
-re-primes the ring and could otherwise sit inside the window the detector uses as reference (measured:
-a run with 9 underruns judged 33 splices at ~0.27 in both spans, which was the recovery and not the
-splice).
+The repaired splice's worst second difference now equals the audio's own worst curvature elsewhere in the
+same span: by the detector's measure the splice is no longer distinguishable from the signal. That is the
+claim the bridge was built for, measured on the device's own audio rather than on a test tone, with the
+oracle still exact (`max|diff| = 0` over 240 000 frames) and 0 render-path allocations in the same run.
+
+What the four bugs cost and bought
+----------------------------------
+All four were found by the verifier, and none was visible from the unit tests:
+
+  1. the detector's guard is a model transition's 5 ms, wider than the span, so it rejected the span
+     outright -- and reporting nothing looked exactly like finding nothing wrong;
+  2. the spacing guard deferred the recording instead of aborting it, judging a block where no bridge
+     was acting;
+  3. the span omitted the last period the device heard, which inverted the measurement;
+  4. `apply()` advanced the anchor for periods the loop then refused, so the bridge left from the last
+     thing it computed rather than the last thing it played. The unit tests hand the fader every period,
+     where computing and writing are the same event, so this one was invisible by construction.
+
+Every one was found by comparing the emitted signal against itself on the device. That is the argument
+for the verifier existing rather than trusting the synthetic case -- the detector chose the repair's
+*shape*, and the device found where the *loop* got it wrong.

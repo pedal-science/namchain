@@ -203,8 +203,14 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   constexpr unsigned kSpliceWindowFrames = 8;
   const size_t splice_history_frames = static_cast<size_t>(kSpliceHistoryPeriods) * info.period_size;
   std::vector<float> emit_history(splice_history_frames, 0.0f);
-  std::vector<float> splice_span_pre(splice_history_frames, 0.0f);
-  std::vector<float> splice_span_post(splice_history_frames, 0.0f);
+  // The span is the whole history *plus* the period after the splice. That the history's own last period
+  // is part of the span is the point: at the recording it is the last period the device actually heard,
+  // and leaving it out -- which the first version did, by joining at the history's last period instead of
+  // after it -- compares the bridge against the period *before* the one it is continuing. The bridge then
+  // looks worse than the raw splice, because it is being measured against the wrong neighbour.
+  const size_t splice_span_frames = splice_history_frames + info.period_size;
+  std::vector<float> splice_span_pre(splice_span_frames, 0.0f);
+  std::vector<float> splice_span_post(splice_span_frames, 0.0f);
   bool splice_pending = false;
   /// The injector's schedule in blocks, and what it has done.
   const uint64_t inject_every_blocks =
@@ -585,9 +591,9 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     {
       if (splice_pending && written != 0)
       {
-        const size_t join = splice_history_frames - info.period_size;
-        std::copy(emit_history.begin(), emit_history.begin() + static_cast<long>(join), splice_span_post.begin());
-        std::copy(emit_history.begin(), emit_history.begin() + static_cast<long>(join), splice_span_pre.begin());
+        const size_t join = splice_history_frames;
+        std::copy(emit_history.begin(), emit_history.end(), splice_span_post.begin());
+        std::copy(emit_history.begin(), emit_history.end(), splice_span_pre.begin());
         std::copy(emitted_now, emitted_now + info.period_size, splice_span_post.begin() + static_cast<long>(join));
         std::copy(mono_out.begin(), mono_out.end(), splice_span_pre.begin() + static_cast<long>(join));
 
@@ -601,13 +607,13 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
         // is what actually stands between the splice and the settled signal, which is the tail of the
         // same period, so it is derived from the span rather than assumed: 48 frames of settled signal
         // follow the window, and the guard is set to exactly that.
-        splice_options.guard_ms = info.sample_rate == 0 || splice_history_frames <= window_end
+        splice_options.guard_ms = info.sample_rate == 0 || splice_span_frames <= window_end
                                     ? 0.0
-                                    : 1000.0 * static_cast<double>(splice_history_frames - window_end) /
+                                    : 1000.0 * static_cast<double>(splice_span_frames - window_end) /
                                         static_cast<double>(info.sample_rate);
         std::string splice_error;
         const glitch::Report report = glitch::analyse(splice_span_post.data(), splice_span_pre.data(),
-                                                      splice_span_pre.data(), splice_history_frames, edits,
+                                                      splice_span_pre.data(), splice_span_frames, edits,
                                                       splice_options, splice_error);
         if (splice_error.empty() && report.continuity_evaluated)
         {
@@ -621,7 +627,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
           // than inferred across two runs whose splices are never the same.
           std::string raw_error;
           const glitch::Report raw_report = glitch::analyse(splice_span_pre.data(), splice_span_pre.data(),
-                                                            splice_span_pre.data(), splice_history_frames, edits,
+                                                            splice_span_pre.data(), splice_span_frames, edits,
                                                             splice_options, raw_error);
           if (raw_error.empty() && raw_report.continuity_evaluated)
           {
