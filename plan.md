@@ -1517,71 +1517,39 @@ decodes and re-encodes through the same `pcm_*` helpers the rest of the I/O laye
 Measured by the same detector, over a window covering the *whole* inserted period so the entry is judged
 rather than left out: the silent payload trips continuity, the held payload trips continuity, and the
 shaped payload **passes every rule** with its worst second difference inside the allowance derived from
-the signal itself (`tests/test_splice_fader.cpp`). **And it is measured on device now, where it does *not* yet hold.** `--inject-insert-every S` is the
-insertion half of the injector and the verifier judges an insertion over a window covering entry, payload
-and exit -- so a payload cannot pass by having its entry left out. With a clean span (ring 12, one
-injection every 10 s, 90 s: 8 inserted, 8 judged, **0 drops, 0 xruns**) the worst second difference is
-**0.272028 against a reference of 0.070685 = 3.8x**, where the unit test says the shaped payload plus the
-loop's exit bridge passes every rule. That gap is the open finding: the verifier *reconstructs* the
-payload from the fader's anchor and slope while the backend built the one it wrote from its own two frames
-of device-format audio, and the two are separately plausible -- which is the exact shape of the bug that
-inverted the drop measurement. The next step is the diagnostic that closed that one: dump the samples from
-the entry through the payload to the exit and compare the reconstruction against what was written.
-`bench-results/splice-injector.txt`.
+the signal itself (`tests/test_splice_fader.cpp`). **And it is verified on device now, both joints.** `--inject-insert-every S` is the insertion half of the
+injector and the verifier judges an insertion over a window covering **entry, payload and exit** -- so a
+payload cannot pass by having its entry left out, which is the whole point for the joint the loop cannot
+repair for itself. With a clean span (ring 12, one injection every 10 s, 90 s: 8 inserted, 8 judged, 0
+drops, 0 xruns, oracle exact, 0 allocations):
 
-**And the repair is judged on the device's own audio, not only on a test tone.** §10.3 above says the
-detector must exist before the machinery, and this is the wiring that was missing: `--splice-verify`
-records the last five periods the device actually heard, and when a period is refused it builds two
-spans over the same real history -- one ending in the engine's raw output for the period after the
-splice, one ending in what was emitted -- and runs `glitch::analyse` over the pair. The raw span is the
-oracle and the emitted span is the signal under judgement, so the difference between them is *only* the
-bridge: a paired measurement inside a single run, not a comparison of two runs. It costs the timed
-section nothing (recorded after it, analysed after the run) and it reports the largest second difference
-inside the splice window against the largest the surrounding signal produces, with the ratio.
+    worst second difference 0.053954 against a reference of 0.068797  =  0.8x
 
-Two things it taught immediately, both worth keeping:
+Below the signal's own worst curvature elsewhere in the same span, so the inserted period -- entry,
+shaped payload and exit bridge -- is no longer distinguishable from the signal by the detector's measure,
+exactly as the drop splice is not (4.3x -> 1.0x). Both splice sources are now verified end to end on the
+device, and no change to the loop was needed for the insertion: the payload was right, the *measurement*
+was wrong.
 
-  * **The detector's guard is a model transition's guard.** Its default is 5 ms either side of an edit,
-    which is wider than a one-period span, so `analyse` *rejects* rather than judging -- and the first
-    version of the verifier swallowed that rejection and reported nothing, which is indistinguishable
-    from finding nothing wrong. It now carries the error out in the report. The guard is derived from
-    the span instead: the settled signal after the window is 48 frames, so the guard is 48 frames.
-  * **A splice can only be judged where it has a settled neighbourhood.** With drops forced every four
-    blocks (a deliberately pathological cap, 858 splices in 60 s) the "reference" rose to 0.09 and the
-    worst to 0.38 -- numbers that describe other clicks, not this repair, because the window that is
-    supposed to be reference material contains more splices. The verifier therefore judges a splice only
-    when the preceding five periods are splice-free, and reports the count it *did* judge. In the
-    measured configurations splices are sparse enough (13 per 900 s at cap 4) that the spans are real.
+**Five bugs had to be found to get there, and every one of them was the same mistake in different clothes:
+the neighbourhood or the state a measurement referenced was off by one period, or had already moved on.**
 
-**And the third thing it taught is a limit of the repair itself, which is now reported rather than
-discovered in the ratios** (`bench-results/splice-bridge-verify.txt`). Cap 2 with the floor at the same
-level -- the squeezed-queue configuration §9.5 item 9 already warns about -- armed the bridge **236 841
-times in 480 s, once every two blocks**, and the 457 splices with a clean enough neighbourhood to judge
-came out **worse** repaired than raw (0.3277 -> 0.3717). The reason is structural: the bridge assumes
-clean audio either side of *one* splice, and when splices arrive every other block the repair overlaps
-itself into a chain of bridges, each bridging the previous one's output. So the repair has a duty-cycle
-limit -- above roughly 5 % of blocks it is not repairing anything -- and the tool now says so.
+  1. the detector's guard was wider than the span, so it rejected the span -- and the rejection was
+     swallowed, which looks exactly like finding nothing wrong;
+  2. the spacing guard *deferred* a recording instead of aborting it, judging a block where no bridge was
+     acting (955 "judged" splices whose raw and emitted numbers were identical to six decimals);
+  3. the drop span omitted the last period the device had heard, which inverted the comparison;
+  4. `rt::SpliceFader::apply()` advanced the anchor for periods the loop then refused, so the bridge left
+     from the last thing it *computed* rather than the last thing it *played* -- invisible to a unit test,
+     which hands the fader every period;
+  5. the insertion recording fired in the same block as the insertion, using a history that omitted the
+     very period the payload continues (an insertion happens *after* its own period, where a drop skips
+     its write and so defers naturally), and the verifier's payload reconstruction read the fader's anchor
+     a block late, after that block's commit had moved it.
 
-**And the repair is now verified on the device's own audio, by the injector.** `--inject-splice-every S`
-loses one output period on a schedule, exactly as a refusal loses it, because a real session cannot be
-asked to produce isolated splices: the same cap-4 configuration gave 13-18 drops per 900 s one afternoon
-and **0 in fifty minutes** the next evening. Injecting them makes it a laboratory measurement instead of
-a wait, and 29 injected splices in 60 s came out **raw 0.301792 (4.3x the signal's own reference) ->
-bridged 0.064053 (1.0x)** -- the repaired splice's worst second difference now equals the audio's own
-worst curvature elsewhere in the span, so by the detector's measure the splice is no longer
-distinguishable from the signal, with the oracle still exact and 0 render-path allocations in the same
-run. Nothing in the loop needed changing to get there.
-
-**Four bugs had to be found first, and all four were found by the verifier rather than by the unit
-tests:** its guard did not fit the span; its spacing guard deferred a recording to a block where no
-bridge was acting (955 "judged" splices whose raw and emitted numbers were identical to six decimals);
-its span omitted the last period the device had heard, which inverted the whole comparison (the bridge
-was being measured against the period before the one it continues); and `rt::SpliceFader::apply()`
-advanced the anchor for periods the loop then refused, so the bridge left from the last thing it
-*computed* rather than the last thing it *played* -- invisible by construction in a unit test, which
-hands the fader every period. `apply()` and `commit()` are now separate events. Evidence:
-`bench-results/splice-injector.txt`.
-
+Every one was found by comparing the emitted signal against itself on the device, none by the unit tests,
+and the pattern is now the first thing to check in this area: **which period does this measurement think
+it is standing next to, and has that state moved since?** Evidence: `bench-results/splice-injector.txt`.
 
 ### 10.4 RT-safety tests
 

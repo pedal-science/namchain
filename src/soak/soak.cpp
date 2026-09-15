@@ -216,7 +216,12 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
                                            static_cast<double>(info.sample_rate) /
                                            static_cast<double>(info.period_size)));
   uint64_t injected_insertions = 0;
-  bool insert_pending = false;
+  /// The block an injected payload was written in, or UINT64_MAX. The recording waits one block: unlike a
+  /// drop, which skips its write and therefore defers naturally, an insertion happens *after* its own
+  /// period has been written -- so a same-block recording puts the payload in front of the period it
+  /// already follows and uses a history that omits the period the payload continues. That is the same
+  /// error as the drop span that skipped the period the device had heard, one period out the other way.
+  uint64_t insert_pending_block = UINT64_MAX;
   float insert_anchor = 0.0f;
   float insert_slope = 0.0f;
   // The spans are sized for the widest case, an insertion: history + payload + the period after it.
@@ -566,7 +571,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
           return fail("injected insertion failed: " + insert_error);
         }
         ++injected_insertions;
-        insert_pending = true;
+        insert_pending_block = block;
         // Captured *here*, where the payload was written, and not read later: the fader's anchor advances
         // with every committed period, so by the time the span is recorded the anchor is a period in the
         // future and the reconstruction no longer describes the payload. That mistake is exactly what the
@@ -637,7 +642,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
       // so another splice or a recovery inside the history makes the reference describe clicks rather
       // than the signal. Measured without it: 26 cap drops alongside 29 insertions gave 5.0x, which was
       // the neighbouring splices and not the payload.
-      if (insert_pending && written != 0 && fader.enabled() &&
+      if (block > insert_pending_block && written != 0 && fader.enabled() &&
           blocks_since_disturbance >= kSpliceHistoryPeriods)
       {
         // The span for an insertion: the real periods the device heard, then the payload it heard (rebuilt
@@ -658,30 +663,6 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
         std::copy(mono_out.begin(), mono_out.end(), splice_span_pre.begin() + static_cast<long>(exit));
 
         const size_t window_end = exit + std::min<size_t>(kSpliceWindowFrames, info.period_size);
-        if (std::getenv("NAMCHAIN_INSERT_DEBUG") != nullptr && insertions_verified < 3)
-        {
-          const float h1 = splice_span_post[entry - 1];
-          const float h0 = splice_span_post[entry - 2];
-          std::fprintf(stderr,
-                       "[insert] last %.6f prev %.6f slope %.6f | rebuilt first %.6f (=last+slope? %.6f) "
-                       "| second %+.6f | last-of-payload %.6f | exit %.6f (raw %.6f) | exit+1 %.6f\n",
-                       h1, h0, h1 - h0, splice_span_post[entry], h1 + (h1 - h0), splice_span_post[entry + 1],
-                       splice_span_post[exit - 1], splice_span_post[exit], splice_span_pre[exit],
-                       splice_span_post[exit + 1]);
-          const auto worst = [&](const std::vector<float>& v, size_t from, size_t to) {
-            double w = 0.0;
-            long long at = 0;
-            for (size_t n = from > 2 ? from : 2; n < to; ++n)
-            {
-              const double d = std::fabs(static_cast<double>(v[n]) - 2.0 * v[n - 1] + v[n - 2]);
-              if (d > w) { w = d; at = static_cast<long long>(n) - static_cast<long long>(entry); }
-            }
-            return std::make_pair(w, at);
-          };
-          const auto w = worst(splice_span_post, entry, window_end + 2);
-          std::fprintf(stderr, "[insert] worst %.6f at entry%+lld  (payload window %zu frames)\n", w.first,
-                       w.second, window_end - entry);
-        }
         std::vector<glitch::Edit> edits;
         edits.push_back({entry, window_end});
         glitch::Options insert_options;
@@ -700,7 +681,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
           insertion_reference_d2 = std::max(insertion_reference_d2, report.reference_d2);
           ++insertions_verified;
         }
-        insert_pending = false;
+        insert_pending_block = UINT64_MAX;
       }
       if (splice_pending && written != 0)
       {

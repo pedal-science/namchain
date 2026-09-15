@@ -145,3 +145,28 @@ the only missing number:
 
 Either way the drop splice's verdict stands unchanged (4.3x -> 1.0x), and the insertion's entry bug is
 fixed and proved fixed by the diagnostic above; what is open is narrower than it was.
+
+
+Resolved: the recording fired a block early, and the insertion measures 0.8x
+---------------------------------------------------------------------------
+The offset diagnostic showed the rebuilt payload's first sample was *still* not `last + slope`, with the
+difference again equal to the whole reported worst second difference, at offset entry+0 -- and the
+neighbouring offsets (`entry+1`, `entry+2`, mid-payload, `exit-1`) were all tiny. So the payload was right
+and the *span* was wrong: the recording fired in the same block as the insertion, where the history still
+ends with period k-1. An insertion is written *after* its own period, so a same-block recording puts the
+payload in front of the period it already follows and reconstructs it against a history that omits the
+period it continues -- the same error as the drop span that skipped the period the device had heard, one
+period out the other way. Unlike a drop, which skips its write and so defers the recording naturally, this
+one needed an explicit one-block delay.
+
+With the delay, on 8 clean isolated judged insertions (ring 12, one every 10 s, 90 s, 0 drops, 0 xruns,
+oracle exact, 0 allocations):
+
+    worst second difference 0.053954 against a reference of 0.068797  =  0.8x
+
+Below the signal's own worst curvature elsewhere in the same span. The insertion -- entry, shaped payload
+and exit bridge -- is no longer distinguishable from the signal, exactly as the drop splice is not.
+
+Both splice sources are now verified end to end on the device. Five bugs were found on the way, all
+recorded above, and every one was the same mistake: the period a measurement thought it was standing next
+to, or state that had already moved on. That is now the first thing to check in this area.
