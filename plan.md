@@ -1503,13 +1503,25 @@ re-injected the mismatch each period so the offset never reached zero. At K = 64
 is invisible; at K = 240 it showed up immediately. The lesson is the same one §9.5 keeps teaching -- a
 parameter that looks cosmetic (`K`) can be the only thing that exercises a code path.
 
-**What remains: the entry of an inserted period.** The bridge reaches the exit and cannot reach the entry,
-because the loop never writes that period. The backend's payload is now the last frame written, repeated,
-rather than silence -- measured: the entry step falls from 0.4 (silence) to under 0.05 (a hold), and the
-worst second difference in the window falls by more than 4x -- but a hold is a break in *slope* where
-silence was a step in *value*, so the continuity rule is still tripped and the test asserts that rather
-than pretending otherwise. Closing it means the backend writing a *bridged* payload from the same two
-Hermite terms: a backend change, and the named remainder of this repair.
+**The entry of an inserted period is fixed too, and it was the last audible step in the repair.**
+The loop's bridge reaches the exit of an inserted period and cannot reach its entry, because the loop
+never writes that period -- the backend does. A payload that merely *holds* the last frame removes the
+step in *value* but leaves one in *slope*: the signal's slope goes to zero in a single sample, which the
+continuity rule sees as a second difference of |slope|. The backend now writes a shaped payload instead
+-- `rt::splice_insert_sample`, one cubic Hermite that continues the signal's value *and* slope at the
+entry (`p[0] = last + slope`, which makes the second difference against the two real samples before it
+exactly zero) and arrives flat at the exit, which is what the loop's bridge expects when it arms with
+`Cause::Inserted`. It needs two frames of history rather than one, and it is format-agnostic because it
+decodes and re-encodes through the same `pcm_*` helpers the rest of the I/O layer uses.
+
+Measured by the same detector, over a window covering the *whole* inserted period so the entry is judged
+rather than left out: the silent payload trips continuity, the held payload trips continuity, and the
+shaped payload **passes every rule** with its worst second difference inside the allowance derived from
+the signal itself (`tests/test_splice_fader.cpp`). What is *not* yet verified on device is the insertion
+as the device emits it: `--splice-verify` records spans for refused periods only, so exercising the
+insertion path on hardware needs the verifier extended to insertions -- reconstructing the payload from
+the fader's anchor and slope -- and a configuration whose floor actually fires, which the injector does
+not currently cover (it injects dropped periods, not inserted ones).
 
 **And the repair is judged on the device's own audio, not only on a test tone.** §10.3 above says the
 detector must exist before the machinery, and this is the wiring that was missing: `--splice-verify`

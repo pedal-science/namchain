@@ -18,6 +18,21 @@ float h10(float t) { return ((t - 2.0f) * t + 1.0f) * t; }
 
 } // namespace
 
+float splice_insert_sample(float last, float slope, unsigned index, unsigned frames)
+{
+  if (frames < 2)
+    return last;
+  const unsigned at = index >= frames ? frames - 1 : index;
+  const float t = static_cast<float>(at) / static_cast<float>(frames - 1);
+  // Hermite bases: h00/h10 for the start, h01/h11 for the end with zero end slope.
+  const float t2 = t * t;
+  const float t3 = t2 * t;
+  const float h00 = 2.0f * t3 - 3.0f * t2 + 1.0f;
+  const float h10 = t3 - 2.0f * t2 + t;
+  const float h01 = -2.0f * t3 + 3.0f * t2;
+  return h00 * (last + slope) + h10 * (slope * static_cast<float>(frames - 1)) + h01 * last;
+}
+
 SpliceFader::SpliceFader(unsigned channels, unsigned fade_frames)
   : channels_(channels == 0 ? 1 : channels),
     fade_frames_(fade_frames == 0 ? 0u : std::max(3u, fade_frames))

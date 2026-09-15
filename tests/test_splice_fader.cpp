@@ -11,6 +11,7 @@
 #include <doctest.h>
 
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -117,6 +118,7 @@ TEST_CASE("an inserted period is repaired the same way, and silence is the worse
   with_hold.insert(with_hold.end(), clean.begin(), clean.begin() + static_cast<long>(kAt));
   with_silence.insert(with_silence.end(), clean.begin(), clean.begin() + static_cast<long>(kAt));
   const float held = clean[kAt - 1];
+  const float held_slope = clean[kAt - 1] - clean[kAt - 2];
   for (size_t i = 0; i < kPeriod; ++i)
   {
     with_hold.push_back(held);
@@ -124,6 +126,13 @@ TEST_CASE("an inserted period is repaired the same way, and silence is the worse
   }
   with_hold.insert(with_hold.end(), clean.begin() + static_cast<long>(kAt), clean.end());
   with_silence.insert(with_silence.end(), clean.begin() + static_cast<long>(kAt), clean.end());
+
+  // The backend's payload now: continue the slope, arrive flat. Built from the *complete* hold, so the
+  // only difference between the two spans is the inserted period itself.
+  std::vector<float> with_shaped(with_hold);
+  for (size_t i = 0; i < kPeriod; ++i)
+    with_shaped[kAt + i] = namchain::rt::splice_insert_sample(held, held_slope, static_cast<unsigned>(i),
+                                                              static_cast<unsigned>(kPeriod));
 
   // Repair the exit of each: the fader is armed for the period after the insert, when the loop finds
   // out what the backend did.
@@ -171,10 +180,19 @@ TEST_CASE("an inserted period is repaired the same way, and silence is the worse
   // and which arrives as a slope break because the signal's slope goes to zero in one sample. Fixing it
   // means the backend writing a *bridged* payload rather than a held one, using the same two Hermite
   // terms; that is the remaining piece of this repair and it is a backend change, not a loop one.
+  const std::vector<float> shaped_fixed = repair_exit(with_shaped, kAt + kPeriod);
   const namchain::glitch::Report raw_report = analyse(with_silence, with_silence, kAt, 240);
   const namchain::glitch::Report hold_report = analyse(hold_fixed, with_silence, kAt, 240);
+  // The shaped payload plus the loop's exit bridge now satisfies every rule the detector states, where
+  // both the held and the silent payloads tripped continuity. The window covers the whole inserted
+  // period, so the entry is judged as well as the exit -- otherwise a hold would "pass" by having its
+  // entry left out of the measurement.
+  const namchain::glitch::Report shaped_report = analyse(shaped_fixed, with_silence, kAt, 240);
   CHECK_FALSE(raw_report.ok);
   CHECK_FALSE(hold_report.ok);
+  CHECK(shaped_report.continuity_evaluated);
+  CHECK(shaped_report.max_edit_d2 <= shaped_report.reference_d2 * 2.0);
+  CHECK(shaped_report.ok);
   CHECK(hold_report.findings.size() <= raw_report.findings.size());
   // What the held payload does buy is measured, not asserted: the entry stops being a step in *value*
   // (0.4 on this signal) and becomes one in *slope* (~a tenth of that), so the worst second difference
@@ -227,6 +245,30 @@ TEST_CASE("the bridge window is long enough to smooth the mismatch and short eno
   CHECK(report.continuity_evaluated);
   CHECK(report.max_edit_d2 <= report.reference_d2 * 2.0); // kappa, §10.3
   CHECK(report.ok);
+}
+
+TEST_CASE("an inserted period's payload continues the slope and arrives flat")
+{
+  // The entry is the joint the loop can never reach, because the loop does not write the inserted
+  // period. A hold leaves a break in slope there; silence leaves a step in value. This payload continues
+  // the signal's value *and* slope at the entry and arrives flat at the exit, so both joints are
+  // continuous -- the exit because the loop's bridge arms with Cause::Inserted, which expects a slope of
+  // zero to leave from.
+  constexpr unsigned kFrames = 64;
+  const float last = 0.30f;
+  const float slope = 0.05f;
+
+  CHECK(namchain::rt::splice_insert_sample(last, slope, 0, kFrames) == doctest::Approx(last + slope));
+  CHECK(namchain::rt::splice_insert_sample(last, slope, kFrames - 1, kFrames) == doctest::Approx(last));
+  // Flat at the exit, so the loop's bridge leaves from a signal at rest rather than mid-slope.
+  CHECK(namchain::rt::splice_insert_sample(last, slope, kFrames - 2, kFrames) == doctest::Approx(last).epsilon(1e-3));
+  // And the entry's second difference is zero against the two real samples before it, which is the whole
+  // point: p[0] - 2*last + (last - slope) == 0.
+  const float entry_d2 = namchain::rt::splice_insert_sample(last, slope, 0, kFrames) - 2.0f * last + (last - slope);
+  CHECK(std::fabs(entry_d2) < 1e-5f);
+  // A hold, for contrast, has an entry second difference of exactly the slope it abandoned.
+  const float hold_d2 = last - 2.0f * last + (last - slope);
+  CHECK(std::fabs(hold_d2) == doctest::Approx(std::fabs(slope)));
 }
 
 TEST_CASE("the fader passes through exactly when nothing is armed, and tracks its anchor")

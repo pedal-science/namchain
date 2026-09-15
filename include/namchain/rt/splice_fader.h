@@ -54,6 +54,28 @@ namespace namchain
 namespace rt
 {
 
+/// \brief One sample of the payload an inserted period is filled with.
+///
+/// The other half of the same repair, and the fix for the last audible step in it. The loop's bridge
+/// repairs the *exit* of an inserted period and cannot reach its entry, because the loop does not write
+/// that period -- the backend does. A payload that simply holds the last sample removes the step in
+/// *value* but leaves one in *slope*: the signal's slope goes to zero in a single sample, which the
+/// continuity rule sees as a second difference of |slope| (measured on a 313 Hz tone: 0.4 step for
+/// silence, under 0.05 for a hold, still over the allowance).
+///
+/// This continues the signal from where it was and arrives flat at the same level:
+///
+///     p(t) = h00(t)*(last + slope) + h10(t)*slope*(frames-1) + h01(t)*last
+///
+/// so the entry matches the signal's value *and* slope -- p[0] = last + slope makes the second
+/// difference at the join exactly zero against the two real samples before it -- and the exit is flat,
+/// which is what the loop's bridge expects when it arms with Cause::Inserted. Both joints are then
+/// continuous, and neither depends on the other layer knowing this function exists.
+///
+/// \param last the last sample the device heard, \param slope the slope it was travelling at,
+/// \param index the sample within the inserted period, \param frames the period's length (>= 2).
+float splice_insert_sample(float last, float slope, unsigned index, unsigned frames);
+
 class SpliceFader
 {
 public:

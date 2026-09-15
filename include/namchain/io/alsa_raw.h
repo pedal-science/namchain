@@ -360,6 +360,9 @@ private:
   /// period holds the last frame rather than silence, because the loop's splice bridge leaves from the
   /// last sample it emitted: a hold continues that sample, where silence would step to zero first.
   std::vector<unsigned char> last_frame_;
+  /// The frame before last_frame_: the payload needs the slope the device was travelling at, not just
+  /// where it was, or the entry is a break in slope instead of a continuation.
+  std::vector<unsigned char> previous_frame_;
   std::vector<unsigned char> hold_period_;
   AlsaRawInfo info_;
   /// NAMCHAIN_QUEUE_DEBUG, read once at open rather than per period: getenv in the write path would
