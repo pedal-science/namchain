@@ -117,6 +117,13 @@ struct SoakOptions
   /// renders), so the geometry the bridge sees is the real one, and the injected count is reported
   /// separately so it can never be read as a real drop.
   double inject_splice_seconds = 0.0;
+  /// \brief Insert one output period deliberately every this many seconds; 0 disables it.
+  ///
+  /// The insertion half of the same diagnostic, and the only way to judge the insertion path's *entry*
+  /// on device: a real session's floor fires rarely (0 insertions in 50 minutes on one evening), and the
+  /// entry is precisely the joint the loop cannot repair for itself. Judged over a window covering entry,
+  /// payload and exit, so a payload can never pass by having its entry left out.
+  double inject_insert_seconds = 0.0;
   /// \brief Verify each repair on the device's own audio, by running the glitch detector over the
   /// emitted signal either side of a splice (plan.md §10.3's "dropped-period edit kind").
   ///
@@ -350,6 +357,14 @@ struct SoakResult
   /// Periods lost to the injector rather than to a refusal. Reported next to the real drops so the one
   /// can never be mistaken for the other.
   uint64_t injected_splices = 0;
+  /// Deliberate insertions, reported beside the floor's own so the two can never be confused.
+  uint64_t injected_insertions = 0;
+  /// Insertions the detector judged on the emitted signal, and the entry-to-exit numbers it returned.
+  /// Separate from the drop numbers because the window is a different shape: this one covers a whole
+  /// inserted period, so its worst second difference is not comparable with a drop's.
+  uint64_t insertions_verified = 0;
+  double insertion_worst_d2 = 0.0;
+  double insertion_reference_d2 = 0.0;
   uint64_t splice_verified = 0;
   double splice_worst_d2 = 0.0;
   double splice_reference_d2 = 0.0;

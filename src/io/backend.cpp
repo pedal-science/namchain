@@ -344,6 +344,8 @@ public:
 
   uint64_t floor_insertions() const override { return device_->floor_insertions(); }
 
+  bool insert_output_period(std::string& error) override { return device_->insert_output_period(error); }
+
   bool prefill_output_queue(std::string& error) override { return device_->fill_output_queue(error); }
 
   bool ring_occupancy(long long& capture_frames, long long& playback_frames) const override

@@ -137,6 +137,13 @@ public:
   /// Record `emitted` as the audio the device has heard, for the next repair to leave from.
   void commit(const float* emitted, unsigned frames);
 
+  /// The slope the last committed period was travelling at, per channel. The loop needs it to rebuild
+  /// the payload an inserted period was filled with, which is how an insertion can be judged on device.
+  float last_slope(unsigned channel) const
+  {
+    return channel < anchor_.size() ? anchor_[channel] - previous_[channel] : 0.0f;
+  }
+
   /// The last sample emitted, per channel. What the next arm(Dropped) will anchor on.
   float last_emitted(unsigned channel) const
   {

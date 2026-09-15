@@ -185,6 +185,15 @@ public:
   /// take the frames.
   bool fill_output_queue(std::string& error);
 
+  /// \brief Write one inserted period now, as the floor controller does when the queue is short.
+  ///
+  /// Exists so the insertion path can be exercised on demand rather than only when a session happens to
+  /// starve the queue: `--inject-insert-every` calls this on a schedule, which makes both joints of an
+  /// inserted period judgeable in any session. It does *not* touch the floor counters -- an injected
+  /// insertion is a diagnostic, not the controller working, and the two must not be confused in a
+  /// report. \return false only on a real write error.
+  bool insert_output_period(std::string& error);
+
   /// Frames of silence written by fill_output_queue(). Bring-up audio, like
   /// settle_discarded_frames(): it is the latency the target costs, paid once, before anything is
   /// timed, and reported so that "the queue was there from block 0" is a checkable statement.
@@ -332,6 +341,9 @@ private:
   /// was written to find is invisible in every aggregate the report has: a target refusing a dead
   /// stream shows up as a large drop count and a healthy xrun count, which is exactly backwards.
   void queue_debug_trace(const AlsaRawOccupancy& occupancy, bool allowed);
+  /// Build the payload for one inserted period: the shaped continuation, or a hold if the format or the
+  /// geometry will not allow it. Returns a pointer to the preallocated buffer to write.
+  const void* insert_payload();
   /// Write silence while the queue is below floor_frames_. Called after a successful write, so the
   /// decision is made on the occupancy the loop just produced rather than on a stale one.
   void maintain_output_floor();

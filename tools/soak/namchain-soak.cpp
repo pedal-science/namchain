@@ -71,6 +71,9 @@ void usage()
                "  --inject-splice-every S  DIAGNOSTIC: lose one output period every S seconds, so the\n"
                "                       repair can be judged on isolated splices in a session that\n"
                "                       produces none. Reported separately from real drops\n"
+               "  --inject-insert-every S  DIAGNOSTIC: insert one output period every S seconds, so the\n"
+               "                       insertion path's entry can be judged on device too. Reported\n"
+               "                       separately from the floor's own insertions\n"
                "  --splice-verify      judge each splice on the emitted signal with the glitch detector,\n"
                "                       against the raw splice as its oracle (needs no bridge; with the\n"
                "                       bridge off this measures the click itself)\n"
@@ -158,6 +161,8 @@ int main(int argc, char** argv)
       options.splice_verify = true;
     else if (arg == "--inject-splice-every" && i + 1 < argc)
       options.inject_splice_seconds = std::atof(argv[++i]);
+    else if (arg == "--inject-insert-every" && i + 1 < argc)
+      options.inject_insert_seconds = std::atof(argv[++i]);
     else if (arg == "--model" && i + 1 < argc)
       options.model = argv[++i];
     else if (arg == "--graph" && i + 1 < argc)
@@ -384,6 +389,10 @@ int main(int argc, char** argv)
                               {"occupancy_mismatches", result.occupancy_mismatches}};
       j["device"]["xruns_by_direction"] = {{"capture_overruns", result.capture_overruns},
                                            {"playback_underruns", result.playback_underruns}};
+      j["device"]["insertion_measured"] = {{"judged", result.insertions_verified},
+                                          {"worst_d2", result.insertion_worst_d2},
+                                          {"reference_d2", result.insertion_reference_d2},
+                                          {"injected", result.injected_insertions}};
       j["device"]["splice_injected"] = {{"periods", result.injected_splices},
                                         {"every_seconds", options.inject_splice_seconds}};
       j["device"]["splice_measured"] = {{"judged", result.splice_verified},
@@ -570,6 +579,22 @@ int main(int argc, char** argv)
                       "                  numbers below describe a chain of bridges, not a splice\n",
                       static_cast<unsigned long long>(result.splice_bridges),
                       static_cast<unsigned long long>(result.blocks));
+        if (result.injected_insertions > 0)
+          std::printf("insert inject:    %llu periods inserted deliberately (one every %.3f s), beside %llu\n"
+                      "                  the floor controller asked for\n",
+                      static_cast<unsigned long long>(result.injected_insertions),
+                      options.inject_insert_seconds,
+                      static_cast<unsigned long long>(result.floor_insertions));
+        if (result.insertions_verified > 0)
+          // The insertion's window covers entry, payload and exit, so this number is not comparable with
+          // the drop numbers above: it judges both joints of a whole inserted period at once.
+          std::printf("insert measured:  %llu insertions judged over entry, payload and exit: worst second\n"
+                      "                  difference %.6f against a reference of %.6f (%.1fx)\n",
+                      static_cast<unsigned long long>(result.insertions_verified), result.insertion_worst_d2,
+                      result.insertion_reference_d2,
+                      result.insertion_reference_d2 > 0.0
+                        ? result.insertion_worst_d2 / result.insertion_reference_d2
+                        : 0.0);
         if (result.splice_verify_evaluated)
         {
           // Measured on the audio this run produced, not on a test tone: the largest second difference

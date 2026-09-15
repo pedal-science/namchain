@@ -872,6 +872,52 @@ void AlsaRawDuplex::remember_last_frame(const void* src, unsigned frames)
               playback_bytes_per_frame_);
 }
 
+const void* AlsaRawDuplex::insert_payload()
+{
+  const void* payload = prime_silence_.data();
+  if (!last_frame_.empty() &&
+      hold_period_.size() == static_cast<size_t>(info_.period_size) * playback_bytes_per_frame_ &&
+      info_.period_size >= 2)
+  {
+    // A shaped payload, not a hold: it continues the signal's value *and* slope into the inserted
+    // period and arrives flat, which is what the loop's bridge expects to leave from. Both joints are
+    // then continuous, and the entry -- which the loop can never reach, because it does not write this
+    // period -- stops being a slope break.
+    const PcmFormat format = alsa::pcm_format(info_.sample_format);
+    const unsigned channels = info_.playback_channels;
+    const unsigned width = info_.bytes_per_sample;
+    if (format != PcmFormat::Unknown && channels > 0 && width > 0)
+    {
+      for (unsigned c = 0; c < channels; ++c)
+      {
+        const float last = pcm_decode(last_frame_.data() + static_cast<size_t>(c) * width, format);
+        const float previous = pcm_decode(previous_frame_.data() + static_cast<size_t>(c) * width, format);
+        const float slope = last - previous;
+        for (unsigned f = 0; f < info_.period_size; ++f)
+          pcm_encode(hold_period_.data() + (static_cast<size_t>(f) * channels + c) * width, format,
+                     rt::splice_insert_sample(last, slope, f, info_.period_size));
+      }
+      payload = hold_period_.data();
+    }
+    else
+    {
+      for (unsigned f = 0; f < info_.period_size; ++f)
+        std::memcpy(hold_period_.data() + static_cast<size_t>(f) * playback_bytes_per_frame_,
+                    last_frame_.data(), playback_bytes_per_frame_);
+      payload = hold_period_.data();
+    }
+  }
+  return payload;
+}
+
+bool AlsaRawDuplex::insert_output_period(std::string& error)
+{
+  if (info_.period_size == 0)
+    return true;
+  const int written = write_playback(insert_payload(), info_.period_size, 1000, error);
+  return written == static_cast<int>(info_.period_size);
+}
+
 void AlsaRawDuplex::maintain_output_floor()
 {
   // One period at a time, and only while the queue is still short. A stall that cost two periods is
@@ -899,39 +945,7 @@ void AlsaRawDuplex::maintain_output_floor()
     // hold continues that sample, where silence would step to zero first and leave a click the bridge
     // cannot reach. Measured with plan.md §10.3's continuity rule: a held entry is a break in *slope*
     // (about a tenth of the signal's first difference), a silence entry is a step in *value*.
-    const void* payload = prime_silence_.data();
-    if (!last_frame_.empty() &&
-        hold_period_.size() == static_cast<size_t>(info_.period_size) * playback_bytes_per_frame_ &&
-        info_.period_size >= 2)
-    {
-      // A shaped payload, not a hold: it continues the signal's value *and* slope into the inserted
-      // period and arrives flat, which is what the loop's bridge expects to leave from. Both joints are
-      // then continuous, and the entry -- which the loop can never reach, because it does not write this
-      // period -- stops being a slope break.
-      const PcmFormat format = alsa::pcm_format(info_.sample_format);
-      const unsigned channels = info_.playback_channels;
-      const unsigned width = info_.bytes_per_sample;
-      if (format != PcmFormat::Unknown && channels > 0 && width > 0)
-      {
-        for (unsigned c = 0; c < channels; ++c)
-        {
-          const float last = pcm_decode(last_frame_.data() + static_cast<size_t>(c) * width, format);
-          const float previous = pcm_decode(previous_frame_.data() + static_cast<size_t>(c) * width, format);
-          const float slope = last - previous;
-          for (unsigned f = 0; f < info_.period_size; ++f)
-            pcm_encode(hold_period_.data() + (static_cast<size_t>(f) * channels + c) * width, format,
-                       rt::splice_insert_sample(last, slope, f, info_.period_size));
-        }
-        payload = hold_period_.data();
-      }
-      else
-      {
-        for (unsigned f = 0; f < info_.period_size; ++f)
-          std::memcpy(hold_period_.data() + static_cast<size_t>(f) * playback_bytes_per_frame_,
-                      last_frame_.data(), playback_bytes_per_frame_);
-        payload = hold_period_.data();
-      }
-    }
+    const void* payload = insert_payload();
     if (write_playback(payload, info_.period_size, 1000, ignored) < 0)
       return;
     ++floor_insertions_;

@@ -1517,11 +1517,17 @@ decodes and re-encodes through the same `pcm_*` helpers the rest of the I/O laye
 Measured by the same detector, over a window covering the *whole* inserted period so the entry is judged
 rather than left out: the silent payload trips continuity, the held payload trips continuity, and the
 shaped payload **passes every rule** with its worst second difference inside the allowance derived from
-the signal itself (`tests/test_splice_fader.cpp`). What is *not* yet verified on device is the insertion
-as the device emits it: `--splice-verify` records spans for refused periods only, so exercising the
-insertion path on hardware needs the verifier extended to insertions -- reconstructing the payload from
-the fader's anchor and slope -- and a configuration whose floor actually fires, which the injector does
-not currently cover (it injects dropped periods, not inserted ones).
+the signal itself (`tests/test_splice_fader.cpp`). **And it is measured on device now, where it does *not* yet hold.** `--inject-insert-every S` is the
+insertion half of the injector and the verifier judges an insertion over a window covering entry, payload
+and exit -- so a payload cannot pass by having its entry left out. With a clean span (ring 12, one
+injection every 10 s, 90 s: 8 inserted, 8 judged, **0 drops, 0 xruns**) the worst second difference is
+**0.272028 against a reference of 0.070685 = 3.8x**, where the unit test says the shaped payload plus the
+loop's exit bridge passes every rule. That gap is the open finding: the verifier *reconstructs* the
+payload from the fader's anchor and slope while the backend built the one it wrote from its own two frames
+of device-format audio, and the two are separately plausible -- which is the exact shape of the bug that
+inverted the drop measurement. The next step is the diagnostic that closed that one: dump the samples from
+the entry through the payload to the exit and compare the reconstruction against what was written.
+`bench-results/splice-injector.txt`.
 
 **And the repair is judged on the device's own audio, not only on a test tone.** §10.3 above says the
 detector must exist before the machinery, and this is the wiring that was missing: `--splice-verify`

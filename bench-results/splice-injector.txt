@@ -74,3 +74,35 @@ All four were found by the verifier, and none was visible from the unit tests:
 Every one was found by comparing the emitted signal against itself on the device. That is the argument
 for the verifier existing rather than trusting the synthetic case -- the detector chose the repair's
 *shape*, and the device found where the *loop* got it wrong.
+
+
+The insertion path, measured on device: not yet continuous
+----------------------------------------------------------
+`--inject-insert-every S` (the insertion half of the injector) plus the verifier extended to insertions
+-- the window covering entry, payload and exit, so a payload cannot pass by having its entry left out.
+The number below is not comparable with the drop numbers: it judges a whole inserted period at once,
+where a drop is judged over eight samples after the join.
+
+    --periods 12 --splice-fade-ms 1.333 --inject-insert-every 10, 90 s
+    8 insertions inserted deliberately, 8 judged, 0 output drops, 0 driver xruns
+    worst second difference 0.272028 against a reference of 0.070685  =  3.8x
+
+So the device's insertion path is **not** continuous, while the unit test says the shaped payload plus the
+loop's exit bridge passes every rule. That gap is the finding, and the run is clean enough to believe it:
+no cap drops, no underruns, injections ten seconds apart so every span had five splice-free periods of
+history -- the guard that *had* to be added first, because with 26 cap drops alongside, the same
+measurement read 5.0x and was describing the neighbouring splices rather than the payload.
+
+Two things to read first, and the reason the drop case took four bugs to close:
+
+  * the verifier *reconstructs* the payload from `fader.last_emitted(0)` and `fader.last_slope(0)`, while
+    the backend built the one it wrote from the two frames of *device-format* audio it had kept. Those
+    should agree to within quantisation, and each is separately plausible -- which is exactly the shape of
+    the bug that inverted the drop measurement, where the reconstructed span differed from the real one.
+  * the injected insertion adds a period of queue, so an injection is only isolated while there is
+    headroom: at ring 6 with one every 2 s it produced 27 refusals of its own, and the conservation law
+    is unforgiving -- every inserted period is eventually paid for by a refusal or an underrun.
+
+The next step is the diagnostic that closed the drop case, unchanged: dump the samples either side of the
+entry, through the payload, to the exit, and compare the verifier's reconstruction against what the
+backend actually wrote. Nothing else should change until that is read.

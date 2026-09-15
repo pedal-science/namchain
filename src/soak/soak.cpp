@@ -208,7 +208,20 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   // and leaving it out -- which the first version did, by joining at the history's last period instead of
   // after it -- compares the bridge against the period *before* the one it is continuing. The bridge then
   // looks worse than the raw splice, because it is being measured against the wrong neighbour.
-  const size_t splice_span_frames = splice_history_frames + info.period_size;
+  const uint64_t inject_insert_every_blocks =
+    options.inject_insert_seconds <= 0.0 || info.sample_rate == 0 || info.period_size == 0
+      ? 0
+      : static_cast<uint64_t>(std::llround(options.inject_insert_seconds *
+                                           static_cast<double>(info.sample_rate) /
+                                           static_cast<double>(info.period_size)));
+  uint64_t injected_insertions = 0;
+  bool insert_pending = false;
+  // The spans are sized for the widest case, an insertion: history + payload + the period after it.
+  const size_t splice_span_frames = splice_history_frames + 2 * info.period_size;
+  std::vector<float> insert_payload(static_cast<size_t>(info.period_size), 0.0f);
+  uint64_t insertions_verified = 0;
+  double insertion_worst_d2 = 0.0;
+  double insertion_reference_d2 = 0.0;
   std::vector<float> splice_span_pre(splice_span_frames, 0.0f);
   std::vector<float> splice_span_post(splice_span_frames, 0.0f);
   bool splice_pending = false;
@@ -530,11 +543,32 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
       else
         ++output_drops;
     }
-    else if (fader.enabled() && emitted_now != nullptr)
+    else
     {
-      // The period was taken, so this is what the device has now heard. A refused or injected period is
-      // not, and the next repair must still leave from the one before it.
-      fader.commit(emitted_now, info.period_size);
+      if (fader.enabled() && emitted_now != nullptr)
+      {
+        // The period was taken, so this is what the device has now heard. A refused or injected period is
+        // not, and the next repair must still leave from the one before it.
+        fader.commit(emitted_now, info.period_size);
+      }
+      // The insertion injector: write one payload period now, exactly as the floor controller does when
+      // the queue is short. Done after the commit so the payload continues the period just taken, and it
+      // does not touch the floor counters -- an injected insertion is a diagnostic.
+      if (inject_insert_every_blocks > 0 && block > 0 && (block % inject_insert_every_blocks) == 0)
+      {
+        std::string insert_error;
+        if (!device->insert_output_period(insert_error))
+        {
+          device->stop();
+          return fail("injected insertion failed: " + insert_error);
+        }
+        ++injected_insertions;
+        insert_pending = true;
+        // The period after the payload must leave from the payload's flat end, which is the value the
+        // anchor already holds.
+        if (fader.enabled())
+          fader.arm(rt::SpliceFader::Cause::Inserted);
+      }
     }
     // A refused period is the splice the verifier judges, whether or not a bridge will repair it: with
     // the bridge off the same span is the raw splice, which is what makes the two arms paired.
@@ -589,9 +623,55 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
     // is the bridge -- which is what makes this a paired measurement and not a comparison of two runs.
     if (options.splice_verify && info.period_size > 0 && splice_history_frames > 0)
     {
+      // Same guard as the drop path: the detector derives its reference from the span outside the window,
+      // so another splice or a recovery inside the history makes the reference describe clicks rather
+      // than the signal. Measured without it: 26 cap drops alongside 29 insertions gave 5.0x, which was
+      // the neighbouring splices and not the payload.
+      if (insert_pending && written != 0 && fader.enabled() &&
+          blocks_since_disturbance >= kSpliceHistoryPeriods)
+      {
+        // The span for an insertion: the real periods the device heard, then the payload it heard (rebuilt
+        // from the anchor and slope the backend's payload used), then the period after it. The window
+        // covers the payload *and* the exit bridge, so the entry is judged rather than left out -- which
+        // is the whole point, since the entry is the joint the loop cannot repair for itself.
+        const size_t entry = splice_history_frames;
+        const size_t exit = splice_history_frames + info.period_size;
+        const float last = fader.last_emitted(0);
+        const float slope = fader.last_slope(0);
+        for (unsigned i = 0; i < info.period_size; ++i)
+          insert_payload[i] = rt::splice_insert_sample(last, slope, i, info.period_size);
+        std::copy(emit_history.begin(), emit_history.end(), splice_span_post.begin());
+        std::copy(emit_history.begin(), emit_history.end(), splice_span_pre.begin());
+        std::copy(insert_payload.begin(), insert_payload.end(), splice_span_post.begin() + static_cast<long>(entry));
+        std::copy(insert_payload.begin(), insert_payload.end(), splice_span_pre.begin() + static_cast<long>(entry));
+        std::copy(emitted_now, emitted_now + info.period_size, splice_span_post.begin() + static_cast<long>(exit));
+        std::copy(mono_out.begin(), mono_out.end(), splice_span_pre.begin() + static_cast<long>(exit));
+
+        const size_t window_end = exit + std::min<size_t>(kSpliceWindowFrames, info.period_size);
+        std::vector<glitch::Edit> edits;
+        edits.push_back({entry, window_end});
+        glitch::Options insert_options;
+        insert_options.sample_rate = static_cast<double>(info.sample_rate);
+        insert_options.guard_ms = insert_options.sample_rate == 0.0 || splice_span_frames <= window_end
+                                    ? 0.0
+                                    : 1000.0 * static_cast<double>(splice_span_frames - window_end) /
+                                        insert_options.sample_rate;
+        std::string insert_error;
+        const glitch::Report report = glitch::analyse(splice_span_post.data(), splice_span_pre.data(),
+                                                      splice_span_pre.data(), splice_span_frames, edits,
+                                                      insert_options, insert_error);
+        if (insert_error.empty() && report.continuity_evaluated)
+        {
+          insertion_worst_d2 = std::max(insertion_worst_d2, report.max_edit_d2);
+          insertion_reference_d2 = std::max(insertion_reference_d2, report.reference_d2);
+          ++insertions_verified;
+        }
+        insert_pending = false;
+      }
       if (splice_pending && written != 0)
       {
         const size_t join = splice_history_frames;
+        const size_t span_frames = splice_history_frames + info.period_size;
         std::copy(emit_history.begin(), emit_history.end(), splice_span_post.begin());
         std::copy(emit_history.begin(), emit_history.end(), splice_span_pre.begin());
         std::copy(emitted_now, emitted_now + info.period_size, splice_span_post.begin() + static_cast<long>(join));
@@ -607,13 +687,13 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
         // is what actually stands between the splice and the settled signal, which is the tail of the
         // same period, so it is derived from the span rather than assumed: 48 frames of settled signal
         // follow the window, and the guard is set to exactly that.
-        splice_options.guard_ms = info.sample_rate == 0 || splice_span_frames <= window_end
+        splice_options.guard_ms = info.sample_rate == 0 || span_frames <= window_end
                                     ? 0.0
-                                    : 1000.0 * static_cast<double>(splice_span_frames - window_end) /
+                                    : 1000.0 * static_cast<double>(span_frames - window_end) /
                                         static_cast<double>(info.sample_rate);
         std::string splice_error;
         const glitch::Report report = glitch::analyse(splice_span_post.data(), splice_span_pre.data(),
-                                                      splice_span_pre.data(), splice_span_frames, edits,
+                                                      splice_span_pre.data(), span_frames, edits,
                                                       splice_options, splice_error);
         if (splice_error.empty() && report.continuity_evaluated)
         {
@@ -627,7 +707,7 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
           // than inferred across two runs whose splices are never the same.
           std::string raw_error;
           const glitch::Report raw_report = glitch::analyse(splice_span_pre.data(), splice_span_pre.data(),
-                                                            splice_span_pre.data(), splice_span_frames, edits,
+                                                            splice_span_pre.data(), span_frames, edits,
                                                             splice_options, raw_error);
           if (raw_error.empty() && raw_report.continuity_evaluated)
           {
@@ -759,6 +839,10 @@ SoakResult run_backend_soak(const SoakOptions& options, const std::string& input
   result.splice_bridges_for_drops = bridges_for_drops;
   result.splice_bridges_for_insertions = bridges_for_insertions;
   result.injected_splices = injected_splices;
+  result.injected_insertions = injected_insertions;
+  result.insertions_verified = insertions_verified;
+  result.insertion_worst_d2 = insertion_worst_d2;
+  result.insertion_reference_d2 = insertion_reference_d2;
   result.splice_verified = result_splice_verified;
   result.splice_worst_d2 = result_splice_worst_d2;
   result.splice_reference_d2 = result_splice_reference_d2;

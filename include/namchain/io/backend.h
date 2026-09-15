@@ -230,6 +230,16 @@ public:
   /// Queue-control counters, where the backend has any. Zeroes for the backends with no rings.
   virtual StreamQueueStats queue_stats() const { return StreamQueueStats{}; }
 
+  /// \brief Write one inserted period now, where the backend can; a no-op elsewhere.
+  ///
+  /// Exists so the insertion path can be exercised on demand rather than only when a session happens to
+  /// starve the queue. \return false only on a real error.
+  virtual bool insert_output_period(std::string& error)
+  {
+    (void)error;
+    return true;
+  }
+
   /// \brief Insertions so far, where the backend has a floor controller; 0 otherwise.
   ///
   /// Read once per period by a loop that is bridging splices, which is why it is its own accessor rather
