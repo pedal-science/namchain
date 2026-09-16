@@ -896,6 +896,8 @@ instructions take 2.4× the cycles (IPC 1.70 → 0.69) with no change in cache m
 constant 2400 MHz. Pinning the engine (`--cpu`) is therefore necessary but nowhere near sufficient,
 which resolves the `--cpu` question in §14 and opens a memory-traffic one in its place.
 
+**ARMv7 hosts differ in three ways worth knowing before tuning one** (measured 2026-09-16, `docs/tuning.md` has the detail): `isolcpus`/`nohz_full`/`rcu_nocbs` are usually unavailable, because a 4-core board with a full userspace has no cores to spare — the RT scheduler is then the only protection, and pinning the audio thread is still free; realtime rlimits are absent by default on Armbian, so `SCHED_FIFO` **and** `mlockall` are refused for the normal user until `/etc/security/limits.d/audio.conf` provides `@audio - rtprio 95` and `memlock unlimited` (root bypasses both via `CAP_SYS_NICE`/`CAP_IPC_LOCK`, which is why this hides during a root-only benchmark); and a bus-powered USB interface may need a powered hub, since on one board the engine underran continuously on a bare socket and was perfect behind one.
+
 **Host target.** The assumed host is Linux with `PREEMPT_RT` *where the platform can
 supply one* — this Pi 500 can (`linux-image-*-realtime`), and the checklist above is what we ship to
 make a stock kernel behave as well as it can. The engine must nevertheless be **correct on a non-RT
