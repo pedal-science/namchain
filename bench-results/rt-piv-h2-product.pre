@@ -1,0 +1,312 @@
+timestamp=2026-09-16T05:58:19+01:00
+uptime_s=13418.91
+kernel_release=7.0.0-1017-raspi-realtime
+kernel_version=#17-Ubuntu SMP PREEMPT_RT Fri Aug  7 17:41:11 UTC 2026
+uname_says_rt=true
+sys_kernel_realtime=1
+cmdline=reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10 isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew_tick=1
+nproc=4
+isolated_cpus=2-3
+nohz_full_cpus=2-3
+governor=performance
+scaling_max_khz=2400000
+scaling_cur_khz=2400000
+temp_mC=39700
+throttled=0x0
+loadavg=0.26 0.58 5.63 1/474 296579
+audio_card= card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name=xhci-hcd:usb2
+audio_irq_number=139
+audio_irq_affinity=2
+audio_irq_thread=369
+audio_irq_thread_prio=85
+label 9 GICv2 25 Level vgic
+int 9 cpu0 0
+int 9 cpu1 0
+int 9 cpu2 0
+int 9 cpu3 0
+label 11 GICv2 30 Level kvm guest ptimer
+int 11 cpu0 0
+int 11 cpu1 0
+int 11 cpu2 0
+int 11 cpu3 0
+label 12 GICv2 27 Level kvm guest vtimer
+int 12 cpu0 0
+int 12 cpu1 0
+int 12 cpu2 0
+int 12 cpu3 0
+label 13 GICv2 26 Level arch_timer
+int 13 cpu0 15547176
+int 13 cpu1 9148775
+int 13 cpu2 18562
+int 13 cpu3 2994
+label 15 GICv2 65 Level 107c013880.mailbox
+int 15 cpu0 10194
+int 15 cpu1 0
+int 15 cpu2 0
+int 15 cpu3 0
+label 22 GICv2 119 Level DMA IRQ
+int 22 cpu0 0
+int 22 cpu1 0
+int 22 cpu2 0
+int 22 cpu3 0
+label 23 GICv2 120 Level DMA IRQ
+int 23 cpu0 0
+int 23 cpu1 0
+int 23 cpu2 0
+int 23 cpu3 0
+label 24 GICv2 121 Level DMA IRQ
+int 24 cpu0 0
+int 24 cpu1 0
+int 24 cpu2 0
+int 24 cpu3 0
+label 25 GICv2 122 Level DMA IRQ
+int 25 cpu0 0
+int 25 cpu1 0
+int 25 cpu2 0
+int 25 cpu3 0
+label 32 GICv2 48 Level arm-pmu
+int 32 cpu0 0
+int 32 cpu1 0
+int 32 cpu2 0
+int 32 cpu3 0
+label 33 GICv2 49 Level arm-pmu
+int 33 cpu0 0
+int 33 cpu1 0
+int 33 cpu2 0
+int 33 cpu3 0
+label 34 GICv2 50 Level arm-pmu
+int 34 cpu0 0
+int 34 cpu1 0
+int 34 cpu2 0
+int 34 cpu3 0
+label 35 GICv2 51 Level arm-pmu
+int 35 cpu0 0
+int 35 cpu1 0
+int 35 cpu2 0
+int 35 cpu3 0
+label 36 interrupt-controller@7d508380 1 Level 107d508200.i2c
+int 36 cpu0 15
+int 36 cpu1 0
+int 36 cpu2 0
+int 36 cpu3 0
+label 37 interrupt-controller@7d508380 2 Level 107d508280.i2c
+int 37 cpu0 0
+int 37 cpu1 0
+int 37 cpu2 0
+int 37 cpu3 0
+label 39 GICv2 308 Level ttyS0
+int 39 cpu0 2684
+int 39 cpu1 0
+int 39 cpu2 0
+int 39 cpu3 0
+label 40 GICv2 105 Level 1000480000.usb, 1000480000.usb, dwc2_hsotg:usb1
+int 40 cpu0 0
+int 40 cpu1 0
+int 40 cpu2 0
+int 40 cpu3 0
+label 41 GICv2 261 Level PCIe PME, aerdrv, PCIe bwctrl
+int 41 cpu0 0
+int 41 cpu1 0
+int 41 cpu2 0
+int 41 cpu3 0
+label 109 rp1_irq_chip 6 Level eth0
+int 109 cpu0 0
+int 109 cpu1 0
+int 109 cpu2 0
+int 109 cpu3 0
+label 111 rp1_irq_chip 8 Level 1f00074000.i2c
+int 111 cpu0 0
+int 111 cpu1 0
+int 111 cpu2 0
+int 111 cpu3 0
+label 122 rp1_irq_chip 19 Level 1f00050000.spi
+int 122 cpu0 0
+int 122 cpu1 0
+int 122 cpu2 0
+int 122 cpu3 0
+label 128 rp1_irq_chip 25 Level uart-pl011
+int 128 cpu0 0
+int 128 cpu1 0
+int 128 cpu2 0
+int 128 cpu3 0
+label 134 rp1_irq_chip 31 Edge xhci-hcd:usb4
+int 134 cpu0 10028233
+int 134 cpu1 0
+int 134 cpu2 0
+int 134 cpu3 0
+label 139 rp1_irq_chip 36 Edge xhci-hcd:usb2
+int 139 cpu0 225
+int 139 cpu1 0
+int 139 cpu2 16562066
+int 139 cpu3 0
+label 143 rp1_irq_chip 40 Level dw_axi_dmac_platform
+int 143 cpu0 0
+int 143 cpu1 0
+int 143 cpu2 0
+int 143 cpu3 0
+label 161 rp1_irq_chip 58 Level 1f00008000.mailbox
+int 161 cpu0 4
+int 161 cpu1 0
+int 161 cpu2 0
+int 161 cpu3 0
+label 164 107d508500.gpio 20 Edge pwr_button
+int 164 cpu0 0
+int 164 cpu1 0
+int 164 cpu2 0
+int 164 cpu3 0
+label 165 GICv2 150 Level 107d004000.spi
+int 165 cpu0 0
+int 165 cpu1 0
+int 165 cpu2 0
+int 165 cpu3 0
+label 166 GICv2 305 Level mmc0
+int 166 cpu0 0
+int 166 cpu1 0
+int 166 cpu2 0
+int 166 cpu3 0
+label 167 GICv2 306 Level mmc1
+int 167 cpu0 1370420
+int 167 cpu1 0
+int 167 cpu2 0
+int 167 cpu3 0
+label 168 GICv2 104 Level pispbe
+int 168 cpu0 0
+int 168 cpu1 0
+int 168 cpu2 0
+int 168 cpu3 0
+label 169 GICv2 130 Level 1000800000.codec
+int 169 cpu0 0
+int 169 cpu1 0
+int 169 cpu2 0
+int 169 cpu3 0
+label 170 GICv2 281 Level v3d_core0
+int 170 cpu0 0
+int 170 cpu1 0
+int 170 cpu2 0
+int 170 cpu3 0
+label 171 GICv2 282 Level v3d_hub
+int 171 cpu0 0
+int 171 cpu1 0
+int 171 cpu2 0
+int 171 cpu3 0
+label 172 interrupt-controller@7c502000 2 Level 107c580000.hvs
+int 172 cpu0 25
+int 172 cpu1 0
+int 172 cpu2 0
+int 172 cpu3 0
+label 173 interrupt-controller@7c502000 9 Level 107c580000.hvs
+int 173 cpu0 0
+int 173 cpu1 0
+int 173 cpu2 0
+int 173 cpu3 0
+label 174 interrupt-controller@7c502000 16 Level 107c580000.hvs
+int 174 cpu0 0
+int 174 cpu1 0
+int 174 cpu2 0
+int 174 cpu3 0
+label 175 interrupt-controller@7d510600 7 Level vc4 hdmi hpd connected
+int 175 cpu0 0
+int 175 cpu1 0
+int 175 cpu2 0
+int 175 cpu3 0
+label 176 interrupt-controller@7d510600 8 Level vc4 hdmi hpd disconnected
+int 176 cpu0 0
+int 176 cpu1 0
+int 176 cpu2 0
+int 176 cpu3 0
+label 177 interrupt-controller@7d510600 2 Level vc4 hdmi cec rx
+int 177 cpu0 0
+int 177 cpu1 0
+int 177 cpu2 0
+int 177 cpu3 0
+label 178 interrupt-controller@7d510600 1 Level vc4 hdmi cec tx
+int 178 cpu0 0
+int 178 cpu1 0
+int 178 cpu2 0
+int 178 cpu3 0
+label 179 interrupt-controller@7d510600 14 Level vc4 hdmi hpd connected
+int 179 cpu0 0
+int 179 cpu1 0
+int 179 cpu2 0
+int 179 cpu3 0
+label 180 interrupt-controller@7d510600 15 Level vc4 hdmi hpd disconnected
+int 180 cpu0 0
+int 180 cpu1 0
+int 180 cpu2 0
+int 180 cpu3 0
+label 181 interrupt-controller@7d510600 12 Level vc4 hdmi cec rx
+int 181 cpu0 0
+int 181 cpu1 0
+int 181 cpu2 0
+int 181 cpu3 0
+label 182 interrupt-controller@7d510600 11 Level vc4 hdmi cec tx
+int 182 cpu0 0
+int 182 cpu1 0
+int 182 cpu2 0
+int 182 cpu3 0
+label 183 interrupt-controller@7c502000 1 Level 107c500000.mop
+int 183 cpu0 0
+int 183 cpu1 0
+int 183 cpu2 0
+int 183 cpu3 0
+label 184 interrupt-controller@7c502000 0 Level 107c501000.moplet
+int 184 cpu0 0
+int 184 cpu1 0
+int 184 cpu2 0
+int 184 cpu3 0
+label 185 GICv2 133 Level vc4 crtc
+int 185 cpu0 16
+int 185 cpu1 0
+int 185 cpu2 0
+int 185 cpu3 0
+label 186 GICv2 142 Level vc4 crtc
+int 186 cpu0 0
+int 186 cpu1 0
+int 186 cpu2 0
+int 186 cpu3 0
+label IPI0 Rescheduling interrupts
+int IPI0 cpu0 9086195
+int IPI0 cpu1 15636668
+int IPI0 cpu2 920454
+int IPI0 cpu3 6174252
+label IPI1 Function call interrupts
+int IPI1 cpu0 212382
+int IPI1 cpu1 220050
+int IPI1 cpu2 8241
+int IPI1 cpu3 8384
+label IPI2 CPU stop interrupts
+int IPI2 cpu0 0
+int IPI2 cpu1 0
+int IPI2 cpu2 0
+int IPI2 cpu3 0
+label IPI3 CPU stop NMIs
+int IPI3 cpu0 0
+int IPI3 cpu1 0
+int IPI3 cpu2 0
+int IPI3 cpu3 0
+label IPI4 Timer broadcast interrupts
+int IPI4 cpu0 0
+int IPI4 cpu1 0
+int IPI4 cpu2 0
+int IPI4 cpu3 0
+label IPI5 IRQ work interrupts
+int IPI5 cpu0 185858
+int IPI5 cpu1 208707
+int IPI5 cpu2 16229
+int IPI5 cpu3 17999
+label IPI6 CPU backtrace interrupts
+int IPI6 cpu0 0
+int IPI6 cpu1 0
+int IPI6 cpu2 0
+int IPI6 cpu3 0
+label IPI7 KGDB roundup interrupts
+int IPI7 cpu0 0
+int IPI7 cpu1 0
+int IPI7 cpu2 0
+int IPI7 cpu3 0
+label Err 
+int Err cpu0 0
+int Err cpu1 
+int Err cpu2 
+int Err cpu3 

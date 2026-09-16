@@ -1,0 +1,59 @@
+A1/A2 screen — which reserved core should the audio thread use?
+===============================================================
+
+2026-09-16, commit 82356e3, kernel 7.0.0-1017-raspi-realtime, 300 s per arm,
+shipping config (q64, ring 6, cap 4, floor 2, splice-fade 1.333, splice-verify,
+4 x A2-Full), balanced A B B A: a1 cpu3, b1 cpu2, b2 cpu2, a2 cpu3.
+
+  arm                cpu  xruns  late  blk p50  blk p99  blk max  cpu max  wall max  spikes  result
+  rt-piv-scr-a1-cpu3   3      0    119      338      822     1901     1825      1827    4096  FAIL
+  rt-piv-scr-b1-cpu2   2      0     10      326      617     1532     1453      1476    1140  FAIL
+  rt-piv-scr-b2-cpu2   2      0      0      325      505     1172     1124      1137     622  PASS
+  rt-piv-scr-a2-cpu3   3      0      0      329      533     1201     1174      1174     721  PASS
+  (us except 'late' = deadline overruns; deadline is 1333 us; gate is p99 <= 50%)
+
+WHAT THE SCREEN SAID
+--------------------
+1. No driver xruns, no output drops, no floor insertions in any of the four arms, and the
+   self-oracle is exact in all four. The non-RT hour produced 8 playback underruns; 20
+   minutes of RT + isolation has produced none.
+
+2. cpu == wall in every arm, with 0 blocks lost to not being on CPU. The tail is CPU time,
+   always. This is the same signature the non-RT hour had, and it is the H-work branch of
+   plan-rt-piv.md section 2 -- PREEMPT_RT did not convert the tail into scheduling delay,
+   it shrank it.
+
+3. THE FIRST TWO ARMS ARE CONTAMINATED AND MUST NOT BE QUOTED AS HOST RESULTS. While a1 and
+   b1 were measuring, this session was running filesystem-wide `find /usr/...`, kernel
+   md5sums and dpkg queries on the machine -- exactly the housekeeping activity the plan
+   says must be absent. The two arms that ran while the machine was quiet both pass; the two
+   that ran while it was busy both fail, with cpu == wall and a 1.5-1.9 ms tail.
+   That is not a nuisance, it is the H-work mechanism caught in the act: activity on the
+   housekeeping cores inflates the DSP's CPU time on an isolated core by ~50%, which means
+   isolation does not shield the engine from the shared memory system. L1 (the load arm) is
+   therefore the most important arm in the plan, not an afterthought.
+
+4. The core question is answered: **no material difference**. The clean pair is b2 (cpu 2,
+   co-located with the audio IRQ thread at prio 85) vs a2 (cpu 3, tickless, no IRQ):
+   p99 505 vs 533 us, max 1172 vs 1201 us, spikes 622 vs 721. A 5% difference on one sample
+   each, inside run-to-run noise. Both pass.
+
+   A prediction was wrong, and the measurement says so: cpu 2 was expected to re-arm the
+   1000 Hz tick, because nohz_full suppresses it only while one task is runnable and the
+   prio-85 irq/139 thread lives there. Measured, cpu 2 took 587 arch_timer interrupts in
+   301 s (2.0/s) against cpu 3's 0 -- the tick stays off on both. The cross-core cost of the
+   cpu 3 arrangement is real but small: IPI0 rescheduling to cpu 3 runs at ~746/s, one per
+   period, which is the wakeup from the xhci IRQ thread on cpu 2 to the audio thread on
+   cpu 3. The audio IRQ itself is delivered 599938 times in 301 s (1993/s) on cpu 2.
+
+5. The margin is thin even when it passes. Quiet arms peak at 1172-1201 us against a
+   1333 us deadline -- 88-90% of the budget -- and the floor never had to fire. The plan
+   warned that a 0-xrun 5-minute configuration became 8 underruns in an hour; an hour is
+   the only run that can say whether this tail stays under the deadline.
+
+DECISION
+--------
+The headline hour runs on cpu 3, because (a) the difference is not measurable, (b) cpu 3
+is exactly tickless (0 arch_timer in 301 s), and (c) the non-RT baseline hour was also
+--cpu 3, so the comparison between them is not confounded by the core. If the hour fails
+and the core choice is suspected, a paired cpu 2 hour is the follow-up, not the default.

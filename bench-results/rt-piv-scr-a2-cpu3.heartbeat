@@ -1,0 +1,10 @@
+start       2026-09-16T03:55:15+01:00
+command     /home/rik/code.local/namchain/tools/soak/rt-manipulation-check.sh arm bench-results/rt-piv-scr-a2-cpu3 ./build/namchain-soak --device hw:2,0 --capture-channels 8 --playback-channels 6 --quantum 64 --periods 6 --output-queue-periods 4 --output-queue-floor-periods 2 --splice-fade-ms 1.333 --splice-verify --seconds 300 --instances 4 --model build/generated/A2-Full.nam --input-channel 0 --output-channel 0 --self-oracle --oracle-window 5 --rt-priority 80 --cpu 3
+2026-09-16T03:55:15+01:00
+2026-09-16T03:56:15+01:00
+2026-09-16T03:57:15+01:00
+2026-09-16T03:58:15+01:00
+2026-09-16T03:59:15+01:00
+2026-09-16T04:00:15+01:00
+end         2026-09-16T04:00:17+01:00
+exit        0

@@ -1,0 +1,95 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 384 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            4 x build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/116, playback min/max 84/200 (last 187) frames
+                  playback queue 1.31..3.12 periods (last 2.92); the floor is the stall the device
+                  absorbs without starving: 1.31 periods = 1.750 ms
+                  p1 2.41, p50 2.94 periods; 0 of 225000 blocks held less than one
+                  period (0.00 %), which is the window a stall has to miss
+queue target:     4 periods = 5.333 ms: a cap on the ring's contents, so a burst
+                  cannot buy latency beyond it. Not a promise of cushion -- the
+                  floor held above is the number to read
+queue floor:      2 periods after each write, so 1 periods = 1.333 ms at the worst
+                  instant; held by inserting silence 0 times (0 frames =
+                  0.000 ms of audio delayed rather than skipped, never needed)
+splice repair:    64-frame bridge (1.333 ms) armed 0 times: 0 dropped periods,
+                  0 inserted ones. Applied to the emitted signal only -- the oracle
+                  below still compares the engine's pristine output
+queue control:    0 output drops (not gated: each refusal is the target's trade), 0 capture bursts
+                  0 of those drops were the queue target refusing a period that
+                  would have raised the ring past 4 periods; 0 were the ring itself
+                  being full
+queue prefill:    8 frames of silence written before block 0 to bring the ring
+                  to its target (0.167 ms of output latency, paid once)
+occupancy check:  895812 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           225000
+audio:            300.000 s in 299.983 s wall (RTF 0.9999)
+deadline:         1333333 ns
+split (p50):      read 3593 ns, chain 317414 ns, write 16759 ns
+split (tail):     read p99 6315 max 28242, chain p99 791450 max 1827308, write p99 23611 max 169376 ns
+chain p99:        791450 ns (59.36% of deadline)
+device wait:      p50 1144296 ns, p99 1179468 ns, max 1473530 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 1824797 ns, wall max 1827308 ns
+                  78.02 s of CPU over 78.01 s of wall in the render path (100.0%), 0 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 56711 cpu 1824797 ns (wall 1827308 ns), block 14129 cpu 1759648 ns (wall 1758518 ns), block 16182 cpu 1719759 ns (wall 1716942 ns), block 68961 cpu 1664703 ns (wall 1654005 ns), block 56941 cpu 1662667 ns (wall 1661119 ns)
+cpu spike bursts: 4096 blocks over half a period of CPU (capped: there were more), in 758 runs; runs start every 3..2767 blocks (0.0..3.7 s at 48 k/64)
+                  run at block 0..0 (1 long), worst 1065148 ns of CPU
+                  run at block 290..290 (1 long), worst 691593 ns of CPU
+                  run at block 1021..1021 (1 long), worst 691741 ns of CPU
+                  run at block 1401..1402 (2 long), worst 738833 ns of CPU
+                  run at block 1971..1971 (1 long), worst 721778 ns of CPU
+                  run at block 2127..2127 (1 long), worst 766963 ns of CPU
+                  run at block 2969..2969 (1 long), worst 680426 ns of CPU
+                  run at block 2991..2991 (1 long), worst 684574 ns of CPU
+block time:       p50 337711 ns, p99 821901 ns, max 1901310 ns
+p99/deadline:     61.64% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+first overrun at: block 13446 of 225000
+deadline overruns:119
+driver xruns:     0
+  by direction:   0 capture overruns, 0 playback underruns
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           FAIL
+=== host state ===
+period           2026-09-16T03:40:10+01:00 -> 2026-09-16T03:45:11+01:00 (301s)
+kernel_release   7.0.0-1017-raspi-realtime
+uname_says_rt    true
+cmdline          reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10 isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew_tick=1
+isolated_cpus    2-3
+nohz_full_cpus   2-3
+governor         performance
+scaling_max_khz  2400000
+scaling_cur_khz  2400000
+temp_mC          40250
+throttled        0x0
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   xhci-hcd:usb2
+audio_irq_number 139
+audio_irq_affinity 2
+audio_irq_thread_prio 85
+
+=== interrupt deltas per CPU (301s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer            324530    246807       587         0
+IPI0_resched          237628    489113         2    224606
+IPI5_irqwork             924       871       587         7
+audio_IRQ                  0         0    599938         0
+IPI1_fncall             1021      3231       140       140
+
+=== verdict ===
+ok:   cpu 2 took 587 arch_timer interrupts in 301s (2.0/s) -- tickless.
+ok:   cpu 3 took 0 arch_timer interrupts in 301s (0.0/s) -- tickless.
+ok:   the audio IRQ (139) was delivered 599938 times to reserved cpu 2,
+      at 1993.1/s -- the interface's data path is landing
+      where it was pinned rather than being accepted and ignored.
+ok:   isolated=2-3 nohz_full=2-3

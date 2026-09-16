@@ -1,0 +1,200 @@
+M1 criterion 3 on piv, re-tested on PREEMPT_RT — what the host change bought, and what it did not
+==================================================================================================
+
+2026-09-16. Host: Raspberry Pi 500 (BCM2712, 4x Cortex-A76), Ubuntu 26.04.
+Kernel: 7.0.0-1017-raspi-realtime #17-Ubuntu SMP PREEMPT_RT, booted with
+isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew_tick=1,
+audio IRQ (xhci-hcd:usb2 = IRQ 139) pinned to cpu 2 at SCHED_FIFO 85 by rtpi-audio-tune.
+Commit: 82356e3. Device: SSL 2+ Mk II, hw:2,0, 8 capture / 6 playback, S32_LE.
+Configured by plan-rt-piv.md; every arm is in bench-results/rt-piv-*.
+
+THE ONE-LINE ANSWER
+-------------------
+The RT kernel removed the driver xruns completely -- the clause that was failing 8 times an
+hour is now zero across 3 h 10 min of soak time -- and it did not remove the CPU-time tail
+that still pushes a handful of blocks past the deadline. The tail is not a scheduling
+failure and no scheduler setting will fix it: it is the DSP waiting on a contended memory
+system, and it is measurable as cycles-per-instruction, not as lateness.
+
+
+1. THE SCOREBOARD (criterion 3, section 1 of plan.md)
+-----------------------------------------------------
+
+                                       non-RT before        RT + isolation
+  clause                               (1 h, 331da80)       H1 1h      H2 1h
+  -----------------------------------  -------------------  ---------  ---------
+  driver xruns over 1 h                8 (0 cap, 8 play)    0          0
+  blocks over the 1333.3 us deadline   204                  15         109
+  max block time                       3427.7 us (2.57x)    1782.5 us  3176.4 us
+  p99 block time                       501.1 us (37.6%)     524.7 us   531.6 us
+  p99 gate (<= 50% of deadline)        pass                 pass       pass
+  render-path allocations              0                    0          0
+  thermal throttle flags               0x0                  0x0        0x0
+  output vs offline render             max|diff| 0         0          0
+  result                               FAIL                 FAIL       FAIL
+
+  H1 = cap 4, floor 2, splice-fade 1.333, --splice-verify (the instrument on)
+  H2 = the same product configuration with the debug verifier off
+
+So of the six clauses, five now pass and one does not: "max block time < the deadline",
+which is the same clause as "zero deadline overruns". Two hours of the same effective
+configuration gave 15 and 109 overruns and 1.78 and 3.18 ms maxima, so the residual is
+also strongly session-dependent -- the earlier evidence recorded the same phenomenon for
+drops (13-18 per 900 s one afternoon, 0 in 50 minutes the next evening).
+
+What is unambiguous is the xrun clause, because zero has no variance:
+
+  RT + isolation, <= 4 instances, no memory load:   0 driver xruns in 11 420 s (3 h 10 min)
+  non-RT, same binary family, 1 h:                  8 playback underruns
+  non-RT, 4-period ring, 1 h:                       92 xruns
+
+At 8/h, seeing none in 3.17 h has probability ~e^-25. That clause is genuinely fixed.
+
+
+2. THE MANIPULATION CHECK EVERY EARLIER HOST EXPERIMENT LACKED
+-------------------------------------------------------------
+
+The 16-arm IRQ-affinity experiment produced a null that could not be interpreted, because
+nothing showed the intervention had happened. Every arm here carries before/after interrupt
+deltas (tools/soak/rt-manipulation-check.sh), and they are consistent across all 20 arms:
+
+  isolated 2-3, nohz_full 2-3 on every arm; governor performance; throttled 0x0; <= 51.8 C
+  cpu 3 arch_timer:  0 interrupts/s in every quiet arm   (a 1000 Hz tick would be 1000/s)
+  cpu 2 arch_timer:  1.9-2.0/s
+  audio IRQ 139:     delivered to cpu 2 at ~1997/s, affinity read back as "2"
+  IPI0 to cpu 3:     ~746/s -- one per period, the wakeup crossing from the IRQ thread on
+                     cpu 2 to the audio thread on cpu 3
+
+Two things this settles. First, the tick and the per-CPU IPIs were 98.8% of cpu 3's
+interrupts and cannot be moved by any runtime affinity write; nohz_full and rcu_nocbs are
+what remove them, and they are gone. Second, a prediction in the plan was wrong and the
+measurement says so: cpu 2 was expected to re-arm the tick, because nohz_full suppresses it
+only while one task is runnable and the prio-85 irq/139 thread lives there. It did not:
+cpu 2 measured 2.0/s. Both reserved cores are effectively tickless.
+
+
+3. THE RESIDUAL TAIL IS MEMORY STALLS, NOT LATENESS
+---------------------------------------------------
+
+The tail has the same signature on both kernels: cpu == wall, and 0 blocks lost to not being
+on CPU. In H2 the slowest block was 3 026 482 ns of CPU against 3 015 662 ns of wall. The
+thread was running; the work took longer. Three arms localise what makes it take longer.
+
+Load added to the housekeeping cores only (cpus 0-1), 300 s each:
+
+  arm                        load                                xruns  late   blk p99  blk max
+  d1-light        stress-ng --cpu 1                       0      0      493 us   884 us
+  d2-medium       stress-ng --cpu 2                       0      0      493 us  1270 us
+  d4-hackbench    hackbench loop (scheduler storm)        0      0      822 us  1078 us
+  d3-vm           stress-ng --vm 1 --vm-bytes 128M      5460  38210     2793 us 10020 us
+  l1-load         cpu+vm+io+hackbench                    3119  26014     2078 us  9318 us
+  (quiet reference: v1, 900 s)                            0      0      513 us  1288 us
+
+Pure CPU load on both housekeeping cores is fully tolerated -- the work is on cpus 0-1, the
+audio is on an isolated cpu 3, and nothing happens. A scheduler storm costs 72% on the
+median (568 us against 330) but never breaks the deadline. Memory stress alone is
+catastrophic: 5 460 xruns in five minutes and blocks seven times the deadline.
+
+And the perf counters say why (quiet 120 s vs vm-stressed 300 s, per block of 64 frames):
+
+                          quiet        vm-stressed   change
+  instructions / block    1.472e6      1.433e6       -2.6%
+  cycles / block          8.64e5       2.081e6       +141%
+  cache-misses / block    1.49e4       1.46e4        -2%
+  IPC                     1.70         0.69          -59%
+
+The same instructions take 2.4x the cycles, with the same number of cache misses. The core
+is not doing more work and is not being descheduled; it is waiting longer for each memory
+access because a 128 MB write stream is saturating the memory system it shares. CPU
+frequency was constant at 2400 MHz for all 382 samples of the l1 arm and `throttled=0x0`
+throughout, so this is not DVFS and not thermal.
+
+This is the prediction the earlier work made and could not test. bench-results/
+queue-target-sweep.txt item 3 named "IRQ affinity and the RT kernel" as the untested
+experiment and guessed "interrupt work charged to our own CPU time" as the candidate. The
+half of it that the RT host could test has now been tested, and the answer is that the
+interrupt side was worth fixing (the xruns went to zero) but the tail was never interrupts:
+it is the memory system, and it is the same on both kernels.
+
+
+4. WHAT THE RT HOST DID BUY, IN THE OTHER TWO DIMENSIONS
+--------------------------------------------------------
+
+Latency. Output latency is the queue's occupancy (plan section 9.2), and the placement rule
+from the non-RT work said a cap must sit above the queue's natural band. On this host the
+band at cap 4 is p1 2.72 / p50 2.94 periods, but cap 3 is not rejected: the queue settles
+lower instead (p1 1.67 / p50 1.94) with zero drops, over 15 minutes.
+
+  cap 4 (5.33 ms bound):  v1 900 s  -- 0 xruns, 0 late, p99 513 us, max 1288 us
+  cap 3 (4.00 ms bound):  c1 300 s  -- 0 xruns, 0 late, p99 549 us, max 1198 us
+                          c2 900 s  -- 0 xruns, 0 late, p99 469 us, max  893 us
+
+So 1.33 ms of end-to-end latency is available for free on this host, and the earlier finding
+that a cap one period above the floor thrashes does not apply when the floor is off.
+
+Quantum. q32 was the worst quantum on the non-RT host because a 1000 Hz tick landed inside
+every 666 us period. On a tickless core that argument is gone, and q32 is close to viable:
+p99 298 us (44.8% of its deadline) and max 835 us against 667 -- 13 blocks late in 5 minutes.
+q128 passes comfortably (max 2020 us against 2667) and q64 is marginal (max 1288 against
+1333, then 15 and 109 overruns in the two hours).
+
+Throughput. Criterion 3 asks for 4 concurrent A2-Full; 4 passes and 6 does not.
+
+  4 instances   chain p99 ~495 us  (37%)   PASS
+  6 instances   chain p99  942 us  (71%)   FAIL -- p99 gate
+  8 instances   73 xruns, 9446 late        FAIL
+
+Note the cost is superlinear (4 -> 6 is 1.9x, not 1.5x), which is the same cache/bandwidth
+effect as section 3: more resident models means more memory traffic per block.
+
+End-to-end round trip, measured with namchain-latency on the RT host, occupancy-corrected:
+analogue path (output 3 -> input 1 through the patch cable) 104 frames = 2.171 ms; internal
+digital loopback 88 frames = 1.833 ms; difference exactly 16 frames = 0.333 ms, the
+converter round trip. That reproduces the pre-RT measurement to the frame, so the RT kernel
+did not change the device path -- as it should not. The digital loopback is still bit-exact
+(peak-to-sidelobe 999 dB) and the analogue gain still -10.5 dB.
+
+
+5. WHAT THE ENGINE DID WHILE THE HOST WAS FAILING
+-------------------------------------------------
+
+Every arm, including the ones with thousands of xruns and a 10 ms block time, reported:
+  render-path allocations: 0
+  self-oracle:             max|diff| = 0 over 240 000 frames
+So the engine stayed sample-exact while the audio path collapsed around it, and the losses
+were counted rather than recovered from. The degradation story the plan promised -- never
+silently recover, always count, always report -- held under load that produced 5 460 xruns
+in five minutes.
+
+
+6. LIMITS OF THIS EVIDENCE
+--------------------------
+
+- H1 and H2 are the same effective configuration and differ by 15 vs 109 deadline overruns.
+  Session variance is therefore of the same order as any single-hour result, and no
+  comparison between two 5-minute arms at q64 should be believed without repeats.
+- The "non-RT before" numbers are a different kernel, five days earlier, and an older commit
+  (331da80, before the floor and the splice work). They are a fair witness for the xrun
+  clause; they are not a paired control. The paired kernel A/B was designed and is not run:
+  against the variance above it would need hour-long arms, which is four reboots and four
+  hours for a result section 3 already predicts (the tail is kernel-independent because it
+  is memory, and both kernels show cpu == wall).
+- One device, one host, one period size, 4 x A2-Full throughout. Nothing here says how a
+  different interface or a machine with more memory bandwidth behaves.
+- The 15-minute cap-3 runs are screens, not a shipping decision. cap 3 should be confirmed
+  over an hour before it replaces cap 4.
+- d0 (a 120 s quiet arm) failed on a single late block, which is the variance in section 6
+  in miniature, not a defect of that configuration.
+
+
+7. WHAT THIS SAYS TO DO NEXT
+----------------------------
+
+1. Keep the RT kernel and the isolation. They removed the xruns and cost nothing measurable
+   (chain p99 moved 485 -> 505-512 us, within the noise of the comparison).
+2. Stop treating the residual late blocks as a host-tuning problem. The lever is the amount
+   of memory traffic per block: fewer resident models, a smaller quantum is worse not better,
+   and anything that keeps other workloads off the machine's memory system. This is worth a
+   plan item of its own.
+3. Adopt cap 3 and confirm it over an hour; it is 1.33 ms of latency for zero drops.
+4. Ship the tiered configuration honestly: q128 with margin, q64 marginal, q32 not yet.

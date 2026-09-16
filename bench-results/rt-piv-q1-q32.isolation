@@ -1,0 +1,33 @@
+=== host state ===
+period           2026-09-16T05:42:28+01:00 -> 2026-09-16T05:47:29+01:00 (301s)
+kernel_release   7.0.0-1017-raspi-realtime
+uname_says_rt    true
+cmdline          reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10 isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew_tick=1
+isolated_cpus    2-3
+nohz_full_cpus   2-3
+governor         performance
+scaling_max_khz  2400000
+scaling_cur_khz  2400000
+temp_mC          45200
+throttled        0x0
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   xhci-hcd:usb2
+audio_irq_number 139
+audio_irq_affinity 2
+audio_irq_thread_prio 85
+
+=== interrupt deltas per CPU (301s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer            325561    206480      1176         0
+IPI0_resched          562072    694433         2    449945
+IPI5_irqwork             525       415      1172         7
+audio_IRQ                  0         0   1199867         0
+IPI1_fncall              751      1832       140       140
+
+=== verdict ===
+ok:   cpu 2 took 1176 arch_timer interrupts in 301s (3.9/s) -- tickless.
+ok:   cpu 3 took 0 arch_timer interrupts in 301s (0.0/s) -- tickless.
+ok:   the audio IRQ (139) was delivered 1199867 times to reserved cpu 2,
+      at 3986.3/s -- the interface's data path is landing
+      where it was pinned rather than being accepted and ignored.
+ok:   isolated=2-3 nohz_full=2-3

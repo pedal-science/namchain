@@ -1,0 +1,52 @@
+Gate 0 — piv RT re-test preconditions
+=====================================
+
+Date:    2026-09-16
+Commit:  82356e3edea0bc8153680ed9bd1190d99c94083c
+Kernel:  7.0.0-1017-raspi-realtime #17-Ubuntu SMP PREEMPT_RT
+Host:    Raspberry Pi 500 (BCM2712, 4x Cortex-A76), Ubuntu 26.04
+
+1. Build and tests, at the measured commit
+   cmake --build build -j4 : current (only the rig copy step ran)
+   ctest --test-dir build   : 4/4 passed (unit, soak_cli, golden_setup, golden_a2_lite)
+   golden_a2_lite passed on the RT kernel, so the A2 bit-identity claim is re-established
+   on this kernel rather than assumed to carry over from the non-RT one.
+
+2. Deviceless smoke (the paced clock, no hardware)
+   ./build/namchain-soak --backend null --seconds 300   -- TIMED OUT at 60s, NOT a failure:
+   the null backend paces in wall clock, so 300 audio-seconds takes 300 wall-seconds.
+   ctest -R soak_cli (above) is the harness that covers this path.
+
+3. Host state, and the manipulation check that the earlier IRQ experiment lacked
+   See rt-piv-gate0.pre / .post / .isolation (10 s idle sample) and the same block
+   re-measured inside every arm from here on.
+
+   isolated 2-3, nohz_full 2-3, governor performance, 2400 MHz, throttled=0x0, 36.4 C
+   audio IRQ: xhci-hcd:usb2 = IRQ 139 -> cpu 2, thread prio 85 (read back, not assumed)
+
+   10 s idle interrupt deltas:  cpu0     cpu1    cpu2   cpu3
+     arch_timer                10646     1710       0      0
+     IPI0 resched                792     1074       0      0
+     IPI5 irq work                 0        6       0      0
+   => both reserved cores are tickless (0 arch_timer), which is the whole point: the
+      timer and IPIs were 98.8% of cpu 3's interrupts and no runtime affinity write can
+      move them. cpu1's sub-1000/s rate is NO_HZ_IDLE suppressing its idle tick.
+
+4. New instruments (both validated on the live host before any arm was trusted)
+   tools/soak/rt-manipulation-check.sh — before/after interrupt deltas + tickless verdict
+   tools/soak/arm-run.sh              — the .env/.heartbeat/.txt/.isolation evidence set
+
+5. Plumbing arm (20 s, shipping config, cpu 3) — rt-piv-plumbing.*
+   0 driver xruns, 0 deadline overruns, max block 1173154 ns (< 1333333 deadline),
+   p99 36.62% of deadline, oracle max|diff| 0 over 240000 frames. PASS.
+   20 s is a smoke test, not evidence about a rate near zero; it says the rig works.
+
+   The same arm's isolation block, which is where the new design question shows up:
+     cpu 3 (soak core)   arch_timer 0 in 22 s        -> tickless holds WITH the soak running
+     cpu 2 (audio core)  arch_timer 42 in 22 s (1.9/s)
+     audio IRQ 139       delivered 40014 times to cpu 2 in 22 s = 1818.8/s
+     IPI0 resched cpu3   15016 in 22 s = 682/s  (~1 per period: the wakeup that crosses
+                         from the IRQ thread on cpu 2 to the soak thread on cpu 3)
+   So the A1 (cpu 3) / A2 (cpu 2) screen is measuring a real tension, not a preference:
+   co-location removes the cross-core wakeup but puts a prio-85 IRQ thread firing ~1800
+   times a second onto the audio thread's core.

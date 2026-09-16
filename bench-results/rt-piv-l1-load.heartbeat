@@ -1,0 +1,20 @@
+start       2026-09-16T05:17:00+01:00
+command     /home/rik/code.local/namchain/tools/soak/rt-manipulation-check.sh arm bench-results/rt-piv-l1-load ./build/namchain-soak --device hw:2,0 --capture-channels 8 --playback-channels 6 --quantum 64 --periods 6 --output-queue-periods 4 --instances 4 --model build/generated/A2-Full.nam --input-channel 0 --output-channel 0 --self-oracle --oracle-window 5 --rt-priority 80 --cpu 3 --seconds 900 --output-queue-floor-periods 0
+2026-09-16T05:17:00+01:00
+2026-09-16T05:18:00+01:00
+2026-09-16T05:19:00+01:00
+2026-09-16T05:20:01+01:00
+2026-09-16T05:21:01+01:00
+2026-09-16T05:22:01+01:00
+2026-09-16T05:23:01+01:00
+2026-09-16T05:24:01+01:00
+2026-09-16T05:25:02+01:00
+2026-09-16T05:26:02+01:00
+2026-09-16T05:27:02+01:00
+2026-09-16T05:28:02+01:00
+2026-09-16T05:29:03+01:00
+2026-09-16T05:30:03+01:00
+2026-09-16T05:31:03+01:00
+2026-09-16T05:32:03+01:00
+end         2026-09-16T05:32:20+01:00
+exit        1

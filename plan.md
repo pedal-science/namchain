@@ -2,14 +2,19 @@
 
 **Status:** approved and in progress. **Phase 0, M0 and M1 are complete** — the repo builds green in CI
 on all five jobs (§12), §11 carries *measured* numbers rather than estimates, and every M1 acceptance
-clause is met on the reference interface (§9.5) except the 1 h criterion-3 soak, which is the one item
-that is only wall-clock and is run on an otherwise idle machine. **M2 is next**, and its first task is
-the glitch detector, by the standing instruction below.
+clause is met on the reference interface (§9.5) except one of criterion 3's clauses. That clause was
+re-attacked on 2026-09-16 by moving the host to a PREEMPT_RT kernel with the audio cores isolated and
+tickless: **five of the six clauses now pass, including the driver-xrun clause that failed 8 times an
+hour** (0 xruns in 3 h 10 min), and the survivor is `max block < deadline`, which is memory-stall
+shaped rather than scheduling-shaped and is not fixed by anything in §9.3. The result, its limits and
+the arms behind it are in `bench-results/rt-piv-summary.txt`, run from `plan-rt-piv.md`. **M2 is next**,
+and its first task is the glitch detector, by the standing instruction below.
 **Author:** planning session (research grounded in the sources cited in §2 and §16), resumed for
 implementation.
-**Updated:** 2026-09-13. The host was upgraded to Ubuntu 26.04 / kernel 7.0 / GCC 15 mid-session, which
-invalidated the in-flight 1 h soak and the toolchain provenance of every host measurement; §0 records
-what moved, and M1 exit is being re-established on the new toolchain before the soak is re-run.
+**Updated:** 2026-09-16. piv now runs `7.0.0-1017-raspi-realtime` with `isolcpus`/`nohz_full`/`rcu_nocbs`
+on cores 2–3; §9.3, §11, §12 and §14 carry the measured consequences, and `docs/tuning.md` — promised
+since M0 — is now written from those measurements. §0's 2026-09-13 note still applies to the *earlier*
+host numbers: every measurement carries the toolchain and kernel it was taken on.
 
 ---
 
@@ -862,29 +867,48 @@ golden test's whole premise is that our path and the core's `render` decode iden
 ### 9.3 Linux RT tuning checklist (shipped as `docs/tuning.md` + a `namchain-doctor` script)
 
 `/etc/security/limits.d/audio.conf` → `@audio - rtprio 95`, `@audio - memlock unlimited`;
-`SCHED_FIFO` 80 via `sched_setscheduler`; `mlockall`; governor `performance`; `threadirqs`; RT kernel
-(`linux-image-rt-*`, PREEMPT_RT mainlined 6.12 but Pi OS stock is not RT); `usbcore.autosuspend=-1`;
+`SCHED_FIFO` 80 via `sched_setscheduler`; `mlockall`; governor `performance`; an RT kernel
+(`linux-image-*-realtime`; PREEMPT_RT mainlined 6.12 but Pi OS stock is not RT); `usbcore.autosuspend=-1`;
 audio thread pinned to a dedicated core (workers and warm threads excluded; only use `isolcpus` if
 IRQs are also moved); `vcgencmd get_throttled`/`measure_temp` in the health loop with a fan/Active
-Cooler mandatory for always-on low-latency use (G18).
+Cooler mandatory for always-on low-latency use (G18). **Do not add `threadirqs` to a PREEMPT_RT
+kernel:** `kernel/irq/manage.c` guards that `early_param` with `!defined(CONFIG_PREEMPT_RT)`, so it is
+never registered, forced threading is already unconditional, and passing it is a no-op that misleads.
+The earlier wording of this checklist listed it, which was wrong.
 
-**Outstanding, and measured to matter (§9.5 item 6):** `namchain::rt::apply_scheduling()` now sets
-`SCHED_FIFO` and thread affinity from inside the program and reports what it was granted (`2c3cdd4`),
-which closes the "the engine does not pin at all" half of the gap. Pinning alone took the tail from 47
-to 25 missed deadlines per 90 s in the same configuration, so the default `--cpu` is still an open
-choice (§14) and `namchain-doctor` should check it. The `isolcpus`/IRQ-affinity half of the list above
-is untested: the engine is confined to a core, but IRQs and other processes are not moved off it, and
-that is where the rest of the tail is.
+**Shipped as `docs/tuning.md` (2026-09-16).** The checklist is now a document that carries
+the measurements behind each line rather than a paragraph of assertions; `namchain-doctor` is still
+outstanding.
 
-**Host target.** The assumed host is Linux with `PREEMPT_RT` and `threadirqs` *where the platform can
-supply one* — this Pi 500 can (`linux-image-rt-*`), and the checklist above is what we ship to make a
-stock kernel behave as well as it can. The engine must nevertheless be **correct on a non-RT kernel**:
-this box has already held RTF 0.9999 and a sample-exact self-oracle for an hour under a stock
+**The `isolcpus`/IRQ-affinity half is no longer untested — measured 2026-09-16.** piv was moved to
+`7.0.0-1017-raspi-realtime` with `isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3
+irqaffinity=0-1 skew_tick=1`, and the audio interrupt (`xhci-hcd:usb2`) pinned to cpu 2 at
+`SCHED_FIFO 85`. The measurement is in `bench-results/rt-piv-summary.txt`, with every arm recording its
+own before/after interrupt deltas via `tools/soak/rt-manipulation-check.sh` — the check the 16-arm IRQ
+experiment lacked, and the reason its null was uninterpretable. What it bought, over 3 h 10 min of soak
+time at ≤ 4 instances: **0 driver xruns against 8 in the single non-RT hour**, with `cpu 3` taking
+**0 timer interrupts/s** (the tick and the per-CPU IPIs were 98.8 % of that core's interrupts and no
+runtime affinity write can move them — only `nohz_full` removes them). What it did **not** buy: the
+residual late blocks. Two consecutive hours of the same configuration produced 15 and 109 blocks over
+the deadline with `cpu == wall` and 0 blocks descheduled, and the mechanism is the memory system, not
+the scheduler — under `stress-ng --vm 1 --vm-bytes 128M` on the housekeeping cores the same
+instructions take 2.4× the cycles (IPC 1.70 → 0.69) with no change in cache misses per block, at a
+constant 2400 MHz. Pinning the engine (`--cpu`) is therefore necessary but nowhere near sufficient,
+which resolves the `--cpu` question in §14 and opens a memory-traffic one in its place.
+
+**Host target.** The assumed host is Linux with `PREEMPT_RT` *where the platform can
+supply one* — this Pi 500 can (`linux-image-*-realtime`), and the checklist above is what we ship to
+make a stock kernel behave as well as it can. The engine must nevertheless be **correct on a non-RT
+kernel**: this box has already held RTF 0.9999 and a sample-exact self-oracle for an hour under a stock
 `PREEMPT_DYNAMIC` kernel, and every failure seen so far has been a control-loop bug that an RT kernel
 would not have touched (§9.5). RT buys margin against the *tail* — wakeup jitter, long kernel critical
 sections, a desktop waking up — and is worth having, but **no acceptance criterion may depend on it**,
-because we cannot require it of a user's host. The escalation path for a device with neither an RT
-kernel nor a quiet one is a dedicated (non-Linux) RTOS; that is deliberately deferred and recorded in
+because we cannot require it of a user's host. **Measured 2026-09-16:** the RT host did exactly that
+and no more. It removed the driver xruns outright (8 in the non-RT hour → 0 in 3 h 10 min) and it did
+not remove the CPU-time tail, because that tail is memory-stall shaped and identical in signature on
+both kernels. A host with a quiet scheduler and a busy memory system is still not a host this engine
+can hold 4 × A2-Full on at q64. The escalation path for a device with neither an RT kernel nor a quiet
+one is a dedicated (non-Linux) RTOS; that is deliberately deferred and recorded in
 §14, and it is the reason the I/O layer is an interface (§9.1) rather than ALSA calls in the engine.
 
 ### 9.4 Platform constraints carried into the design
@@ -1825,6 +1849,41 @@ worker synchronization is the single largest reliability risk in the design; it 
 soak + glitch tests pass with it enabled. With PR #313 in place the arithmetic budget roughly doubles,
 so parallel rendering's urgency drops further and the attention belongs on memory bandwidth and I/O.
 
+### The RT host, measured (2026-09-16)
+
+The same engine, same rig, on `7.0.0-1017-raspi-realtime` with cores 2–3 isolated and tickless and the
+audio IRQ pinned to cpu 2. Full evidence in `bench-results/rt-piv-summary.txt`.
+
+| clause | non-RT (1 h, `331da80`) | RT + isolation (H1 1 h) | RT (H2 1 h) |
+|---|---|---|---|
+| driver xruns | 8 (0 cap, 8 play) | **0** | **0** |
+| blocks over the 1333.3 µs deadline | 204 | 15 | 109 |
+| max block | 3427.7 µs (2.57×) | 1782.5 µs | 3176.4 µs |
+| p99 block | 501.1 µs (37.6 %) | 524.7 µs (39.4 %) | 531.6 µs (39.9 %) |
+| chain p99 | 485.2 µs | 505.4 µs | 511.6 µs |
+| allocations / oracle / throttle | 0 / 0 / 0x0 | 0 / 0 / 0x0 | 0 / 0 / 0x0 |
+
+**The xrun clause is fixed; the late-block clause is not, and the reason is memory.** Over 3 h 10 min
+of RT soak time at ≤ 4 instances there were **zero** driver xruns. The remaining late blocks have
+`cpu == wall` with 0 blocks descheduled in every arm, so they are work, not lateness — and the work is
+stalling. With the load on the *housekeeping* cores (300 s per arm):
+
+| load on cpus 0-1 | xruns | block p99 | block max | instructions/block | cycles/block | IPC |
+|---|---|---|---|---|---|---|
+| none | 0 | 513 µs | 1288 µs | 1.472 M | 0.864 M | 1.70 |
+| `stress-ng --cpu 2` | 0 | 493 µs | 1270 µs | — | — | — |
+| `hackbench` loop | 0 | 822 µs | 1078 µs | — | — | — |
+| **`stress-ng --vm 1 --vm-bytes 128M`** | **5 460** | **2793 µs** | **10 020 µs** | 1.433 M | 2.081 M | **0.69** |
+
+Pure CPU load on both housekeeping cores is fully tolerated; memory stress alone is catastrophic. The
+same instructions take 2.4× the cycles with *no change* in cache misses per block, at a constant
+2400 MHz (`scaling_cur_freq` identical in all 382 samples) and `throttled=0x0`. That is the
+memory-bound ceiling of risk 5 below, measured rather than assumed, and it means the levers above are
+in the right order — but it also means **core isolation is not a substitute for a quiet memory
+system**. Two other measured consequences: the cap can come down to 3 periods (0 drops over 15 min,
+p99 469 µs, 1.33 ms of latency saved), and 6 × A2-Full costs 1.9× the p99 of 4 rather than the 1.5×
+the arithmetic predicts, i.e. the throughput ceiling is memory-shaped too.
+
 ---
 
 ## 12. Milestones
@@ -1832,7 +1891,7 @@ so parallel rendering's urgency drops further and the attention belongs on memor
 | M | Deliverable | Acceptance |
 |---|---|---|
 | **M0** | Phase 0 environment fixed ✔; repo, CMake, CI, vendored core pinned ✔; `namchain-bench` measuring RTF per model/quantum ✔; lookback calculator + golden test vs. hand-computed A2 numbers ✔; **`namchain-render` offline WAV→WAV with `file` I/O ✔ (+ `namchain-wavcmp`, determinism / block-invariance / golden tests)** | Builds green **in CI on all four jobs** — x86_64 (18 cases / 192,245 assertions), x86_64 under RTSan, aarch64 cross + qemu (full suite *and* the 146-assertion planar parity gate), armv7 cross ✔; bench table for A2-Full/A2-Lite/IR on this Pi 500 ✔; offline render byte-identical to the core's own `render` output ✔; §11 table revised with real numbers ✔ |
-| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; **`AudioBackend` interface with `null` and `file` implemented and `pipewire` refused by name ✔ (§9.1) — the stream loop is now written once and runs against a device, a paced clock or a WAV, so `ctest -R soak_cli` exercises the timers, the gates and the oracle with no hardware**; **memory locking made safe and the block timer sized from the run — `MCL_FUTURE` plus a fixed 44 MB timer reserve aborted the `null` backend with `std::bad_alloc` under a finite `RLIMIT_MEMLOCK`, and `soak_cli` now reproduces that limit ✔ (§14.10)**; **multichannel WAV reader ✔**; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔**; **the loop's cadence and its output-queue policy — `sw_params` now sets `avail_min` to the period so `poll` wakes on the boundary the loop consumes at, and the one-period prime plus the resulting occupancy ratchet are diagnosed in §9.5 items 2 and 4**; **the output queue became a knob — `--output-queue-periods` caps the queue, `prefill_output_queue` establishes it before block 0, the xruns are split into capture overruns and playback underruns, and the hour at `--periods 6 --output-queue-periods 4` reports 8 playback underruns against 92 for the 4-period ring, measured in §9.5 item 8 ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **device-mode self-oracle ✔ — the run records the input it consumed and compares its output against a freshly compiled offline render of it, `max|diff| = 0` over 2 880 000 frames (§10.5.1)**; **1 h soak vs §1 criterion 3 — run, *not met*: chain p99 45.7 % and 0 render-path allocations hold; block p99 112.6 % and 1 driver xrun fail the current wording, for the output-queue reason in §9.5 item 4, not for engine or kernel-latency reasons**; allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference, and the ring occupancy measured and removed so the residual spread is reported rather than assumed (§9.5)**; **parity test green at release flags** |
+| **M1** | `libnamchain` core: **RT primitives, arena, command ring, epoch reclamation ✔**; **graph IR + validation + compiler + liveness/colour memory plan + `RenderPlan` execution ✔**; **rig JSON loader + `chain_graph` ✔**; **reference interpreter as the compiler's oracle ✔**; **built-in nodes `nc.input/output/gain/split/mix/nam/cab.ir/eq.biquad/delay/unit_delay` ✔**; static DAG render with block-delay feedback ✔; **`alsa_raw` backend ✔ — raw ioctls, full-duplex, xrun counting, verified on the PCM2902 and the SSL 2+ Mk II (§9.5)**; **`AudioBackend` interface with `null` and `file` implemented and `pipewire` refused by name ✔ (§9.1) — the stream loop is now written once and runs against a device, a paced clock or a WAV, so `ctest -R soak_cli` exercises the timers, the gates and the oracle with no hardware**; **memory locking made safe and the block timer sized from the run — `MCL_FUTURE` plus a fixed 44 MB timer reserve aborted the `null` backend with `std::bad_alloc` under a finite `RLIMIT_MEMLOCK`, and `soak_cli` now reproduces that limit ✔ (§14.10)**; **multichannel WAV reader ✔**; daemon skeleton; N-way `split`/`mix` arity; **A2 planar kernels live on AArch64 with the bit-identity parity gate in CI (§4.2, §7.8)**; **`namchain-soak` acceptance harness — block percentiles, xrun counters, offline and in-process oracle (§10.5.1)**; **the device soak runs a compiled `RenderPlan`, not a private loop ✔**; **the loop's cadence and its output-queue policy — `sw_params` now sets `avail_min` to the period so `poll` wakes on the boundary the loop consumes at, and the one-period prime plus the resulting occupancy ratchet are diagnosed in §9.5 items 2 and 4**; **the output queue became a knob — `--output-queue-periods` caps the queue, `prefill_output_queue` establishes it before block 0, the xruns are split into capture overruns and playback underruns, and the hour at `--periods 6 --output-queue-periods 4` reports 8 playback underruns against 92 for the 4-period ring, measured in §9.5 item 8 ✔** | Plays a guitar through 2 chains at 64 samples — **met on the SSL 2+ Mk II: 2 parallel A2-Lite chains, p99 53.7 µs = 4.0 % of the 1.333 ms deadline, 0 xruns, 0 allocations (§11)**; **device-mode self-oracle ✔ — the run records the input it consumed and compares its output against a freshly compiled offline render of it, `max|diff| = 0` over 2 880 000 frames (§10.5.1)**; **1 h soak vs §1 criterion 3 — re-run on the RT host 2026-09-16, *five of six clauses met*: driver xruns 0 (was 8), 0 render-path allocations, p99 39.4 % against the ≤ 50 % gate, no throttle flag, oracle `max|diff| = 0`; the clause still failing is `max block < deadline` — 15 and 109 late blocks in two consecutive hours, maxima 1.78 and 3.18 ms, `cpu == wall` in every arm so the residue is work and not lateness, and the work is memory-stall shaped (§9.3, §11, `bench-results/rt-piv-summary.txt`)**; allocation interposer clean; **true round-trip latency measured ✔ — `namchain-latency` over both a physical loopback cable and the device's internal digital loopback, giving the converter round trip as an exact 0.333 ms difference, and the ring occupancy measured and removed so the residual spread is reported rather than assumed (§9.5)**; **parity test green at release flags** |
 | **M2** | Graph compiler + memory planner + patch protocol; transition ops (param ramp, bypass fade, dual-render rewire); `namchain-render` edit timeline; **glitch detector** | Torture render passes all 4 metrics at all quanta/rates for non-NAM nodes; RTSan clean in CI |
 | **M3** | `nc.nam` + `nc.cab.ir`: registry, loader, capability probe, instance tokens, input rings, **warm-start replay**, warming policy engine, deferred commits; telemetry (`rtf`, `warm_through`, `estimated_switch_ms`) | **Flag demo:** A/B/C model switching with zero click and exact state continuity (< −60 dBFS), p99 ready ≤ 5 ms, 16 resident models; `maxmodels` vs `instant` modes measured |
 | **M4** | Optional parallel rendering; governor/degradation ladder; slimming governor; watchdog + flight recorder | Soak 8 h with edit storms, 0 xruns, degradation ladder exercised; parallel mode passes every test or stays off |
@@ -1940,11 +1999,25 @@ saturated ring: the same engine work reported as 112 % and 23 xruns/hour); §9.5
 and found the shape of the trade -- the ring size is the cushion and is free, the cap is the latency
 and must sit at or above the level the queue reaches by itself -- with `--periods 6
 --output-queue-periods 4` as the measured recommendation (8 playback underruns and 0 capture overruns
-in an hour, queue held at 3.59 periods = 4.8 ms, against 92 xruns for the 4-period ring); and **whether
+in an hour, queue held at 3.59 periods = 4.8 ms, against 92 xruns for the 4-period ring). **Updated
+2026-09-16:** on the RT host the queue's natural band is tighter (p1 2.72 / p50 2.94 periods) and
+`cap 3` does not manufacture drops -- it settles the queue lower instead (p1 1.67 / p50 1.94) and held
+0 xruns and 0 late blocks for 15 min, so **`--output-queue-periods 3` is now the recommended cap,
+worth 1.33 ms of latency**, and wants an hour to confirm; the ring stays 6. And **whether
 a queue floor controller should insert a period of silence when the occupancy falls too low**, which is
 the only mechanism that can hold a floor the loop cannot produce audio for, and which wants the
-occupancy-distribution instrument first; and **whether `--cpu` defaults to pinning at all**, or
+occupancy-distribution instrument first; a floor of 2 never fired once in 3 h 10 min of RT soak time,
+so the default stays off until a configuration is found that needs it; and **whether `--cpu` defaults to
+pinning at all**, or
 stays off until `namchain-doctor` can pick a core and report the IRQ mask it shares it with.
+**Resolved 2026-09-16 for the reference host:** pin, and pick the core by measurement. A balanced
+A B B A screen (cpu 3, tickless and IRQ-free, against cpu 2, co-located with the prio-85 audio IRQ
+thread) found no material difference -- clean arms at p99 533 vs 505 µs and max 1201 vs 1172 µs, one
+sample each -- so `--cpu` defaults to pinning and the *specific* core does not matter, provided it is
+one of the isolated ones. A prediction was wrong here and the arm says so: cpu 2 was expected to
+re-arm the 1000 Hz tick (a second runnable task on a `nohz_full` core), and measured 2.0 timer
+interrupts/s against cpu 3's 0. `namchain-doctor` should still check the IRQ mask, because the same
+question on a board with fewer cores or without `nohz_full` has a different answer.
 
 ---
 

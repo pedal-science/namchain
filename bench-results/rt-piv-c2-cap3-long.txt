@@ -1,0 +1,88 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 384 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            4 x build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/48, playback min/max 88/136 (last 131) frames
+                  playback queue 1.38..2.12 periods (last 2.05); the floor is the stall the device
+                  absorbs without starving: 1.38 periods = 1.833 ms
+                  p1 1.77, p50 1.94 periods; 0 of 675000 blocks held less than one
+                  period (0.00 %), which is the window a stall has to miss
+queue target:     3 periods = 4.000 ms: a cap on the ring's contents, so a burst
+                  cannot buy latency beyond it. Not a promise of cushion -- the
+                  floor held above is the number to read
+queue control:    0 output drops (not gated: each refusal is the target's trade), 0 capture bursts
+                  0 of those drops were the queue target refusing a period that
+                  would have raised the ring past 3 periods; 0 were the ring itself
+                  being full
+queue prefill:    8 frames of silence written before block 0 to bring the ring
+                  to its target (0.167 ms of output latency, paid once)
+occupancy check:  2022113 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           675000
+audio:            900.000 s in 899.929 s wall (RTF 0.9999)
+deadline:         1333333 ns
+split (p50):      read 3611 ns, chain 306408 ns, write 15352 ns
+split (tail):     read p99 4741 max 27777, chain p99 450779 max 864261, write p99 16574 max 34704 ns
+chain p99:        450779 ns (33.81% of deadline)
+device wait:      p50 1163650 ns, p99 1184577 ns, max 1467762 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 865352 ns, wall max 864261 ns
+                  211.97 s of CPU over 211.91 s of wall in the render path (100.0%), 0 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 539985 cpu 865352 ns (wall 864261 ns), block 333653 cpu 860685 ns (wall 860427 ns), block 179895 cpu 854130 ns (wall 854446 ns), block 359940 cpu 848241 ns (wall 849002 ns), block 404956 cpu 845426 ns (wall 845391 ns)
+cpu spike bursts: 188 blocks over half a period of CPU, in 155 runs; runs start every 3..37613 blocks (0.0..50.2 s at 48 k/64)
+                  run at block 0..0 (1 long), worst 726871 ns of CPU
+                  run at block 14757..14757 (1 long), worst 673518 ns of CPU
+                  run at block 30649..30649 (1 long), worst 702722 ns of CPU
+                  run at block 44866..44866 (1 long), worst 777796 ns of CPU
+                  run at block 75602..75602 (1 long), worst 689445 ns of CPU
+                  run at block 75690..75690 (1 long), worst 684778 ns of CPU
+                  run at block 75951..75951 (1 long), worst 816944 ns of CPU
+                  run at block 75956..75956 (1 long), worst 680315 ns of CPU
+block time:       p50 325574 ns, p99 468927 ns, max 892687 ns
+p99/deadline:     35.17% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+deadline overruns:0
+driver xruns:     0
+  by direction:   0 capture overruns, 0 playback underruns
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           PASS
+=== host state ===
+period           2026-09-16T07:11:01+01:00 -> 2026-09-16T07:26:03+01:00 (902s)
+kernel_release   7.0.0-1017-raspi-realtime
+uname_says_rt    true
+cmdline          reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10 isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew_tick=1
+isolated_cpus    2-3
+nohz_full_cpus   2-3
+governor         performance
+scaling_max_khz  2400000
+scaling_cur_khz  2400000
+temp_mC          40800
+throttled        0x0
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   xhci-hcd:usb2
+audio_irq_number 139
+audio_irq_affinity 2
+audio_irq_thread_prio 85
+
+=== interrupt deltas per CPU (902s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer            969762    593918      1762         0
+IPI0_resched          937298   1038462         2    675019
+IPI5_irqwork            1239      1101      1759         6
+audio_IRQ                  0         0   1799785         0
+IPI1_fncall             2068      3772       405       405
+
+=== verdict ===
+ok:   cpu 2 took 1762 arch_timer interrupts in 902s (2.0/s) -- tickless.
+ok:   cpu 3 took 0 arch_timer interrupts in 902s (0.0/s) -- tickless.
+ok:   the audio IRQ (139) was delivered 1799785 times to reserved cpu 2,
+      at 1995.3/s -- the interface's data path is landing
+      where it was pinned rather than being accepted and ignored.
+ok:   isolated=2-3 nohz_full=2-3
