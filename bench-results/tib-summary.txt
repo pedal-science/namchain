@@ -88,42 +88,61 @@ B1's arithmetic holds in the loop: three A2-Lite at 9.56% of the deadline each p
 and the loop measures 29.68%. What is left to test on tib was the device, and tib cannot test it.
 
 
-5. WHY THE DEVICE ARMS COULD NOT RUN — AND IT IS NOT THE ENGINE
----------------------------------------------------------------
-tib has two USB host controllers, and **all four USB-A sockets are on the wrong one**:
+5. THE DEVICE PATH: IT FAILS ON A BARE PORT AND WORKS THROUGH A POWERED HUB
+----------------------------------------------------------------------------
+**This section replaces an earlier conclusion that was wrong, and the correction matters more
+than the original claim did.** The first device arms failed badly, and the account below is
+what is actually true.
+
+tib has two USB host controllers, and **all four USB-A sockets are on the hub**:
 
   Bus 001  dwc2 -> on-board Genesys 4-port hub -> **all four USB-A sockets**
   Bus 002  dwc2 OTG   (the micro-USB; a device port, running usb-gadget.target)
   Bus 003  ehci-platform, one port, occupied by an internal Realtek USB audio
 
-Verified socket by socket: the SSL reports bus 1 in every one of the four. The EHCI controller
-that does work is not exposed as a socket.
+Verified socket by socket with tools/soak/tib-which-port.sh: the SSL reports bus 1 in every one
+of the four. The EHCI controller is not exposed as a socket, which is why moving the interface
+between sockets changed nothing.
 
-Pure passthrough — no model, no DSP in the path — on the SSL through dwc2 + the hub:
+On a bare socket the device path fails, and pure passthrough (no model, no DSP) shows it is not
+the engine:
 
-  q64,  60 s: 739 underruns, RTF 1.0165, queue p50 0.62 periods, drains to 0
-  q256, 60 s: 180 underruns, RTF 1.0162
-  Realtek on EHCI, q32, 60 s: 0 underruns, RTF 1.0000, queue steady at 0.25, PASS
+  SSL, bare socket,  q64,  60 s: 739 underruns, RTF 1.0165, queue p50 0.62, drains to 0
+  SSL, bare socket,  q256, 60 s: 180 underruns, RTF 1.0162
+  Realtek on EHCI,   q32,  60 s:   0 underruns, RTF 1.0000, queue steady at 0.25, PASS
 
-The engine is exonerated: in passthrough the block is **24 us p50 / 41 us p99**, 3% of the
-period, and across the whole 300 s DSP arm there was one block over half a period of CPU. The
-arithmetic identifies the mechanism exactly — **the run slips by precisely one period per
-underrun** (739 x 1.333 ms = the 1.65% slip), so the underruns are the entire loss rather than a
-symptom of falling behind.
+In passthrough the block costs **24 us p50 / 41 us p99**, 3% of the period, and across the whole
+300 s DSP arm one single block exceeded half a period of CPU. The run slipped by **exactly one
+period per underrun** (739 x 1.333 ms = the 1.65% slip), so the underruns were the entire loss.
 
-The pacing number names the cause:
+**Putting the SSL behind a powered hub fixes it completely.**
 
-  SSL on dwc2:     device wait p50 1 471 463 ns against a 1 333 333 ns period — **the wait is
-                   longer than the period**, so the loop cannot pace itself off this device;
-                   the ring drains to 0.00 and oscillates to completely full (536 blocks wrote
-                   into a full playback ring).
-  Realtek on EHCI: device wait p50 3 974 844 ns against 4 000 000 ns — 99.4% of the period —
-                   and it holds exactly 0.25 periods of queue for the whole run at RTF 1.0000.
+  SSL via powered hub, q64, 60 s, passthrough: **0 underruns, RTF 0.9999, PASS**
+  SSL via powered hub, q64, 300 s, 3 x A2-Lite, ring 6, cap 3:
+     0 driver xruns, 0 deadline overruns, block p50 380 336 ns / p99 429 629 ns (32.22% of
+     deadline) / **max 713 131 ns**, chain p99 402 212 ns, queue p1 1.77 / p50 1.94 periods with
+     0 blocks below one period, write max 48 417 ns, RTF 0.9999, oracle max|diff| 0 over
+     240 000 frames, 0 allocations. **PASS.**
 
-99.4% of a period is fine. 110% cannot be. So tib cannot host this interface for a device
-measurement, and the device-path question on ARMv7 needs a board whose USB sockets are on a
-real host controller directly rather than behind an on-board hub.
+THE CORRECTION. The earlier write-up blamed dwc2's host-mode isochronous scheduling, on the
+evidence that `device wait` p50 was 1 471 463 ns against a 1 333 333 ns period -- "the wait is
+longer than the period, so the loop cannot pace itself off this device". That inference was
+wrong, and the powered-hub measurement is what falsifies it: **`device wait` is still 1 474 000 ns
+and the run now passes.** The wait being close to (or above) the period is a property of a
+capture-paced loop, not a fault. What actually differed was the *rate*: on a marginal link the
+SSL's implicit-feedback rate estimate is corrupted, so the host sends playback data at a slightly
+wrong average rate (~1.6% slow), the ring drains, and it underruns regularly -- one period each,
+which is exactly the regular signature observed. A stable link gives an accurate feedback estimate
+and RTF 0.9999.
 
+So the correct conclusion is: **tib can host this interface, but not on a bare socket** -- the
+board's rail and/or signal integrity through its own hub is marginal for this device, and a
+powered hub is required. That is consistent with the two electrical symptoms seen earlier, the
+board going down on first contact and the hub's ganged switch latching off afterwards.
+
+The generality lesson is worth stating plainly: a failure that looks like a controller or driver
+limitation was a *power and signal* problem, and the instrument that settled it was not a deeper
+analysis of the pacing numbers but a change of hardware followed by the same 60 s measurement.
 
 6. TWO HARDWARE FACTS ABOUT tib WORTH KEEPING
 ---------------------------------------------

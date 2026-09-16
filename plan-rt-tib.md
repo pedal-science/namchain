@@ -111,15 +111,18 @@ The on-board codec *can*, with an excellent period floor, but:
 - it is 2 channels where piv was 8 capture / 6 playback, so the per-block I/O cost differs.
 - `snd-aloop` and `snd-dummy` **load fine** (verified) and remain the no-hardware fallback.
 
-**Resolved 2026-09-16: it does not matter, because tib's sockets are all on the hub.** The SSL was
-connected and reports **bus 1 in every one of the four USB-A sockets** (verified socket by socket with
-`tools/soak/tib-which-port.sh`). The EHCI controller that *does* hold its ring is not exposed as a
-socket -- its single port carries an internal Realtek USB audio. Pure passthrough on the SSL through
-dwc2 + the hub underruns continuously (739 in 60 s at q64, one period lost per underrun, `device wait`
-1.471 ms against a 1.333 ms period), while the Realtek on EHCI is clean (0 underruns, RTF 1.0000,
-`device wait` 99.4% of its period). So the device arms cannot run on tib, for a reason about the
-board's USB topology rather than about the engine, and the ARMv7 device question needs a board whose
-sockets are on a host controller directly. Full account: `bench-results/tib-summary.txt` section 5.
+**Resolved 2026-09-16: the SSL works on tib, through a powered hub.** All four USB-A sockets are
+downstream of the on-board Genesys hub (bus 1, dwc2) -- verified socket by socket with
+`tools/soak/tib-which-port.sh`, and the EHCI controller that also holds its ring is not exposed as a
+socket. On a **bare** socket the device path fails: pure passthrough (no DSP) underruns 739 times in
+60 s at q64, losing exactly one period each, and RTF slips 1.65%. Behind a **powered hub** the same
+passthrough is clean (0 underruns, RTF 0.9999) and so is the real arm: 3 x A2-Lite, q64, cap 3,
+300 s gives 0 driver xruns, 0 deadline overruns, block max 713 131 ns against a 1 333 333 ns
+deadline, queue p50 1.94 periods, oracle exact. **The device arms run here; the hub is part of the
+rig, not an option.** An earlier version of this section blamed dwc2's isochronous scheduling and was
+wrong: `device wait` is still above the period (1.474 ms) in the passing run, so it was a symptom of
+a corrupted implicit-feedback rate estimate on a marginal link, not the cause. See
+`bench-results/tib-summary.txt` section 5.
 
 **Decision needed from the user: is the SSL 2+ to be moved to tib?** With it, tib becomes a
 like-for-like device comparison against piv and the *only* variable is the CPU/kernel. Without it,
