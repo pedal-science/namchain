@@ -213,6 +213,10 @@ switching genuinely seamless via state-accurate warm starts rather than crossfad
    second-difference bound.
 3. **Throughput and real-time integrity (Pi 5, bare metal, 48 kHz, 64-sample quantum).** ≥ 4 concurrent
    A2-Full (8-channel) **or** ≥ 12 concurrent A2-Lite (3-channel) audible NAM models, with **all** of:
+   *(the model count is a property of the reference host, not of the engine: on ARMv7 the same clause
+   is read as **one A2-Full within 90 % of one core**, which is what that class of CPU can carry —
+   measured on tib 2026-09-16, 1 × A2-Full at q64 uses 58.5 % of a core at p99 with 0 xruns over a
+   full hour; see §9.4 and §11)*
    p99 block time ≤ 50 % of the 1.33 ms deadline; max block time < the deadline; **zero driver-reported
    xruns over 1 h** — `-EPIPE` or `SNDRV_PCM_STATE_XRUN`, counted, never silently recovered from;
    no thermal throttle flags raised; and the captured output **sample-identical** to the deterministic
