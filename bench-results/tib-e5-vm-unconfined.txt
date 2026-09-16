@@ -1,0 +1,70 @@
+backend:          null
+device:           null -> null
+period/buffer:    64 / 256 frames
+sample format:    F32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            3 x models/A2-Lite.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarNano
+plan:             single model chain, 5 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           135000
+audio:            180.000 s in 179.999 s wall (RTF 1.0000)
+deadline:         1333333 ns
+split (p50):      read 875 ns, chain 472794 ns, write 4666 ns
+split (tail):     read p99 3209 max 157793, chain p99 1721718 max 1995302, write p99 32667 max 721588 ns
+chain p99:        1721718 ns (129.13% of deadline)
+device wait:      p50 849338 ns, p99 976505 ns, max 995755 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 1835458 ns, wall max 1995302 ns
+                  78.51 s of CPU over 78.74 s of wall in the render path (99.7%), 0 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 59461 cpu 1835458 ns (wall 1951552 ns), block 97885 cpu 1835167 ns (wall 1995302 ns), block 61118 cpu 1829625 ns (wall 1901093 ns), block 97969 cpu 1817666 ns (wall 1979844 ns), block 97909 cpu 1813875 ns (wall 1975177 ns)
+cpu spike bursts: 4096 blocks over half a period of CPU (capped: there were more), in 219 runs; runs start every 3..9316 blocks (0.0..12.4 s at 48 k/64)
+                  run at block 718..719 (2 long), worst 721875 ns of CPU
+                  run at block 737..737 (1 long), worst 798584 ns of CPU
+                  run at block 1115..1115 (1 long), worst 667917 ns of CPU
+                  run at block 1338..1340 (3 long), worst 769417 ns of CPU
+                  run at block 1343..1343 (1 long), worst 674041 ns of CPU
+                  run at block 1358..1358 (1 long), worst 686875 ns of CPU
+                  run at block 1723..1723 (1 long), worst 673750 ns of CPU
+                  run at block 1891..1891 (1 long), worst 670834 ns of CPU
+block time:       p50 478627 ns, p99 1759343 ns, max 2169137 ns
+p99/deadline:     131.95% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+first overrun at: block 2259 of 135000
+deadline overruns:12722
+driver xruns:     0 (this backend has no driver to report)
+oracle:           match vs offline render of the captured input, first 60.000000 s
+  max|diff|:      0 over 2880000 frames
+result:           FAIL
+=== host state ===
+period           2026-09-16T17:28:11+01:00 -> 2026-09-16T17:31:34+01:00 (203s)
+kernel_release   7.2.6
+uname_says_rt    true
+cmdline          earlyprintk root=UUID=e04f90b4-4c61-41cf-80bd-03df2cb494d6 rootwait rootfstype=ext4 splash=verbose console=ttyS2,115200n8 console=tty1 consoleblank=0 loglevel=1 ubootpart=4c19c430-01 usb-storage.quirks=0x2537:0x1066:u,0x2537:0x1068:u rtpi.slot=known-good coherent_pool=2M  cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory
+isolated_cpus    <absent>
+nohz_full_cpus   <absent>
+governor         performance
+scaling_max_khz  1416000
+scaling_cur_khz  1416000
+temp_mC          63750
+throttled        no-vcgencmd
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   xhci-hcd:usb2
+audio_irq_number <absent>
+audio_irq_affinity <absent>
+audio_irq_thread_prio <absent>
+
+=== interrupt deltas per CPU (203s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer            197236    203423     84539    334565
+IPI0_resched               0         0         0         0
+IPI5_irqwork           20618      8638       219        42
+audio_IRQ          (line not found)
+IPI1_fncall                0         0         0         0
+
+=== verdict ===
+ok:   no CPUs are isolated, and that is this host's expected configuration.
+      No reservation is being claimed; the RT kernel's scheduler is the only
+      protection on this arm, so say that when quoting it.

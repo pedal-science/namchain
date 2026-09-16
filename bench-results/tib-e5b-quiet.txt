@@ -1,0 +1,70 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 256 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            3 x models/A2-Lite.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarNano
+ring occupancy:   capture min/max 0/145, playback min/max 0/255 (last 56) frames (769 blocks wrote into a full playback ring)
+                  playback queue 0.00..3.98 periods (last 0.88); the floor is the stall the device
+                  absorbs without starving: 0.00 periods = 0.000 ms
+                  p1 0.00, p50 0.62 periods; 105506 of 135000 blocks held less than one
+                  period (78.15 %), which is the window a stall has to miss
+queue target:     none: the loop writes whenever the kernel has room, so how much audio
+                  is queued -- and so the stall it can absorb -- is whatever the run holds
+queue control:    1 output drops (gate <= 0), 2 capture bursts
+occupancy check:  270745 samples where delay disagreed with the pointer pair
+plan:             single model chain, 5 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           135000
+audio:            180.000 s in 183.136 s wall (RTF 1.0174)
+deadline:         1333333 ns
+split (p50):      read 6708 ns, chain 355547 ns, write 16917 ns
+split (tail):     read p99 8167 max 26250, chain p99 401924 max 576637, write p99 39376 max 3117969 ns
+chain p99:        401924 ns (30.14% of deadline)
+device wait:      p50 1111852 ns, p99 1139270 ns, max 1642115 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 575166 ns, wall max 576637 ns
+                  48.44 s of CPU over 48.44 s of wall in the render path (100.0%), 0 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 0 cpu 575166 ns (wall 576637 ns), block 114414 cpu 509250 ns (wall 509842 ns), block 119243 cpu 497875 ns (wall 498174 ns), block 114413 cpu 491750 ns (wall 491758 ns), block 114495 cpu 482125 ns (wall 481258 ns)
+block time:       p50 379756 ns, p99 430507 ns, max 3577644 ns
+p99/deadline:     32.29% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+bring-up xruns:   1 (before the measured loop)
+first overrun at: block 73703 of 135000
+deadline overruns:2
+driver xruns:     2341
+  by direction:   0 capture overruns, 2341 playback underruns
+result:           FAIL
+=== host state ===
+period           2026-09-16T17:36:08+01:00 -> 2026-09-16T17:39:12+01:00 (184s)
+kernel_release   7.2.6
+uname_says_rt    true
+cmdline          earlyprintk root=UUID=e04f90b4-4c61-41cf-80bd-03df2cb494d6 rootwait rootfstype=ext4 splash=verbose console=ttyS2,115200n8 console=tty1 consoleblank=0 loglevel=1 ubootpart=4c19c430-01 usb-storage.quirks=0x2537:0x1066:u,0x2537:0x1068:u rtpi.slot=known-good coherent_pool=2M  cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory
+isolated_cpus    <absent>
+nohz_full_cpus   <absent>
+governor         performance
+scaling_max_khz  1416000
+scaling_cur_khz  1416000
+temp_mC          56818
+throttled        no-vcgencmd
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   xhci-hcd:usb2
+audio_irq_number <absent>
+audio_irq_affinity <absent>
+audio_irq_thread_prio <absent>
+
+=== interrupt deltas per CPU (184s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer             56220    184753     12363    175037
+IPI0_resched               0         0         0         0
+IPI5_irqwork           19834       863         9        63
+audio_IRQ          (line not found)
+IPI1_fncall                0         0         0         0
+
+=== verdict ===
+ok:   no CPUs are isolated, and that is this host's expected configuration.
+      No reservation is being claimed; the RT kernel's scheduler is the only
+      protection on this arm, so say that when quoting it.

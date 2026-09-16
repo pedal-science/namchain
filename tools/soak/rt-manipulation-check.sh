@@ -56,11 +56,24 @@
 set -u
 
 # The audio controller's interrupt, by name. Overridable because it is a property of which
-# USB port the interface is on, not of this script.
-# The audio controller's interrupt, by name. Overridable because it is a property of which
 # USB port the interface is on, and it differs per board: piv's SSL 2+ is on xhci-hcd:usb2,
-# tib's USB is a different controller entirely.
-AUDIO_IRQ_NAME="${AUDIO_IRQ_NAME:-xhci-hcd:usb2}"
+# tib's SSL 2+ is on ehci_hcd:usb3 (EHCI, not xHCI), and tib's Realtek is on dwc2.
+# Set AUDIO_IRQ_NAME to override. Left unset, the first of the candidates below that is
+# actually present in /proc/interrupts wins, and if none is, the snapshot records that fact
+# instead of silently reporting "(line not found)" for the one interrupt that matters.
+AUDIO_IRQ_CANDIDATES="${AUDIO_IRQ_CANDIDATES:-${AUDIO_IRQ_NAME:-xhci-hcd:usb2 ehci_hcd:usb3 ehci_hcd:usb1 dwc2_hsotg:usb1 dwc2_hsotg:usb2}}"
+
+resolve_audio_irq_name() {
+  local n
+  for n in $AUDIO_IRQ_CANDIDATES; do
+    if awk -v name="$n" '$NF == name { found = 1 } END { exit !found }' /proc/interrupts; then
+      printf '%s' "$n"
+      return 0
+    fi
+  done
+  printf '%s' "${AUDIO_IRQ_CANDIDATES%% *}"
+}
+AUDIO_IRQ_NAME="$(resolve_audio_irq_name)"
 
 die() { echo "rt-manipulation-check: $*" >&2; exit 2; }
 

@@ -1,0 +1,153 @@
+namchain on tib (ARMv7) — what this board answered, and what it cannot
+=====================================================================
+
+2026-09-16. Host: Tinker Board S (RK3288, Cortex-A17, armv7l, 4 cores, 2 GB).
+Kernel: **7.2.6 #1 SMP PREEMPT_RT** (mainline build), `NO_HZ_IDLE` only — no `isolcpus`, no
+`nohz_full`, deliberately: a 4-core board with a full userspace has no cores to spare.
+Governor `performance`, capped 1416 MHz (the board cannot hold its top bin; the rtpi suite
+once drove it to the 90 C critical trip). Temperature 46-52 C throughout, never near a trip.
+Built from piv at commit 82356e3 — tib has no compiler — and the tests were run natively on
+the board. Arms in bench-results/tib-*, plan in plan-rt-tib.md.
+
+
+1. THE ANSWER TO THE QUESTION THIS BOARD EXISTS FOR
+---------------------------------------------------
+Section 9.4 predicted, since M0: *"FMA-less NEON halves FLOPs/cycle, so A2-Full counts will be
+much lower there — the engine should prefer A2-Lite and aggressive slimming on that target."*
+
+Measured, the count is not lower. **It is zero. A2-Full is not real-time on this CPU.**
+
+  A2-Full   q    shipped (-mfpu=vfpv3-d16)        NEON (-mfpu=neon-vfpv4)
+              p50      p99     RTF   %dl          p50      p99     RTF   %dl
+          32   911.8    950.8  1.3717 142.63       355.3    395.2  0.5356  59.28
+          64  1764.9   1819.7  1.3251 136.48       690.1    733.5  0.5199  55.02
+         128  3410.2   3478.4  1.2805 130.44      1362.4   1429.2  0.5132  53.59
+         256  6737.2   6910.8  1.2659 129.58      2722.7   2819.6  0.5120  52.87
+
+  A2-Lite   q    shipped                             NEON
+          32    88.4     98.3  0.1336  14.74        58.6     72.0  0.0897  10.81
+          64   165.1    175.6  0.1249  13.17       110.2    127.5  0.0842   9.56
+         128   318.8    344.5  0.1206  12.92       213.2    237.4  0.0810   8.90
+         256   635.0    651.0  0.1187  12.21       420.3    454.1  0.0788   8.51
+
+  (%dl = p99 as a percentage of the period; the soak's gate is 50%.)
+
+  instances that fit the 50% gate at q64:   A2-Full shipped 0, NEON 0 (one is 55%)
+                                            A2-Lite shipped 3, NEON 5
+
+One A2-Full instance costs more CPU than the audio it produces, in both builds. **Criterion
+3's ">= 4 concurrent A2-Full at q64" is therefore unreachable on ARMv7**, and it should be
+recorded that way rather than attempted: the throughput clause of criterion 3 is a statement
+about an A76-class CPU (on piv the same model is RTF 0.0501, 26x faster than tib's shipped
+build and 10x faster than its NEON one).
+
+
+2. THE SHIPPED ARMv7 BUILD LEAVES THE NEON UNIT UNUSED
+------------------------------------------------------
+`-mfpu=vfpv3-d16` is the Debian armhf ABI baseline, and it has no NEON, so the compiler emits
+no vector code at all on a CPU that has a NEON unit: **1256** NEON-family instructions in the
+shipped binary against **10614** with `-mfpu=neon-vfpv4`, same source, same commit.
+
+Enabling it is worth **2.55x on A2-Full and 1.48x on A2-Lite** at q64. The A2-Lite figure
+lands on the 1.42-1.55x section 9.4 predicted for PR #313's ARMv7 arm, so that prediction was
+sound and the packaging decision deferred to M6 now has a measured price.
+
+It also enables the **planar** kernels, because `a2_planar.h` selects its ARMv7 arm on
+`__arm__ && __ARM_NEON && __ARM_FEATURE_FMA` — while `CMakeLists.txt` gates
+`NAMCHAIN_A2_PLANAR_ACTIVE` on `aarch64|arm64|armv8`. So an armv7 NEON build prints **"A2
+planar NEON: OFF" at configure time while actually running the planar kernels**. The parity
+test keys off the header macro rather than the CMake variable, so it is not skipped — but the
+configure summary is wrong, and CI reading it would conclude the opposite of the truth.
+
+
+3. THE ARMv7 FAST PATH IS BIT-IDENTICAL ON THE SILICON
+------------------------------------------------------
+That correctness question matters because section 9.4 says ARMv7 bit-identity "rests on
+FPSCR.FZ being set (AArch32 NEON is unconditionally flush-to-zero, scalar VFP is not)" — a
+hardware behaviour an emulator need not model.
+
+  shipped build (no planar):   132 cases / 230 708 assertions, 0 failed
+  NEON build under qemu:       133 cases / 230 854 assertions, 0 failed
+  NEON build ON TIB:           133 cases / 230 854 assertions, 0 failed
+
+The extra case is the planar bit-identity gate, and it passes on the Cortex-A17 itself. Getting
+there took two rounds of failures (13, then 5) that were *all* fixtures missing from paths
+baked in at compile time, never a numerical difference — recorded because a suite moved to
+another machine without its fixtures fails exactly like a regression.
+
+
+4. THE ENGINE LOOP IS SOUND ON ARMv7
+------------------------------------
+`namchain-soak --backend null`, 3 x A2-Lite, q64, 300 s, SCHED_FIFO 80 pinned to one core,
+RT kernel with no isolation:
+
+  block p50 351 462 ns   p99 395 796 ns (29.68% of deadline)   max 627 966 ns
+  deadline overruns 0    allocations 0    oracle max|diff| 0 over 60 s    PASS
+
+B1's arithmetic holds in the loop: three A2-Lite at 9.56% of the deadline each predicts 28.7%,
+and the loop measures 29.68%. What is left to test on tib was the device, and tib cannot test it.
+
+
+5. WHY THE DEVICE ARMS COULD NOT RUN — AND IT IS NOT THE ENGINE
+---------------------------------------------------------------
+tib has two USB host controllers, and **all four USB-A sockets are on the wrong one**:
+
+  Bus 001  dwc2 -> on-board Genesys 4-port hub -> **all four USB-A sockets**
+  Bus 002  dwc2 OTG   (the micro-USB; a device port, running usb-gadget.target)
+  Bus 003  ehci-platform, one port, occupied by an internal Realtek USB audio
+
+Verified socket by socket: the SSL reports bus 1 in every one of the four. The EHCI controller
+that does work is not exposed as a socket.
+
+Pure passthrough — no model, no DSP in the path — on the SSL through dwc2 + the hub:
+
+  q64,  60 s: 739 underruns, RTF 1.0165, queue p50 0.62 periods, drains to 0
+  q256, 60 s: 180 underruns, RTF 1.0162
+  Realtek on EHCI, q32, 60 s: 0 underruns, RTF 1.0000, queue steady at 0.25, PASS
+
+The engine is exonerated: in passthrough the block is **24 us p50 / 41 us p99**, 3% of the
+period, and across the whole 300 s DSP arm there was one block over half a period of CPU. The
+arithmetic identifies the mechanism exactly — **the run slips by precisely one period per
+underrun** (739 x 1.333 ms = the 1.65% slip), so the underruns are the entire loss rather than a
+symptom of falling behind.
+
+The pacing number names the cause:
+
+  SSL on dwc2:     device wait p50 1 471 463 ns against a 1 333 333 ns period — **the wait is
+                   longer than the period**, so the loop cannot pace itself off this device;
+                   the ring drains to 0.00 and oscillates to completely full (536 blocks wrote
+                   into a full playback ring).
+  Realtek on EHCI: device wait p50 3 974 844 ns against 4 000 000 ns — 99.4% of the period —
+                   and it holds exactly 0.25 periods of queue for the whole run at RTF 1.0000.
+
+99.4% of a period is fine. 110% cannot be. So tib cannot host this interface for a device
+measurement, and the device-path question on ARMv7 needs a board whose USB sockets are on a
+real host controller directly rather than behind an on-board hub.
+
+
+6. TWO HARDWARE FACTS ABOUT tib WORTH KEEPING
+---------------------------------------------
+- **The USB-A sockets will latch off, and a reboot does not clear it.** The on-board hub's
+  descriptor is `wHubCharacteristic 0x0008` — ganged power switching with per-port over-current
+  protection — so one event on one socket takes all four, and `reboot` never removes VBUS, so
+  the hub re-probes with its switch still latched. The machine comes back with four dead ports
+  and *no error anywhere*: a port with no VBUS never powers the device, so the device never
+  pulls up D+ and the host sees no attach attempt at all. A failed connection logs "device
+  descriptor read/64, error -71"; dead port power logs nothing. `USBDEVFS_RESET` on the hub
+  clears it (`sudo usbreset 05e3:0610`, or tools/soak/tib-usb-recover.sh, or
+  tools/soak/tib-which-port.sh to see which controller a device landed on). A cold power cycle
+  also clears it.
+- **The on-board codec cannot be opened full-duplex.** Either direction alone works; the pair is
+  refused with EINVAL however long the delay between the opens, and the same node twice gives
+  EBUSY — different errno, different meaning. `alsa_raw` opens both directions before
+  configuring either (for the SSL's implicit-feedback capture), so it refuses the device
+  correctly; its message now says so instead of just reporting EINVAL (src/io/alsa_raw.cpp).
+
+
+7. WHAT TIB IS STILL GOOD FOR
+-----------------------------
+Everything above is deviceless or engine-side, and all of it stands. tib remains the ARMv7
+*CPU* target — the throughput ceiling, the NEON finding, the bit-identity verification and the
+loop's behaviour under SCHED_FIFO with no isolation are exactly what section 9.4 needed. What
+it cannot be is the ARMv7 *device* target for this interface, for a reason that is about the
+board's USB topology rather than about the engine.

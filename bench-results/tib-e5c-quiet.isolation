@@ -1,0 +1,30 @@
+=== host state ===
+period           2026-09-16T17:56:14+01:00 -> 2026-09-16T17:59:18+01:00 (184s)
+kernel_release   7.2.6
+uname_says_rt    true
+cmdline          earlyprintk root=UUID=e04f90b4-4c61-41cf-80bd-03df2cb494d6 rootwait rootfstype=ext4 splash=verbose console=ttyS2,115200n8 console=tty1 consoleblank=0 loglevel=1 ubootpart=4c19c430-01 usb-storage.quirks=0x2537:0x1066:u,0x2537:0x1068:u rtpi.slot=known-good coherent_pool=2M  cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory
+isolated_cpus    <absent>
+nohz_full_cpus   <absent>
+governor         performance
+scaling_max_khz  1416000
+scaling_cur_khz  1416000
+temp_mC          57272
+throttled        no-vcgencmd
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   ehci_hcd:usb3
+audio_irq_number 54
+audio_irq_affinity 2
+audio_irq_thread_prio 50
+
+=== interrupt deltas per CPU (184s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer             64508    184194     24316    175075
+IPI0_resched               0         0         0         0
+IPI5_irqwork           19321      1311       108       157
+audio_IRQ                  0         0         0         0
+IPI1_fncall                0         0         0         0
+
+=== verdict ===
+ok:   no CPUs are isolated, and that is this host's expected configuration.
+      No reservation is being claimed; the RT kernel's scheduler is the only
+      protection on this arm, so say that when quoting it.

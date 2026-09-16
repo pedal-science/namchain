@@ -1,0 +1,200 @@
+{
+  "schema": "namchain-host-confinement-screen/1",
+  "host": "Linux piv 7.0.0-1017-raspi-realtime #17-Ubuntu SMP PREEMPT_RT Fri Aug  7 17:41:11 UTC 2026 aarch64 GNU/Linux",
+  "cmdline": "reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10 isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew_tick=1",
+  "isolated": "2-3",
+  "nohz_full": "2-3",
+  "subtree_control": "cpuset cpu io memory hugetlb pids rdma misc dmem",
+  "vcgencmd_throttled": "throttled=0x0",
+  "arms": [
+    {
+      "arm": "quiet-unconfined",
+      "load": "quiet",
+      "confined": false,
+      "duration_s": 120,
+      "returncode": 0,
+      "stderr": "WARN: open /dev/cpu_dma_latency: Permission denied",
+      "cpuset": {
+        "system.slice": "0-3",
+        "user.slice": "0-3",
+        "init.scope": "0-3"
+      },
+      "irq_total_delta": [
+        397260,
+        158236,
+        614019,
+        600059
+      ],
+      "arch_timer_delta": [
+        300473,
+        104003,
+        511751,
+        473924
+      ],
+      "threads": [
+        {
+          "cpu": 2,
+          "min": 1,
+          "avg": 2.17,
+          "max": 19,
+          "p99": 3,
+          "p999": 6,
+          "samples": 600000
+        },
+        {
+          "cpu": 3,
+          "min": 2,
+          "avg": 2.23,
+          "max": 32,
+          "p99": 4,
+          "p999": 6,
+          "samples": 599999
+        }
+      ],
+      "max_of_max": 32
+    },
+    {
+      "arm": "vm-unconfined",
+      "load": "vm",
+      "confined": false,
+      "duration_s": 120,
+      "returncode": 0,
+      "stderr": "WARN: open /dev/cpu_dma_latency: Permission denied",
+      "cpuset": {
+        "system.slice": "0-3",
+        "user.slice": "0-3",
+        "init.scope": "0-3"
+      },
+      "irq_total_delta": [
+        305774,
+        141459,
+        613601,
+        600048
+      ],
+      "arch_timer_delta": [
+        287511,
+        126802,
+        470953,
+        509458
+      ],
+      "threads": [
+        {
+          "cpu": 2,
+          "min": 1,
+          "avg": 3.77,
+          "max": 215,
+          "p99": 19,
+          "p999": 51,
+          "samples": 599999
+        },
+        {
+          "cpu": 3,
+          "min": 2,
+          "avg": 3.53,
+          "max": 147,
+          "p99": 18,
+          "p999": 38,
+          "samples": 599990
+        }
+      ],
+      "max_of_max": 215
+    },
+    {
+      "arm": "vm-confined",
+      "load": "vm",
+      "confined": true,
+      "duration_s": 120,
+      "returncode": 0,
+      "stderr": "WARN: Couldn't setaffinity in main thread: Invalid argument\nWARN: open /dev/cpu_dma_latency: Permission denied\nWARN: Could not set CPU affinity to CPU #2\nWARN: Could not set CPU affinity to CPU #3",
+      "cpuset": {
+        "system.slice": "0-1",
+        "user.slice": "0-1",
+        "init.scope": "0-3"
+      },
+      "irq_total_delta": [
+        434426,
+        1062099,
+        1846,
+        56
+      ],
+      "arch_timer_delta": [
+        414590,
+        1053244,
+        23,
+        0
+      ],
+      "threads": [
+        {
+          "cpu": 2,
+          "min": 1,
+          "avg": 2.59,
+          "max": 114,
+          "p99": 8,
+          "p999": 26,
+          "samples": 600000
+        },
+        {
+          "cpu": 3,
+          "min": 1,
+          "avg": 2.63,
+          "max": 169,
+          "p99": 8,
+          "p999": 22,
+          "samples": 599995
+        }
+      ],
+      "max_of_max": 169
+    },
+    {
+      "arm": "cpu-unconfined",
+      "load": "cpu",
+      "confined": false,
+      "duration_s": 120,
+      "returncode": 0,
+      "stderr": "WARN: open /dev/cpu_dma_latency: Permission denied",
+      "cpuset": {
+        "system.slice": "0-3",
+        "user.slice": "0-3",
+        "init.scope": "0-3"
+      },
+      "irq_total_delta": [
+        326680,
+        301394,
+        614200,
+        600056
+      ],
+      "arch_timer_delta": [
+        300985,
+        297873,
+        465860,
+        409558
+      ],
+      "threads": [
+        {
+          "cpu": 2,
+          "min": 1,
+          "avg": 2.22,
+          "max": 9,
+          "p99": 3,
+          "p999": 4,
+          "samples": 600000
+        },
+        {
+          "cpu": 3,
+          "min": 1,
+          "avg": 2.29,
+          "max": 22,
+          "p99": 3,
+          "p999": 5,
+          "samples": 599998
+        }
+      ],
+      "max_of_max": 22
+    }
+  ],
+  "after_rollback": {
+    "system.slice": "0-3",
+    "user.slice": "0-3",
+    "init.scope": "0-3"
+  }
+}
