@@ -115,3 +115,19 @@ missing from a path baked in at compile time (the vendored `example_audio/input.
 `example_models/*.nam`), not a numerical difference. A test suite moved to another machine
 without its fixtures fails in a way that looks exactly like a regression, so the fixture
 deployment is part of the harness rather than an afterthought.
+
+
+B2 — the engine loop on tib, no device
+--------------------------------------
+`namchain-soak --backend null`, 3 x A2-Lite, q64, 300 s, `--cpu 3`, SCHED_FIFO 80, NEON build,
+RT kernel with no isolation (tib has none, and EXPECT_NO_ISOLATION records that as the
+expected state rather than a failure). Evidence: tib-b2-null.*.
+
+  block    p50 351 462 ns   p99 395 796 ns (29.68% of deadline)   max 627 966 ns
+  chain    p99 392 004 ns (29.40%)
+  deadline overruns 0      allocations 0      oracle max|diff| 0 over 60 s      PASS
+
+This is the arithmetic from B1 holding up in the loop: three A2-Lite at 9.56% of the deadline
+each predicts 28.7% p99, and the loop measures 29.68% with a maximum at 47% of the deadline.
+So the engine's own cadence, timers, gates and oracle are sound on an in-order ARMv7 with no
+core isolation -- what is left to test there is the device, and that is D1/§2.
