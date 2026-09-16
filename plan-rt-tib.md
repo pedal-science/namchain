@@ -70,6 +70,29 @@ worth ~30× on the tail on this board, and the machine is a legitimate RT host.
 
 ---
 
+## 1a. tib's USB-A ports can latch off, and a reboot does not clear it
+
+Measured 2026-09-16, and it cost an hour of confusion, so it is written down here rather than
+discovered again: tib's four USB-A ports hang off **one on-board Genesys hub (05e3:0610) on bus 1**
+whose descriptor is `wHubCharacteristic 0x0008` -- **ganged power switching with per-port over-current
+protection**. One electrical event on one port therefore takes all four, and the switch latches.
+
+**A warm reboot does not clear it**, because `reboot` never removes VBUS. The board comes back with four
+dead ports and no error anywhere: `lsusb` looks unchanged, dmesg says nothing, and nothing plugged in
+enumerates -- not the device under test and not a mouse, because a port with no VBUS never powers the
+device, so the device never pulls up D+ and the host never sees an attach attempt. The diagnostic
+distinction that matters: a *failed connection* logs `device descriptor read/64, error -71`; **dead port
+power logs nothing at all**, and that is what was seen.
+
+A **device reset of the hub** (`USBDEVFS_RESET`) clears it, and so does a cold power cycle. `tools/soak/
+tib-usb-recover.sh` issues the reset and finds the hub by VID:PID rather than by bus/device number, which
+is reassigned every boot. After the reset a card reader behind an external hub enumerated at 480 Mbit/s
+and read data at 2 MB/s.
+
+**Consequence for the device arms:** the SSL 2+ Mk II is to be connected through a **powered hub**, so
+its inrush never reaches the board's rail. That is not a preference -- on a bare port it took this board
+down once and latched all four ports off.
+
 ## 2. The device situation, which decides what "criterion 3" can mean
 
 **The SSL 2+ Mk II is not attached to tib.** What tib has:
