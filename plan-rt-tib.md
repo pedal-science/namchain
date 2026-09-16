@@ -134,9 +134,12 @@ in §4 works either way, and none of it is blocked on the answer.
 ## 3. What criterion 3 means on this host
 
 > **B1 is done, and it changed the plan.** Measured 2026-09-16 (`bench-results/tib-armv7-throughput.txt`):
-> **A2-Full is not real-time on this CPU in either build** — RTF 1.3251 with the shipped
-> `-mfpu=vfpv3-d16` build and 0.5199 with `-mfpu=neon-vfpv4`. One instance costs more than the audio
-> it produces, so the "≥ 4 concurrent A2-Full" clause is not hard here, it is unreachable, and
+> RTF is CPU-seconds per audio-second. The shipped `-mfpu=vfpv3-d16` build **cannot run A2-Full at
+> all** (RTF 1.3251 — 133% of a core, and its p50 block already exceeds the deadline), while the
+> `-mfpu=neon-vfpv4` build runs **exactly one instance per core** (RTF 0.5199, p50 690 µs against a
+> 1333 µs deadline, with two costing 1380 µs even at the median). So A2-Full *is* real time on
+> ARMv7 with the planar kernels — but the "≥ 4 concurrent A2-Full" clause needs 4 × 0.52 = 2.1 cores
+> from an engine that renders single-threaded on one pinned core, so that clause is unreachable, and
 > criterion 3's throughput clause **cannot be met on ARMv7 and should be recorded as such rather than
 > attempted**. A2-Lite is the viable model: **5 instances** fit the 50 % gate at q64 with NEON
 > (RTF 0.0842, p99 9.6 % of the deadline), against 3 with the shipped build. Enabling NEON is worth

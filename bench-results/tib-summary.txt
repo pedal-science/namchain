@@ -15,7 +15,9 @@ the board. Arms in bench-results/tib-*, plan in plan-rt-tib.md.
 Section 9.4 predicted, since M0: *"FMA-less NEON halves FLOPs/cycle, so A2-Full counts will be
 much lower there — the engine should prefer A2-Lite and aggressive slimming on that target."*
 
-Measured, the count is not lower. **It is zero. A2-Full is not real-time on this CPU.**
+Measured, the count is **one per core with NEON and zero without it** -- and criterion 3 needs
+four, so the clause is unreachable by a factor of four. See the note under the tables: RTF is
+CPU-seconds per audio-second, so RTF < 1 means faster than real time.
 
   A2-Full   q    shipped (-mfpu=vfpv3-d16)        NEON (-mfpu=neon-vfpv4)
               p50      p99     RTF   %dl          p50      p99     RTF   %dl
@@ -32,14 +34,29 @@ Measured, the count is not lower. **It is zero. A2-Full is not real-time on this
 
   (%dl = p99 as a percentage of the period; the soak's gate is 50%.)
 
-  instances that fit the 50% gate at q64:   A2-Full shipped 0, NEON 0 (one is 55%)
-                                            A2-Lite shipped 3, NEON 5
+  instances that fit at q64, by the 50% p99 gate / by the deadline (100%):
+      A2-Full shipped   0 / 0        A2-Lite shipped   3 / 8
+      A2-Full NEON      0 / 1        A2-Lite NEON      5 / 11
 
-One A2-Full instance costs more CPU than the audio it produces, in both builds. **Criterion
-3's ">= 4 concurrent A2-Full at q64" is therefore unreachable on ARMv7**, and it should be
-recorded that way rather than attempted: the throughput clause of criterion 3 is a statement
-about an A76-class CPU (on piv the same model is RTF 0.0501, 26x faster than tib's shipped
-build and 10x faster than its NEON one).
+**Read RTF as CPU-seconds per audio-second, so RTF < 1 is faster than real time.** The shipped
+build cannot run A2-Full at all: RTF 1.3251 means one instance needs 133% of a core, and its p50
+block time (1764.9 us) already exceeds the 1333.3 us deadline. The NEON build runs **exactly one
+instance per core**: RTF 0.5199, p50 690.1 us, p99 733.5 us -- genuine real time, with
+2 x 690.1 = 1380 us showing that a second would not fit even at the median.
+
+Criterion 3's ">= 4 concurrent A2-Full at q64" is therefore unreachable on ARMv7, for two
+independent reasons, and the first is the binding one:
+
+  1. **The engine renders single-threaded on one pinned core**, so four instances need
+     4 x 0.52 = **2.1 cores** of CPU throughput. They cannot fit on one core whatever the
+     deadline is. This is about the engine's threading model, not about ARMv7.
+  2. The p99 gate compounds it: 4 x 55% = 220% of the deadline.
+
+For scale, on piv the same model is RTF 0.0501, so four instances cost 0.2 of a core and fit
+comfortably. That is what the criterion encodes: it is a statement about an A76-class CPU with a
+single-threaded engine, not a claim about the engine's quality. Note also that the single
+instance NEON does fit sits at 55% of the deadline -- under the deadline, but above the
+criterion's 50% gate, so even one A2-Full is marginal on this board.
 
 
 2. THE SHIPPED ARMv7 BUILD LEAVES THE NEON UNIT UNUSED

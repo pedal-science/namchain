@@ -15,11 +15,28 @@ build and 133/133 for the NEON build (the extra case is the planar parity test).
 
 THE HEADLINE
 ------------
-**A2-Full is not real-time on this CPU, in either build.** One instance costs more CPU than
-the audio it produces: RTF 1.3251 shipped, 0.5199 with NEON. Criterion 3's ">= 4 concurrent
-A2-Full at q64" is therefore not merely hard on ARMv7, it is unreachable -- and the plan's
-one-line prediction ("A2-Full counts will be much lower there") understates what was
-measured, which is that the count is zero.
+**Tib runs one A2-Full per core with the planar kernels, and none without them.** RTF here is
+CPU-seconds per audio-second, so RTF < 1 is faster than real time:
+
+  shipped (-mfpu=vfpv3-d16)   RTF 1.3251, p50 block 1764.9 us  -> **cannot run A2-Full at all.**
+                              One instance needs 133% of a core, and its *median* block already
+                              exceeds the 1333.3 us deadline.
+  NEON (-mfpu=neon-vfpv4)     RTF 0.5199, p50 690.1 us, p99 733.5 us -> **one instance per core,
+                              genuine real time**, with 2 x 690.1 = 1380 us showing a second
+                              would not fit even at the median.
+
+Criterion 3's ">= 4 concurrent A2-Full at q64" is therefore unreachable on ARMv7, and the
+binding reason is not the deadline but the threading model: **the engine renders single-threaded
+on one pinned core, so four instances need 4 x 0.52 = 2.1 cores of CPU throughput.** The p99 gate
+compounds it (4 x 55% = 220% of the deadline), but four instances would not fit on one core even
+if every block met the deadline. On piv the same model is RTF 0.0501, so four cost 0.2 of a core
+and fit comfortably -- which is what the clause encodes: a statement about an A76-class CPU, not
+about the engine.
+
+Two footnotes. The single instance NEON does fit sits at 55% of the deadline: *under* the
+deadline, *above* criterion 3's 50% p99 gate, so even one A2-Full is marginal on this board. And
+the plan's one-line prediction ("A2-Full counts will be much lower there") was directionally
+right but understated the shipped build, which manages zero rather than few.
 
 A2-Lite is the ARMv7 path, and the shipped build is leaving most of the CPU unused.
 
