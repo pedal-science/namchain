@@ -57,6 +57,9 @@ set -u
 
 # The audio controller's interrupt, by name. Overridable because it is a property of which
 # USB port the interface is on, not of this script.
+# The audio controller's interrupt, by name. Overridable because it is a property of which
+# USB port the interface is on, and it differs per board: piv's SSL 2+ is on xhci-hcd:usb2,
+# tib's USB is a different controller entirely.
 AUDIO_IRQ_NAME="${AUDIO_IRQ_NAME:-xhci-hcd:usb2}"
 
 die() { echo "rt-manipulation-check: $*" >&2; exit 2; }
@@ -278,9 +281,23 @@ do_compare() {
     }
   }')
   if [[ -z $isolated ]]; then
-    echo "FAIL: no CPUs are isolated -- this arm measured an ordinary shared core."
-    echo "      The kernel command line is missing isolcpus=. Check: cat /proc/cmdline"
-    verdict_rc=3
+    # On a host that has no cores to spare, no isolation is the correct configuration rather
+    # than a failure -- tib is a 4-core board running a full userspace, and its kernel config
+    # deliberately declines NO_HZ_FULL. EXPECT_NO_ISOLATION=1 says "I know, and this arm is
+    # still the experiment". Without it, an unisolated host is reported as a failure, because
+    # on a host that *can* isolate, an arm that silently lost its reservation measures a
+    # different machine than the one being reported.
+    if [[ ${EXPECT_NO_ISOLATION:-0} == 1 ]]; then
+      echo "ok:   no CPUs are isolated, and that is this host's expected configuration."
+      echo "      No reservation is being claimed; the RT kernel's scheduler is the only"
+      echo "      protection on this arm, so say that when quoting it."
+    else
+      echo "FAIL: no CPUs are isolated -- this arm measured an ordinary shared core."
+      echo "      The kernel command line is missing isolcpus=. Check: cat /proc/cmdline"
+      echo "      (If this host has no cores to spare and that is deliberate, re-run the arm"
+      echo "      with EXPECT_NO_ISOLATION=1.)"
+      verdict_rc=3
+    fi
   else
     local d r stopped
     for c in $cpu_list; do

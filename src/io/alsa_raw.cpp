@@ -166,7 +166,21 @@ std::unique_ptr<AlsaRawDuplex> AlsaRawDuplex::open(const AlsaRawConfig& config, 
   self->playback_fd_ = ::open(self->info_.playback_node.c_str(), O_RDWR | O_NONBLOCK);
   if (self->playback_fd_ < 0)
   {
+    // Distinguish "the second direction was refused" from "this node is wrong or unusable".
+    // EINVAL here, with the capture side already open, is not a bad path and not a busy
+    // device (that is EBUSY) -- it is a driver refusing to have both directions of one PCM
+    // open at once. Measured on tib's on-board tinker-codec (2026-09-16): either direction
+    // alone opens, the pair is refused with EINVAL, and a 1.5 s delay between the two opens
+    // does not change it, so it is topology rather than a race. Without this note the message
+    // reads like a malformed argument, which sends the reader to the channel count and the
+    // rate instead of to the device.
+    const int saved = errno;
     error = errno_text("cannot open " + self->info_.playback_node);
+    if (saved == EINVAL)
+      error += " (the capture side opened, so the path is valid: this device appears not to"
+               " support full-duplex capture+playback on the same PCM -- either direction"
+               " alone works. Use a device that exposes the two directions separately, or a"
+               " USB interface, which does)";
     return nullptr;
   }
 
