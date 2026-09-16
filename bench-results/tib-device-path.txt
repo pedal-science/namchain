@@ -1,0 +1,64 @@
+The SSL 2+ does not work on tib's dwc2 USB controller — but the device path is fine on EHCI
+=============================================================================================
+
+2026-09-16. tib (RK3288, armv7, 7.2.6 PREEMPT_RT), performance governor capped 1416 MHz,
+NEON armv7 build, all runs `--rt-priority 80 --cpu 3` with no isolation (tib has none).
+
+THE FINDING
+-----------
+tib has two USB host controllers, and the four USB-A ports are not on the same one as the
+other audio device:
+
+  Bus 001  dwc2        root hub -> the on-board Genesys 4-port hub -> **the four USB-A ports**
+  Bus 002  dwc2 (OTG)  gadget port, nothing attached
+  Bus 003  ehci-platform  1 port -> the Realtek USB audio
+
+`alsa_raw` cannot sustain playback on the SSL 2+ through **dwc2 + the on-board hub**, and it
+is perfect through **EHCI**. Measured, passthrough only (no model, no DSP in the path):
+
+  arm                        device / controller      quantum  xruns  RTF      queue p50
+  tib-f0-pass   (60 s)       SSL / dwc2 + hub         64       739   1.0165   0.62 periods
+  tib-f1-pass256 (60 s)      SSL / dwc2 + hub         256      180   1.0162   0.56
+  tib-e1-ring12 (120 s)      3xA2-Lite, SSL, ring 12  64      1692   1.0190   0.62
+  tib-e2-q128   (120 s)      3xA2-Lite, SSL, ring 6   128      684   1.0152   0.62
+  tib-g0-realtek (60 s)      Realtek / **EHCI**       32         0   1.0000   0.25 (stable)
+
+WHY IT IS NOT THE ENGINE
+------------------------
+In the passthrough arm the chain costs 2.3 us and the whole block is **24 us p50, 41 us p99** --
+3% of the 1.333 ms period. There is no CPU pressure whatsoever (`cpu spike bursts: 1 block over
+half a period` in the D2 arm) and the oracle is exact throughout.
+
+The arithmetic identifies the mechanism exactly: **the run slips by precisely one period per
+underrun.** 739 x 1.333 ms = 0.985 s over 60 s = the 1.65% RTF slip; 1692 x 1.333 ms = 2.256 s
+over 120 s = the 1.90% slip in e1. So the underruns are not a symptom of falling behind; they
+*are* the entire loss, and the loop is otherwise keeping up.
+
+And the pacing number names the cause:
+
+  SSL on dwc2:   device wait p50 1 471 463 ns   against a 1 333 333 ns period -- **the wait is
+                 longer than the period**, so the loop can never pace itself off this device;
+                 the ring drains to 0.00 (p50 0.62, and 35431 of 45000 blocks held less than one
+                 period) and oscillates between empty and completely full (`536 blocks wrote
+                 into a full playback ring`).
+  Realtek on EHCI: device wait p50 3 974 844 ns against a 4 000 000 ns period -- 99.4% of the
+                 period, and it holds **exactly** 0.25 periods of queue for the whole run with
+                 RTF 1.0000.
+
+A wait of 99.4% of the period is fine. A wait of 110% of it cannot be.
+
+WHAT REMAINS OPEN, AND THE NEXT TEST
+------------------------------------
+Two candidates, and one swap separates them: the **SSL is a demanding device** (ASYNC playback
+with an explicit sync endpoint and implicit feedback), or **dwc2's host-mode isochronous
+scheduling** is the limitation (dwc2 is primarily an OTG/gadget controller). The on-board hub is
+a third possibility but a weak one -- it is high-speed and passes 480 Mbit/s without a
+transaction translator.
+
+The test: move the SSL to the port the Realtek audio is on (bus 3, EHCI). If the SSL is clean
+there, it is dwc2 and the fix is "use the EHCI port"; if it underruns there too, it is the
+device's feedback mode and tib cannot host this interface at 48 kHz.
+
+None of the ARMv7 conclusions depend on this: the throughput ceiling, the NEON finding, the
+bit-identity verification and the deviceless loop pass are all deviceless measurements and are
+unaffected. This finding is about tib's USB host controller, not about the engine.
