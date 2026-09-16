@@ -120,6 +120,66 @@ half of it that the RT host could test has now been tested, and the answer is th
 interrupt side was worth fixing (the xruns went to zero) but the tail was never interrupts:
 it is the memory system, and it is the same on both kernels.
 
+### 3a. Where inside the DSP the stalls are
+
+The counters above say the engine is memory-bound. The Cortex-A76 PMU names the stall type,
+and `perf record` says which code absorbs it. Evidence: bench-results/rt-piv-profile.txt,
+120 s per arm, same configuration, quiet against the vm worker alone.
+
+  counter            quiet          memory-loaded   change
+  cycles              77.08e9        204.54e9        +165%
+  instructions       132.58e9        132.83e9          +0.2%
+  mem_access          40.35e9         40.30e9          -0.1%
+  mem_access_rd       31.27e9         31.32e9          +0.2%
+  mem_access_wr        9.09e9          9.12e9          +0.4%
+  stall_backend       39.17e9        157.10e9        +301%
+  stall_frontend       2.19e9         11.63e9        +430%
+  branch-misses       38.04e6         34.40e6          -10%
+
+Read the first three lines together: **the number of memory accesses does not change at all**
+(40.35e9 against 40.30e9, a tenth of a percent) and neither do the instructions, while the
+cycles rise 165%. Backend stalls ("no operation issued due to the backend") go from 51% of
+all cycles to 77%. The engine does not touch memory more often; every access simply takes
+longer, because a 128 MB write stream is queueing in front of it. It is not extra cache
+misses (that was measured earlier and is also unchanged) -- it is the cost of each miss.
+
+The symbol-level attribution is the other half of the answer, and it is a negative one:
+
+  symbol (by sampled cycles)                        quiet    loaded
+  A2PlanarFull::tile<6, 2, false, true>             63.51%   62.50%
+  A2PlanarFull::tile<15, 2, false, true>            12.12%    6.55%
+  A2PlanarFull::tile<6, 2, false, false>             6.81%   10.96%
+  __memcpy_generic                                   4.83%    9.23%
+  A2PlanarFull::tile<6, 2, true, true>               2.97%    1.91%
+  A2PlanarFull::process                              2.35%    2.10%
+  xhci_get_frame                                     2.21%    0.87%
+
+The mix is essentially unchanged. There is no single loop that "absorbs" the extra cycles --
+the same code, doing the same accesses, in the same proportions, is just slower. So the
+question "which code should be optimised" has no useful answer here: the stall is a property
+of the memory system the accesses reach, not of the access pattern. What follows is a
+constraint rather than a task:
+
+  - The lever is the NUMBER of accesses per block, not their shape: fewer resident models,
+    narrower models, more reuse of weights between blocks, better blocking so a repeated
+    weight read finds it in cache. The instantiation tile<6, 2, false, true> is 63% of all
+    cycles on its own, so that is where the accesses are concentrated if any of this is tried.
+  - __memcpy_generic is the most exposed code in the process (4.8% of cycles quiet, 9.2%
+    loaded). It has no arithmetic to hide latency behind, so it pays the full stall and its
+    share nearly doubles under load. Buffer-copy traffic is a cheaper target than the DSP
+    kernels, on this evidence.
+  - On this host, with a competing workload, none of that would be enough: the same accesses
+    cost 3.5x. The only complete fix is a machine whose memory system is not shared.
+
+One honest limit on these arms: attaching perf puts a ~1 kHz hrtimer on the profiled core, so
+cpu 3 showed ~920 arch_timer interrupts/s even though the tick was provably stopped
+(.tick_stopped = 1). That is a bug the profiling found in this project's own manipulation
+check -- it counted arch-timer interrupts, which include hrtimers, and called it "the tick is
+RUNNING". It now reads .tick_stopped from /proc/timer_list and reports the interrupt delta as
+corroboration only. The perf arms' cycle total agrees with an independent 120 s arm without
+sampling (77.08e9 against 77.79e9), so perf's own overhead is under 1% and the comparison
+above stands.
+
 
 4. WHAT THE RT HOST DID BUY, IN THE OTHER TWO DIMENSIONS
 --------------------------------------------------------

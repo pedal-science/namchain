@@ -133,6 +133,26 @@ on each memory access because another workload is saturating the shared memory s
 frequency was 2400 MHz for every one of 382 samples and `throttled=0x0`, so this is not
 frequency scaling and not thermal.
 
+The Cortex-A76 PMU says the same thing more precisely, and it is worth knowing which counters
+to read (quiet vs memory-loaded, 120 s each):
+
+| counter | quiet | loaded | change |
+|---|---|---|---|
+| `instructions` | 132.58e9 | 132.83e9 | +0.2 % |
+| `mem_access` | 40.35e9 | 40.30e9 | **−0.1 %** |
+| `cycles` | 77.08e9 | 204.54e9 | +165 % |
+| `stall_backend` | 39.17e9 | 157.10e9 | +301 % |
+| `stall_frontend` | 2.19e9 | 11.63e9 | +430 % |
+| `cache-misses` (per block) | 1.49e4 | 1.46e4 | −2 % |
+
+**The number of memory accesses does not change; each one just takes longer.** Backend stalls
+go from 51 % of all cycles to 77 %. `perf record -e cycles` then shows that the *mix* of hot
+functions is also unchanged — the same A2 planar tile kernels do the same accesses in the same
+proportions, ~63 % of cycles in one instantiation during both runs. There is therefore no
+single loop to optimise: the stall is a property of the memory system, not of the access
+pattern. The lever is the **number** of accesses per block (fewer or narrower models, more
+weight reuse between blocks, better cache blocking), not their shape.
+
 The practical rules that follow:
 
 - Do not run memory-heavy work (builds, VMs, containers, large copies, a desktop under load)
@@ -143,6 +163,11 @@ The practical rules that follow:
 - `namchain-soak`'s tail is CPU-time (`cpu == wall`, 0 blocks descheduled) whenever it is not
   a genuine wakeup problem. Read `render path cpu:` before blaming the scheduler — it is the
   line that says which of the two you have.
+- If you profile the audio thread, expect the profiling itself to disturb what you are
+  measuring: `perf`'s event multiplexing arms a ~1 kHz hrtimer on the profiled core. Compare
+  the two arms against each other, never against an unprofiled run, and check the tick state
+  with `.tick_stopped` in `/proc/timer_list` rather than by counting `arch_timer` interrupts
+  (which include hrtimers and will read ~1000/s with the tick provably stopped).
 
 ## What tuning does not do
 

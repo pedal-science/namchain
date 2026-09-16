@@ -1,0 +1,48 @@
+DSP stall profiling, 4 x A2-Full at q64, cap 3, cpu 3
+quiet vs memory-loaded. The DELTA between the two tables is the measurement.
+          38038527      branch-misses                                                           (73.71%)
+     121.293839738 seconds time elapsed
+      30.008172000 seconds user
+       2.443455000 seconds sys
+cmdline          reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10 isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew_tick=1
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+source                   cpu0       cpu1       cpu2       cpu3
+ok:   cpu 2 took 236 arch_timer interrupts in 121s (2.0/s) -- tickless.
+FAIL: cpu 3 took 111504 arch_timer interrupts in 121s (921.5/s) -- the tick is
+      task is runnable, so a second runnable task here brings it back. Discard
+ok:   the audio IRQ (139) was delivered 239987 times to reserved cpu 2,
+ok:   isolated=2-3 nohz_full=2-3
+
+########## QUIET — top symbols by cycles
+   63.51%  void nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull::tile<6, 2, false, true>
+   12.12%  void nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull::tile<15, 2, false, true
+    6.81%  void nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull::tile<6, 2, false, false
+    4.83%  __memcpy_generic - -
+    2.97%  void nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull::tile<6, 2, true, true>(
+    2.35%  nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull::process(double**, double**, 
+    2.21%  xhci_get_frame - -
+    0.67%  el0_svc - -
+    0.39%  __memmove_generic - -
+          34401418      branch-misses                                                           (74.85%)
+     135.860030894 seconds time elapsed
+      79.839652000 seconds user
+       5.021800000 seconds sys
+cmdline          reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10 isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew_tick=1
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+source                   cpu0       cpu1       cpu2       cpu3
+ok:   cpu 2 took 257 arch_timer interrupts in 136s (1.9/s) -- tickless.
+FAIL: cpu 3 took 132930 arch_timer interrupts in 136s (977.4/s) -- the tick is
+      task is runnable, so a second runnable task here brings it back. Discard
+ok:   the audio IRQ (139) was delivered 261655 times to reserved cpu 2,
+ok:   isolated=2-3 nohz_full=2-3
+
+########## MEMORY-LOADED (stress-ng --vm 1 --vm-bytes 128M on cpus 0-1) — top symbols by cycles
+   62.50%  void nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull::tile<6, 2, false, true>
+   10.96%  void nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull::tile<6, 2, false, false
+    9.23%  __memcpy_generic - -
+    6.55%  void nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull::tile<15, 2, false, true
+    2.10%  nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull::process(double**, double**, 
+    1.91%  void nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull::tile<6, 2, true, true>(
+    0.87%  xhci_get_frame - -
+    0.67%  __memmove_generic - -
+    0.35%  el0_svc - -

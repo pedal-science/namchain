@@ -17,12 +17,16 @@
 #
 #   1. isolated / nohz_full / rcu_nocbs  — is the reservation actually on the command line?
 #      If `isolated` is empty the arm measures an ordinary shared core and must be discarded.
-#   2. arch_timer delta per CPU          — is the 1000 Hz tick really off the reserved cores?
-#      Expect ~0/s on 2-3. A rate near 1000/s means nohz_full did not hold (it suppresses the
-#      tick only while exactly one task is runnable, so a second runnable task — an IRQ
-#      thread, a worker — silently brings it back). This is the check the old run lacked, and
-#      it is the *point* of the whole host change: the tick and IPIs were 98.8% of cpu 3's
-#      interrupts and no runtime affinity write can move them.
+#   2. .tick_stopped per CPU             — is the 1000 Hz tick really off the reserved cores?
+#      Read from /proc/timer_list, which is the kernel's own state, so it is a fact rather
+#      than an inference. This is the check the old run lacked, and it is the *point* of the
+#      whole host change: the tick and the per-CPU IPIs were 98.8% of cpu 3's interrupts and
+#      no runtime affinity write can move them.
+#      The arch_timer delta is reported alongside it as corroboration, NOT as the test. IRQ 13
+#      counts every arch-timer interrupt including hrtimers, and perf's event multiplexing
+#      arms a ~1 kHz hrtimer on the CPU it profiles -- so a profiling arm shows ~1000
+#      arch_timer/s on a core whose tick is provably stopped. The first version of this file
+#      called that "the tick is RUNNING", which was wrong; see the note at the snapshot.
 #   3. IPI0 (rescheduling) and IPI5 (IRQ work) deltas — the other unsteerable sources.
 #   4. the audio IRQ, matched BY NAME  — its number, its affinity READ BACK, its kernel
 #      thread's priority, and its delivered count per CPU. IRQ numbers on this board are
@@ -101,6 +105,32 @@ do_snapshot() {
     fi
     echo "loadavg=$(cat /proc/loadavg)"
     echo "audio_card=$(aplay -l 2>/dev/null | grep -i 'SSL 2' | head -1 | sed 's/^/ /' || echo unknown)"
+
+    # --- the scheduler tick, per CPU, from the kernel's own state ------------------
+    # /proc/timer_list exposes ".tick_stopped" per CPU: the direct answer to "is the
+    # scheduler tick off here", which is the question this script exists to answer.
+    #
+    # The arch_timer delta below is NOT that answer, and treating it as one was a real bug
+    # in the first version of this file. IRQ 13 counts every arch-timer interrupt, which
+    # includes hrtimers -- and perf's event multiplexing arms a ~1 kHz hrtimer on the CPU it
+    # profiles. A perf arm therefore measured ~920 arch_timer/s on cpu 3 while
+    # .tick_stopped was 1, and the old wording called that "the tick is RUNNING". It was not.
+    # The counter stays because it is useful (it is how a *stray* tick or an unexpected
+    # hrtimer source shows up), but the verdict reads .tick_stopped.
+    local tl
+    tl=$(sudo -n cat /proc/timer_list 2>/dev/null)
+    if [[ -n $tl ]]; then
+      printf '%s\n' "$tl" | awk '
+        /^cpu: / { c = $2 }
+        /\.nohz[[:space:]]*:/ { printf "nohz_cpu%s=%s\n", c, $3 }
+        /\.tick_stopped[[:space:]]*:/ { printf "tick_stopped_cpu%s=%s\n", c, $3 }
+      '
+    else
+      # Unreadable without root is normal when the arm is not root; the verdict then falls
+      # back to the interrupt counter and says so.
+      echo "tick_stopped_cpu0="; echo "tick_stopped_cpu1="
+      echo "tick_stopped_cpu2="; echo "tick_stopped_cpu3="
+    fi
 
     # --- the audio interrupt, by name ---------------------------------------------
     local irq
@@ -251,24 +281,51 @@ do_compare() {
     echo "FAIL: no CPUs are isolated -- this arm measured an ordinary shared core."
     echo "      The kernel command line is missing isolcpus=. Check: cat /proc/cmdline"
     verdict_rc=3
-  elif [[ -z $tick_key ]]; then
-    echo "UNKNOWN: no arch_timer line found; cannot tell whether the tick is off."
-    verdict_rc=3
   else
-    local d r
+    local d r stopped
     for c in $cpu_list; do
-      d=$(delta "$before" "$after" "$tick_key" "$c")
-      r=$(rate_per_s "$d" "$secs")
-      if awk -v r="$r" 'BEGIN { exit !(r >= 100) }'; then
-        echo "FAIL: cpu $c took $d arch_timer interrupts in ${secs}s ($r/s) -- the tick is"
-        echo "      RUNNING on a reserved core. nohz_full suppresses it only while exactly one"
-        echo "      task is runnable, so a second runnable task here brings it back. Discard"
-        echo "      this arm or move the competing task to the other reserved core."
+      # The verdict reads the kernel's own tick state. The arch_timer rate is reported next
+      # to it as corroboration, not as the test: it also counts hrtimers.
+      stopped=$(field "$after" "tick_stopped_cpu$c")
+      if [[ $stopped == 1 ]]; then
+        echo "ok:   cpu $c .tick_stopped=1 -- the scheduler tick is stopped on this core."
+      elif [[ $stopped == 0 ]]; then
+        echo "FAIL: cpu $c .tick_stopped=0 -- the scheduler tick is RUNNING on a reserved"
+        echo "      core. nohz_full suppresses it only while exactly one task is runnable, so"
+        echo "      a second runnable task here brings it back. Discard this arm, or move the"
+        echo "      competing task to the other reserved core."
         verdict_rc=3
       else
-        echo "ok:   cpu $c took $d arch_timer interrupts in ${secs}s ($r/s) -- tickless."
+        # Either /proc/timer_list was unreadable, or this is an older snapshot.
+        if [[ -n $tick_key ]]; then
+          d=$(delta "$before" "$after" "$tick_key" "$c")
+          r=$(rate_per_s "$d" "$secs")
+          if awk -v r="$r" 'BEGIN { exit !(r >= 100) }'; then
+            echo "UNKNOWN: .tick_stopped unavailable and cpu $c took $d arch_timer"
+            echo "      interrupts in ${secs}s ($r/s). That is consistent with a running tick"
+            echo "      AND with a ~1 kHz hrtimer on this core (a profiler attached to it does"
+            echo "      exactly this), so it cannot decide the question. Re-run with root."
+            verdict_rc=3
+          else
+            echo "ok:   cpu $c took $d arch_timer interrupts in ${secs}s ($r/s), and"
+            echo "      .tick_stopped was unavailable -- consistent with a stopped tick."
+          fi
+        else
+          echo "UNKNOWN: cannot tell whether the tick is off on cpu $c."
+          verdict_rc=3
+        fi
       fi
     done
+    # The arch_timer delta, always reported: it is how an unexpected interrupt source on a
+    # reserved core becomes visible, even when .tick_stopped says the tick is stopped.
+    if [[ -n $tick_key ]]; then
+      for c in $cpu_list; do
+        d=$(delta "$before" "$after" "$tick_key" "$c")
+        echo "info: cpu $c arch_timer delta $d in ${secs}s ($(rate_per_s "$d" "$secs")/s)."
+        echo "      On a tickless core this is normally 0; a nonzero value is an hrtimer (or a"
+        echo "      tick that came back), not proof of either."
+      done
+    fi
     if [[ -n $audio_key ]]; then
       for c in $cpu_list; do
         d=$(delta "$before" "$after" "$audio_key" "$c")

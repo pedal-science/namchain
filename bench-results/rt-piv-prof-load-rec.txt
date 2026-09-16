@@ -1,0 +1,65 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 384 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            4 x build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/382, playback min/max 0/383 (last 95) frames (1219 blocks wrote into a full playback ring)
+                  playback queue 0.00..5.98 periods (last 1.48); the floor is the stall the device
+                  absorbs without starving: 0.00 periods = 0.000 ms
+                  p1 0.00, p50 2.12 periods; 4432 of 45000 blocks held less than one
+                  period (9.85 %), which is the window a stall has to miss
+queue target:     3 periods = 4.000 ms: a cap on the ring's contents, so a burst
+                  cannot buy latency beyond it. Not a promise of cushion -- the
+                  floor held above is the number to read
+queue control:    349 output drops (not gated: each refusal is the target's trade), 9997 capture bursts
+                  349 of those drops were the queue target refusing a period that
+                  would have raised the ring past 3 periods; 0 were the ring itself
+                  being full
+queue prefill:    8 frames of silence written before block 0 to bring the ring
+                  to its target (0.167 ms of output latency, paid once)
+capture xruns:    1281 found by the gate (a subset of the driver xruns below: an
+                  xrun freezes hw_ptr, so without this the loop stalls instead)
+occupancy check:  127439 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           45000
+audio:            60.000 s in 72.267 s wall (RTF 1.2044)
+deadline:         1333333 ns
+split (p50):      read 4223 ns, chain 741650 ns, write 18981 ns
+split (tail):     read p99 37130 max 1620283, chain p99 2970121 max 4384589, write p99 2056915 max 8659214 ns
+chain p99:        2970121 ns (222.76% of deadline)
+device wait:      p50 520558 ns, p99 2234693 ns, max 4366015 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 4127482 ns, wall max 4384589 ns
+                  43.03 s of CPU over 44.46 s of wall in the render path (96.8%), 0 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 28424 cpu 4127482 ns (wall 4384589 ns), block 28421 cpu 3925238 ns (wall 4160995 ns), block 28420 cpu 3730150 ns (wall 3971606 ns), block 20413 cpu 3615929 ns (wall 3897198 ns), block 20156 cpu 3526313 ns (wall 3645679 ns)
+cpu spike bursts: 4096 blocks over half a period of CPU (capped: there were more), in 80 runs; runs start every 4..1619 blocks (0.0..2.2 s at 48 k/64)
+                  run at block 0..0 (1 long), worst 735314 ns of CPU
+                  run at block 87..87 (1 long), worst 672648 ns of CPU
+                  run at block 1706..1709 (4 long), worst 740259 ns of CPU
+                  run at block 2463..2508 (46 long), worst 2497444 ns of CPU
+                  run at block 2518..2519 (2 long), worst 793093 ns of CPU
+                  run at block 2538..2547 (10 long), worst 1179781 ns of CPU
+                  run at block 2551..2551 (1 long), worst 678684 ns of CPU
+                  run at block 2598..2967 (370 long), worst 3035907 ns of CPU
+block time:       p50 770317 ns, p99 4231533 ns, max 11628224 ns
+p99/deadline:     317.37% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+first overrun at: block 2464 of 45000
+deadline overruns:12143
+driver xruns:     3518
+  by direction:   1291 capture overruns, 2227 playback underruns
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           FAIL
+[ perf record: Woken up 32 times to write data ]
+Warning:
+Processed 210276 events and lost 1 chunks!
+
+Check IO/CPU overload!
+
+[ perf record: Captured and wrote 8.031 MB bench-results/rt-piv-load.data (209994 samples) ]
