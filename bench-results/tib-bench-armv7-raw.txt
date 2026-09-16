@@ -1,0 +1,33 @@
+host: 7.2.6 PREEMPT_RT
+governor=performance max=1416000 cur=1416000
+temp_start_mC=46363
+##### A2-Full
+model:        models/A2-Full.nam
+cpp_type:     nam::wavenet::a2_fast::(anonymous namespace)::A2FastModel<8>
+channels:     in=1 out=1
+expected rate:48000.0 Hz
+core prewarm: 6347 samples
+lookback:     6347 samples (ok) [WaveNet]
+sample type:  double
+
+ quantum     p50_us     p99_us     max_us      RTF p99%deadline
+      32      911.8      950.8      980.0   1.3717      142.63%
+      64     1764.9     1819.7     1890.3   1.3251      136.48%
+     128     3410.2     3478.4     3617.3   1.2805      130.44%
+     256     6737.2     6910.8     8539.8   1.2659      129.58%
+##### A2-Lite
+model:        models/A2-Lite.nam
+cpp_type:     nam::wavenet::a2_fast::(anonymous namespace)::A2FastModel<3>
+channels:     in=1 out=1
+expected rate:48000.0 Hz
+core prewarm: 6347 samples
+lookback:     6347 samples (ok) [WaveNet]
+sample type:  double
+
+ quantum     p50_us     p99_us     max_us      RTF p99%deadline
+      32       88.4       98.3      142.3   0.1336       14.74%
+      64      165.1      175.6      200.4   0.1249       13.17%
+     128      318.8      344.5      401.0   0.1206       12.92%
+     256      635.0      651.0      669.7   0.1187       12.21%
+temp_end_mC=51250
+cur_end=1416000
