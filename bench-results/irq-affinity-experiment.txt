@@ -49,9 +49,23 @@ AND THE INTERVENTION IS NOT PROVEN, which makes the null uninterpretable:
 
 What the same measurement does show, and it changes the plan:
 
-  cpu 3's interrupt load is dominated by sources that cannot be steered from /proc. The per-CPU local timer
-  alone is ~1 000 interrupts per second here (290 000 per 300 s), which is the whole of the per-arm delta,
-  and the arch timer, IPIs and RCU callbacks are exactly the sources a runtime affinity mask cannot remove.
+  cpu 3's interrupt load is dominated by sources that cannot be steered from /proc. Measured over the whole
+  of /proc/interrupts (since boot, 36 669 233 interrupts on cpu 3):
+
+    IPI0   16 380 700  Rescheduling interrupts          per-CPU, not steerable
+    13     16 064 436  GICv2 26 Level arch_timer        per-CPU PPI, not steerable
+    IPI5    3 854 775  IRQ work interrupts              per-CPU, not steerable
+    IPI1      369 322  Function call interrupts         per-CPU, not steerable
+
+  That is 36.2 M of 36.7 M -- 98.8 % -- from per-CPU sources no runtime mask can move. The steerable device
+  IRQs (xhci, network, block) are the remainder, about 1 %. Which is exactly why the per-arm delta was
+  identical in both arms at ~290 000 per 300 s: that is the 1 kHz local timer, and it is the whole of it.
+
+  Note what this does and does not say. It is a count, not a time: the tail's spikes are milliseconds while a
+  timer interrupt is microseconds, so "1 % of the interrupts" does not mean "1 % of the interference". What
+  it does say is that a *successful* runtime intervention would remove about 1 % of cpu 3's interrupt count,
+  so a null result from it would carry almost no information about the hypothesis -- which is the reason this
+  run cannot settle anything even once the write is proven.
 
 So the runtime half of this experiment -- move the device IRQs, see whether the tail shrinks -- cannot test
 the hypothesis on this host on its own. The lever that can is the boot-time configuration the RT work
