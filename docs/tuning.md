@@ -180,3 +180,77 @@ most settings you can change, which is why:
   configuration became 8 underruns in an hour on the stock kernel);
 - every comparison needs repeats, and preferably alternation;
 - and a claim about a rate should quote the duration it was measured over.
+
+---
+
+## ARMv7 boards: what tib taught us
+
+Measured on a Tinker Board S (RK3288, Cortex-A17, armv7l, 4 cores, 2 GB) running mainline
+`7.2.6` PREEMPT_RT. `bench-results/tib-summary.txt` has the full account.
+
+### What this class of board can actually do
+
+| | measured |
+|---|---|
+| A2-Full, shipped `-mfpu=vfpv3-d16` | **RTF 1.3251** — not real time; 133 % of a core, and the *median* block already exceeds the deadline |
+| A2-Full, `-mfpu=neon-vfpv4` | **RTF 0.5199** — one instance per core, p50 690 µs / p99 734 µs against a 1333 µs deadline |
+| A2-Lite, `-mfpu=neon-vfpv4` | RTF 0.0842 — five instances fit the 50 % gate |
+| 1 h soak, 3 × A2-Lite, q64, cap 3 | **0 driver xruns, 0 deadline overruns**, max block 748.7 µs, oracle exact |
+
+So an ARMv7 board of this class is a viable host for **A2-Lite**, and for a single A2-Full per
+core. It is not a host for four A2-Full: that needs 4 × 0.52 = 2.1 cores of throughput from an
+engine that renders single-threaded on one pinned core.
+
+### The build flag is not optional
+
+The Debian armhf ABI baseline is `-mfpu=vfpv3-d16`, which has **no NEON**, so a default armhf
+build emits no vector code at all on a CPU that has a NEON unit — 1 256 vector instructions
+against 10 614 with `-mfpu=neon-vfpv4`, same source. Enabling NEON is worth **2.55× on A2-Full
+and 1.48× on A2-Lite**, and it is also what selects the planar kernels, because `a2_planar.h`
+gates its ARMv7 arm on `__arm__ && __ARM_NEON && __ARM_FEATURE_FMA`. Two consequences:
+
+- Ship a **separate `-mfpu=neon-vfpv4` artifact** for known-NEON boards. Runtime dispatch cannot
+  do it, because the kernel selection is a compile-time macro.
+- **Check the configure summary against reality.** `NAMCHAIN_A2_PLANAR_ACTIVE` is gated on
+  `aarch64|arm64|armv8`, so an armv7 NEON build prints "A2 planar NEON: OFF" while actually
+  running the planar kernels. The bit-identity gate keys off the header macro and does run.
+
+### `NO_HZ_FULL` is not available here, and that is fine
+
+tib's kernel deliberately declines `isolcpus`/`nohz_full`/`rcu_nocbs`: a 4-core board with a full
+userspace has no cores to spare. The RT kernel's scheduler is then the *only* protection, and the
+engine still holds its period — the 1 h soak above ran with `SCHED_FIFO 80` pinned to one core and
+no isolation at all. Pin the audio thread anyway (`--cpu`): a pin is not a reservation, but it
+stops migration for free.
+
+**Under load it does degrade.** With `stress-ng --cpu 4 --io 2 --vm 1` + `hackbench` on all four
+cores the same configuration produced 36 xruns and 1138 late blocks in 5 minutes, and the engine's
+own CPU time more than doubled (chain p99 410 → 851 µs) at a pinned 1416 MHz — the same
+memory-stall signature as the x86/ARM64 case above, since the engine's core is now shared. The
+rule is the same on both: **do not run memory-heavy work beside the engine.**
+
+**Cap the frequency and watch the thermals.** 1416 MHz is the point this board holds; the stock
+top bin drove the rtpi suite into its 90 °C critical trip once. Sample `thermal_zone0` and
+`scaling_cur_freq` during any run — a throttled arm measures a different machine.
+
+### Two hardware traps on tib specifically, both of which cost an hour
+
+**The USB-A sockets latch off, and a reboot does not clear it.** All four hang off one on-board
+Genesys hub whose descriptor is `wHubCharacteristic 0x0008` — ganged power switching with
+per-port over-current protection — so one event on one socket takes all four. `reboot` never
+removes VBUS, so the hub re-probes with its switch still latched and the board comes back with
+four dead ports and **no error anywhere**: a port with no VBUS never powers the device, so it
+never pulls up D+ and the host sees no attach attempt. A *failed connection* logs
+`device descriptor read/64, error -71`; **dead port power logs nothing.** Clear it with a hub
+device reset — `tools/soak/tib-usb-recover.sh`, or `sudo usbreset 05e3:0610` — or a cold power
+cycle.
+
+**Put a USB audio interface behind a powered hub on this board.** On a bare socket the SSL 2+
+underruns continuously (739 in 60 s of pure passthrough, one period per underrun, RTF 1.0165);
+behind a powered hub the same passthrough is perfect (0 underruns, RTF 0.9999) and the 1 h soak
+passes. The mechanism is worth recording because it is not obvious: on a marginal link the
+interface's **implicit-feedback rate estimate is corrupted**, so the host sends playback data at a
+slightly wrong average rate (~1.6 % slow), the ring drains, and it underruns regularly. A stable
+link gives an accurate estimate. Note that `device wait` p50 was 1.47 ms — *longer than the
+1.333 ms period* — in **both** the failing and the passing runs, so that number is not a fault
+indicator on a capture-paced loop; the rate is what matters.

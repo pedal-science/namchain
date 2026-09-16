@@ -187,3 +187,52 @@ Everything above is deviceless or engine-side, and all of it stands. tib remains
 loop's behaviour under SCHED_FIFO with no isolation are exactly what section 9.4 needed. What
 it cannot be is the ARMv7 *device* target for this interface, for a reason that is about the
 board's USB topology rather than about the engine.
+
+
+8. THE TWO ARMS THE DEVICE FIX UNBLOCKED
+-----------------------------------------
+Both run on the SSL through the powered hub, 3 x A2-Lite, q64, ring 6, cap 3, `--cpu 3`,
+SCHED_FIFO 80, governor performance at 1416 MHz.
+
+**j2, the criterion hour (3600 s, unladen) -- PASS, and it is the first clean hour in this
+project.**
+
+  driver xruns        0   (0 capture overruns, 0 playback underruns)
+  deadline overruns   **0** of 2 700 000
+  block time          p50 388 795 ns   p99 438 670 ns (32.90%)   max **748 714 ns** (56% of deadline)
+  chain p99           410 377 ns (30.78%),  max 685 422 ns
+  queue               p1 1.77 / p50 1.94 periods, **0 of 2 700 000 blocks below one period**
+  write               p99 29 167 ns, max 77 584 ns
+  RTF 0.9999          oracle max|diff| 0 over 240 000 frames          0 allocations
+
+piv never managed this: its two criterion hours produced 15 and 109 deadline overruns with
+maxima of 1782 and 3176 us, and both failed. Two caveats before anyone reads a ranking into it.
+The loads are comparable but not identical (tib 3 x A2-Lite with chain p99 410 us, piv 4 x
+A2-Full with chain p99 505 us -- 31% and 38% of the deadline). And piv's own two hours differed
+by 7x, so one hour does not establish that tib is the better host. What it *is* consistent with
+is the explanation already recorded for piv's tail: that tail was memory-system contention from
+housekeeping activity, and tib is a headless board with a quieter memory system, whereas piv
+was running this session's harness and a desktop. A quiet host produces no late blocks; that is
+the whole prediction, and this hour is what it looks like when it holds.
+
+**j1, the load arm (300 s, `stress-ng --cpu 4 --io 2 --vm 1 --vm-bytes 128M` + a hackbench
+loop, all four cores, unpinned) -- FAIL.**
+
+  driver xruns        36  (8 capture overruns, 28 playback underruns)
+  deadline overruns   1138
+  block time          p50 574 588 ns (+51% on the unladen 388 795)   p99 931 591 ns (69.87%, gate fails)
+                      max 3 386 570 ns (2.5x the deadline)
+  chain p99           851 382 ns (63.85%) against 410 377 ns unladen -- **the engine's own CPU
+                      time more than doubles under load**
+  RTF 1.0003          queue p50 2.11 periods
+
+Two things to take from this. First, **the engine's CPU time doubling is the same memory-stall
+signature measured on piv** (there: instructions per block unchanged while cycles per block rose
+141%), and the frequency was pinned at 1416 MHz with no throttling throughout, so it is not DVFS.
+Second, the severity differs: piv lost the audio path outright under its load arm (3119 xruns,
+p99 at 156% of the deadline), while tib degrades to 36 xruns and p99 at 70%. The obvious reason
+is that piv's engine had a reserved core and still lost, because the contention was in the memory
+system; tib has no reservation at all and its four cores now share one with the engine, so part
+of its loss is ordinary preemption on top of the same memory effect. Either way the operational
+rule from plan section 9.3 holds on both boards: **do not run memory-heavy work beside the
+engine.**
