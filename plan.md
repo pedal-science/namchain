@@ -1849,6 +1849,45 @@ worker synchronization is the single largest reliability risk in the design; it 
 soak + glitch tests pass with it enabled. With PR #313 in place the arithmetic budget roughly doubles,
 so parallel rendering's urgency drops further and the attention belongs on memory bandwidth and I/O.
 
+### The ARMv7 target, measured (2026-09-16)
+
+tib (Tinker Board S, RK3288 Cortex-A17, armv7l), kernel `7.2.6` PREEMPT_RT, governor performance at
+1416 MHz, `namchain-bench` at 48 kHz with `double` samples. **RTF is CPU-seconds per audio-second, so
+RTF < 1 is faster than real time.** Full account in `bench-results/tib-summary.txt`.
+
+| model | q | shipped `-mfpu=vfpv3-d16` | `-mfpu=neon-vfpv4` |
+|---|---|---|---|
+| **A2-Full** | 64 | RTF **1.3251**, p50 1764.9 µs, p99 136 % of deadline | RTF **0.5199**, p50 690.1 µs, p99 55 % |
+| **A2-Lite** | 64 | RTF 0.1249, p50 165.1 µs, p99 13.2 % | RTF **0.0842**, p50 110.2 µs, p99 9.6 % |
+| A2-Full | 32 / 128 / 256 | 1.3717 / 1.2805 / 1.2659 | 0.5356 / 0.5132 / 0.5120 |
+| A2-Lite | 32 / 128 / 256 | 0.1336 / 0.1206 / 0.1187 | 0.0897 / 0.0810 / 0.0788 |
+
+Instances at q64, by the 50 % p99 gate / by the deadline (100 %):
+
+| | shipped | NEON |
+|---|---|---|
+| A2-Full | 0 / 0 | 0 / **1** |
+| A2-Lite | 3 / 8 | **5** / 11 |
+
+Three readings of this table. **The shipped armv7 default cannot run A2-Full at all** — one instance
+needs 133 % of a core and its median block already exceeds the deadline. **NEON gives exactly one
+A2-Full per core**, which is genuine real time (2 × 690.1 = 1380 µs shows a second would not fit even
+at the median). And **criterion 3's "≥ 4 concurrent A2-Full" is unreachable on this target for a reason
+about the engine rather than the board**: it renders single-threaded on one pinned core, so four
+instances need 4 × 0.52 = 2.1 cores of throughput; the p99 gate compounds it but is not binding. On
+piv the same model is RTF 0.0501, so four cost 0.2 of a core — which is what the clause encodes.
+
+The device side, once a powered hub was inserted (see §9.4): a 1 h soak with 3 × A2-Lite at q64 and
+cap 3 gives **0 driver xruns, 0 deadline overruns, max block 748.7 µs (56 % of the deadline)**, queue
+p50 1.94 periods, RTF 0.9999 and an exact oracle — **the first clean criterion hour in this project.**
+piv's two hours gave 15 and 109 late blocks and both failed; the caveat is in the summary (the loads
+differ by 31 % against 38 % of the deadline, and piv's own two hours differed by 7×, so this does not
+rank the hosts — it is consistent with the memory-contention explanation of piv's tail).
+
+Under load, tib degrades: `stress-ng --cpu 4 --io 2 --vm 1` + `hackbench` on all four cores, with no
+reservation to protect the audio thread, produced 36 xruns and 1138 late blocks in 5 minutes with the
+engine's own CPU time more than doubled (chain p99 410 → 851 µs) at a pinned 1416 MHz.
+
 ### The RT host, measured (2026-09-16)
 
 The same engine, same rig, on `7.0.0-1017-raspi-realtime` with cores 2–3 isolated and tickless and the
