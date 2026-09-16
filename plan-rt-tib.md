@@ -97,6 +97,20 @@ in §4 works either way, and none of it is blocked on the answer.
 
 ## 3. What criterion 3 means on this host
 
+> **B1 is done, and it changed the plan.** Measured 2026-09-16 (`bench-results/tib-armv7-throughput.txt`):
+> **A2-Full is not real-time on this CPU in either build** — RTF 1.3251 with the shipped
+> `-mfpu=vfpv3-d16` build and 0.5199 with `-mfpu=neon-vfpv4`. One instance costs more than the audio
+> it produces, so the "≥ 4 concurrent A2-Full" clause is not hard here, it is unreachable, and
+> criterion 3's throughput clause **cannot be met on ARMv7 and should be recorded as such rather than
+> attempted**. A2-Lite is the viable model: **5 instances** fit the 50 % gate at q64 with NEON
+> (RTF 0.0842, p99 9.6 % of the deadline), against 3 with the shipped build. Enabling NEON is worth
+> 2.55× on A2-Full and 1.48× on A2-Lite, and the ARMv7 planar fast path is **verified bit-identical
+> on the hardware** (133/133 cases, 230 854 assertions, natively on the Cortex-A17).
+>
+> **Everything below that assumed A2-Full is therefore re-pointed at A2-Lite**, and the NEON build
+> (`build-armv7-neon`, deployed as `~/namchain/bin-neon`) is the one to measure with — the shipped
+> build's numbers are kept only as the "what the default costs" comparison.
+
 The clauses, re-stated for ARMv7 rather than copied:
 
 | clause | on piv it was | here it should be read as |
@@ -157,13 +171,14 @@ isolation" as the expected state rather than a failure, and take the audio IRQ n
   48 kHz, `double` samples, `a2_fast` on, planar off. This is §9.4's prediction, measured. It
   produces the instances-at-50 % table and settles whether 4×A2-Full is even worth attempting.
 - **B2. Paced engine loop, no device.** `namchain-soak --backend null` + self-oracle + the p99 gate,
-  at the instance count B1 says is plausible. Tests the timers, the gates, the oracle and the RT
+  with **3 × A2-Lite** (B1 measured 5 fitting the 50 % gate; 3 leaves headroom for the I/O the
+  deviceless backend does not pay). Tests the timers, the gates, the oracle and the RT
   scheduling of the loop with no driver in the path.
 
 ### Tier 2 — the real device
 
 - **D1. First soak on the on-board codec.** `--device hw:1,0`, 48 kHz, 2 channels in and out,
-  S32_LE if the driver takes it, q64. This is the first non-USB device `alsa_raw` has seen; expect
+  S32_LE if the driver takes it, q64, **3 × A2-Lite** — A2-Full is not an option (B1). This is the first non-USB device `alsa_raw` has seen; expect
   the negotiated period and the buffer constraints to differ, and treat a refusal as a finding about
   the backend rather than a failure of the run.
 - **D2. Instances sweep** at the count D1 tolerates, to find where p99 crosses 50 %.
