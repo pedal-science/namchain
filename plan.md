@@ -5,7 +5,7 @@ on all five jobs (§12), §11 carries *measured* numbers rather than estimates, 
 clause is met on the reference interface (§9.5) except one of criterion 3's clauses. That clause was
 re-attacked on 2026-09-16 by moving the host to a PREEMPT_RT kernel with the audio cores isolated and
 tickless: **five of the six clauses now pass, including the driver-xrun clause that failed 8 times an
-hour** (0 xruns in 3 h 10 min), and the survivor is `max block < deadline`, which is memory-stall
+hour** (0 xruns in 4 h 10 min), and the survivor is `max block < deadline`, which is memory-stall
 shaped rather than scheduling-shaped and is not fixed by anything in §9.3. The result, its limits and
 the arms behind it are in `bench-results/rt-piv-summary.txt`, run from `plan-rt-piv.md`. **M2 is next**,
 and its first task is the glitch detector, by the standing instruction below.
@@ -885,7 +885,7 @@ outstanding.
 irqaffinity=0-1 skew_tick=1`, and the audio interrupt (`xhci-hcd:usb2`) pinned to cpu 2 at
 `SCHED_FIFO 85`. The measurement is in `bench-results/rt-piv-summary.txt`, with every arm recording its
 own before/after interrupt deltas via `tools/soak/rt-manipulation-check.sh` — the check the 16-arm IRQ
-experiment lacked, and the reason its null was uninterpretable. What it bought, over 3 h 10 min of soak
+experiment lacked, and the reason its null was uninterpretable. What it bought, over 4 h 10 min of soak
 time at ≤ 4 instances: **0 driver xruns against 8 in the single non-RT hour**, with `cpu 3` taking
 **0 timer interrupts/s** (the tick and the per-CPU IPIs were 98.8 % of that core's interrupts and no
 runtime affinity write can move them — only `nohz_full` removes them). What it did **not** buy: the
@@ -904,7 +904,7 @@ kernel**: this box has already held RTF 0.9999 and a sample-exact self-oracle fo
 would not have touched (§9.5). RT buys margin against the *tail* — wakeup jitter, long kernel critical
 sections, a desktop waking up — and is worth having, but **no acceptance criterion may depend on it**,
 because we cannot require it of a user's host. **Measured 2026-09-16:** the RT host did exactly that
-and no more. It removed the driver xruns outright (8 in the non-RT hour → 0 in 3 h 10 min) and it did
+and no more. It removed the driver xruns outright (8 in the non-RT hour → 0 in 4 h 10 min) and it did
 not remove the CPU-time tail, because that tail is memory-stall shaped and identical in signature on
 both kernels. A host with a quiet scheduler and a busy memory system is still not a host this engine
 can hold 4 × A2-Full on at q64. The escalation path for a device with neither an RT kernel nor a quiet
@@ -1863,7 +1863,7 @@ audio IRQ pinned to cpu 2. Full evidence in `bench-results/rt-piv-summary.txt`.
 | chain p99 | 485.2 µs | 505.4 µs | 511.6 µs |
 | allocations / oracle / throttle | 0 / 0 / 0x0 | 0 / 0 / 0x0 | 0 / 0 / 0x0 |
 
-**The xrun clause is fixed; the late-block clause is not, and the reason is memory.** Over 3 h 10 min
+**The xrun clause is fixed; the late-block clause is not, and the reason is memory.** Over 4 h 10 min
 of RT soak time at ≤ 4 instances there were **zero** driver xruns. The remaining late blocks have
 `cpu == wall` with 0 blocks descheduled in every arm, so they are work, not lateness — and the work is
 stalling. With the load on the *housekeeping* cores (300 s per arm):
@@ -1880,8 +1880,9 @@ same instructions take 2.4× the cycles with *no change* in cache misses per blo
 2400 MHz (`scaling_cur_freq` identical in all 382 samples) and `throttled=0x0`. That is the
 memory-bound ceiling of risk 5 below, measured rather than assumed, and it means the levers above are
 in the right order — but it also means **core isolation is not a substitute for a quiet memory
-system**. Two other measured consequences: the cap can come down to 3 periods (0 drops over 15 min,
-p99 469 µs, 1.33 ms of latency saved), and 6 × A2-Full costs 1.9× the p99 of 4 rather than the 1.5×
+system**. Two other measured consequences: the cap can come down to 3 periods (0 drops and 0 refusals
+over a full hour, p99 528 µs, max 1422 µs, queue held at 1.94 periods — 1.33 ms of latency saved), and
+6 × A2-Full costs 1.9× the p99 of 4 rather than the 1.5×
 the arithmetic predicts, i.e. the throughput ceiling is memory-shaped too.
 
 ---
@@ -2001,12 +2002,15 @@ and must sit at or above the level the queue reaches by itself -- with `--period
 --output-queue-periods 4` as the measured recommendation (8 playback underruns and 0 capture overruns
 in an hour, queue held at 3.59 periods = 4.8 ms, against 92 xruns for the 4-period ring). **Updated
 2026-09-16:** on the RT host the queue's natural band is tighter (p1 2.72 / p50 2.94 periods) and
-`cap 3` does not manufacture drops -- it settles the queue lower instead (p1 1.67 / p50 1.94) and held
-0 xruns and 0 late blocks for 15 min, so **`--output-queue-periods 3` is now the recommended cap,
-worth 1.33 ms of latency**, and wants an hour to confirm; the ring stays 6. And **whether
+`cap 3` does not manufacture drops -- it settles the queue lower instead (p1 1.69 / p50 1.94) and, over
+a full hour, held 0 xruns, 0 drops and 0 cap refusals with one late block; so
+**`--output-queue-periods 3` with the floor off is now the recommended cap and is confirmed over the
+criterion's own duration, worth 1.33 ms of latency** (4.000 ms bound against 5.333 ms); the ring stays
+6. Note the floor must be off at cap 3, not 2: cap and floor one period apart is the squeezed-queue
+configuration that thrashes (§9.5). And **whether
 a queue floor controller should insert a period of silence when the occupancy falls too low**, which is
 the only mechanism that can hold a floor the loop cannot produce audio for, and which wants the
-occupancy-distribution instrument first; a floor of 2 never fired once in 3 h 10 min of RT soak time,
+occupancy-distribution instrument first; a floor of 2 never fired once in 4 h 10 min of RT soak time,
 so the default stays off until a configuration is found that needs it; and **whether `--cpu` defaults to
 pinning at all**, or
 stays off until `namchain-doctor` can pick a core and report the IRQ mask it shares it with.

@@ -11,7 +11,7 @@ Configured by plan-rt-piv.md; every arm is in bench-results/rt-piv-*.
 THE ONE-LINE ANSWER
 -------------------
 The RT kernel removed the driver xruns completely -- the clause that was failing 8 times an
-hour is now zero across 3 h 10 min of soak time -- and it did not remove the CPU-time tail
+hour is now zero across 4 h 10 min of soak time -- and it did not remove the CPU-time tail
 that still pushes a handful of blocks past the deadline. The tail is not a scheduling
 failure and no scheduler setting will fix it: it is the DSP waiting on a contended memory
 system, and it is measurable as cycles-per-instruction, not as lateness.
@@ -35,6 +35,10 @@ system, and it is measurable as cycles-per-instruction, not as lateness.
 
   H1 = cap 4, floor 2, splice-fade 1.333, --splice-verify (the instrument on)
   H2 = the same product configuration with the debug verifier off
+  C3 = cap 3, floor 0, splice-fade 1.333, verifier off: 0 xruns, 0 drops, **1** late block,
+       max 1421.6 us (1.07x the deadline), queue held at p50 1.94 periods -> a 4.000 ms
+       bound instead of 5.333 ms. The best of the three hours, but see the variance note
+       below before attributing that to the cap.
 
 So of the six clauses, five now pass and one does not: "max block time < the deadline",
 which is the same clause as "zero deadline overruns". Two hours of the same effective
@@ -44,11 +48,11 @@ drops (13-18 per 900 s one afternoon, 0 in 50 minutes the next evening).
 
 What is unambiguous is the xrun clause, because zero has no variance:
 
-  RT + isolation, <= 4 instances, no memory load:   0 driver xruns in 11 420 s (3 h 10 min)
+  RT + isolation, <= 4 instances, no memory load:   0 driver xruns in 15 020 s (4 h 10 min)
   non-RT, same binary family, 1 h:                  8 playback underruns
   non-RT, 4-period ring, 1 h:                       92 xruns
 
-At 8/h, seeing none in 3.17 h has probability ~e^-25. That clause is genuinely fixed.
+At 8/h, seeing none in 4.17 h has probability ~e^-33. That clause is genuinely fixed.
 
 
 2. THE MANIPULATION CHECK EVERY EARLIER HOST EXPERIMENT LACKED
@@ -128,9 +132,17 @@ lower instead (p1 1.67 / p50 1.94) with zero drops, over 15 minutes.
   cap 4 (5.33 ms bound):  v1 900 s  -- 0 xruns, 0 late, p99 513 us, max 1288 us
   cap 3 (4.00 ms bound):  c1 300 s  -- 0 xruns, 0 late, p99 549 us, max 1198 us
                           c2 900 s  -- 0 xruns, 0 late, p99 469 us, max  893 us
+                          c3 3600 s -- 0 xruns, 0 drops, 1 late, p99 528 us, max 1422 us
 
-So 1.33 ms of end-to-end latency is available for free on this host, and the earlier finding
-that a cap one period above the floor thrashes does not apply when the floor is off.
+So 1.33 ms of end-to-end latency is available on this host, and it is now confirmed over the
+criterion's own duration: cap 3 held a p50 occupancy of 1.94 periods for a full hour with
+zero drops and zero cap refusals, and finished with one late block out of 2.7 million. The
+earlier finding that a cap one period above the floor thrashes does not apply when the floor
+is off, which is why the recommended configuration pairs cap 3 with floor 0. The one late
+block against cap 4's 15 and 109 is suggestive but not causal: three hours is not enough to
+separate a cap effect from the session variance, and the cap does not touch the mechanism in
+section 3 -- what it does is remove 1.33 ms of latency at no measured cost, which is worth
+taking on its own terms.
 
 Quantum. q32 was the worst quantum on the non-RT host because a 1000 Hz tick landed inside
 every 666 us period. On a tickless core that argument is gone, and q32 is close to viable:
@@ -181,8 +193,10 @@ in five minutes.
   is memory, and both kernels show cpu == wall).
 - One device, one host, one period size, 4 x A2-Full throughout. Nothing here says how a
   different interface or a machine with more memory bandwidth behaves.
-- The 15-minute cap-3 runs are screens, not a shipping decision. cap 3 should be confirmed
-  over an hour before it replaces cap 4.
+- The cap-3 result is confirmed over an hour (C3), so it is a shipping recommendation rather
+  than a screen. What is not established is that cap 3 *reduces* the late-block rate: one
+  late block against 15 and 109 is consistent with that and with luck, and the cap does not
+  touch the memory mechanism. Adopt it for the 1.33 ms of latency, not for the overruns.
 - d0 (a 120 s quiet arm) failed on a single late block, which is the variance in section 6
   in miniature, not a defect of that configuration.
 
@@ -196,5 +210,7 @@ in five minutes.
    of memory traffic per block: fewer resident models, a smaller quantum is worse not better,
    and anything that keeps other workloads off the machine's memory system. This is worth a
    plan item of its own.
-3. Adopt cap 3 and confirm it over an hour; it is 1.33 ms of latency for zero drops.
+3. Adopt cap 3 with floor 0. Confirmed over an hour: 0 drops, 0 refusals, queue held at 1.94
+   periods, 4.000 ms bound instead of 5.333 ms, and one late block. It is 1.33 ms of latency
+   for nothing measurable, which is the cleanest win in this document.
 4. Ship the tiered configuration honestly: q128 with margin, q64 marginal, q32 not yet.
