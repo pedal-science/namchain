@@ -1,0 +1,56 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 384 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            4 x build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/150, playback min/max 42/200 (last 192) frames
+                  playback queue 0.66..3.12 periods (last 3.00); the floor is the stall the device
+                  absorbs without starving: 0.66 periods = 0.875 ms
+                  p1 2.56, p50 2.94 periods; 3 of 225000 blocks held less than one
+                  period (0.00 %), which is the window a stall has to miss
+queue target:     4 periods = 5.333 ms: a cap on the ring's contents, so a burst
+                  cannot buy latency beyond it. Not a promise of cushion -- the
+                  floor held above is the number to read
+queue control:    0 output drops (not gated: each refusal is the target's trade), 3 capture bursts
+                  0 of those drops were the queue target refusing a period that
+                  would have raised the ring past 4 periods; 0 were the ring itself
+                  being full
+queue prefill:    8 frames of silence written before block 0 to bring the ring
+                  to its target (0.167 ms of output latency, paid once)
+occupancy check:  673819 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           225000
+audio:            300.000 s in 299.977 s wall (RTF 0.9999)
+deadline:         1333333 ns
+split (p50):      read 3056 ns, chain 327112 ns, write 12870 ns
+split (tail):     read p99 6222 max 29223, chain p99 645224 max 2172914, write p99 21315 max 134612 ns
+chain p99:        645224 ns (48.39% of deadline)
+device wait:      p50 1143874 ns, p99 1176152 ns, max 1470283 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 2161925 ns, wall max 2172914 ns
+                  76.33 s of CPU over 76.58 s of wall in the render path (99.7%), 9 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 76662 cpu 2161925 ns (wall 2172914 ns), block 76830 cpu 1973076 ns (wall 1992507 ns), block 76652 cpu 1927316 ns (wall 1942766 ns), block 76663 cpu 1823185 ns (wall 1831857 ns), block 76978 cpu 1822332 ns (wall 1838265 ns)
+cpu spike bursts: 1955 blocks over half a period of CPU, in 430 runs; runs start every 3..18443 blocks (0.0..24.6 s at 48 k/64)
+                  run at block 0..0 (1 long), worst 874870 ns of CPU
+                  run at block 180..180 (1 long), worst 682259 ns of CPU
+                  run at block 183..184 (2 long), worst 707129 ns of CPU
+                  run at block 210..210 (1 long), worst 707316 ns of CPU
+                  run at block 220..220 (1 long), worst 717926 ns of CPU
+                  run at block 231..248 (18 long), worst 1437852 ns of CPU
+                  run at block 251..252 (2 long), worst 770184 ns of CPU
+                  run at block 255..257 (3 long), worst 713759 ns of CPU
+block time:       p50 340631 ns, p99 671742 ns, max 2260952 ns
+p99/deadline:     50.38% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+first overrun at: block 237 of 225000
+deadline overruns:29
+driver xruns:     0
+  by direction:   0 capture overruns, 0 playback underruns
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           FAIL

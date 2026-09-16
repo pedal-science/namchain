@@ -1,67 +1,63 @@
 irqbalance        inactive
 pairs             8 x 300 s
 steerable IRQs    59, deliverable to cpu 3: 56 (all of these move in arm B)
-a1   on  cpu3 56       chain_p99          overruns       xruns     spikes 
-b1   off cpu3 59       chain_p99          overruns       xruns     spikes 
-a2   on  cpu3 53       chain_p99          overruns       xruns     spikes 
-b2   off cpu3 53       chain_p99          overruns       xruns     spikes 
-a3   on  cpu3 51       chain_p99          overruns       xruns     spikes 
-b3   off cpu3 57       chain_p99          overruns       xruns     spikes 
-a4   on  cpu3 54       chain_p99          overruns       xruns     spikes 
-b4   off cpu3 51       chain_p99          overruns       xruns     spikes 
-a5   on  cpu3 51       chain_p99          overruns       xruns     spikes 
-b5   off cpu3 54       chain_p99          overruns       xruns     spikes 
-a6   on  cpu3 55       chain_p99          overruns       xruns     spikes 
-b6   off cpu3 56       chain_p99          overruns       xruns     spikes 
-a7   on  cpu3 54       chain_p99          overruns       xruns     spikes 
-b7   off cpu3 53       chain_p99          overruns       xruns     spikes 
-a8   on  cpu3 81       chain_p99          overruns       xruns     spikes 
-b8   off cpu3 57       chain_p99          overruns       xruns     spikes 
+a1   on  cpu3 292529   chain_p99 553668   overruns       xruns 0   spikes bursts:
+b1   off cpu3 291340   chain_p99 487354   overruns       xruns 0   spikes bursts:
+a2   on  cpu3 290304   chain_p99 562187   overruns       xruns 0   spikes bursts:
+b2   off cpu3 289146   chain_p99 581612   overruns       xruns 0   spikes bursts:
+a3   on  cpu3 291038   chain_p99 570354   overruns       xruns 0   spikes bursts:
+b3   off cpu3 291887   chain_p99 580817   overruns       xruns 0   spikes bursts:
+a4   on  cpu3 289723   chain_p99 602409   overruns       xruns 0   spikes bursts:
+b4   off cpu3 290292   chain_p99 579020   overruns       xruns 0   spikes bursts:
+a5   on  cpu3 291033   chain_p99 645224   overruns       xruns 0   spikes bursts:
+b5   off cpu3 291133   chain_p99 580798   overruns       xruns 0   spikes bursts:
+a6   on  cpu3 290732   chain_p99 564853   overruns       xruns 0   spikes bursts:
+b6   off cpu3 291390   chain_p99 637375   overruns       xruns 0   spikes bursts:
+a7   on  cpu3 292120   chain_p99 574392   overruns       xruns 0   spikes bursts:
+b7   off cpu3 292399   chain_p99 560965   overruns       xruns 0   spikes bursts:
+a8   on  cpu3 290396   chain_p99 580410   overruns       xruns 0   spikes bursts:
+b8   off cpu3 291291   chain_p99 583114   overruns       xruns 0   spikes bursts:
 restored, differences: 0
-b1   off cpu3 129851   chain_p99          overruns       xruns     spikes 
-a2   on  cpu3 66231    chain_p99          overruns       xruns     spikes 
-b2   off cpu3 91656    chain_p99          overruns       xruns     spikes 
-a3   on  cpu3 11698    chain_p99          overruns       xruns     spikes 
 
-STATE: no valid paired data yet. Four launch attempts, four environmental failures.
--------------------------------------------------------------------------------
-Each attempt failed for a different reason, and each time the host was restored and verified:
+RESULT of the 16-arm run: no detectable effect, and the intervention is not proven.
+------------------------------------------------------------------------------
+All 16 arms completed (8 pairs x 300 s), the trap restored every mask, and a re-check reports 0
+differences across 59 IRQs with no processes left. Paired within-pair differences, B minus A:
 
-  1. the helper was named `expand`, which collides with /usr/bin/expand, so bash ran the external
-     tab-expander on "0-3" instead of the function. No IRQ moved, and the four arms were four samples of
-     the same configuration -- kept above, because they measure this host's drift.
-  2. a cleanup step used `pkill -f 'namchain-soak --device'`, whose pattern matched the job's own command
-     line, so the job killed itself before the arms ran.
-  3. a stale soak from attempt 1 still held /dev/snd/pcmC2D0c, so all sixteen arms exited rc=2
-     ("Device or resource busy") in seconds. My probe for that used a *blocking* open and hung instead of
-     reporting the busy state.
-  4. overlapping leftovers from attempts 1-3 then ran as two concurrent instances, competing for the same
-     device, so most arms failed while a few produced partial deltas.
+  metric      A mean        B mean      paired diff     sd       se      t
+  chain p99   581 687 ns    573 882 ns      -7 805 ns   42 635   15 074  -0.52
+  block p99   605 247 ns    596 878 ns      -8 370 ns   46 383   16 399  -0.51
+  overruns          9.38         6.75          -2.62     13.37     4.73  -0.56
+  driver xruns      0.00         0.00           0.00      0.00     0.00   0.00
+  spike blocks   1 353.5      1 346.6           -6.9    301.8    106.7   -0.06
 
-`kill -9` on those instances bypassed the script's trap, which is what restores the masks: it left **25 of
-the 59 IRQs** steered away from cpu 3. Caught by the same verification the experiment uses on itself, and
-restored from the saved originals -- 0 differences across 59 IRQs, no processes left, device free.
+Nothing is resolved: every effect is a fraction of its own standard error. The paired design did what it
+was for -- the within-arm spread is 16 % (chain p99 553-645 us) while the paired differences have an sd of
+43 us -- but the effect being hunted is ~1 %, so 8 pairs cannot see it however well the drift cancels.
 
-What is now known and usable:
+Incidentally: zero driver xruns in all sixteen arms, i.e. 80 minutes with no dropouts, which is consistent
+with this being a quiet session.
 
-  * the design is settled: alternating A/B pairs, because two arms of the *same* configuration 20 minutes
-    apart differed by 8.8 points of chain p99, so only within-pair differences are trustworthy;
-  * the manipulation is settled and *measured*: 59 steerable IRQs, **56 of them currently deliverable to
-    cpu 3**, and arm B removes cpu 3 from all of them (`0-3` -> `0-2`) -- nothing on this machine steers
-    away from the audio core today, and `irqbalance` is inactive;
-  * the check that the manipulation happened is per-run: cpu 3's interrupt count for that arm's own
-    duration. It caught attempt 1 (deltas identical at ~291 400 across all four arms) and it will show
-    immediately whether a B arm is really a B arm;
-  * the limit that bounds a null result: only *steerable* IRQs move. The arch timer, IPIs and RCU
-    callbacks are per-CPU and cannot be steered from /proc -- exactly the sources a
-    nohz_full/rcu_nocbs/threadirqs boot configuration addresses. So this tests the device-IRQ half, and a
-    null result would not rule out interrupt work from the non-steerable half. That is what the RT kernel
-    being prepared would cover.
+AND THE INTERVENTION IS NOT PROVEN, which makes the null uninterpretable:
 
-To run it cleanly, with nothing else on the machine:
+  * cpu 3's interrupt count for each arm was ~290 000 in BOTH arms (292 529, 291 340, 290 304, ...), so the
+    global count cannot show that anything moved;
+  * the direct write test returned `Operation not permitted` -- but it was run against IRQ 1, a legacy ISA
+    IRQ, which is special-cased and is not representative of the 56 device IRQs a B arm is supposed to move;
+  * so nothing in this run demonstrates that cpu 3 stopped receiving device interrupts, and "no effect"
+    cannot be distinguished from "no intervention".
 
-    pkill -9 -x namchain-soak          # name-based, so it cannot match the caller
-    sleep 5                             # and confirm the device is free with a NON-BLOCKING open
-    tools/soak/irq-affinity-ab.sh 8 300 # ~85 minutes; the trap restores on exit, INT and TERM
+What the same measurement does show, and it changes the plan:
 
-and do not `kill -9` the script: that bypasses the restore. A plain `kill` (SIGTERM) runs the trap.
+  cpu 3's interrupt load is dominated by sources that cannot be steered from /proc. The per-CPU local timer
+  alone is ~1 000 interrupts per second here (290 000 per 300 s), which is the whole of the per-arm delta,
+  and the arch timer, IPIs and RCU callbacks are exactly the sources a runtime affinity mask cannot remove.
+
+So the runtime half of this experiment -- move the device IRQs, see whether the tail shrinks -- cannot test
+the hypothesis on this host on its own. The lever that can is the boot-time configuration the RT work
+covers: `isolcpus`/`nohz_full` on the audio core, `rcu_nocbs` to move RCU callbacks off it, and
+`threadirqs` (or PREEMPT_RT) so the remaining IRQ work can at least be prioritised and observed.
+
+A corrected runtime run needs, in order: prove the write works on a *device* IRQ (the xhci one, not IRQ 1)
+and record the read-back; show the B arms' steerable-IRQ counts on cpu 3 fall, not the global count; and
+many more pairs, because 1 % against a 43 us paired sd is not an 8-pair question.
