@@ -1,0 +1,35 @@
+start       2026-09-17T13:22:57+01:00
+command     /home/rik/code.local/namchain/tools/soak/rt-manipulation-check.sh arm /home/rik/code.local/namchain/bench-results/piv-cx-3-conf /home/rik/code.local/namchain/build/namchain-soak --device hw:2,0 --capture-channels 8 --playback-channels 6 --quantum 64 --periods 6 --output-queue-periods 3 --output-queue-floor-periods 0 --splice-fade-ms 1.333 --splice-verify --instances 4 --model /home/rik/code.local/namchain/build/generated/A2-Full.nam --input-channel 0 --output-channel 0 --self-oracle --oracle-window 5 --rt-priority 80 --cpu 3 --seconds 1800
+2026-09-17T13:22:57+01:00
+2026-09-17T13:23:57+01:00
+2026-09-17T13:24:57+01:00
+2026-09-17T13:25:57+01:00
+2026-09-17T13:26:57+01:00
+2026-09-17T13:27:57+01:00
+2026-09-17T13:28:57+01:00
+2026-09-17T13:29:57+01:00
+2026-09-17T13:30:57+01:00
+2026-09-17T13:31:57+01:00
+2026-09-17T13:32:57+01:00
+2026-09-17T13:33:57+01:00
+2026-09-17T13:34:57+01:00
+2026-09-17T13:35:57+01:00
+2026-09-17T13:36:57+01:00
+2026-09-17T13:37:57+01:00
+2026-09-17T13:38:57+01:00
+2026-09-17T13:39:57+01:00
+2026-09-17T13:40:57+01:00
+2026-09-17T13:41:57+01:00
+2026-09-17T13:42:57+01:00
+2026-09-17T13:43:57+01:00
+2026-09-17T13:44:57+01:00
+2026-09-17T13:45:57+01:00
+2026-09-17T13:46:57+01:00
+2026-09-17T13:47:57+01:00
+2026-09-17T13:48:57+01:00
+2026-09-17T13:49:57+01:00
+2026-09-17T13:50:57+01:00
+2026-09-17T13:51:57+01:00
+2026-09-17T13:52:57+01:00
+end         2026-09-17T13:52:59+01:00
+exit        1

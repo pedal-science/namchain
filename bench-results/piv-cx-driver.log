@@ -1,1 +1,16 @@
   confinement=off system.slice=0-3  user.slice=0-3   loadavg=0.58
+  piv-cx-1-unconf rc=1  pin: SCHED_FIFO priority 80, cpu 3
+  confinement=on  system.slice=0-1  user.slice=0-1   loadavg=0.39
+  piv-cx-2-conf rc=1  pin: SCHED_FIFO priority 80, cpu 3
+  confinement=on  system.slice=0-1  user.slice=0-1   loadavg=0.65
+  piv-cx-3-conf rc=1  pin: SCHED_FIFO priority 80, cpu 3
+  confinement=off system.slice=0-3  user.slice=0-3   loadavg=0.56
+  piv-cx-4-unconf rc=1  pin: SCHED_FIFO priority 80, cpu 3
+  confinement=off system.slice=0-3  user.slice=0-3   loadavg=0.57
+=== done ===
+| arm             | cpu | xruns | cap/play | late blks | blk p50 us | blk p99 us | blk max us | p99 % | cpu max us | wall max us | spike blks | drops | floor ins | tick c2/c3 /s | throttled | result |
+|-----------------|-----|-------|----------|-----------|------------|------------|------------|-------|------------|-------------|------------|-------|-----------|---------------|-----------|--------|
+| piv-cx-1-unconf | 3   | 0     | 0/0      | 7         | 330        | 445        | 1931       | 33.38 | 1845       | 1842        | 1949       | 0     | -         | -/-           | 0x0       | FAIL   |
+| piv-cx-2-conf   | 3   | 0     | 0/0      | 1         | 326        | 393        | 1339       | 29.49 | 1297       | 1299        | 2635       | 0     | -         | -/-           | 0x0       | FAIL   |
+| piv-cx-3-conf   | 3   | 0     | 0/0      | 2         | 322        | 382        | 1428       | 28.68 | 1378       | 1376        | 2650       | 0     | -         | -/-           | 0x0       | FAIL   |
+| piv-cx-4-unconf | 3   | 0     | 0/0      | 5         | 321        | 381        | 1376       | 28.60 | 1332       | 1331        | 2163       | 0     | -         | -/-           | 0x0       | FAIL   |

@@ -1,0 +1,102 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 384 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            4 x build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/383, playback min/max 0/383 (last 151) frames (206 blocks wrote into a full playback ring)
+                  playback queue 0.00..5.98 periods (last 2.36); the floor is the stall the device
+                  absorbs without starving: 0.00 periods = 0.000 ms
+                  p1 0.70, p50 2.19 periods; 3909 of 225000 blocks held less than one
+                  period (1.74 %), which is the window a stall has to miss
+queue target:     3 periods = 4.000 ms: a cap on the ring's contents, so a burst
+                  cannot buy latency beyond it. Not a promise of cushion -- the
+                  floor held above is the number to read
+splice repair:    64-frame bridge (1.333 ms) armed 368 times: 368 dropped periods,
+                  0 inserted ones. Applied to the emitted signal only -- the oracle
+                  below still compares the engine's pristine output
+splice measured:  152 splices judged on the emitted signal (reference 0.061180):
+                  raw 0.358592 (5.1x) -> emitted 0.072715 (1.2x)
+queue control:    368 output drops (not gated: each refusal is the target's trade), 8339 capture bursts
+                  368 of those drops were the queue target refusing a period that
+                  would have raised the ring past 3 periods; 0 were the ring itself
+                  being full
+queue prefill:    8 frames of silence written before block 0 to bring the ring
+                  to its target (0.167 ms of output latency, paid once)
+capture xruns:    171 found by the gate (a subset of the driver xruns below: an
+                  xrun freezes hw_ptr, so without this the loop stalls instead)
+occupancy check:  640869 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           225000
+audio:            300.000 s in 301.518 s wall (RTF 1.0051)
+deadline:         1333333 ns
+split (p50):      read 4482 ns, chain 434280 ns, write 15611 ns
+split (tail):     read p99 19797 max 1547617, chain p99 1507746 max 2470768, write p99 71741 max 4383275 ns
+chain p99:        1507746 ns (113.08% of deadline)
+device wait:      p50 671429 ns, p99 1177615 ns, max 3374271 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 2476389 ns, wall max 2470768 ns
+                  133.56 s of CPU over 133.53 s of wall in the render path (100.0%), 69 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 83765 cpu 2476389 ns (wall 2469120 ns), block 220584 cpu 2474870 ns (wall 2470768 ns), block 181216 cpu 2457204 ns (wall 2448916 ns), block 222883 cpu 2445741 ns (wall 2446620 ns), block 190716 cpu 2354370 ns (wall 2343897 ns)
+cpu spike bursts: 4096 blocks over half a period of CPU (capped: there were more), in 182 runs; runs start every 3..2503 blocks (0.0..3.3 s at 48 k/64)
+                  run at block 0..4 (5 long), worst 1885870 ns of CPU
+                  run at block 13..13 (1 long), worst 793111 ns of CPU
+                  run at block 25..80 (56 long), worst 1428592 ns of CPU
+                  run at block 89..93 (5 long), worst 808685 ns of CPU
+                  run at block 99..99 (1 long), worst 698463 ns of CPU
+                  run at block 103..104 (2 long), worst 755130 ns of CPU
+                  run at block 108..108 (1 long), worst 831834 ns of CPU
+                  run at block 111..111 (1 long), worst 779759 ns of CPU
+block time:       p50 455317 ns, p99 1596728 ns, max 6147799 ns
+p99/deadline:     119.75% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+first overrun at: block 0 of 225000
+deadline overruns:10083
+driver xruns:     562
+  by direction:   174 capture overruns, 388 playback underruns
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           FAIL
+=== host state ===
+period           2026-09-17T14:39:48+01:00 -> 2026-09-17T14:44:51+01:00 (303s)
+kernel_release   7.0.0-1017-raspi-realtime
+uname_says_rt    true
+cmdline          reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10 isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew_tick=1
+isolated_cpus    2-3
+nohz_full_cpus   2-3
+governor         performance
+scaling_max_khz  2400000
+scaling_cur_khz  2400000
+temp_mC          48500
+throttled        0x0
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   xhci-hcd:usb2
+audio_irq_number 134
+audio_irq_affinity 2
+audio_irq_thread_prio 85
+
+=== interrupt deltas per CPU (303s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer            303598    182694        35        33
+IPI0_resched             742    279814         2    200283
+IPI5_irqwork             479       787        35       206
+audio_IRQ                  0         0       312         0
+IPI1_fncall              338     20721         0         0
+
+=== verdict ===
+ok:   cpu 2 .tick_stopped=1 -- the scheduler tick is stopped on this core.
+ok:   cpu 3 .tick_stopped=1 -- the scheduler tick is stopped on this core.
+info: cpu 2 arch_timer delta 35 in 303s (0.1/s).
+      On a tickless core this is normally 0; a nonzero value is an hrtimer (or a
+      tick that came back), not proof of either.
+info: cpu 3 arch_timer delta 33 in 303s (0.1/s).
+      On a tickless core this is normally 0; a nonzero value is an hrtimer (or a
+      tick that came back), not proof of either.
+ok:   the audio IRQ (134) was delivered 312 times to reserved cpu 2,
+      at 1.0/s -- the interface's data path is landing
+      where it was pinned rather than being accepted and ignored.
+ok:   isolated=2-3 nohz_full=2-3

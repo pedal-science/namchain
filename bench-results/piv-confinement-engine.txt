@@ -63,3 +63,70 @@ The matched vm-load pair, which answers the harder question their document leave
   piv-cab-d-confined-vm  confined,   the same load, engine in the audio partition
 Driver: tools/soak/piv-confine-engine-ab.sh. Neither the confinement nor the load is persistent:
 the slice properties are `--runtime` and are gone at reboot.
+
+
+THE SAME-SESSION ANSWER (2026-09-17, 14:00-14:23)
+-------------------------------------------------
+Four arms in one session, **no reboots**, balanced unconfined / confined / confined / unconfined,
+1800 s each, nothing else deliberate running (loadavg 0.39-0.65), engine pinned to cpu 3 in both
+conditions and in its own cpuset partition for the confined ones. Every arm confirmed
+`SCHED_FIFO priority 80, cpu 3`. Evidence: `bench-results/piv-cx-*`.
+
+  arm             condition    xruns  late  blk p50  blk p99  blk max   p99%
+  piv-cx-1-unconf unconfined       0     7      330      445     1931   33.38
+  piv-cx-4-unconf unconfined       0     5      321      381     1376   28.60
+  piv-cx-2-conf   confined         0     1      326      393     1339   29.49
+  piv-cx-3-conf   confined         0     2      322      382     1428   28.68
+
+  late blocks      unconfined 7, 5  ->  confined 1, 2       (means 6.0 -> 1.5, 4x fewer, and the
+                                                            two conditions do not overlap)
+  block p99 us     unconfined 445, 381 -> confined 393, 382 (means 413 -> 388, -6%)
+  block max us     unconfined 1931, 1376 -> confined 1339, 1428 (means 1654 -> 1384, -16%)
+  p99 % of deadline unconfined 33.38, 28.60 -> confined 29.49, 28.68 (means 31.0 -> 29.1)
+
+**So confinement does move the engine, but modestly, and only the late-block count separates the
+conditions cleanly at n=2.** The p99 and max differences are the same size as the spread *within*
+the unconfined condition (cx-1 is markedly worse than cx-4 despite being the same configuration),
+so they are a trend and not a result. There were **0 driver xruns and 0 queue drops in all four
+arms**: on a quiet machine both conditions are good, and confinement buys a reduction in rare late
+blocks rather than a change of regime.
+
+That is a long way from the "15x" this file used to claim, and it is why the retraction above
+matters: the large effect was the boot storm, and the modest one is what confinement is worth.
+
+
+THE LOAD ITSELF IS NOT REPRODUCIBLE, WHICH IS THE BIGGER FINDING
+----------------------------------------------------------------
+Chasing a discrepancy turned up something more important than the confinement question.
+
+`stress-ng --vm 1 --vm-bytes 128M` on cpus 0-1, 4 x A2-Full, q64, 300 s:
+
+  arm                engine config                     load flags        xruns   late    p99 us   max us
+  piv-d3-retest      cap 4, no splice                  --vm, no keep      5467   32875    2756    10527
+  rt-piv-d3-vm       cap 4, no splice                  --vm, no keep      5460   38210    2793    10020
+  piv-vm-nokeep      cap 3 + splice                    --vm, no keep      2400   26719    2050    10441
+  piv-vm-keep        cap 3 + splice                    --vm-keep           562   10083    1597     6148
+  piv-cab-c-unconf-vm cap 3 + splice                   --vm-keep             0       6     396     1431
+
+Two readings.
+
+1. **`--vm-keep` matters, and it is worth about 4x on xruns in a controlled pair** (2400 -> 562,
+   both arms back to back this afternoon, same engine configuration). Without it stress-ng frees
+   and re-maps its 128 MB every cycle, so the kernel zeroes and re-faults those pages continuously;
+   with it, the same pages are rewritten in place. So the thing that hurts the engine is **new-page
+   traffic -- faults, zeroing, mapping churn -- not the size of the working set.** That is a real
+   refinement of docs/tuning.md, whose rule currently says "do not run memory-heavy work beside the
+   engine" without saying what makes it heavy.
+2. **The same flags do not reproduce across sessions.** `piv-cab-c-unconf-vm` and `piv-vm-keep`
+   are the same configuration and the same load flags, 3.5 hours apart: **0 driver xruns against
+   562**, and 6 late blocks against 10 083. Meanwhile `piv-d3-retest` reproduced `rt-piv-d3-vm`
+   to within 7 xruns a day apart (5467 against 5460), so it is not that the machine cannot repeat
+   itself -- it is that *this* comparison sits near a cliff. A small uncontrolled difference flips
+   the engine between "fine" and "thousands of xruns", which is exactly the regime where a
+   single-arm measurement means nothing and only a balanced same-session design does.
+
+**Consequence for how this project measures from here on:** on piv, any arm that involves memory
+pressure must be run in a balanced same-session sequence, and the manipulation check must record
+the *load's* own traffic (page faults or equivalent), not just its presence. The confinement
+question could be answered cleanly because confinement is a runtime property; the memory-pressure
+question has no such luxury and needs the pairing.
