@@ -1,0 +1,55 @@
+The tib confinement arms, re-run properly: confinement does not move the engine there
+======================================================================================
+
+2026-09-17. Corrects docs/distro-slimming.md §7b, §7c and §7d, all of which confined the
+*measurement process* along with everything else (§7.0). This run does what §7.0 says: the
+top-level slices at 0-1, the engine in its own cpuset partition at 2-3, rlimits passed through
+the unit, four arms in one session with **no reboots**, balanced. Every device arm confirmed
+`SCHED_FIFO priority 80, cpu 3` -- the check the originals failed.
+
+DEVLESSLESS, under a memory load (tib-cx-*, 900 s per arm, `stress-ng --vm 1 --vm-bytes 128M
+--vm-keep` on cpus 0-1, `--backend null`, 3 x A2-Lite, q64):
+
+  arm              condition    late blocks   blk p50   blk p99   blk max   p99%
+  tib-cx-1-unconf  unconfined         73 607      457      1760      9827  131.97
+  tib-cx-4-unconf  unconfined         71 264      460      1749      2033  131.21
+  tib-cx-2-conf    confined           68 364      459      1739      3326  130.40
+  tib-cx-3-conf    confined           72 356      459      1742      2051  130.64
+
+  late blocks 72 436 -> 70 360 (3%), p99 1755 -> 1741 us, worst block anything from 2033 to 9827
+  in *both* conditions. **Confinement does nothing measurable here.** The original E5 claimed
+  overruns -31% and p99 -14%; that was the placement change, not confinement.
+
+THE DEVICE PATH, the 2x2 (tib-dx-*, 600 s per arm, SSL 2+ card 2, 3 x A2-Lite, ring 6, cap 4,
+floor 2, engine pinned to cpu 3 in all four arms):
+
+  arm                  load   confined   xruns   late blocks   blk p99   blk max   p99%    result
+  tib-dx-1-quiet-unc   none   no             0             0       493       768   36.95   PASS
+  tib-dx-4-quiet-conf  none   yes            0             0       492       672   36.90   PASS
+  tib-dx-2-vm-unc      vm     no          2876        51 048      1786      6402  133.92   FAIL
+  tib-dx-3-vm-conf     vm     yes         2701        48 780      1796      6407  134.73   FAIL
+
+Two results, and the second is the one that matters.
+
+1. **tib's device ceiling when nothing else runs, and it is good:** 0 driver xruns, 0 deadline
+   overruns, block p99 **36.9% of the deadline**, worst block under 800 us -- and identical with
+   and without confinement. That is the number E5b's author warned not to quote from the wrong
+   arm, now measured on the right one.
+2. **Confinement does not rescue the device path under memory pressure.** 2876 xruns unconfined
+   against 2701 confined -- 6%, inside the noise -- with p99 133.9% against 134.7% and floor
+   insertions 9924 against 9803. The original claimed 746 -> 0. The honest answer is that on this
+   board **confinement buys nothing when the memory system is busy**, because the housekeeping
+   CPUs and the audio CPU share one bus and there is no core to spare to move anything to.
+
+That is a *better* argument for the conclusion §7b already reached by a different route -- "the
+variable is not controllable from userspace, so run nothing else on it" -- but the evidence for
+it is now the absence of an effect rather than a large one.
+
+HOW THE TWO BOARDS DIFFER
+-------------------------
+  piv, quiet, same session, balanced:   late blocks 7 and 5 unconfined -> 1 and 2 confined (~4x)
+  tib, vm load, same session, balanced: late blocks 72 436 -> 70 360 (3%), xruns 2876 -> 2701 (6%)
+  tib, quiet, device:                   0 xruns and 0 late blocks either way
+
+So confinement is worth having on piv and near-useless on tib under load. That is consistent with
+piv having a core to spare and a quieter memory system, and tib having neither.
