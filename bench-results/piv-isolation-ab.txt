@@ -83,3 +83,28 @@ CAVEATS, ALL OF THEM
    555/300), with a large gap between the groups. That is the opposite of the 15-vs-109
    spread seen between two identical *hours* earlier, and it is what the balanced design was
    for.
+
+
+HOW THIS RELATES TO THE CONFINEMENT WORK (added 2026-09-17)
+----------------------------------------------------------
+The other session's `bench-results/host-confine-screen.json` measured ~475 000 `arch_timer`
+interrupts per 120 s on cpu 2/3 with the isolation command line present but the cgroup slices
+unconfined, falling to 23 and 0 once `AllowedCPUs=0-1` was set on `system.slice`, `user.slice`
+and `init.scope`. That looks like it contradicts the "on" arms above, which recorded 0.0/s on
+cpu 3, and it does not. The two measurements differ in workload and both are right:
+
+  * `nohz_full` suppresses the tick on a core **only while exactly one task is runnable there**.
+  * In these arms the soak was the only runnable task on cpu 3, held there by `--cpu 3` at
+    `SCHED_FIFO 80`, so the core was genuinely tickless for the whole 1805 s: 0.0/s on cpu 3,
+    and cpu 2 at 2.0 and 0.3/s in the two "on" arms.
+  * The screen ran `cyclictest` on 2-3 while the rest of the system was free to place work
+    there, and `isolcpus=domain` does not stop a task whose affinity mask already contains
+    cores 2-3 from being placed on one. A second runnable task re-arms the tick.
+
+So the boot arguments deliver a tickless, reserved core **for as long as the engine is the only
+thing on it**, which is why this A/B shows a factor of ten, and they are fragile when the
+machine does anything else. A cgroup v2 `cpuset` partition is what makes them hold in general,
+and it is the next layer rather than a correction: with it, on tib, driver xruns under an
+identical memory load went 746 -> 0 and deadline overruns 14 090 -> 1 (E5c in
+`docs/distro-slimming.md`). The engine-level question -- whether 4 x A2-Full survives a memory
+load *once confined* -- is what the confinement work leaves open.
