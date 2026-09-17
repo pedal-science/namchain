@@ -574,23 +574,60 @@ Same as E5b but with the piv shipping queue shape (`--periods 6 --output-queue-p
 
 ---
 
-## 8. Deliverable that should come out of this
+## 8. The deliverable: `tools/soak/host-slim.sh`
 
-One idempotent, self-verifying script, `tools/soak/host-slim.sh [--apply|--revert|--check]`,
-because every technique above is currently prose:
+Written and run end-to-end on both boards on 2026-09-17. `--apply`, `--check`, `--diff`,
+`--revert`, plus `--dry-run`. It does the six things §4 describes:
 
-- masks the service list of §4.1/§4.3, journald `Storage=volatile`/`RuntimeMaxUse`, and the
-  `AllowedCPUs=` slice drop-ins;
-- **reads everything back** and prints the read-back, including the ones that lie
-  (`smp_affinity` on an idle IRQ, `vm.stat_interval`, `RT_GROUP_SCHED` from
-  `/boot/config-$(uname -r)`);
-- has a `--check` mode that emits the same before/after delta block
-  `tools/soak/rt-manipulation-check.sh` already produces, so a stripped-host claim is
-  auditable in the run's own `.env`;
-- and does nothing destructive: no package purge, no `sched_rt_runtime_us`, no kernel
-  rebuild. `plan.md` §9.3 promised a `namchain-doctor`; this is the same instrument with a
-  narrower job.
+1. `AllowedCPUs=` on `system.slice`, `user.slice`, `machine.slice` and `init.scope` —
+   transiently *and* as drop-ins, so it survives reboot.
+2. Masks the per-board service list, `mask` rather than `disable`.
+3. journald `Storage=volatile` + `RuntimeMaxUse=64M`, so logging never reaches the disk.
+4. `vm.stat_interval=10` via a oneshot unit (runtime-writable but not persistent).
+5. A udev rule giving `/dev/cpu_dma_latency` to group `audio`.
+6. `rttime 200000` for `@audio` as a runaway backstop — deliberately **not**
+   `sched_rt_runtime_us=-1`.
+
+Design decisions worth knowing before using it:
+
+- **Every action is recorded in `/var/lib/namchain/host-slim/manifest`, and `--revert` undoes
+  exactly that list.** No guessing which units were ours.
+- **`--revert` disables the oneshot unit before deleting its file**, or systemd is left with a
+  dangling enablement symlink.
+- **A time-sync guard.** `systemd-timesyncd` is on the piv list, but masking the only time
+  source would break TLS, apt and every timestamp a measurement is compared against, and piv
+  has no chrony installed. So the guard holds it back and `--check` reports it as intentional
+  (`--  held back: only time source`) rather than as a failure. Install `chrony` or set
+  `NAMSLIM_ALLOW_NO_TIME=1` to override.
+- **`armbian-zram-config` is masked on tib but `armbian-ramlog` is not**, and the script says
+  so at run time: zram swap costs CPU and memory bandwidth on a 2 GB board, whereas relocating
+  `/var/log` off zram would put log writes on tib's only block device.
+- **Masking a timer and the service it triggers leaves the timer reporting
+  `result=resources`**, which shows up in `systemctl --failed` and would eventually hide a
+  real failure. The script clears that cosmetic state with `reset-failed` after masking.
+- It touches **no** package, **no** boot asset and **no** kernel setting.
+
+**Verified round trip, 2026-09-17:**
+
+| | piv | tib |
+|---|---|---|
+| `--apply` twice | idempotent; second run `(32 already masked, …)` | idempotent; `(10 already masked, …)` |
+| cpuset read-back | `system.slice`/`user.slice`/`init.scope` → **0-1** | same |
+| audio IRQ after confinement | `irq/134-xhci-hcd:usb2` still mask `0-3`, `/proc/irq/134/smp_affinity_list=2` — **the pin survives**, because the thread is in the root cgroup | n/a (EHCI) |
+| `arch_timer` 10 s delta on the audio cores, after | **cpu2 = 1, cpu3 = 0** | cpu2 = 581, cpu3 = 272 — expected, tib has no `NO_HZ_FULL` |
+| `--revert` | 12 units unmasked, 4 files removed, cpusets back to `0-3` | same, and `system.slice` empty again |
+| essentials after apply | sshd, systemd-resolved, NetworkManager, dbus, journald all active; `timedatectl` still synchronised | sshd reachable; engine still runs |
+
+Two notes on the piv result. First, the `arch_timer` collapse is the whole point: it is the
+same measurement as §7a's screen, now produced by the persistent configuration rather than a
+transient one. Second, `systemctl --failed` on piv shows `libvirtd`, `logrotate` and
+`pg-backup` — all three predate this work (09:17, 00:32 and 00:00 respectively), and
+`docker.service` was stopped 12 minutes before `--apply`; none of it is attributable to the
+script. Check that distinction before blaming a change.
+
+`host-slim.sh` is **currently applied on both boards.** To undo:
+`sudo tools/soak/host-slim.sh --revert`.
 
 The kernel half stays where it already is — `rtpi` for piv and tib, `docs/tuning.md` for
-what a *user* should do. This document is the third layer: what to do to the distribution
-between the kernel and the engine.
+what a *user* should do. This document and its script are the third layer: what to do to the
+distribution between the kernel and the engine.

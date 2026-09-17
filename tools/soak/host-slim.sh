@@ -105,9 +105,11 @@ masked_by_us() { [[ -r $MANIFEST ]] && grep -q "^mask " "$MANIFEST"; }
 # 1. cpuset confinement of the top-level slices
 do_confine() {
   head2 "cpuset confinement (housekeeping -> $(housekeeping_cpus))"
-  local hk; hk=$(housekeeping_cpus) s
+  local hk s; hk=$(housekeeping_cpus)
   for s in system.slice user.slice machine.slice; do
-    if ! systemctl cat "$s" >/dev/null 2>&1; then skip "$s (not present)"; continue; fi
+    # `systemctl cat system.slice` exits non-zero for a built-in slice with no unit file,
+    # so test the cgroup filesystem instead: the directory exists iff the slice exists.
+    if [[ ! -d /sys/fs/cgroup/$s ]]; then skip "$s (not present)"; continue; fi
     run systemctl set-property --runtime "$s" AllowedCPUs="$hk"
     local eff; eff=$(cat "/sys/fs/cgroup/$s/cpuset.cpus.effective" 2>/dev/null)
     if [[ $DRY -eq 0 && $eff == "$hk" ]]; then ok "$s -> $eff"
@@ -115,7 +117,7 @@ do_confine() {
   done
   # init.scope holds pid 1 and kernel threads; constraining it is what removes unbound work
   # from the audio cores entirely. Measured to be effective where the kernel permits it.
-  if systemctl cat init.scope >/dev/null 2>&1; then
+  if [[ -d /sys/fs/cgroup/init.scope ]]; then
     run systemctl set-property --runtime init.scope AllowedCPUs="$hk"
     local e; e=$(cat /sys/fs/cgroup/init.scope/cpuset.cpus.effective 2>/dev/null)
     [[ $DRY -eq 0 ]] && ok "init.scope -> ${e:-<unchanged>}"
@@ -173,17 +175,62 @@ EOF
 # It is listed separately so the trade is visible instead of smuggled into a list.
 ramlog_service() { board | grep -qx tib && echo armbian-ramlog.service; }
 
+# A guard, not an absolute: masking the only time source on a box that has no RTC worth
+# trusting is a self-inflicted outage. Masking is allowed only when another time daemon is
+# actually present, or when the operator says so explicitly with NAMSLIM_ALLOW_NO_TIME=1.
+guard_time_sync() {
+  local u=$1 alt
+  [[ $u == systemd-timesyncd.service ]] || return 0
+  for alt in chrony.service ntpsec.service ntp.service openntpd.service; do
+    systemctl cat "$alt" >/dev/null 2>&1 && return 1
+  done
+  [[ ${NAMSLIM_ALLOW_NO_TIME:-0} == 1 ]] && return 0
+  return 2   # 2 = "would be masked, but the guard holds it back"
+}
+
+# Descriptions for items the guard keeps, so --check reports them as intended rather than
+# as failures. Keep in sync with guard_time_sync.
+guard_reason() {
+  case $1 in
+    systemd-timesyncd.service) echo "held back: only time source (install chrony to mask)" ;;
+    *) echo "held back by a guard" ;;
+  esac
+}
+
 do_mask() {
   head2 "mask background services"
-  local u existing=0 absent=0
+  local u existing=0 absent=0 skipped=0 g
   for u in $(service_list); do
     if ! systemctl cat "$u" >/dev/null 2>&1; then absent=$((absent+1)); continue; fi
+    g=0; guard_time_sync "$u" || g=$?
+    if [[ $g -eq 1 ]]; then
+      say "  $u: skipping the mask because another time daemon is present"
+      skipped=$((skipped+1)); continue
+    elif [[ $g -eq 2 ]]; then
+      warn "$u: $(guard_reason "$u")"
+      skipped=$((skipped+1)); continue
+    fi
     if [[ $(systemctl is-enabled "$u" 2>/dev/null) == masked ]]; then existing=$((existing+1)); continue; fi
     run systemctl mask "$u"
     manifest_add "mask $u"
     [[ $DRY -eq 0 ]] && ok "masked $u"
   done
-  say "  ($existing already masked, $absent not present on this board)"
+  say "  ($existing already masked, $absent not present on this board, $skipped deliberately skipped)"
+  # Masking a timer AND the service it triggers makes the timer report
+  # "Unit to trigger vanished / result=resources" and show up in `systemctl --failed`.
+  # That is cosmetic -- the timer cannot fire -- but a failed unit in the list is exactly
+  # the kind of noise that hides a real failure later, so clear it.
+  local masked_units
+  masked_units=$(systemctl list-unit-files --state=masked --no-legend --no-pager 2>/dev/null | awk '{print $1}')
+  local clear=()
+  for u in $(service_list); do
+    grep -qxF "$u" <<<"$masked_units" || continue
+    [[ $(systemctl show "$u" -p Result --value 2>/dev/null) == resources ]] && clear+=("$u")
+  done
+  if (( ${#clear[@]} > 0 )); then
+    run systemctl reset-failed "${clear[@]}"
+    [[ $DRY -eq 0 ]] && ok "cleared cosmetic failed state on ${#clear[@]} masked timer(s)"
+  fi
   local r; r=$(ramlog_service)
   if [[ -n $r && $(systemctl is-enabled "$r" 2>/dev/null) != masked ]]; then
     say "  NOT masking $r: it keeps /var/log in RAM. Masking it moves log writes to the"
@@ -302,9 +349,15 @@ do_check() {
   done
 
   head2 "masked services"
-  local u n=0 bad=0 st
+  local u n=0 bad=0 st g
   for u in $(service_list); do
     systemctl cat "$u" >/dev/null 2>&1 || continue
+    # A unit a guard deliberately holds back is intended state, not a defect.
+    g=0; guard_time_sync "$u" || g=$?
+    if [[ $g -eq 1 || $g -eq 2 ]]; then
+      printf '  --    %-46s %s\n' "$u" "$(guard_reason "$u")"
+      n=$((n+1)); continue
+    fi
     st=$(systemctl is-enabled "$u" 2>/dev/null)
     # `static` and `indirect` units are not driven by the enablement system at all, so
     # masking is a no-op for them and they are not a defect. `enabled` is.
@@ -334,7 +387,12 @@ do_revert() {
   if [[ ! -r $MANIFEST ]]; then
     warn "no manifest at $MANIFEST; reverting only the fixed file set"
   fi
-  local u
+  # Stop and disable the oneshot unit BEFORE deleting its file, or systemd keeps a
+  # dangling enablement symlink and the vmstat write is reverted but still wanted.
+  if [[ -f $VMSTAT_UNIT ]]; then
+    run systemctl disable --now namchain-host-slim-vmstat.service
+  fi
+  local kind what
   while read -r kind what _; do
     case $kind in
       mask) run systemctl unmask "$what"; ok "unmasked $what" ;;
@@ -346,7 +404,7 @@ do_revert() {
   # reload the transient cgroup properties
   local s
   for s in system.slice user.slice machine.slice init.scope; do
-    systemctl cat "$s" >/dev/null 2>&1 && run systemctl revert --runtime "$s" 2>/dev/null
+    [[ -d /sys/fs/cgroup/$s ]] && run systemctl revert --runtime "$s" 2>/dev/null
   done
   run systemctl daemon-reload
   run udevadm control --reload-rules

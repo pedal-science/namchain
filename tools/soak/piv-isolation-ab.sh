@@ -200,6 +200,11 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=$SELF --driver
 RemainAfterExit=no
+# The duration must be passed through the unit, not inherited: systemd starts a service with
+# a clean environment, so `sudo env ARM_SECONDS=3600 ./piv-isolation-ab.sh --install` armed a
+# sequence that silently ran the 1800 s default instead. That is how the first A/B ran half
+# the length requested.
+Environment=ARM_SECONDS=$ARM_SECONDS
 # An arm plus the oracle afterwards; do not let systemd kill it mid-measurement.
 TimeoutStartSec=infinity
 
@@ -229,6 +234,7 @@ case "${1:-}" in
     echo "state:        $(cat "$STATE" 2>/dev/null || echo '(not armed)')"
     [[ -f $ABORT ]] && echo "abort file:   present"
     echo "isolation now: $(grep -cE "$ISO_KEYS=" /proc/cmdline) args in /proc/cmdline"
+    echo "armed duration: $(grep -ohE 'ARM_SECONDS=[0-9]+' "$UNIT" 2>/dev/null || echo '(unit not installed)')"
     echo "arms done:"
     ls -1 "$REPO"/bench-results/piv-ab-*.txt 2>/dev/null | sed 's/^/  /' || echo "  (none)"
     ;;
