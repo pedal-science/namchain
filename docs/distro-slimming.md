@@ -432,7 +432,65 @@ host. All of these are cheap and reversible; none needs a reboot except where no
 Stop rules are the existing ones: non-zero oracle diff, `isolated` empty, `arch_timer`
 growing on the soak core, `throttled != 0x0`, or the device failing to open.
 
-### 7a. E1 result — run 2026-09-16, and it moves the tail
+### 7.0 Correction (2026-09-17): the confined arms moved the workload too
+
+Added after the fact, because it affects **E1, E5, E5b and E5c**. Their own instruments recorded
+the problem -- the conclusions drawn from those arms did not account for it.
+
+`AllowedCPUs=` on `system.slice`, `user.slice` and `init.scope` confines *everything in those
+slices*, and the measurement process lives in them. So in every "confined" arm the workload was
+pushed off the audio cores **along with** everything else, rather than the other work being kept
+off while the audio work stayed. The evidence is in the arms' own output:
+
+| arm | what it reported |
+|---|---|
+| E1 (`cyclictest`) | `WARN: Couldn't setaffinity in main thread: Invalid argument`, `WARN: Could not set CPU affinity to CPU #2 / #3` |
+| E5 (`null` soak) | `any of 2 cpus (not as requested: sched_setaffinity(cpu 3): Invalid argument)` |
+| E5b (SSL), E5c (SSL) | the same |
+
+So each table contrasts two different **placements**, not one placement with and without
+confinement:
+
+  * unconfined: the measurement runs on the audio cores, with the rest of the system free to join it;
+  * confined: the measurement runs on the **housekeeping** cores, alongside the load.
+
+That changes what each number means:
+
+  * **E1's arch_timer fall from ~475 000/120 s to 23/0 is not "`nohz_full` starts working"** -- it
+    is that nothing was left running on cores 2-3. And the latency comparison (max 215 → 169 µs)
+    is cyclictest *on the audio cores* against cyclictest *on the loaded housekeeping cores*.
+  * **E5/E5b/E5c's "confinement takes driver xruns 746 → 0"** is the same confound: the engine
+    moved onto cpus 0-1 with the vm worker and did better there. Whatever that is, it is not a
+    confinement effect, because confinement was not applied to the configuration it is credited
+    with improving -- it was applied to a different one.
+
+**The research this document is for is unaffected.** §1's reframing (the tail is memory traffic,
+not CPU time), §2's board survey, §3's prior art and §4's recommended actions all rest on
+measurements that do not depend on these arms.
+
+**The correct method, and what these must be re-run as:**
+
+1. hold the top-level slices at 0-1 (`system.slice`, `user.slice`, `machine.slice`, `init.scope`),
+   so all the *other* work is off the audio cores;
+2. put the audio work in **its own** cpuset partition with `AllowedCPUs=2-3`, so it is the one
+   thing allowed to use them;
+3. pass the rlimits to the unit, because a systemd service does not get `pam_limits` and
+   `SCHED_FIFO` is therefore refused to it:
+
+```sh
+systemd-run --slice=audio.slice -p AllowedCPUs=2-3 \
+            -p LimitRTPRIO=95 -p LimitMEMLOCK=infinity --uid=rik ...
+```
+
+Verified on piv 2026-09-17 with a 20 s smoke test: `scheduling: SCHED_FIFO priority 80, cpu 3`.
+Without the two `Limit...` properties the identical invocation silently reports
+`SCHED_OTHER priority 0` -- real-time refused -- which is its own warning about how easy this is
+to get wrong, and the reason step 3 is written down rather than assumed.
+
+### 7a. E1 result
+
+> **Confounded -- see §7.0.** The confined arm here did not keep the workload on
+> the audio cores, so this table compares two placements rather than confinement. — run 2026-09-16, and it moves the tail
 
 The SSL 2+ is not currently attached to piv (only Dummy/Loopback/HDMI cards were present), so
 the engine soak could not run. The hypothesis was tested without it: `cyclictest` on the audio
@@ -473,7 +531,10 @@ soak must record `arch_timer` per core the way this screen did. The engine-level
 (whether 4 × A2-Full survives the memory load once confined) is still open and still needs the
 device.
 
-### 7b. E5 result — tib, run 2026-09-16: confinement helps and is not enough
+### 7b. E5 result
+
+> **Confounded -- see §7.0.** The confined arm here did not keep the workload on
+> the audio cores, so this table compares two placements rather than confinement. — tib, run 2026-09-16: confinement helps and is not enough
 
 tib has no `isolcpus` and no `NO_HZ_FULL` (deliberately — 4 cores, no spares), so
 `AllowedCPUs=` on the top-level slices is the only isolation lever it has. Both arms ran the
@@ -509,7 +570,10 @@ that the housekeeping CPUs and the audio CPU share one bus. So for tib the desig
 indexers, no desktop. If a machine must do both, piv (where the confined p99 stayed well
 under the deadline) is the one that tolerates it, and tib is the one that does not.
 
-### 7c. E5b — tib with the real device, on the SSL 2+ Mk II
+### 7c. E5b — tib with the real device
+
+> **Confounded -- see §7.0.** The confined arm here did not keep the workload on
+> the audio cores, so this table compares two placements rather than confinement., on the SSL 2+ Mk II
 
 The SSL moved to tib mid-session (§4.3), which allowed the device arms that
 `plan-rt-tib.md` §2 had assumed were impossible. Arms: 3 × A2-Lite, NEON build, 48 kHz, q64,
@@ -546,7 +610,10 @@ The SSL moved to tib mid-session (§4.3), which allowed the device arms that
   resolves the first name actually present, so tib records `ehci_hcd:usb3`. Synced to both
   boards.
 
-### 7d. E5c — the fair device comparison, and tib's real ceiling
+### 7d. E5c — the fair device comparison
+
+> **Confounded -- see §7.0.** The confined arm here did not keep the workload on
+> the audio cores, so this table compares two placements rather than confinement., and tib's real ceiling
 
 Same as E5b but with the piv shipping queue shape (`--periods 6 --output-queue-periods 4
 --output-queue-floor-periods 2`), which removes the queue artifact. Evidence:

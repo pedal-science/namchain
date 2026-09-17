@@ -1,0 +1,5 @@
+start       2026-09-17T09:47:02+01:00
+command     /home/rik/code.local/namchain/tools/soak/rt-manipulation-check.sh arm /home/rik/code.local/namchain/bench-results/piv-ab-smoke2 /home/rik/code.local/namchain/build/namchain-soak --device hw:2,0 --capture-channels 8 --playback-channels 6 --quantum 64 --periods 6 --output-queue-periods 3 --output-queue-floor-periods 0 --instances 4 --model /home/rik/code.local/namchain/build/generated/A2-Full.nam --input-channel 0 --output-channel 0 --rt-priority 80 --cpu 3 --seconds 20
+2026-09-17T09:47:02+01:00
+end         2026-09-17T09:47:23+01:00
+exit        0
