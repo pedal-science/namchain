@@ -644,10 +644,11 @@ Same as E5b but with the piv shipping queue shape (`--periods 6 --output-queue-p
 ## 8. The deliverable: `tools/soak/host-slim.sh`
 
 Written and run end-to-end on both boards on 2026-09-17. `--apply`, `--check`, `--diff`,
-`--revert`, plus `--dry-run`. It does the six things §4 describes:
+`--revert`, `--list-services`, plus `--dry-run`. It does the six things §4 describes:
 
-1. `AllowedCPUs=` on `system.slice`, `user.slice`, `machine.slice` and `init.scope` —
-   transiently *and* as drop-ins, so it survives reboot.
+1. `AllowedCPUs=` on `system.slice`, `user.slice` and `machine.slice` — transiently *and* as
+   drop-ins — plus `init.scope`, which cannot take a drop-in at all and gets a boot oneshot
+   instead (§8.1).
 2. Masks the per-board service list, `mask` rather than `disable`.
 3. journald `Storage=volatile` + `RuntimeMaxUse=64M`, so logging never reaches the disk.
 4. `vm.stat_interval=10` via a oneshot unit (runtime-writable but not persistent).
@@ -659,8 +660,10 @@ Design decisions worth knowing before using it:
 
 - **Every action is recorded in `/var/lib/namchain/host-slim/manifest`, and `--revert` undoes
   exactly that list.** No guessing which units were ours.
-- **`--revert` disables the oneshot unit before deleting its file**, or systemd is left with a
-  dangling enablement symlink.
+- **The manifest is merged, never reset.** See §8.1 — resetting it was the more damaging of
+  the two defects that section records.
+- **`--revert` disables the oneshot units before deleting their files**, or systemd is left
+  with a dangling enablement symlink.
 - **A time-sync guard.** `systemd-timesyncd` is on the piv list, but masking the only time
   source would break TLS, apt and every timestamp a measurement is compared against, and piv
   has no chrony installed. So the guard holds it back and `--check` reports it as intentional
@@ -672,27 +675,81 @@ Design decisions worth knowing before using it:
 - **Masking a timer and the service it triggers leaves the timer reporting
   `result=resources`**, which shows up in `systemctl --failed` and would eventually hide a
   real failure. The script clears that cosmetic state with `reset-failed` after masking.
+- **`--check` distinguishes `masked` from merely `disabled`, and checks the masks against the
+  manifest.** "Not enabled" and "we masked it, and can therefore unmask it" are different
+  claims, and conflating them is what let a half-reverted board pass as green.
 - It touches **no** package, **no** boot asset and **no** kernel setting.
 
-**Verified round trip, 2026-09-17:**
+### 8.1 Two defects, and why the transcript exists
+
+The first version of this section claimed a verified round trip. That claim was too strong,
+and the reason it survived is instructive: `--check` answers "is the intended state in force
+*right now*", and that answer is gone the moment the terminal closes. It cannot tell an
+applied configuration from one that came back after a reboot, and it never said which revision
+of the tool produced the state. Adding `tools/soak/host-slim-capture.sh` — which copies the
+local tool to the board, re-reads its md5 there, and writes one file per board containing the
+check, the manifest, the persisted files verbatim and the unit-transience facts — immediately
+showed that piv, believed applied, was **half reverted**: cpusets back to `0-3` and all five
+files absent, but 32 units still masked.
+
+1. **The manifest was truncated on every apply, so `--revert` could not undo the masks.** The
+   mask step records a `mask <unit>` line only for units it actually masks. A second `--apply`
+   found them already masked, recorded nothing, and left a manifest that no longer mentioned
+   any of them — so `--revert` unmasked nothing and reported success for the parts it could
+   see. Fixed by merging the manifest instead of resetting it, and by making `--check` count
+   masked units that have no manifest line and report them with a `WARN`. `--list-services`
+   was added so a reconciliation is driven by the script's own set rather than a hand-written
+   list. piv was repaired by unmasking exactly the 32 units in `service_list` that had no
+   manifest line (the vendor's separately-masked units — `cryptdisks`, `hwclock`, `nbd-client`,
+   `screen-cleanup`, `serial-getty@ttyAMA0`, `sudo`, `x11-common` — were left alone), then
+   re-applying. The raw output is in `bench-results/host-slim-remediation-piv.txt`: after the
+   fix, `--revert` took the board from 45 masked units to 9, with **0** of ours remaining.
+
+2. **`init.scope` confinement did not survive a reboot, and could not.** `init.scope` is a
+   *transient* unit (`systemctl show init.scope -p Transient` → `yes`, `FragmentPath` empty).
+   Its drop-in directory is `/run/systemd/transient/init.scope.d/`, created by
+   `set-property --runtime`; a drop-in written to `/etc/systemd/system/init.scope.d/` is
+   silently ignored for it, and `/run` is tmpfs. Verified directly: with the drop-in in place
+   and the runtime property cleared, `cpuset.cpus.effective` fell straight back to `0-3`.
+   tib's first post-reboot check showed exactly this decay. The fix is a boot oneshot,
+   `namchain-host-slim-initconfine.service`, ordered `After=systemd-sysctl.service
+   Before=sysinit.target`, whose `ExecStartPost` asserts the read-back so a failure to confine
+   shows up as a failed unit rather than as silent decay. `machine.slice` is *not* transient,
+   so it now gets a drop-in like the other slices.
+
+Both fixes are in the same revision, and **tib's confinement was re-verified across a real
+reboot**: the transcript at `boot id c82e4bc5` (uptime 4 minutes, i.e. after the reboot, not
+before) shows `init.scope cpuset.cpus.effective 0-1` with the unit `enabled`, `active` and
+`result=success`. piv was not rebooted — it is the workstation running this session — so its
+row below is a live-state check only, and it is the one row that has *not* been shown to
+survive a reboot.
+
+**Verified state, 2026-09-17** (transcripts: `bench-results/host-slim-state-piv.txt`,
+`bench-results/host-slim-state-tib.txt`; both run tool md5 `fb5a335d…`):
 
 | | piv | tib |
 |---|---|---|
-| `--apply` twice | idempotent; second run `(32 already masked, …)` | idempotent; `(10 already masked, …)` |
-| cpuset read-back | `system.slice`/`user.slice`/`init.scope` → **0-1** | same |
-| audio IRQ after confinement | `irq/134-xhci-hcd:usb2` still mask `0-3`, `/proc/irq/134/smp_affinity_list=2` — **the pin survives**, because the thread is in the root cgroup | n/a (EHCI) |
-| `arch_timer` 10 s delta on the audio cores, after | **cpu2 = 1, cpu3 = 0** | cpu2 = 581, cpu3 = 272 — expected, tib has no `NO_HZ_FULL` |
-| `--revert` | 12 units unmasked, 4 files removed, cpusets back to `0-3` | same, and `system.slice` empty again |
+| cpuset read-back | `system.slice`/`user.slice`/`machine.slice`/`init.scope` → **0-1** | `system.slice`/`user.slice`/`init.scope` → **0-1** (`machine.slice` absent) |
+| across a reboot | **not tested** (host of this session) | **yes** — boot id `c82e4bc5`, init.scope still `0-1`, unit `result=success` |
+| audio IRQ after confinement | `xhci-hcd:usb2` (IRQ 134) still `smp_affinity_list=2`, thread at rtprio 85 — **the pin survives**, because the thread is in the root cgroup that none of the drop-ins touch | n/a (EHCI) |
+| `arch_timer` 10 s delta, audio cores | **cpu2 = 1, cpu3 = 0** | cpu2 ≈ 100–440, cpu3 ≈ 250 — expected, tib has no `NO_HZ_FULL` |
+| masked services | 32, all recorded in the manifest | 12, all recorded |
+| `--revert` round trip | 45 → 9 masked (all 32 of ours unmasked), 8 files removed, cpusets back to `0-3`, then re-applied | — |
 | essentials after apply | sshd, systemd-resolved, NetworkManager, dbus, journald all active; `timedatectl` still synchronised | sshd reachable; engine still runs |
 
 Two notes on the piv result. First, the `arch_timer` collapse is the whole point: it is the
 same measurement as §7a's screen, now produced by the persistent configuration rather than a
 transient one. Second, `systemctl --failed` on piv shows `libvirtd`, `logrotate` and
 `pg-backup` — all three predate this work (09:17, 00:32 and 00:00 respectively), and
-`docker.service` was stopped 12 minutes before `--apply`; none of it is attributable to the
-script. Check that distinction before blaming a change.
+`docker.service` was stopped before `--apply`; none of it is attributable to the script. Check
+that distinction before blaming a change. Also note that `journald` is `Storage=volatile`, so
+the boot oneshot's own log lines may be gone by the time anyone looks — the durable evidence is
+the unit's `result` and the cgroup read-back, not the journal.
 
-`host-slim.sh` is **currently applied on both boards.** To undo:
+`host-slim.sh` is **currently applied on both boards** — piv via
+`/home/rik/code.local/namchain/tools/soak/host-slim.sh`, tib via
+`/home/rik/namchain/tools/soak/host-slim.sh`. To re-record the evidence:
+`tools/soak/host-slim-capture.sh piv` (or `tib`). To undo:
 `sudo tools/soak/host-slim.sh --revert`.
 
 The kernel half stays where it already is — `rtpi` for piv and tib, `docs/tuning.md` for
