@@ -1,0 +1,98 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 384 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            4 x /home/rik/code.local/namchain/build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/71, playback min/max 5/136 (last 71) frames
+                  playback queue 0.08..2.12 periods (last 1.11); the floor is the stall the device
+                  absorbs without starving: 0.08 periods = 0.104 ms
+                  p1 0.84, p50 1.25 periods; 162692 of 1350000 blocks held less than one
+                  period (12.05 %), which is the window a stall has to miss
+queue target:     3 periods = 4.000 ms: a cap on the ring's contents, so a burst
+                  cannot buy latency beyond it. Not a promise of cushion -- the
+                  floor held above is the number to read
+splice repair:    64-frame bridge (1.333 ms) armed 0 times: 0 dropped periods,
+                  0 inserted ones. Applied to the emitted signal only -- the oracle
+                  below still compares the engine's pristine output
+queue control:    0 output drops (not gated: each refusal is the target's trade), 0 capture bursts
+                  0 of those drops were the queue target refusing a period that
+                  would have raised the ring past 3 periods; 0 were the ring itself
+                  being full
+queue prefill:    8 frames of silence written before block 0 to bring the ring
+                  to its target (0.167 ms of output latency, paid once)
+occupancy check:  4048620 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           1350000
+audio:            1800.000 s in 1799.860 s wall (RTF 0.9999)
+deadline:         1333333 ns
+split (p50):      read 3556 ns, chain 308093 ns, write 15056 ns
+split (tail):     read p99 4222 max 21519, chain p99 375965 max 1389448, write p99 16000 max 83759 ns
+chain p99:        375965 ns (28.20% of deadline)
+device wait:      p50 1162762 ns, p99 1182580 ns, max 1472153 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 1389889 ns, wall max 1389448 ns
+                  425.21 s of CPU over 425.05 s of wall in the render path (100.0%), 0 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 1006595 cpu 1389889 ns (wall 1389448 ns), block 1025462 cpu 1373759 ns (wall 1374762 ns), block 1308467 cpu 1343167 ns (wall 1343099 ns), block 436785 cpu 1318389 ns (wall 1317374 ns), block 497168 cpu 1317870 ns (wall 1318300 ns)
+cpu spike bursts: 3230 blocks over half a period of CPU, in 973 runs; runs start every 3..3774 blocks (0.0..5.0 s at 48 k/64)
+                  run at block 2839..2840 (2 long), worst 849741 ns of CPU
+                  run at block 2844..2850 (7 long), worst 1009222 ns of CPU
+                  run at block 2853..2853 (1 long), worst 871611 ns of CPU
+                  run at block 6612..6613 (2 long), worst 819500 ns of CPU
+                  run at block 6618..6626 (9 long), worst 983796 ns of CPU
+                  run at block 9461..9462 (2 long), worst 705370 ns of CPU
+                  run at block 10385..10387 (3 long), worst 1016370 ns of CPU
+                  run at block 10392..10396 (5 long), worst 900556 ns of CPU
+block time:       p50 326871 ns, p99 395927 ns, max 1431467 ns
+p99/deadline:     29.69% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+first overrun at: block 138694 of 1350000
+deadline overruns:6
+driver xruns:     0
+  by direction:   0 capture overruns, 0 playback underruns
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           FAIL
+=== host state ===
+period           2026-09-17T10:49:50+01:00 -> 2026-09-17T11:19:52+01:00 (1802s)
+kernel_release   7.0.0-1017-raspi-realtime
+uname_says_rt    true
+cmdline          reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10 isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew_tick=1
+isolated_cpus    2-3
+nohz_full_cpus   2-3
+governor         performance
+scaling_max_khz  2400000
+scaling_cur_khz  2400000
+temp_mC          41350
+throttled        0x0
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   xhci-hcd:usb2
+audio_irq_number 134
+audio_irq_affinity 2
+audio_irq_thread_prio 85
+
+=== interrupt deltas per CPU (1802s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer           1854026   1217331       319         2
+IPI0_resched           93904   2337447      1850   1349854
+IPI5_irqwork            1054       910      1513        13
+audio_IRQ                  0         0      1190         0
+IPI1_fncall             2452      5481        55         0
+
+=== verdict ===
+ok:   cpu 2 .tick_stopped=1 -- the scheduler tick is stopped on this core.
+ok:   cpu 3 .tick_stopped=1 -- the scheduler tick is stopped on this core.
+info: cpu 2 arch_timer delta 319 in 1802s (0.2/s).
+      On a tickless core this is normally 0; a nonzero value is an hrtimer (or a
+      tick that came back), not proof of either.
+info: cpu 3 arch_timer delta 2 in 1802s (0.0/s).
+      On a tickless core this is normally 0; a nonzero value is an hrtimer (or a
+      tick that came back), not proof of either.
+ok:   the audio IRQ (134) was delivered 1190 times to reserved cpu 2,
+      at 0.7/s -- the interface's data path is landing
+      where it was pinned rather than being accepted and ignored.
+ok:   isolated=2-3 nohz_full=2-3

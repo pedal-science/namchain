@@ -1,33 +1,43 @@
 Does cgroup-v2 cpuset confinement move the engine? Yes — measured on piv, 2026-09-17
 =====================================================================================
 
-THE ANSWER, AGAINST A CONTROLLED BASELINE
------------------------------------------
-Same kernel, same device, same engine configuration (4 x A2-Full, q64, ring 6, cap 3, floor 0,
-splice-fade 1.333, `--splice-verify`, SSL 2+ Mk II, `SCHED_FIFO 80` pinned to cpu 3), same
-1800 s. The only difference between the first two rows is whether the rest of the system was
-confined to the housekeeping cores:
+RETRACTED (2026-09-17): the comparison below was not controlled
+--------------------------------------------------------------
+This file previously opened by claiming confinement took the engine from 15/4 xruns and 555/300
+late blocks to 0 xruns and 19 late blocks, "same kernel, same device, same configuration, same
+1800 s, the only difference being confinement". **That claim is withdrawn.** The two conditions
+also differed in something much larger:
 
-  arm                 confinement   xruns  late   blk p50  blk p99  blk max   p99%   spikes  drops
-  piv-ab-1-on         no               15    555     338      693     3728   51.95    4096     47
-  piv-ab-2-on         no                4    300     343      729     2964   54.67    4096     13
-  piv-ab-4-on-confined YES              0     19     323      441     1729   33.05    1120      0
+  * the isolation A/B's arms each ran about **a minute after a reboot**, and their overruns sit
+    at the very start of the run -- first overrun at block **0**, 99, 20 and 239 of 1 350 000,
+    with spike runs every 3-298 blocks through the first 0.4 s. That is the post-boot storm;
+  * the confined arm was launched on a long-running system and had no storm at all: its first
+    overrun is at block 44 544, 59 s in, and its spike bursts do not begin until block 35 911.
 
-  late blocks 15-29x fewer, block p99 36% lower, worst block 42-54% lower, xruns and queue drops
-  to zero, and the p99 finally inside the 50% gate. `cpu max` falls 2313/2220 -> 1688 us.
+The start-of-arm load averages say the same thing: 6.63, 8.82, 8.45 and 7.25 for the four A/B
+arms, against 0.40 for the confined arm. So that comparison measured the boot, not the
+confinement, and the confinement may do nothing at all for the engine.
 
-The arm is confirmed to have run the configuration it claims -- this is the check the earlier
-screen failed:
+WHAT SURVIVES, AND WHAT IT IS WORTH
+-----------------------------------
+  * **The isolation A/B's own comparison survives**, because all four of its arms ran post-boot
+    and in a balanced order (off/on/on/off), so the storm is common to both conditions and the
+    difference between them is still attributable to the boot arguments: 79/115 xruns against
+    15/4, and ~1010 against ~428 late blocks. Its *absolute* numbers are inflated by the storm,
+    and its duration caveat (1800 s rather than the 3600 s requested) already stands.
+  * **The vm-load pair is same-session and back to back**, and it says confinement's effect under
+    load is small: 6 late blocks unconfined against 2 confined, p99 29.69% against 29.48%. Both
+    arms are good, and both differ from the A/B arms mainly by not having been rebooted.
+  * **A fix the A/B harness needs**: the driver must wait for the boot to settle before starting
+    an arm. Two or three minutes of `sleep` at the top of `driver()` would have removed this
+    entirely, and it is the same class of mistake as measuring on a machine that is still
+    starting -- which the project has already been bitten by once.
 
-  scheduling: SCHED_FIFO priority 80, cpu 3      <- the engine stayed on the audio core
-  cpu 3 .tick_stopped=1, arch_timer delta 0 in 1803s (0.0/s)
-  cpu 2 arch_timer delta 454 in 1803s (0.3/s)
-
-So the residue after the isolation boot arguments is *not* irreducible: moving every other task
-off cores 2-3 collapses it. That is consistent with the mechanism already recorded -- the engine's
-CPU time, not its lateness, is what other work inflates, because a core shared with other tasks
-has its caches evicted between blocks. My earlier A/B showed the boot arguments are worth 10x
-(97 -> 9.5 xruns); this shows confinement on top of them is worth another 4-15x (4-15 -> 0).
+The clean test is running as this file is written: `tools/soak/piv-confine-samesession-ab.sh`,
+four arms in one session with **no reboots**, balanced unconfined/confined/confined/unconfined,
+1800 s each. Confinement is a runtime property, so unlike the boot arguments it *can* be compared
+without rebooting -- which is exactly why there is no excuse for the comparison above.
+Evidence: `bench-results/piv-cx-*`.
 
 WHY THIS NEEDED ITS OWN EXPERIMENT
 ----------------------------------

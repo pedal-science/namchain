@@ -1,1 +1,8 @@
   confinement=off  system.slice=0-3 user.slice=0-3
+=== piv-cab-c-unconf-vm (unconfined, load=yes) engine card=2, pinned cpu 3 ===
+  rc=1
+  confinement=on  system.slice=0-1 user.slice=0-1
+=== piv-cab-d-confined-vm (CONFINED, load=yes) engine in audio.slice/2-3, card=2 ===
+  rc=1
+  confinement=off  system.slice=0-3 user.slice=0-3
+=== done; summarise with rt-arm-summary.py ===
