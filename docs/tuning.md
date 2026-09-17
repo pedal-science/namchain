@@ -155,8 +155,38 @@ weight reuse between blocks, better cache blocking), not their shape.
 
 The practical rules that follow:
 
-- Do not run memory-heavy work (builds, VMs, containers, large copies, a desktop under load)
-  on the same machine while playing. "Isolated cores" does not mean isolated machine.
+- **It is new-page traffic that hurts, not the size of the working set.** "Do not run memory-heavy
+  work beside the engine" is the right rule but the wrong diagnosis, and the difference decides
+  what you are allowed to run. Measured on piv, same engine, back to back, load pinned to cpus 0-1:
+
+  | load | xruns | late blocks | block p99 |
+  |---|---|---|---|
+  | `stress-ng --vm 1 --vm-bytes 128M` | 2400 | 26 719 | 2050 µs |
+  | the same **with `--vm-keep`** | 562 | 10 083 | 1597 µs |
+
+  Without `--vm-keep`, stress-ng frees and re-maps its 128 MB every cycle, so the kernel keeps
+  zeroing and re-faulting those pages; with it, the same pages are rewritten in place. A large
+  working set touched steadily is far cheaper than a small one allocated and freed repeatedly.
+  So watch for allocation churn — page faults, `mmap`/`munmap`, page zeroing, a build or a
+  container runtime starting and stopping — rather than for the RSS figure.
+- **A memory-pressure measurement on this class of host is not reproducible on its own.** The same
+  load flags gave **0 driver xruns at one time and 562 at another** (piv, 3.5 h apart), while a
+  different configuration reproduced to within 7 xruns a day apart. This comparison sits near a
+  cliff, so arms involving memory pressure must be run **balanced and in one session**, and the
+  record should carry the load's own traffic rather than merely its presence.
+- **Do not measure an arm straight after boot.** Each arm of the first boot-argument A/B began
+  about a minute after a reboot, and every one had its first deadline overrun inside the first 240
+  blocks of 1 350 000, with CPU spike runs through the first 0.4 s — the post-boot storm. It
+  inflated the late-block counts and made those arms incomparable with anything run on a settled
+  machine. Wait a couple of minutes, or measure a settled machine.
+- **Cgroup v2 cpuset confinement is worth having, and is worth about 4× on late blocks rather than
+  more.** Same session, no reboots, balanced, quiet, engine pinned to cpu 3: unconfined 7 and 5
+  late blocks against confined 1 and 2, with 0 xruns and 0 drops in all four arms; p99 and worst
+  block moved by less than the spread within the unconfined condition. Two traps if you do it:
+  confine the top-level slices to the housekeeping cores **and** run the engine in its own cpuset
+  partition, or the confinement stops the engine reaching its own core; and pass the rlimits to
+  the unit, because a systemd service does not get `pam_limits` and will silently run
+  `SCHED_OTHER`. Details and the corrected screens: `docs/distro-slimming.md`.
 - The engine has a **throughput ceiling that is memory-shaped, not CPU-shaped**: 4 concurrent
   A2-Full holds, 6 costs 1.9× the p99 of 4 rather than the 1.5× the arithmetic predicts, and
   8 produces xruns. More resident models is more traffic per block.
