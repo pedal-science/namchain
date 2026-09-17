@@ -179,10 +179,15 @@ The practical rules that follow:
   blocks of 1 350 000, with CPU spike runs through the first 0.4 s — the post-boot storm. It
   inflated the late-block counts and made those arms incomparable with anything run on a settled
   machine. Wait a couple of minutes, or measure a settled machine.
-- **Cgroup v2 cpuset confinement is worth having, and is worth about 4× on late blocks rather than
-  more.** Same session, no reboots, balanced, quiet, engine pinned to cpu 3: unconfined 7 and 5
-  late blocks against confined 1 and 2, with 0 xruns and 0 drops in all four arms; p99 and worst
-  block moved by less than the spread within the unconfined condition. Two traps if you do it:
+- **Cgroup v2 cpuset confinement is worth having on a board with a core to spare, and worth
+  nothing on one without.** On piv, same session, no reboots, balanced, quiet, engine pinned to
+  cpu 3: unconfined 7 and 5 late blocks against confined 1 and 2, with 0 xruns and 0 drops in all
+  four arms — about 4× on late blocks, and p99 and worst block moved by less than the spread
+  *within* the unconfined condition. On tib, which has no core to spare: **3 % on late blocks
+  deviceless and 6 % on device xruns under an identical memory load — i.e. nothing**, because its
+  housekeeping and audio CPUs share one memory bus and there is nowhere to move the work to. So
+  confine on a Pi-class board, and on a 4-core ARMv7 board the rule is the one that actually
+  works: **run nothing else on it.** Two traps if you do it:
   confine the top-level slices to the housekeeping cores **and** run the engine in its own cpuset
   partition, or the confinement stops the engine reaching its own core; and pass the rlimits to
   the unit, because a systemd service does not get `pam_limits` and will silently run

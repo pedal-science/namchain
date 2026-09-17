@@ -487,6 +487,55 @@ Without the two `Limit...` properties the identical invocation silently reports
 `SCHED_OTHER priority 0` -- real-time refused -- which is its own warning about how easy this is
 to get wrong, and the reason step 3 is written down rather than assumed.
 
+### 7.0b The re-run, 2026-09-17: on tib, confinement does not move the engine
+
+Run with the method above -- top-level slices at 0-1, engine in its own cpuset partition at 2-3,
+rlimits through the unit, four arms in one session with **no reboots**, balanced. Every device arm
+confirmed `SCHED_FIFO priority 80, cpu 3`, which is the check §7's arms failed. Evidence:
+`bench-results/tib-confinement-rerun.txt` and `bench-results/tib-{cx,dx}-*`.
+
+**Deviceless, under `stress-ng --vm 1 --vm-bytes 128M --vm-keep` on cpus 0-1** (`tib-cx-*`, 900 s
+per arm, `--backend null`, 3 × A2-Lite):
+
+| arm | condition | late blocks | blk p99 | blk max | p99 % |
+|---|---|---|---|---|---|
+| cx-1 / cx-4 | unconfined | 73 607 / 71 264 | 1760 / 1749 | 9827 / 2033 | 131.97 / 131.21 |
+| cx-2 / cx-3 | confined | 68 364 / 72 356 | 1739 / 1742 | 3326 / 2051 | 130.40 / 130.64 |
+
+**3 % on late blocks and 14 µs on p99** — nothing measurable, and the worst block varies by a
+factor of five *within* each condition. §7b's "overruns −31 %, p99 −14 %" was the placement
+change.
+
+**The device path** (`tib-dx-*`, 600 s per arm, SSL 2+ as card 2 through the powered hub, 3 ×
+A2-Lite, ring 6, cap 4, floor 2, engine pinned to cpu 3 in all four arms):
+
+| arm | load | confined | xruns | late blocks | blk p99 | p99 % | result |
+|---|---|---|---|---|---|---|---|
+| dx-1-quiet-unc | none | no | **0** | **0** | 493 µs | 36.95 | **PASS** |
+| dx-4-quiet-conf | none | yes | **0** | **0** | 492 µs | 36.90 | **PASS** |
+| dx-2-vm-unc | vm | no | 2876 | 51 048 | 1786 µs | 133.92 | FAIL |
+| dx-3-vm-conf | vm | yes | 2701 | 48 780 | 1796 µs | 134.73 | FAIL |
+
+1. **tib's device ceiling is real and good:** 0 xruns, 0 deadline overruns, p99 36.9 % of the
+   deadline, worst block under 800 µs — and identical with and without confinement. This is the
+   number §7c warned must not be quoted from the wrong arm, now measured on the right one.
+2. **Confinement does not rescue the device path under memory pressure.** 2876 → 2701 xruns is
+   6 %, inside the noise; p99 133.9 % → 134.7 % is if anything the wrong way. §7d's "746 → 0" was
+   the placement change, and the real effect is nil.
+
+**So on this board confinement buys nothing when the memory system is busy** — the housekeeping
+CPUs and the audio CPU share one bus, and there is no spare core to move anything to. That
+strengthens the conclusion §7b reached by a different route ("the variable is not controllable
+from userspace; run nothing else on it"), but the evidence is now the *absence* of an effect
+rather than a large one.
+
+The two boards genuinely differ, and that is the durable finding:
+
+| | confinement, quiet | confinement, under a vm load |
+|---|---|---|
+| **piv** (core to spare, quieter memory system) | late blocks 7/5 → 1/2 (~4×) | not measured |
+| **tib** (no spare core, shared bus) | device: 0 xruns and 0 late blocks either way | 3 % on late blocks; 6 % on device xruns |
+
 ### 7a. E1 result
 
 > **Confounded -- see §7.0.** The confined arm here did not keep the workload on
