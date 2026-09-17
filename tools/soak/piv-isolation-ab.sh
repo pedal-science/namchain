@@ -138,6 +138,17 @@ driver() {
     exit 0
   fi
 
+  # Let the boot settle before measuring anything. Every arm of the first A/B began about a
+  # minute after a reboot, and every one of them had its first deadline overrun in the first 240
+  # blocks -- block 0, 99, 20 and 239 of 1 350 000 -- with CPU spike runs every 3-298 blocks
+  # through the first 0.4 s. That is the post-boot storm, and it inflated the late-block counts
+  # by an unknown amount; it also made those arms incomparable with any arm run on a settled
+  # machine, which is how a later comparison of mine went wrong. Nothing about the arm wants to
+  # start at boot, so it waits.
+  local settle="${SETTLE_SECONDS:-180}"
+  log "letting the boot settle for ${settle}s before measuring"
+  sleep "$settle"
+
   local cond="${ARMS[$idx]}"
   log "running arm $idx (isolation=$cond)" | tee -a "$DIR/ab.log"
   run_arm "$idx" "$cond" 2>&1 | tee -a "$DIR/ab.log"
