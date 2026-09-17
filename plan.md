@@ -884,6 +884,17 @@ The earlier wording of this checklist listed it, which was wrong.
 the measurements behind each line rather than a paragraph of assertions; `namchain-doctor` is still
 outstanding.
 
+**The boot arguments are worth a factor of ten, measured against each other rather than against
+a stock kernel (2026-09-16/17).** A balanced four-arm A/B on piv -- same kernel image, only the
+command line differing, off/on/on/off, one arm per boot -- gives **10x fewer driver xruns**
+(97 vs 9.5), **2.4x fewer late blocks** (1010 vs 428), a worst block of 3.3 ms against 5.8 ms and
+3.4x fewer queue drops with the arguments in force. The manipulation check confirms each arm ran
+what it claims: the off arms report no isolated CPUs, and the on arms report `.tick_stopped=1` on
+both reserved cores. Evidence: `bench-results/piv-isolation-ab.txt`. Caveat: those arms ran 1800 s
+rather than the 3600 s intended (the harness reads its duration from the environment, which
+systemd does not pass), and all four still fail the p99 gate, so this shows the arguments reduce
+the damage rather than remove it.
+
 **The `isolcpus`/IRQ-affinity half is no longer untested — measured 2026-09-16.** piv was moved to
 `7.0.0-1017-raspi-realtime` with `isolcpus=managed_irq,domain,2-3 nohz_full=2-3 rcu_nocbs=2-3
 irqaffinity=0-1 skew_tick=1`, and the audio interrupt (`xhci-hcd:usb2`) pinned to cpu 2 at

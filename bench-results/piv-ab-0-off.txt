@@ -1,0 +1,94 @@
+backend:          alsa_raw
+device:           /dev/snd/pcmC2D0c -> /dev/snd/pcmC2D0p
+period/buffer:    64 / 384 frames
+sample format:    S32_LE (4 bytes/sample)
+mlockall:         locked
+scheduling:       SCHED_FIFO priority 80, cpu 3
+chain:            4 x /home/rik/code.local/namchain/build/generated/A2-Full.nam
+model type:       nam::wavenet::a2_fast::(anonymous namespace)::A2PlanarFull
+ring occupancy:   capture min/max 0/382, playback min/max 0/383 (last 122) frames (43 blocks wrote into a full playback ring)
+                  playback queue 0.00..5.98 periods (last 1.91); the floor is the stall the device
+                  absorbs without starving: 0.00 periods = 0.000 ms
+                  p1 1.48, p50 1.97 periods; 448 of 1350000 blocks held less than one
+                  period (0.03 %), which is the window a stall has to miss
+queue target:     3 periods = 4.000 ms: a cap on the ring's contents, so a burst
+                  cannot buy latency beyond it. Not a promise of cushion -- the
+                  floor held above is the number to read
+splice repair:    64-frame bridge (1.333 ms) armed 111 times: 111 dropped periods,
+                  0 inserted ones. Applied to the emitted signal only -- the oracle
+                  below still compares the engine's pristine output
+splice measured:  20 splices judged on the emitted signal (reference 0.070853):
+                  raw 0.305545 (4.3x) -> emitted 0.067211 (0.9x)
+queue control:    111 output drops (not gated: each refusal is the target's trade), 541 capture bursts
+                  111 of those drops were the queue target refusing a period that
+                  would have raised the ring past 3 periods; 0 were the ring itself
+                  being full
+queue prefill:    8 frames of silence written before block 0 to bring the ring
+                  to its target (0.167 ms of output latency, paid once)
+capture xruns:    17 found by the gate (a subset of the driver xruns below: an
+                  xrun freezes hw_ptr, so without this the loop stalls instead)
+occupancy check:  4036258 samples where delay disagreed with the pointer pair
+plan:             single model chain, 6 nodes, 3 buffers (768 bytes)
+quantum:          64
+pacing:           wall clock
+blocks:           1350000
+audio:            1800.000 s in 1799.738 s wall (RTF 0.9999)
+deadline:         1333333 ns
+split (p50):      read 3184 ns, chain 313067 ns, write 14053 ns
+split (tail):     read p99 8790 max 1550991, chain p99 746427 max 2533402, write p99 31623 max 4790696 ns
+chain p99:        746427 ns (55.98% of deadline)
+device wait:      p50 1157528 ns, p99 1187225 ns, max 3442701 ns
+render path cpu:  p99 wall vs cpu is the deadline question: cpu max 2460926 ns, wall max 2533402 ns
+                  452.28 s of CPU over 454.06 s of wall in the render path (99.6%), 172 blocks lost >= 0.5 ms to not being on CPU
+slowest blocks:   block 7046 cpu 2460926 ns (wall 2481898 ns), block 8313 cpu 2437855 ns (wall 2533402 ns), block 6945 cpu 2414630 ns (wall 2464124 ns), block 8262 cpu 2412983 ns (wall 2490860 ns), block 8317 cpu 2412224 ns (wall 2498795 ns)
+cpu spike bursts: 4096 blocks over half a period of CPU (capped: there were more), in 108 runs; runs start every 3..457 blocks (0.0..0.6 s at 48 k/64)
+                  run at block 0..3 (4 long), worst 834260 ns of CPU
+                  run at block 6..12 (7 long), worst 855482 ns of CPU
+                  run at block 15..45 (31 long), worst 921074 ns of CPU
+                  run at block 48..54 (7 long), worst 863703 ns of CPU
+                  run at block 57..233 (177 long), worst 1059760 ns of CPU
+                  run at block 237..247 (11 long), worst 1272147 ns of CPU
+                  run at block 252..302 (51 long), worst 1299426 ns of CPU
+                  run at block 305..309 (5 long), worst 899408 ns of CPU
+block time:       p50 330601 ns, p99 787766 ns, max 6223857 ns
+p99/deadline:     59.08% (gate <= 50.00%)
+max lateness:     0.000 ms
+render-path alloc:0 allocations, 0 frees (must be 0)
+first overrun at: block 239 of 1350000
+deadline overruns:1028
+driver xruns:     79
+  by direction:   18 capture overruns, 61 playback underruns
+oracle:           match vs offline render of the captured input, first 5.000000 s
+  max|diff|:      0 over 240000 frames
+result:           FAIL
+=== host state ===
+period           2026-09-16T21:29:23+01:00 -> 2026-09-16T21:59:26+01:00 (1803s)
+kernel_release   7.0.0-1017-raspi-realtime
+uname_says_rt    true
+cmdline          reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10
+isolated_cpus    <absent>
+nohz_full_cpus   <absent>
+governor         performance
+scaling_max_khz  2400000
+scaling_cur_khz  2400000
+temp_mC          41350
+throttled        0x0
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   xhci-hcd:usb2
+audio_irq_number 134
+audio_irq_affinity 2
+audio_irq_thread_prio 85
+
+=== interrupt deltas per CPU (1803s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer           1341891   1048828    960814   1794150
+IPI0_resched          306598   1356877    939560   1787934
+IPI5_irqwork            2884      2382      3217    385602
+audio_IRQ                  0         0     87085         0
+IPI1_fncall           313322     32210     20289     61089
+
+=== verdict ===
+FAIL: no CPUs are isolated -- this arm measured an ordinary shared core.
+      The kernel command line is missing isolcpus=. Check: cat /proc/cmdline
+      (If this host has no cores to spare and that is deliberate, re-run the arm
+      with EXPECT_NO_ISOLATION=1.)

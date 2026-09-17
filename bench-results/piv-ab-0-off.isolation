@@ -1,0 +1,31 @@
+=== host state ===
+period           2026-09-16T21:29:23+01:00 -> 2026-09-16T21:59:26+01:00 (1803s)
+kernel_release   7.0.0-1017-raspi-realtime
+uname_says_rt    true
+cmdline          reboot=w coherent_pool=1M 8250.nr_uarts=1 pci=pcie_bus_safe numa_policy=interleave nvme.max_host_mem_size_mb=0  numa=fake=8 system_heap.max_order=0 iommu_dma_numa_policy=interleave smsc95xx.macaddr=2C:CF:67:C4:D2:DD vc_mem.mem_base=0x3fc00000 vc_mem.mem_size=0x40000000  console=ttyAMA0,115200 multipath=off dwc_otg.lpm_enable=0 console=tty1 root=LABEL=writable rootfstype=ext4 rootwait fixrtc cfg80211.ieee80211_regdom=GB video=HDMI-A-1:1280x720@60D rd.shell=0 rd.emergency=reboot rd.retry=60 rd.timeout=90 panic=10
+isolated_cpus    <absent>
+nohz_full_cpus   <absent>
+governor         performance
+scaling_max_khz  2400000
+scaling_cur_khz  2400000
+temp_mC          41350
+throttled        0x0
+audio_card        card 2: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   xhci-hcd:usb2
+audio_irq_number 134
+audio_irq_affinity 2
+audio_irq_thread_prio 85
+
+=== interrupt deltas per CPU (1803s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer           1341891   1048828    960814   1794150
+IPI0_resched          306598   1356877    939560   1787934
+IPI5_irqwork            2884      2382      3217    385602
+audio_IRQ                  0         0     87085         0
+IPI1_fncall           313322     32210     20289     61089
+
+=== verdict ===
+FAIL: no CPUs are isolated -- this arm measured an ordinary shared core.
+      The kernel command line is missing isolcpus=. Check: cat /proc/cmdline
+      (If this host has no cores to spare and that is deliberate, re-run the arm
+      with EXPECT_NO_ISOLATION=1.)

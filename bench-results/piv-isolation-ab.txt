@@ -1,0 +1,85 @@
+The piv isolation A/B: the boot arguments matter, and the effect is large
+=========================================================================
+
+2026-09-16/17, commit 1172283 + the harness. Same kernel image
+(`7.0.0-1017-raspi-realtime`) in all four arms -- **the only difference is the command line**,
+which is the one paired comparison in this project that needs no stock kernel as a control.
+4 x A2-Full, q64, ring 6, cap 3, floor 0, splice-fade 1.333, `--splice-verify`, on the SSL
+2+ Mk II, `SCHED_FIFO 80` pinned to cpu 3. Balanced order off / on / on / off, one arm per
+boot, driven by tools/soak/piv-isolation-ab.sh. Evidence: piv-ab-{0-off,1-on,2-on,3-off}.*
+
+
+RESULT
+------
+  arm          condition   xruns   late blocks   p99        block max   drops
+  0-off        off            79          1028   59.08%      6224 us     111
+  3-off        off           115           992   60.57%      5444 us      91
+                                   mean 97       1010      59.8%       5.8 ms
+  1-on         on             15           555   51.95%      3728 us      47
+  2-on         on              4           300   54.67%      2964 us      13
+                                   mean 9.5       428      53.3%       3.3 ms
+
+  ratio on/off, by the two arms' means:   **10x fewer xruns, 2.4x fewer late blocks,
+  1.8x lower worst block, 3.4x fewer queue drops.**
+
+  Every arm: oracle max|diff| 0 over 240 000 frames, `SCHED_FIFO priority 80, cpu 3`,
+  0 render-path allocations.
+
+**The isolation boot arguments are worth having, and this is the first time that has been
+shown rather than assumed.** Every measurement in the piv round was taken with them in force,
+so "the RT kernel removed the tail" could not previously be separated from "the boot arguments
+removed it". On the same kernel image, removing them costs a factor of ten in xruns and
+roughly a factor of two in late blocks.
+
+THE MANIPULATION CHECK, IN BOTH DIRECTIONS
+------------------------------------------
+This is the check whose absence made the earlier 16-arm IRQ experiment uninterpretable, and
+here it reads perfectly:
+
+  off arms: "FAIL: no CPUs are isolated -- this arm measured an ordinary shared core."
+  on arms:  "cpu 2 .tick_stopped=1 ... cpu 3 .tick_stopped=1" -- both reserved cores tickless
+
+So each arm is confirmed to have run the configuration it claims. Note that the off arms'
+verdict is *correct*, not a defect of the arm: no isolation is exactly what that condition
+means, and the tool reports it because on a host that can isolate, an arm that silently lost
+its reservation measures a different machine.
+
+WHY IT IS NOT JUST THE TICK
+---------------------------
+The tick is the obvious suspect -- 1000 interrupts/s on the audio core without `nohz_full` --
+but the numbers say the engine's own **CPU time** is what changes, not its lateness:
+
+  arm      cpu max    wall max
+  0-off    2461 us    2533 us
+  1-on     2313 us    2307 us
+  2-on     2220 us    2214 us
+  3-off    2780 us    2843 us
+
+`cpu` tracks `wall` in every arm, so the loop is running, not waiting. A reserved core raises
+the *worst* block from 5.8 ms to 3.3 ms by reducing the work's CPU time, which points at the
+same family of mechanism as the memory finding from the piv round: a core shared with other
+tasks has its caches and TLB evicted between blocks, and the engine pays for it on its own
+clock. Isolation stops that, and it also stops the tick; this experiment does not separate the
+two, and does not need to -- it measures the arguments as shipped.
+
+
+CAVEATS, ALL OF THEM
+--------------------
+1. **The arms ran 1800 s, not the 3600 s asked for.** The harness reads `ARM_SECONDS` from its
+   environment, but the systemd unit starts the driver with a clean environment, so it fell
+   back to its 1800 s default. The sequence is still balanced and paired, so the comparison
+   stands; the individual arms are just half the length requested. Fixing this means writing
+   the duration into the unit (`Environment=` or a state file) before arming.
+2. **All four arms FAIL**, and none is clean: even isolation-on produces 4-15 xruns and 300-555
+   late blocks over 30 minutes. So the boot arguments reduce the damage substantially without
+   removing it, which is consistent with the piv round's conclusion that the residual tail is
+   memory-shaped and needs a different lever. The 90 %/one-A2-Full reading of criterion 3 is
+   what this host satisfies; 4 x A2-Full at q64 was never clean here for long.
+3. **The arms ran with no agent session on the machine** (the sequence ended the session that
+   armed it), so they are quieter than the H1/H2 hours from the daytime round. That helps the
+   measurement and hurts comparability with those hours.
+4. n = 2 per condition. What makes it usable anyway is that the two off arms agree with each
+   other (79/115 xruns, 1028/992 late) and the two on arms agree with each other (15/4,
+   555/300), with a large gap between the groups. That is the opposite of the 15-vs-109
+   spread seen between two identical *hours* earlier, and it is what the balanced design was
+   for.
