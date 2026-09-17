@@ -1,0 +1,55 @@
+Does cgroup-v2 cpuset confinement move the engine? Yes — measured on piv, 2026-09-17
+=====================================================================================
+
+THE ANSWER, AGAINST A CONTROLLED BASELINE
+-----------------------------------------
+Same kernel, same device, same engine configuration (4 x A2-Full, q64, ring 6, cap 3, floor 0,
+splice-fade 1.333, `--splice-verify`, SSL 2+ Mk II, `SCHED_FIFO 80` pinned to cpu 3), same
+1800 s. The only difference between the first two rows is whether the rest of the system was
+confined to the housekeeping cores:
+
+  arm                 confinement   xruns  late   blk p50  blk p99  blk max   p99%   spikes  drops
+  piv-ab-1-on         no               15    555     338      693     3728   51.95    4096     47
+  piv-ab-2-on         no                4    300     343      729     2964   54.67    4096     13
+  piv-ab-4-on-confined YES              0     19     323      441     1729   33.05    1120      0
+
+  late blocks 15-29x fewer, block p99 36% lower, worst block 42-54% lower, xruns and queue drops
+  to zero, and the p99 finally inside the 50% gate. `cpu max` falls 2313/2220 -> 1688 us.
+
+The arm is confirmed to have run the configuration it claims -- this is the check the earlier
+screen failed:
+
+  scheduling: SCHED_FIFO priority 80, cpu 3      <- the engine stayed on the audio core
+  cpu 3 .tick_stopped=1, arch_timer delta 0 in 1803s (0.0/s)
+  cpu 2 arch_timer delta 454 in 1803s (0.3/s)
+
+So the residue after the isolation boot arguments is *not* irreducible: moving every other task
+off cores 2-3 collapses it. That is consistent with the mechanism already recorded -- the engine's
+CPU time, not its lateness, is what other work inflates, because a core shared with other tasks
+has its caches evicted between blocks. My earlier A/B showed the boot arguments are worth 10x
+(97 -> 9.5 xruns); this shows confinement on top of them is worth another 4-15x (4-15 -> 0).
+
+WHY THIS NEEDED ITS OWN EXPERIMENT
+----------------------------------
+The first attempt (docs/distro-slimming.md section 7) confined the workload along with everything
+else: `AllowedCPUs=` on the top-level slices applies to the measurement process too, so its
+"confined" arms pushed the engine onto the loaded housekeeping cores and reported
+"sched_setaffinity(cpu 3): Invalid argument". Those tables therefore compared two placements
+rather than confinement, and its headline ("confinement takes driver xruns 746 -> 0") credited
+confinement with improving a configuration it had not been applied to. Corrected in section 7.0
+of that document; the method used here is:
+
+  1. top-level slices held at 0-1 (all other work off the audio cores);
+  2. the audio work in its own cpuset partition, `AllowedCPUs=2-3`, so it may still use them;
+  3. rlimits passed to the unit -- a systemd service does not get pam_limits, and without
+     `-p LimitRTPRIO=95` the identical invocation silently runs SCHED_OTHER. Verified: the smoke
+     test reported `SCHED_FIFO priority 80, cpu 3` only after that property was added.
+
+WHAT IS STILL RUNNING
+---------------------
+The matched vm-load pair, which answers the harder question their document leaves open -- whether
+4 x A2-Full survives a *memory* load once the other work is genuinely confined:
+  piv-cab-c-unconf-vm    unconfined, `stress-ng --vm 1 --vm-bytes 128M --vm-keep` on cpus 0-1
+  piv-cab-d-confined-vm  confined,   the same load, engine in the audio partition
+Driver: tools/soak/piv-confine-engine-ab.sh. Neither the confinement nor the load is persistent:
+the slice properties are `--runtime` and are gone at reboot.
