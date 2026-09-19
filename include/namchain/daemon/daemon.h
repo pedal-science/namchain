@@ -134,6 +134,12 @@ private:
   bool setup_signals(std::string& error);
   /// Compile \p rig_path and publish it. Called for the startup rig, SIGHUP and `rig.load`.
   bool load_rig(const std::string& rig_path, std::string& error);
+  /// \brief Compile \p graph, prewarm it and publish it, keeping it as the graph later patches apply to.
+  ///
+  /// Control thread. On success \ref current_graph_ becomes \p graph, the generation advances and the
+  /// render thread crossfades into the new plan; on any failure nothing changes and the running plan
+  /// keeps rendering.
+  bool publish_graph(const graph::Graph& graph, const std::string& label, std::string& error);
   /// Resolve a `set_param` against the newest published plan and push it on the ring.
   bool publish_param(const std::string& node, const std::string& param, double value, std::string& error);
   bool push_slot(PlanSlot* slot);
@@ -169,6 +175,9 @@ private:
   bool mask_saved_ = false;
   std::vector<int> clients_;
   std::string current_rig_;
+  /// The graph the newest published plan was built from. Control-thread-only; it is the base a
+  /// structural `rig.patch` mutates, and it is replaced only by a successful publish.
+  graph::Graph current_graph_;
   uint64_t generation_ = 0;
   bool started_ = false;
 

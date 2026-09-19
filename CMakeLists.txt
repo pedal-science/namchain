@@ -132,6 +132,7 @@ add_library(namchain OBJECT
   src/graph/plan.cpp
   src/graph/reference.cpp
   src/graph/rig.cpp
+  src/graph/patch.cpp
   src/daemon/config.cpp
   src/daemon/daemon.cpp
   src/render/timeline.cpp
@@ -265,6 +266,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_backend.cpp
     tests/test_rt_primitives.cpp
     tests/test_graph.cpp
+    tests/test_patch.cpp
     tests/test_nodes.cpp
     tests/test_rig.cpp
     tests/test_latency.cpp

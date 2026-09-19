@@ -1,15 +1,16 @@
 # The rig spec pipeline: load, parse, compile, apply
 
 **Status:** design, partly built. Load, parse and compile are implemented and tested. Apply is
-partial in two separate ways. The `smooth` class (parameter-only) never recompiles and is ramped
-inside the node, over both the daemon's `rig.patch` and the offline `namchain-render` timeline. A
-*structural* change compiles a new plan, dual-renders it against the old one for `fade_ms` with an
-equal-power crossfade at the chain outputs, and retires the old after a grace window — but nothing yet
-*builds* a modified graph from an op, and there is no admission control. Control-side awareness is
-partial: the daemon's socket, protocol, `signalfd` reload and device-loss survival exist, and the
-offline edit timeline now exists; telemetry subscription does not. The audio-side command ring is
-drained at the top of each block and carries plan identity and parameter dispatches. The last section
-says exactly which is which, so nothing here is mistaken for running code.
+partial. The `smooth` class (parameter-only) never recompiles and is ramped inside the node, over both
+the daemon's `rig.patch` and the offline `namchain-render` timeline. A *structural* change — a
+whole-rig load, or the `add_node`/`remove_node`/`connect`/`disconnect`/`rewire`/`swap_model` patch
+ops — builds a new graph, compiles it, dual-renders it against the old plan for `fade_ms` with an
+equal-power crossfade at the chain outputs, and retires the old after a grace window. What is missing
+is bypass, the cost model and admission control. Control-side awareness is partial: the daemon's
+socket, protocol, `signalfd` reload and device-loss survival exist, and the offline edit timeline now
+exists; telemetry subscription does not. The audio-side command ring is drained at the top of each
+block and carries plan identity and parameter dispatches. The last section says exactly which is
+which, so nothing here is mistaken for running code.
 
 **Names.** Three stages, three words, because using one word for all of them is how a conversation
 about latency ends up talking about the wrong thing:
@@ -201,9 +202,9 @@ The mechanisms, in the order they matter:
 | load | **implemented** — `load_graph_json` |
 | parse | **implemented** — `parse_graph_json` plus full structural validation |
 | compile | **implemented** for validation, Kahn ordering, liveness/colouring, arena allocation and pointer binding; lowering, PDC and the cost model still to come |
-| apply | **partial** — the `smooth` class is built: a parameter-only change resolves to a vtable dispatch (`NodeType::set_param`) and ramps inside the node, with no compile and no step, over both the daemon's `rig.patch` and the offline timeline. A structural change dual-renders the old and new plans for `fade_ms` and equal-power crossfades their chain outputs before retiring the old one (`rt::Crossfade`), with one transition in flight and a pending slot that coalesces bursts. What is missing is the patch protocol that *builds* a modified graph (§8.4 ops), and admission control: the fade is fixed, and a plan too expensive to dual-render is not rejected |
+| apply | **partial** — the `smooth` class is built: a parameter-only change resolves to a vtable dispatch (`NodeType::set_param`) and ramps inside the node, no compile and no step, over both the daemon's `rig.patch` and the offline timeline. A structural change is built from a graph mutation (`graph::apply_patch`: `add_node`/`remove_node`/`connect`/`disconnect`/`rewire`/`swap_model`/non-rampable `set_param`), applied all-or-nothing to a copy, compiled, dual-rendered for `fade_ms` and equal-power crossfaded (`rt::Crossfade`) before the old plan is retired. `rig.patch` routes smooth vs structural and reports which it took. Missing: bypass, and admission control — the fade is fixed and an expensive dual-render is not rejected |
 | control-side awareness | **partial** — `namchaind` is the daemon: a Unix `SOCK_SEQPACKET` socket with the versioned JSON protocol (`engine.hello/status/mute/panic`, `rig.load/get/patch`), `signalfd` for SIGHUP reload and TERM/INT stop, startup-from-config, and a `poll` loop whose timeout is the reclamation window. The offline edit timeline exists (`namchain-render --graph --timeline/--torture`); the in-process API and telemetry subscription are not built |
-| audio-side awareness | **partial** — the daemon drains the SPSC command ring at the top of each block and carries two kinds of record: plan identity (start a crossfade, or adopt the first plan) and parameter dispatches (ramp a node). The structural patch ops and the deferred-commit scheduler are M2/M3 |
+| audio-side awareness | **partial** — the daemon drains the SPSC command ring at the top of each block and carries two kinds of record: plan identity (start a crossfade, or adopt the first plan) and parameter dispatches (ramp a node). The deferred-commit scheduler is M3 |
 | stall avoidance | mixed. `rt/arena.h` is in use today — the compiler allocates every intermediate buffer from one — and `rt/splice_fader.h` is in use in the live device loop, though for the output-queue splice rather than for plan transitions. `rt/spsc_ring.h` and `rt/reclaimer.h` are wired into `namchaind`: the render thread drains the ring each block and retires the old plan, and the control loop's timeout is the reclamation window. The ring now carries a `set_param` dispatch as well as plan identity; the structural ops of §4 are still missing |
 
 `RenderPlan::execute(input, output, frames)` still has no plan-swap indirection of its own; the

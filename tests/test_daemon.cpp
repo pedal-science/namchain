@@ -399,29 +399,67 @@ TEST_CASE("rig.patch pushes a ramped set_param and refuses what it cannot apply"
   REQUIRE(nlohmann::json::parse(daemon.handle_request(R"({"method":"rig.load","rig":"gain.json"})"))["ok"] ==
           true);
 
-  SUBCASE("a settable param is accepted")
+  SUBCASE("a settable param takes the smooth path and does not recompile")
   {
     const auto reply = nlohmann::json::parse(daemon.handle_request(
       R"({"method":"rig.patch","ops":[{"op":"set_param","node":"g","param":"gain","value":0.7}]})"));
     REQUIRE(reply["ok"] == true);
+    CHECK(reply["kind"] == "smooth");
     CHECK(reply["applied"] == 1);
+    CHECK(reply["generation"] == 1); // no new plan was built
   }
 
-  SUBCASE("an unknown param is rejected with the node's name in the reason")
+  SUBCASE("a param the node cannot ramp takes the structural path instead")
+  {
+    // `gain_db` is a *build* parameter: `nc.gain` only ramps `gain`, so the only way to honour this
+    // is to rebuild the node. The router is what decides, and the response says which path it took.
+    const auto reply = nlohmann::json::parse(daemon.handle_request(
+      R"({"method":"rig.patch","ops":[{"op":"set_param","node":"g","param":"gain_db","value":3.0}]})"));
+    REQUIRE(reply["ok"] == true);
+    CHECK(reply["kind"] == "structural");
+    CHECK(reply["generation"] == 2);
+  }
+
+  SUBCASE("an unknown op is rejected rather than ignored")
   {
     const auto reply = nlohmann::json::parse(daemon.handle_request(
-      R"({"method":"rig.patch","ops":[{"op":"set_param","node":"g","param":"gain_db","value":0.7}]})"));
+      R"({"method":"rig.patch","ops":[{"op":"explode","node":"g"}]})"));
     CHECK(reply["ok"] == false);
     CHECK(reply["error"]["code"] == "patch_rejected");
-    CHECK(reply["error"]["message"].get<std::string>().find("gain_db") != std::string::npos);
+    CHECK(reply["error"]["message"].get<std::string>().find("unknown op") != std::string::npos);
   }
 
-  SUBCASE("a structural op names its own unsupported class")
+  SUBCASE("add_node and rewire take the structural path and build a new plan")
+  {
+    const auto reply = nlohmann::json::parse(daemon.handle_request(R"({"method":"rig.patch","ops":[
+      {"op":"add_node","id":"g2","type":"nc.gain","gain":0.5},
+      {"op":"connect","from":"g","to":"g2"},
+      {"op":"rewire","from":"g2","to":"out"}
+    ]})"));
+    REQUIRE(reply["ok"] == true);
+    CHECK(reply["kind"] == "structural");
+    CHECK(reply["applied"] == 3);
+    CHECK(reply["generation"] == 2);
+  }
+
+  SUBCASE("a structural op that would leave the rig uncompilable is refused, generation unchanged")
   {
     const auto reply = nlohmann::json::parse(daemon.handle_request(
-      R"({"method":"rig.patch","ops":[{"op":"rewire","node":"g","param":"gain","value":0.7}]})"));
+      R"({"method":"rig.patch","ops":[{"op":"remove_node","node":"out"}]})"));
     CHECK(reply["ok"] == false);
-    CHECK(reply["error"]["code"] == "unsupported_op");
+    CHECK(reply["error"]["code"] == "compile_failed");
+    // Nothing was published, so the running generation is still the loaded rig.
+    const auto status = nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.status"})"));
+    CHECK(status["status"]["generation"] == 1);
+  }
+
+  SUBCASE("bypass is named rather than silently ignored")
+  {
+    const auto reply = nlohmann::json::parse(daemon.handle_request(
+      R"({"method":"rig.patch","ops":[{"op":"bypass","node":"g","bypass":true}]})"));
+    CHECK(reply["ok"] == false);
+    CHECK(reply["error"]["code"] == "patch_rejected");
+    CHECK(reply["error"]["message"].get<std::string>().find("not implemented") != std::string::npos);
   }
 }
 
@@ -550,6 +588,67 @@ TEST_CASE("a structural rig.load is dual-rendered and crossfaded")
   CHECK(status["status"]["transitions_started"].get<uint64_t>() >= 1);
   CHECK(status["status"]["target_generation"] == 2);
   CHECK(status["status"]["generation"] == 2);
+}
+
+TEST_CASE("a structural rig.patch rebuilds the running rig and crossfades into it")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "gain.json", kGainRig);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "gain.json").string();
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  config.fade_ms = 5.0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() == 1;
+  }));
+
+  const auto patch = nlohmann::json::parse(call(config.socket_path, R"({"id":"p","method":"rig.patch","ops":[
+    {"op":"add_node","id":"g2","type":"nc.gain","gain":0.5},
+    {"op":"connect","from":"g","to":"g2"},
+    {"op":"rewire","from":"g2","to":"out"}
+  ]})"));
+  REQUIRE(patch["ok"] == true);
+  CHECK(patch["kind"] == "structural");
+  CHECK(patch["generation"] == 2);
+
+  const bool settled = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["transition_active"] == false && status["audible_generation"].get<uint64_t>() == 2;
+  });
+  CHECK_MESSAGE(settled, "the render thread never finished the patch's transition");
+
+  // The rebuilt plan is the one now live: a param on the *added* node resolves, and takes the smooth
+  // path (so the patch protocol and the plan agree about the graph).
+  const auto smooth = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"id":"s","method":"rig.patch","ops":[{"op":"set_param","node":"g2","param":"gain","value":0.25}]})"));
+  REQUIRE(smooth["ok"] == true);
+  CHECK(smooth["kind"] == "smooth");
+  CHECK(smooth["generation"] == 2);
 }
 
 TEST_CASE("the daemon stays up and reports lost when the device cannot be opened")

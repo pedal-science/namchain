@@ -98,7 +98,7 @@ length prefix to get wrong. A request is:
 | `engine.mute` | `{"mute": true\|false}` | the new state |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `rig.load` | `{"rig": "name.json"}` | compiled and published; returns `rig`, `generation` |
-| `rig.patch` | `{"ops": [{"op":"set_param","node":"g","param":"gain","value":0.5}]}` | ramped with no recompile; returns `applied`, `generation` |
+| `rig.patch` | `{"ops": [...]}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model` | `kind` (`smooth` or `structural`), `applied`, `generation` |
 | `rig.get` | — | the current rig path, generation, `loaded` |
 
 Unknown fields are ignored; an unknown method is `unknown_method`. A malformed message never kills
@@ -107,22 +107,26 @@ the connection or the daemon.
 `mute` zeroes the *emitted* copy **after** the chain has run: a muted chain whose inference is
 skipped freezes the model's state and clicks on unmute (plan.md G14).
 
-`rig.patch` is the `smooth` op class of plan.md §5.3: the control thread resolves the node and param
-to the vtable dispatch, pushes one POD record on the ring, and the render thread ramps it over the
-node's own smoothing time. It never recompiles and never steps, so it costs nothing and cannot click;
-`engine.status` reports `params_applied` once the render thread has taken it. The response is an
-acknowledgement, not a completion — adoption is asynchronous by design. `"op"` may be omitted and
-defaults to `set_param`; any other op kind is a structured `unsupported_op`, so a client cannot
-believe a rewire happened when it did not.
+`rig.patch` **routes by op class** (plan.md §5.3), and says which path it took in `kind`:
 
-Structural reloads take the other path: `rig.load` (and a SIGHUP reload) publishes a complete new
-plan, and the render thread dual-renders the old and new plans for `fade_ms`, crossfading their chain
-outputs with `rt::Crossfade` before retiring the old one. `engine.status` reports
-`"structural_transitions": "crossfade"`, and during the fade `transition_active` is true with
-`audible_generation`/`target_generation` naming the two plans. A burst of requests coalesces to the
-newest: one transition in flight, one pending. Nothing yet *builds* a modified graph from an op —
-that is the structural patch protocol, still to come — so the only structural changes available today
-are whole-rig loads.
+- If every op is a `set_param` the live plan's vtable can dispatch, the whole patch is `"smooth"`: one
+  POD record per op on the ring, ramped inside the node over its own smoothing time. No recompile and
+  no step; `engine.status` reports `params_applied` once the render thread has taken it. The response
+  is an acknowledgement, not a completion — adoption is asynchronous by design.
+- Any other op — or a `set_param` the vtable cannot ramp, such as `gain_db`, which `nc.gain` only
+  reads at build — makes the whole patch `"structural"`: the ops are applied to a *copy* of the
+  current graph, and the copy is compiled and published only if every op succeeded. The render thread
+  then dual-renders the old and new plans for `fade_ms` and equal-power crossfades their outputs
+  (`rt::Crossfade`) before retiring the old one. `engine.status` reports `"structural_transitions":
+  "crossfade"`, with `transition_active` and `audible_generation`/`target_generation` during the fade.
+  A burst coalesces to the newest: one transition in flight, one pending.
+
+`add_node` takes a node object in the rig's own syntax, parsed by the same parser, so a patched node
+and a declared node mean the same thing. `rewire` repoints one input port. A patch is **all-or-
+nothing**: a rejected op or a graph the compiler will not accept leaves the running plan rendering
+exactly as it was, and `generation` unchanged. `bypass` is refused by name rather than ignored,
+because a client that gets "ok" would believe the node is out of the signal path when it still is.
+The full op list and semantics are in docs/transitions.md.
 
 ### Rig names and trust
 
@@ -187,15 +191,15 @@ expected.
 
 Built: the `smooth` op class (a `rig.patch` set_param ramps inside the node, no recompile, no step),
 the offline scripted timeline that measures it (`namchain-render --graph rig.json --timeline
-edits.json`, or `--torture N --seed S`, judged by the glitch detector), and the structural dual-render
-crossfade that a `rig.load` or SIGHUP reload now takes. See docs/transitions.md.
+edits.json`, or `--torture N --seed S`, judged by the glitch detector), the structural dual-render
+crossfade that a `rig.load` or SIGHUP reload takes, and the structural patch protocol
+(`add_node`/`remove_node`/`connect`/`disconnect`/`rewire`/`swap_model` and a non-rampable
+`set_param`). See docs/transitions.md.
 
 Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 
-- no structural patch ops, so nothing yet *builds* a modified graph; a structural change is always a
-  whole-rig load (`add_node`/`remove_node`/`connect`/`disconnect`/`swap_model`/`rewire`);
-- no bypass/enable or model-swap op class;
+- no `bypass`/enable and no `nc.bypass` dry path (the op is refused by name);
 - no admission control or cost model, so a plan too expensive to dual-render is not rejected before it
   runs, and the fade length is fixed rather than shortened under load;
 - no telemetry subscription and no `scene.*`, `model.*`, `bench.run` methods;
-- no state-accurate NAM warm start (M3).
+- no state-accurate NAM warm start (M3), so `swap_model` crossfades rather than replaying history.

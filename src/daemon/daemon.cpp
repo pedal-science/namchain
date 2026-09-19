@@ -33,6 +33,7 @@
 #include <json.hpp>
 
 #include "namchain/graph/rig.h"
+#include "namchain/graph/patch.h"
 #include "namchain/pcm.h"
 #include "namchain/rt/scheduling.h"
 #include "namchain/rt_check.h"
@@ -286,7 +287,11 @@ bool Daemon::load_rig(const std::string& rig_path, std::string& error)
   graph::Graph graph;
   if (!graph::load_graph_json(rig_path, graph, error))
     return false;
+  return publish_graph(graph, rig_path, error);
+}
 
+bool Daemon::publish_graph(const graph::Graph& graph, const std::string& label, std::string& error)
+{
   render::CompileOptions options;
   options.max_quantum = static_cast<int>(config_.period_size);
   options.sample_rate = static_cast<double>(config_.sample_rate);
@@ -299,7 +304,7 @@ bool Daemon::load_rig(const std::string& rig_path, std::string& error)
   // The first process() call on a freshly built node is tens of times its steady-state cost, and a
   // stall that long can drain the device ring. It is control-thread work, before publication (§3.3).
   slot->plan->prewarm();
-  slot->rig = rig_path;
+  slot->rig = label;
   const uint64_t generation = generation_ + 1;
   slot->generation = generation;
 
@@ -310,13 +315,16 @@ bool Daemon::load_rig(const std::string& rig_path, std::string& error)
     error = "the publication ring is full; the render thread is not consuming plans";
     return false;
   }
+  // Only now does anything about the running engine change. A failed compile or a full ring leaves
+  // the previous graph, plan and generation exactly as they were.
   generation_ = generation;
-  current_rig_ = rig_path;
+  current_rig_ = label;
+  current_graph_ = graph;
   last_published_ = raw;
 
   if (config_.verbose)
   {
-    std::fprintf(stderr, "[namchaind] published %s (generation %llu, %d buffers)\n", rig_path.c_str(),
+    std::fprintf(stderr, "[namchaind] published %s (generation %llu, %d buffers)\n", label.c_str(),
                  static_cast<unsigned long long>(generation_), buffers);
   }
   return true;
@@ -881,36 +889,73 @@ std::string Daemon::handle_request(const std::string& request)
   }
   if (method == "rig.patch")
   {
-    // The `smooth` op class of §5.3: each op is a vtable dispatch on the render thread, no compile
-    // and no fade. The response says how many were accepted; adoption is asynchronous, so a caller
-    // that wants to observe the rendered result polls engine.status (params_applied).
     if (!doc.contains("ops") || !doc["ops"].is_array())
       return error_response(id, "bad_request", "rig.patch needs an 'ops' array");
-    unsigned applied = 0;
-    for (std::size_t i = 0; i < doc["ops"].size(); ++i)
+    if (current_graph_.nodes.empty() || last_published_ == nullptr)
+      return error_response(id, "patch_rejected", "no plan is loaded; rig.load first");
+
+    // Route by op class (§5.3). If every op is a `set_param` the live plan can dispatch, the whole
+    // patch is the smooth class: a vtable dispatch on the render thread, no compile, no fade. Any
+    // other op means the graph changes, so the whole patch is structural and all-or-nothing: it is
+    // applied to a copy and published, which the render thread crossfades into.
+    bool smooth = true;
+    for (std::size_t i = 0; smooth && i < doc["ops"].size(); ++i)
     {
-      const std::string where = "ops[" + std::to_string(i) + "]";
       const nlohmann::json& op = doc["ops"][i];
-      if (!op.is_object())
-        return error_response(id, "bad_request", where + " must be an object");
-      if (op.contains("op") && (!op["op"].is_string() || op["op"].get<std::string>() != "set_param"))
-        return error_response(id, "unsupported_op",
-                              where + ": only 'set_param' is implemented");
+      if (!op.is_object() || !op.contains("op") || !op["op"].is_string() ||
+          op["op"].get<std::string>() != "set_param")
+      {
+        smooth = false;
+        break;
+      }
       if (!op.contains("node") || !op["node"].is_string() || !op.contains("param") ||
           !op["param"].is_string() || !op.contains("value") || !op["value"].is_number())
       {
-        return error_response(id, "bad_request", where + " needs string 'node' and 'param' and a numeric 'value'");
+        // Malformed even for the structural path, but let apply_patch produce the precise message.
+        smooth = false;
+        break;
       }
-      std::string error;
-      if (!publish_param(op["node"].get<std::string>(), op["param"].get<std::string>(),
-                         op["value"].get<double>(), error))
-      {
-        return error_response(id, "patch_rejected", where + ": " + error);
-      }
-      ++applied;
+      std::size_t node_index = 0;
+      uint32_t param_id = 0;
+      if (!last_published_->plan->resolve_param(op["node"].get<std::string>(),
+                                                op["param"].get<std::string>(), node_index, param_id))
+        smooth = false;
     }
+
+    if (smooth)
+    {
+      unsigned applied = 0;
+      for (const nlohmann::json& op : doc["ops"])
+      {
+        std::string error;
+        if (!publish_param(op["node"].get<std::string>(), op["param"].get<std::string>(),
+                           op["value"].get<double>(), error))
+        {
+          return error_response(id, "patch_rejected", "ops[" + std::to_string(applied) + "]: " + error);
+        }
+        ++applied;
+      }
+      nlohmann::json body;
+      body["kind"] = "smooth";
+      body["applied"] = applied;
+      body["generation"] = generation_;
+      return ok_response(id, body);
+    }
+
+    graph::Graph patched = current_graph_;
+    graph::PatchContext context;
+    // A model path in a patch is relative to the rig being patched, the same rule a rig's own model
+    // paths follow, so the two agree about where models live.
+    context.base_dir = std::filesystem::path(current_rig_).parent_path().string();
+    std::string error;
+    if (!graph::apply_patch(patched, doc["ops"].dump(), context, error))
+      return error_response(id, "patch_rejected", error);
+    if (!publish_graph(patched, current_rig_, error))
+      return error_response(id, "compile_failed", error);
+
     nlohmann::json body;
-    body["applied"] = applied;
+    body["kind"] = "structural";
+    body["applied"] = static_cast<unsigned>(doc["ops"].size());
     body["generation"] = generation_;
     return ok_response(id, body);
   }
