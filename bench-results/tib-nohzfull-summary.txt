@@ -1,0 +1,127 @@
+namchain on tib — NO_HZ_FULL + isolcpus on the audio core: what it changed
+========================================================================
+
+2026-09-19. Host: Tinker Board S (RK3288, Cortex-A17, armv7l, 4 cores, 2 GB).
+Kernel: **7.2.6-tib1**, built by rtpi from the board's own config migrated to 7.2.6 with the RT
+fragments on top, with NO_HZ_FULL enabled and the module set trimmed. Booted as the CANDIDATE
+slot (`rtpi.slot=candidate`); the frozen known-good slot still holds 7.2.6, so the next reboot
+returns to it until the new kernel is frozen. `rtpi-validate` PASSed it (PREEMPT_RT banner,
+network and sshd up).
+
+The command line now carries:
+
+    isolcpus=managed_irq,domain,3 nohz_full=3 rcu_nocbs=3
+
+This file answers one question: with the tick finally off the audio core, what did it buy?
+
+Arms: `bench-results/tib-nz-{quiet,vm}.*`, compared against the unconfined device baselines
+`bench-results/tib-dx-{1-quiet-unc,2-vm-unc}.*` (2026-09-17, kernel 7.2.6, no isolation).
+Script: `tools/soak/tib-nohzfull-device-ab.sh`. Engine: SSL 2+ Mk II, 3x A2-Lite, q64,
+`--periods 6 --output-queue-periods 4 --output-queue-floor-periods 2`, SCHED_FIFO 80, cpu 3.
+Both new arms passed the isolation check (`.tick_stopped=1` on cpu 3) — no
+`EXPECT_NO_ISOLATION` was set, so the reservation had to be proved rather than excused.
+
+
+1. THE TICK IS GONE, AND THE PROOF IS NOT THE INTERRUPT COUNT
+-------------------------------------------------------------
+`arch_timer` counts every arch-timer interrupt, including hrtimers, so it cannot by itself
+distinguish "the tick stopped" from "the workload arms timers". `/proc/timer_list` can:
+
+    cpu: 0  .tick_stopped : 0
+    cpu: 1  .tick_stopped : 0
+    cpu: 2  .tick_stopped : 0
+    cpu: 3  .tick_stopped : 1      <- idling, spinning, and with the engine running
+
+The clean discriminator is a workload with no timers in it at all — one busy task on cpu 3,
+nothing else:
+
+    $ taskset -c 3 sh -c 'while :; do :; done' &
+    $ <sample arch_timer cpu3 before and after 30 s>
+    0 per second
+
+With the tick running, the same core took ~921 per second (see below). Note that
+`/proc/interrupts` lists TWO lines named `arch_timer` (IRQ 25 and 26); the second is 0 for the
+whole of every run measured here, so the single-line numbers below are the complete picture.
+
+  workload on cpu 3                              arch_timer on cpu 3
+  pure busy spinner (one task, zero timers)      0 /s
+  engine, null backend (paces itself, 3xA2-Lite) 468-554 /s
+  engine, device backend, quiet, 602 s            601 total = 1.0 /s
+  engine, device backend, vm load, 618 s          3 084 total = 5.0 /s
+
+In-arm evidence, from the same 602/618 s arms as the latency table below:
+
+  arm            cpu0       cpu1       cpu2       cpu3
+  tib-nz-quiet   608298    24066      20041        601
+  tib-nz-vm      625855    618768     618202      3084
+  tib-dx-1-quiet-unc (7.2.6)  611596  57921  23992  554761   <- 921/s, the tick
+  tib-dx-2-vm-unc    (7.2.6)  631761 621551 258408  614320   <- 1024/s, the tick
+
+So the audio core went from ~920-1020 timer interrupts per second to 1-5, while the housekeeping
+cores kept theirs (in the vm arm cpu1/cpu2 carry ~618 000 each — that is the tick, still running
+where it is not wanted).
+
+**What NO_HZ_FULL does not remove is the workload's own timers, and the two backends differ.**
+The null backend paces itself with a per-block sleep and leaves ~470-550/s on the core; the
+device backend is driven by the driver's period wakeups and leaves 1-5/s. That difference is the
+engine, not the tick, and no tick setting touches it. The old 921/s is therefore an upper bound
+on what the tick cost there, because it also contains the engine's own hrtimers.
+
+
+2. WHAT IT BOUGHT THE LATENCY: A LITTLE, IN THE QUIET CASE ONLY
+---------------------------------------------------------------
+Same engine, same pins, same device; the only differences are the kernel and the load.
+
+  arm                 xruns  cap/play   late blks   p50 us   p99 us   max us   p99 %   result
+  tib-dx-1-quiet-unc      0     0/0            0    304.8    492.6    768.3   36.95   PASS
+  tib-nz-quiet            0     0/0            0    310.6    357.0    596.5   26.77   PASS
+  tib-dx-2-vm-unc      2876  2071/805      51048    510.1   1785.6   6401.6  133.92   FAIL
+  tib-nz-vm            2082  1571/511      53278    501.7   1709.8   4411.5  128.23   FAIL
+
+Quiet: p99 492.6 -> 357.0 us (-27.5 %), max 768.3 -> 596.5 us (-22.4 %), zero xruns either way.
+Loaded: still a gate failure in both directions — p99 1785.6 -> 1709.8 (-4.2 %), max
+6401.6 -> 4411.5 (-31 %), xruns 2876 -> 2082 (-27.6 %), late blocks 51048 -> 53278 (+4.4 %).
+
+The loaded case failing is not a surprise and is not a contradiction: the earlier analysis
+already put the binding constraint under memory load in the shared L2 and ~2.98 GB/s of
+bandwidth, and the tick was never what set the tail there. **NO_HZ_FULL on this board is hygiene
+for a headless node, not a cure, exactly as predicted.**
+
+
+3. WHAT THESE ARMS DO NOT ESTABLISH
+-----------------------------------
+* **This is one arm per condition, two days apart — not a balanced same-session A/B.** The
+  old-kernel quiet p99 has been measured near 36.9 % several times (tib-dx-1, e5b/e5c quiet), so
+  26.77 % sits outside that cluster rather than inside its spread; but a repeated baseline is
+  not a control, and the thermal state differed (the 09-17 arms started at ~62-68 C, this one at
+  ~56 C). Treat the quiet improvement as a lead, not a result.
+* **Four things changed at once**, so nothing here can be attributed to NO_HZ_FULL on its own:
+  (a) isolcpus + nohz_full; (b) the module trim, 1472 -> 64 built; (c) CONFIG_SOUND/SND/
+  SND_USB_AUDIO now genuinely built in rather than merely requested (see §4); (d) no debug info
+  generated. The attribution experiment is a build with the same trim and NO_HZ_FULL/isolcpus
+  *off* — same session, alternating, as the piv isolation A/B did.
+* The tick's cost was ~920 interrupts/s, each a few microseconds of kernel entry and exit: a
+  fraction of one percent of a core against a chain p99 in the hundreds of microseconds. A large
+  latency effect was never expected from removing it.
+
+
+4. WHAT ELSE IS IN THIS KERNEL, FOR READING THE COMPARISON ABOVE
+----------------------------------------------------------------
+* **Modules: 1483 .ko / 74 MB installed -> 61 .ko / 7.8 MB.** The vendor config's module set is
+  trimmed to what this board actually loads (`/proc/modules` taken off the board at build time),
+  plus a keep-list for the things that must stay loadable when the hardware is not attached on
+  the build day: the SDIO wifi (tib's only network path), USB serial, snd-aloop/snd-dummy for
+  the test harness, and the crypto the wifi pulls in. 64 symbols are built as modules.
+* **`CONFIG_SOUND=y`.** The RT fragment has asked for `SND=y` and `SND_USB_AUDIO=y` since the
+  first commit and the kernel shipped `=m` anyway: `sound/Kconfig` nests `menuconfig SND` inside
+  `if SOUND`, the base config has `SOUND=m`, so olddefconfig silently downgraded the whole
+  family. ALSA core is now in the image instead of loaded.
+* **No debug info is generated** (`CONFIG_DEBUG_INFO_NONE=y`), rather than built and stripped at
+  install. The module tarball is 2.6 MB compressed.
+* **One intended removal:** `snd_seq_device`, which existed only because the vendor config had
+  `SND_SEQUENCER=m` (`select SND_SEQ_DEVICE if SND_SEQUENCER != n`). The board never loads the
+  sequencer. No `seq_device` symbols are in the built vmlinux, USB MIDI is built in and works;
+  what is gone is `/dev/snd/seq`, i.e. MIDI routing between applications.
+* Wifi, both USB audio interfaces (SSL 2+ on card 1, the Realtek on card 0) and the onboard
+  codec all came up on the candidate boot; card numbers move between boots, so resolve them by
+  name.

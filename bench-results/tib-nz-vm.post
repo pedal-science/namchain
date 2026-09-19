@@ -1,0 +1,280 @@
+timestamp=2026-09-19T10:16:19+01:00
+uptime_s=1699.67
+kernel_release=7.2.6-tib1
+kernel_version=#1 SMP PREEMPT_RT Sat Sep 19 08:43:21 UTC 2026
+uname_says_rt=true
+sys_kernel_realtime=absent
+cmdline=earlyprintk root=UUID=e04f90b4-4c61-41cf-80bd-03df2cb494d6 rootwait rootfstype=ext4 splash=verbose console=ttyS2,115200n8 console=tty1 consoleblank=0 loglevel=1 ubootpart=4c19c430-01 usb-storage.quirks=0x2537:0x1066:u,0x2537:0x1068:u rtpi.slot=candidate isolcpus=managed_irq,domain,3 nohz_full=3 rcu_nocbs=3 coherent_pool=2M  cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory
+nproc=4
+isolated_cpus=3
+nohz_full_cpus=3
+governor=performance
+scaling_max_khz=1608000
+scaling_cur_khz=1608000
+temp_mC=70833
+throttled=no-vcgencmd
+loadavg=2.11 1.82 1.24 2/196 4543
+audio_card= card 1: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+nohz_cpu0=1
+tick_stopped_cpu0=0
+nohz_cpu1=1
+tick_stopped_cpu1=0
+nohz_cpu2=1
+tick_stopped_cpu2=0
+nohz_cpu3=1
+tick_stopped_cpu3=1
+audio_irq_name=ehci_hcd:usb3
+audio_irq_number=54
+audio_irq_affinity=0-3
+audio_irq_thread=112
+audio_irq_thread_prio=50
+label 25 GIC-0 29 Level arch_timer
+int 25 cpu0 1764543
+int 25 cpu1 723574
+int 25 cpu2 713435
+int 25 cpu3 101694
+label 26 GIC-0 30 Level arch_timer
+int 26 cpu0 0
+int 26 cpu1 0
+int 26 cpu2 0
+int 26 cpu3 0
+label 29 GIC-0 104 Level rk_timer
+int 29 cpu0 0
+int 29 cpu1 0
+int 29 cpu2 0
+int 29 cpu3 0
+label 39 GIC-0 34 Level ff250000.dma-controller
+int 39 cpu0 0
+int 39 cpu1 0
+int 39 cpu2 0
+int 39 cpu3 0
+label 40 GIC-0 35 Level ff250000.dma-controller
+int 40 cpu0 0
+int 40 cpu1 0
+int 40 cpu2 0
+int 40 cpu3 0
+label 41 GIC-0 32 Level ffb20000.dma-controller
+int 41 cpu0 0
+int 41 cpu1 0
+int 41 cpu2 0
+int 41 cpu3 0
+label 42 GIC-0 33 Level ffb20000.dma-controller
+int 42 cpu0 0
+int 42 cpu1 0
+int 42 cpu2 0
+int 42 cpu3 0
+label 45 GIC-0 89 Level ttyS2
+int 45 cpu0 9
+int 45 cpu1 0
+int 45 cpu2 0
+int 45 cpu3 0
+label 48 GIC-0 47 Level ff930300.iommu, ff930000.vop
+int 48 cpu0 0
+int 48 cpu1 0
+int 48 cpu2 0
+int 48 cpu3 0
+label 49 GIC-0 48 Level ff940300.iommu, ff940000.vop
+int 49 cpu0 0
+int 49 cpu1 0
+int 49 cpu2 0
+int 49 cpu3 0
+label 50 GIC-0 43 Level ff9a0800.iommu
+int 50 cpu0 0
+int 50 cpu1 0
+int 50 cpu2 0
+int 50 cpu3 0
+label 51 GIC-0 143 Level ff9c0440.iommu
+int 51 cpu0 0
+int 51 cpu1 0
+int 51 cpu2 0
+int 51 cpu3 0
+label 52 GIC-0 57 Level ff540000.usb, dwc2_hsotg:usb1
+int 52 cpu0 16953718
+int 52 cpu1 0
+int 52 cpu2 0
+int 52 cpu3 0
+label 53 GIC-0 55 Level ff580000.usb, ff580000.usb, dwc2_hsotg:usb2
+int 53 cpu0 0
+int 53 cpu1 0
+int 53 cpu2 0
+int 53 cpu3 0
+label 54 GIC-0 56 Level ehci_hcd:usb3
+int 54 cpu0 337
+int 54 cpu1 0
+int 54 cpu2 0
+int 54 cpu3 0
+label 55 GIC-0 97 Level ff170000.i2c
+int 55 cpu0 0
+int 55 cpu1 0
+int 55 cpu2 0
+int 55 cpu3 0
+label 56 GIC-0 92 Level ff650000.i2c
+int 56 cpu0 6033
+int 56 cpu1 0
+int 56 cpu2 0
+int 56 cpu3 0
+label 57 rockchip_gpio_irq 4 Level rk808
+int 57 cpu0 0
+int 57 cpu1 0
+int 57 cpu2 0
+int 57 cpu3 0
+label 63 rk808 5 Edge RTC alarm
+int 63 cpu0 0
+int 63 cpu1 0
+int 63 cpu2 0
+int 63 cpu3 0
+label 67 GIC-0 93 Level ff660000.i2c
+int 67 cpu0 0
+int 67 cpu1 0
+int 67 cpu2 0
+int 67 cpu3 0
+label 68 GIC-0 64 Level dw-mci
+int 68 cpu0 15281
+int 68 cpu1 0
+int 68 cpu2 0
+int 68 cpu3 0
+label 69 GIC-0 65 Level dw-mci
+int 69 cpu0 644139
+int 69 cpu1 0
+int 69 cpu2 0
+int 69 cpu3 0
+label 70 GIC-0 67 Level dw-mci
+int 70 cpu0 80
+int 70 cpu1 0
+int 70 cpu2 0
+int 70 cpu3 0
+label 71 GIC-0 68 Level ff100000.saradc
+int 71 cpu0 0
+int 71 cpu1 0
+int 71 cpu2 0
+int 71 cpu3 0
+label 72 GIC-0 183 Level arm-pmu
+int 72 cpu0 0
+int 72 cpu1 0
+int 72 cpu2 0
+int 72 cpu3 0
+label 73 GIC-0 184 Level arm-pmu
+int 73 cpu0 0
+int 73 cpu1 0
+int 73 cpu2 0
+int 73 cpu3 0
+label 74 GIC-0 185 Level arm-pmu
+int 74 cpu0 0
+int 74 cpu1 0
+int 74 cpu2 0
+int 74 cpu3 0
+label 75 GIC-0 186 Level arm-pmu
+int 75 cpu0 0
+int 75 cpu1 0
+int 75 cpu2 0
+int 75 cpu3 0
+label 76 GIC-0 135 Level ff980000.hdmi, dw-hdmi-cec
+int 76 cpu0 0
+int 76 cpu1 0
+int 76 cpu2 0
+int 76 cpu3 0
+label 77 GIC-0 59 Level end0
+int 77 cpu0 0
+int 77 cpu1 0
+int 77 cpu2 0
+int 77 cpu3 0
+label 78 GIC-0 60 Level end0
+int 78 cpu0 0
+int 78 cpu1 0
+int 78 cpu2 0
+int 78 cpu3 0
+label 79 GIC-0 111 Edge ff800000.watchdog
+int 79 cpu0 0
+int 79 cpu1 0
+int 79 cpu2 0
+int 79 cpu3 0
+label 80 rockchip_gpio_irq 5 Edge GPIO Key Power
+int 80 cpu0 0
+int 80 cpu1 0
+int 80 cpu2 0
+int 80 cpu3 0
+label 81 GIC-0 69 Level rockchip_thermal
+int 81 cpu0 66
+int 81 cpu1 0
+int 81 cpu2 0
+int 81 cpu3 0
+label 82 GIC-0 80 Level rk-crypto
+int 82 cpu0 0
+int 82 cpu1 0
+int 82 cpu2 0
+int 82 cpu3 0
+label 83 GIC-0 50 Level ff920000.rga
+int 83 cpu0 0
+int 83 cpu1 0
+int 83 cpu2 0
+int 83 cpu3 0
+label 84 GIC-0 44 Level ff9c0000.video-codec
+int 84 cpu0 0
+int 84 cpu1 0
+int 84 cpu2 0
+int 84 cpu3 0
+label 85 GIC-0 41 Level ff9a0000.video-codec
+int 85 cpu0 0
+int 85 cpu1 0
+int 85 cpu2 0
+int 85 cpu3 0
+label 86 GIC-0 42 Level ff9a0000.video-codec
+int 86 cpu0 0
+int 86 cpu1 0
+int 86 cpu2 0
+int 86 cpu3 0
+label 87 GIC-0 40 Level panfrost-gpu
+int 87 cpu0 0
+int 87 cpu1 0
+int 87 cpu2 0
+int 87 cpu3 0
+label 88 GIC-0 39 Level panfrost-mmu
+int 88 cpu0 0
+int 88 cpu1 0
+int 88 cpu2 0
+int 88 cpu3 0
+label 89 GIC-0 38 Level panfrost-job
+int 89 cpu0 0
+int 89 cpu1 0
+int 89 cpu2 0
+int 89 cpu3 0
+label IPI0 CPU wakeup interrupts
+int IPI0 cpu0 0
+int IPI0 cpu1 0
+int IPI0 cpu2 0
+int IPI0 cpu3 0
+label IPI1 Timer broadcast interrupts
+int IPI1 cpu0 0
+int IPI1 cpu1 0
+int IPI1 cpu2 0
+int IPI1 cpu3 0
+label IPI2 Rescheduling interrupts
+int IPI2 cpu0 16036
+int IPI2 cpu1 69665
+int IPI2 cpu2 132725
+int IPI2 cpu3 889578
+label IPI3 Function call interrupts
+int IPI3 cpu0 2066
+int IPI3 cpu1 20494
+int IPI3 cpu2 604089
+int IPI3 cpu3 1
+label IPI4 CPU stop interrupts
+int IPI4 cpu0 0
+int IPI4 cpu1 0
+int IPI4 cpu2 0
+int IPI4 cpu3 0
+label IPI5 IRQ work interrupts
+int IPI5 cpu0 253775
+int IPI5 cpu1 368
+int IPI5 cpu2 507
+int IPI5 cpu3 1454
+label IPI6 completion interrupts
+int IPI6 cpu0 0
+int IPI6 cpu1 0
+int IPI6 cpu2 0
+int IPI6 cpu3 0
+label Err 
+int Err cpu0 0
+int Err cpu1 
+int Err cpu2 
+int Err cpu3 

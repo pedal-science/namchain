@@ -269,59 +269,62 @@ gates its ARMv7 arm on `__arm__ && __ARM_NEON && __ARM_FEATURE_FMA`. Two consequ
   `aarch64|arm64|armv8`, so an armv7 NEON build prints "A2 planar NEON: OFF" while actually
   running the planar kernels. The bit-identity gate keys off the header macro and does run.
 
-### `NO_HZ_FULL` is off on tib by configuration, not by limitation
+### `NO_HZ_FULL` on tib: enabled 2026-09-19, and what it bought
 
-It is worth being exact about this, because the earlier version of this section said the option was
-unavailable and that is wrong. On tib (`7.2.6`, armv7):
+Two earlier versions of this section were wrong in opposite directions: the first said the option
+was unavailable on this board, and the second — correctly, at the time — said it was off by
+configuration. It is now **on**, in rtpi's `7.2.6-tib1` build:
 
 ```
-$ grep -n NO_HZ_FULL /boot/config-$(uname -r)
-96:# CONFIG_NO_HZ_FULL is not set          <- offered by Kconfig, simply disabled
-$ grep -E '^CONFIG_(CONTEXT_TRACKING|TICK_ONESHOT|HIGH_RES_TIMERS|SMP|NO_HZ_COMMON|HZ)='
-CONFIG_CONTEXT_TRACKING=y
-CONFIG_TICK_ONESHOT=y
-CONFIG_HIGH_RES_TIMERS=y
-CONFIG_SMP=y
-CONFIG_NO_HZ_COMMON=y
-CONFIG_HZ=1000
+$ grep -E '^CONFIG_(NO_HZ_FULL|NO_HZ_IDLE)=' /boot/config-$(uname -r)
+CONFIG_NO_HZ_FULL=y
+# CONFIG_NO_HZ_IDLE is not set
+$ tr ' ' '\n' < /proc/cmdline | grep -E 'isolcpus|nohz_full|rcu_nocbs'
+isolcpus=managed_irq,domain,3
+nohz_full=3
+rcu_nocbs=3
 ```
 
-Every prerequisite is present, so nothing about the RK3288 or the architecture blocks it: enabling
-it is `CONFIG_NO_HZ_FULL=y` plus `nohz_full=` on the command line — **the same mechanism as piv**,
-not a different one. The difference between the boards is that Ubuntu's `raspi-realtime` ships the
-option on and this build does not. The config fragment's own note gives the reason, and it is a
-judgement rather than a constraint: *"NO_HZ_FULL needs CPUs isolated from the tick to pay for
-itself, and on a 4-core board running a full desktop-ish Armbian userspace there are none to
-spare. Revisit only with isolcpus."*
+`NO_HZ_IDLE` being unset is not a regression. The two are members of `kernel/time/Kconfig`'s
+"Timer tick handling" **choice**, so exactly one is set and FULL is the superset — it stops the
+tick on an idle core *and* on a busy core running exactly one task. The fragment had asked for
+both since the first commit, and Kconfig had been silently keeping one of them.
 
-**What it costs as built is measurable.** An `arch_timer` delta across a 600 s device arm with the
-engine pinned to cpu 3:
+**Enable it, then measure it the right way: the interrupt count is not the test.** `arch_timer`
+counts every arch-timer interrupt including hrtimers, so a workload with its own timers shows a
+rate no matter what the tick is doing — and the first version of this section read that rate as
+"the tick", which is how it concluded the opposite of the truth. `/proc/timer_list` answers the
+actual question, and a timer-free busy task separates the two sources:
 
-| | cpu0 | cpu1 | cpu2 | cpu3 |
-|---|---|---|---|---|
-| tib, 600 s | 611 596 | 57 921 | 23 992 | **554 761** (≈ 925/s) |
-| piv, 1805 s | — | — | 3 522 | **0** |
+| workload on cpu 3, 2026-09-19 | `.tick_stopped` | `arch_timer` on cpu 3 |
+|---|---|---|
+| pure busy spinner, one task, no timers | 1 | **0/s** |
+| engine, device backend, quiet (602 s) | 1 | 1.0/s (601 total) |
+| engine, device backend, under vm load (618 s) | 1 | 5.0/s (3 084 total) |
+| the same engine on 7.2.6 without it | 0 | **921/s** (554 761 in 602 s) |
 
-cpu2 sits at 40/s because it is idle — `NO_HZ_IDLE` stops the tick on *idle* cores and does nothing
-for a busy one, which is exactly what `NO_HZ_FULL` adds. So the engine's own core takes ~925 timer
-interrupts a second on this board.
+The housekeeping cores keep their tick — in the loaded arm cpu1 and cpu2 take ~618 000 each. The
+tick on the audio core went from ~920/s to 1-5/s, and the remainder is the *workload's* own
+timers, which no tick setting removes: the null backend, which paces itself with a per-block
+sleep, leaves 470-550/s behind even with the tick provably stopped. That is also why the old
+921/s is an upper bound on what the tick cost there.
 
-**Revisit the judgement, but expect little from it.** The reason given assumes a desktop-ish
-userspace with no spare core; the measurement configuration gives the engine one core and its own
-cpuset partition and leaves the rest to housekeeping, and this document's own conclusion for this
-board is "run nothing else on it" — which is the condition under which `NO_HZ_FULL` pays. So it is
-worth enabling if tib is to be a headless node, alongside `isolcpus` and the confinement, since
-`NO_HZ_FULL` holds only while a core has one runnable task. What it will **not** do is remove
-xruns: the quiet device case already passes on tib (0 xruns, 0 deadline overruns, p99 36.9 %, with
-the tick running), and under a memory load the binding constraint is the shared L2 and 2.98 GB/s
-of bandwidth, which no tick setting touches. The tick's cost here is well under 1 % of a core
-against a chain p99 of 402 µs.
+**What it bought: a little, and the loaded case is unchanged.** Device arms, same engine, same
+pins, only the kernel differing: p99 492.6 → 357.0 µs and max 768.3 → 596.5 µs with 0 xruns either
+way; under a memory load both directions still fail the gate (p99 1785.6 → 1709.8 µs, xruns
+2876 → 2082). That is one arm per condition two days apart with four changes bundled together, so
+it is a lead rather than a result — `bench-results/tib-nohzfull-summary.txt` §3 has the caveats
+and the attribution experiment that would settle it. The loaded case behaving the same is the
+expected outcome: there the binding constraint is the shared L2 and ~2.98 GB/s of bandwidth, not
+the tick. **This is hygiene for a headless node, not a cure.**
 
-**Under load it does degrade.** With `stress-ng --cpu 4 --io 2 --vm 1` + `hackbench` on all four
-cores the same configuration produced 36 xruns and 1138 late blocks in 5 minutes, and the engine's
-own CPU time more than doubled (chain p99 410 → 851 µs) at a pinned 1416 MHz — the same
-memory-stall signature as the x86/ARM64 case above, since the engine's core is now shared. The
-rule is the same on both: **do not run memory-heavy work beside the engine.**
+**Under load it still degrades, and the load now has to be aimed.** With
+`stress-ng --cpu 4 --io 2 --vm 1` + `hackbench` the same engine configuration produced 36 xruns
+and 1138 late blocks in five minutes, and the engine's own CPU time more than doubled (chain p99
+410 → 851 µs) at a pinned 1416 MHz — the same memory-stall signature as the x86/ARM64 case above.
+`isolcpus=3` stops the scheduler *balancing* work onto the engine's core, but a load whose workers
+are explicitly affine to all four CPUs still lands there, so pin the load to the housekeeping
+cores. The rule is unchanged on both boards: **do not run memory-heavy work beside the engine.**
 
 **Cap the frequency and watch the thermals.** 1416 MHz is the point this board holds; the stock
 top bin drove the rtpi suite into its 90 °C critical trip once. Sample `thermal_zone0` and
