@@ -113,7 +113,9 @@ void process_marker(void*, const float* const*, float* const*, int) noexcept {}
 // to samples is control-thread work (§6.1). `ramp_ms = 0` is a legal instant change, which the
 // timeline's negative control uses to show the detector can fail.
 
-constexpr uint32_t kGainParamGain = 1;
+/// Parameter ids are positions in \ref kGainParams plus one (plan.h, \ref ParamDesc).
+constexpr uint32_t kGainParamGainDb = 1;
+constexpr uint32_t kGainParamGain = 2;
 
 struct GainState
 {
@@ -161,18 +163,38 @@ void destroy_gain(void* state)
   delete static_cast<GainState*>(state);
 }
 
-// The settable set, in id order: `gain` is id 1 (kGainParamGain). `gain_db` is a build-time
-// convenience that resolves to the same value, not a second thing to patch.
-const char* const kGainSettable[] = {"gain"};
+// The declared parameters, in id order. `gain_db` is id 1 and is the canonical one -- dB is the unit a
+// player thinks in; `gain` is the linear spelling, kept because rigs and timelines are written in it,
+// and marked hidden so a generic inspector shows one knob rather than two that mean the same thing.
+// `ramp_ms` is build-only: it is a smoothing time, so changing it changes how every later ramp
+// behaves, which is a rebuild rather than a ramp.
+const ParamDesc kGainParams[] = {
+  {.id = "gain_db", .name = "Gain", .unit = "dB", .default_value = 0.0, .has_min = true, .min = -60.0,
+   .has_max = true, .max = 24.0, .rampable = true},
+  {.id = "gain", .name = "Gain (linear)", .default_value = 1.0, .has_min = true, .min = -8.0,
+   .has_max = true, .max = 16.0, .rampable = true, .hidden = true},
+  {.id = "ramp_ms", .name = "Ramp", .unit = "ms", .default_value = 5.0, .has_min = true, .min = 0.0,
+   .has_max = true, .max = 1000.0},
+};
 
 bool set_param_gain(void* raw, uint32_t param_id, float value) noexcept
 {
-  if (param_id != kGainParamGain || !std::isfinite(value))
+  if (!std::isfinite(value))
     return false;
   GainState* state = static_cast<GainState*>(raw);
+  switch (param_id)
+  {
+  case kGainParamGainDb:
+    state->to = static_cast<float>(std::pow(10.0, static_cast<double>(value) / 20.0));
+    break;
+  case kGainParamGain:
+    state->to = value;
+    break;
+  default:
+    return false;
+  }
   // From the *current* value, so a second change mid-ramp does not jump back to the old endpoint.
   state->from = state->gain;
-  state->to = value;
   state->ramp_pos = 0;
   state->ramp_len = state->smoothing_samples;
   return true;
@@ -724,46 +746,132 @@ void process_unit_delay(void*, const float* const* in, float* const* out, int fr
   std::copy(in[0], in[0] + frames, out[0]);
 }
 
-// Field order matches NodeType: id, inputs, outputs, create, destroy, process, describe,
-// set_block_input, block_delay, arity_param, min_ports, max_ports, param_id, set_param.
-const NodeType kInput{"nc.input", 0, 1, create_input, destroy_input, process_input, nullptr, set_block_input};
-const NodeType kOutput{"nc.output", 1, 0, nullptr, nullptr, process_marker};
-// `nc.gain` is the first settable-parameter node: `param_id`/`set_param` are the `smooth` op class
-// of §5.3, and every later settable node reuses the same two vtable slots.
-const NodeType kGain{.id = "nc.gain", .inputs = 1, .outputs = 1, .create = create_gain,
-                     .destroy = destroy_gain, .process = process_gain,
-                     .settable_params = kGainSettable, .settable_param_count = 1,
-                     .set_param = set_param_gain};
+// --- the declared parameters of every built-in (docs/ui-integration-plan.md §1.4) ----------------
+//
+// One table per type, in id order, and the only place a parameter is described: the compiler validates
+// against these, `engine.schema` publishes them, and a param's id is its position plus one. A
+// parameter that is declared but ignored is a knob that does nothing, so `tests/test_schema.cpp`
+// checks each one against what the node actually reads.
+
+const ParamDesc kSplitParams[] = {
+  {.id = "outputs", .name = "Outputs", .kind = ParamKind::Flag, .default_value = 2.0, .has_min = true,
+   .min = 1.0, .has_max = true, .max = 64.0, .step = 1.0, .snap = true},
+};
+
+const ParamDesc kMixParams[] = {
+  {.id = "inputs", .name = "Inputs", .kind = ParamKind::Flag, .default_value = 2.0, .has_min = true,
+   .min = 1.0, .has_max = true, .max = 64.0, .step = 1.0, .snap = true},
+};
+
+const ParamDesc kNamParams[] = {
+  {.id = "model", .name = "Model", .kind = ParamKind::Option, .required = true, .options_from = "models"},
+};
+
+/// The modes `nc.eq.biquad` accepts. The labels are what a client shows; the values are what it sends.
+const OptionDesc kBiquadModes[] = {
+  {"peaking", "Peaking"},   {"lowshelf", "Low shelf"}, {"highshelf", "High shelf"},
+  {"lowpass", "Low pass"},  {"highpass", "High pass"}, {"bandpass", "Band pass"},
+  {"notch", "Notch"},
+};
+
+const char* const kBiquadModeAliases[] = {"peak",  "eq",        "low_shelf",  "high_shelf",
+                                           "low_pass", "high_pass", "band_pass", "bp"};
+
+const ParamDesc kBiquadParams[] = {
+  {.id = "mode", .name = "Mode", .kind = ParamKind::Option, .default_value = 0.0,
+   .options = kBiquadModes, .option_count = 7, .aliases = kBiquadModeAliases, .alias_count = 8},
+  // Not rampable yet, and deliberately: interpolating a biquad's *coefficients* is not the same thing
+  // as interpolating a value, so a smooth freq/q/gain needs an in-node crossfade between the old and
+  // new coefficient sets. Until that exists, a change here is the structural class -- dual-rendered
+  // and crossfaded at the plan level, which is glitch-free by construction
+  // (docs/ui-integration-plan.md §2, slice B3).
+  // No maximum: the real limit is Nyquist at whatever rate the rig runs at, which the schema does not
+  // know and a fixed 20 kHz would get wrong at 96 kHz. The node's own check owns that bound and says
+  // so, which is the difference between a schema limit and an engine limit.
+  {.id = "freq", .name = "Frequency", .unit = "Hz", .default_value = 1000.0, .has_min = true,
+   .min = 10.0, .min_inclusive = false, .scale = ParamScale::Log},
+  {.id = "q", .name = "Q", .default_value = 0.707, .has_min = true, .min = 0.0,
+   .min_inclusive = false, .has_max = true, .max = 20.0, .scale = ParamScale::Log},
+  {.id = "gain_db", .name = "Gain", .unit = "dB", .default_value = 0.0, .has_min = true, .min = -30.0,
+   .has_max = true, .max = 30.0},
+};
+
+const ParamDesc kDelayParams[] = {
+  // Same reasoning as the biquad: moving a read pointer needs a crossfade between two taps rather
+  // than an interpolated value, so changing either spelling is the structural class for now.
+  // Bounded by the engine, not by the schema: 60 seconds at the rig's rate, in samples. A client
+  // showing a slider picks its own display range when a parameter is unbounded here.
+  {.id = "samples", .name = "Delay", .unit = "samples", .has_min = true, .min = 1.0, .step = 1.0,
+   .snap = true, .one_of = "delay time"},
+  {.id = "ms", .name = "Delay", .unit = "ms", .has_min = true, .min = 0.021, .scale = ParamScale::Log,
+   .one_of = "delay time"},
+};
+
+const ParamDesc kCabIrParams[] = {
+  {.id = "ir", .name = "Impulse response", .kind = ParamKind::Option, .required = true,
+   .options_from = "irs"},
+};
+
+// Field order matches NodeType: id, name, category, inputs, outputs, create, destroy, process,
+// describe, set_block_input, block_delay, arity_param, min_ports, max_ports, params, param_count,
+// channels, set_param.
+const NodeType kInput{"nc.input", "Input", "io", 0, 1, create_input, destroy_input, process_input,
+                      nullptr, set_block_input};
+const NodeType kOutput{"nc.output", "Output", "io", 1, 0, nullptr, nullptr, process_marker};
+// `nc.gain` is the first node with a parameter a client can ramp: `params`/`set_param` are the
+// `smooth` op class of §5.3, and every later settable node reuses the same two vtable slots.
+const NodeType kGain{.id = "nc.gain", .name = "Gain", .category = "utility", .inputs = 1, .outputs = 1,
+                     .create = create_gain, .destroy = destroy_gain, .process = process_gain,
+                     .params = kGainParams, .param_count = 3, .set_param = set_param_gain};
 // `nc.split`/`nc.mix` are the per-spec arity nodes (plan.md §6.1): the fan-out is the rig's
 // `"outputs"`/`"inputs"` param rather than a fixed 2, which is what makes N parallel chains a
 // first-class shape. The default stays 2, so a rig written before this means exactly what it did.
-const NodeType kSplit{.id = "nc.split", .inputs = 1, .outputs = 2, .process = process_split,
-                      .arity_param = "outputs", .min_ports = 1, .max_ports = 64};
-const NodeType kMix{.id = "nc.mix", .inputs = 2, .outputs = 1, .process = process_mix,
-                    .arity_param = "inputs", .min_ports = 1, .max_ports = 64};
-const NodeType kBypass{"nc.bypass", 1, 1, nullptr, nullptr, process_bypass};
-const NodeType kNam{"nc.nam", 1, 1, create_nam, destroy_dsp, process_dsp, describe_dsp};
-const NodeType kCabIr{"nc.cab.ir", 1, 1, create_cab_ir, destroy_dsp, process_dsp, describe_dsp};
-const NodeType kBiquad{"nc.eq.biquad", 1, 1, create_biquad, destroy_biquad, process_biquad};
-const NodeType kDelay{"nc.delay", 1, 1, create_delay, destroy_delay, process_delay};
-const NodeType kUnitDelay{"nc.unit_delay", 1, 1, nullptr, nullptr, process_unit_delay, nullptr, nullptr, true};
+const NodeType kSplit{.id = "nc.split", .name = "Split", .category = "utility", .inputs = 1,
+                      .outputs = 2, .process = process_split, .arity_param = "outputs", .min_ports = 1,
+                      .max_ports = 64, .params = kSplitParams, .param_count = 1};
+const NodeType kMix{.id = "nc.mix", .name = "Mix", .category = "utility", .inputs = 2, .outputs = 1,
+                    .process = process_mix, .arity_param = "inputs", .min_ports = 1, .max_ports = 64,
+                    .params = kMixParams, .param_count = 1};
+const NodeType kBypass{"nc.bypass", "Bypass", "utility", 1, 1, nullptr, nullptr, process_bypass};
+const NodeType kNam{.id = "nc.nam", .name = "NAM model", .category = "amp", .inputs = 1, .outputs = 1,
+                    .create = create_nam, .destroy = destroy_dsp, .process = process_dsp,
+                    .describe = describe_dsp, .arity_param = nullptr, .min_ports = 1, .max_ports = 64,
+                    .params = kNamParams, .param_count = 1};
+const NodeType kCabIr{.id = "nc.cab.ir", .name = "Cabinet IR", .category = "cab", .inputs = 1,
+                      .outputs = 1, .create = create_cab_ir, .destroy = destroy_dsp,
+                      .process = process_dsp, .describe = describe_dsp, .arity_param = nullptr,
+                      .min_ports = 1, .max_ports = 64, .params = kCabIrParams, .param_count = 1};
+const NodeType kBiquad{.id = "nc.eq.biquad", .name = "Biquad EQ", .category = "eq", .inputs = 1,
+                       .outputs = 1, .create = create_biquad, .destroy = destroy_biquad,
+                       .process = process_biquad, .params = kBiquadParams, .param_count = 4};
+const NodeType kDelay{.id = "nc.delay", .name = "Delay", .category = "delay", .inputs = 1, .outputs = 1,
+                      .create = create_delay, .destroy = destroy_delay, .process = process_delay,
+                      .params = kDelayParams, .param_count = 2};
+// A scheduling primitive rather than a pedal: `block_delay` is what breaks a feedback cycle, and a
+// palette should leave it out, which is what the flag is for.
+const NodeType kUnitDelay{"nc.unit_delay", "Unit delay", "utility", 1, 1, nullptr, nullptr,
+                          process_unit_delay, nullptr, nullptr, true};
 
 } // namespace
 
+/// Every registered type, in the order `engine.schema` reports them: the palette's order, grouped by
+/// what a player is looking for rather than by when each was written.
+const NodeType* const kNodeTypes[] = {&kInput,  &kOutput, &kGain,  &kBiquad, &kDelay, &kNam,
+                                      &kCabIr,  &kSplit,  &kMix,   &kBypass, &kUnitDelay};
+
 const NodeType* find_node_type(const std::string& id)
 {
-  if (id == kInput.id) return &kInput;
-  if (id == kOutput.id) return &kOutput;
-  if (id == kGain.id) return &kGain;
-  if (id == kSplit.id) return &kSplit;
-  if (id == kMix.id) return &kMix;
-  if (id == kBypass.id) return &kBypass;
-  if (id == kNam.id) return &kNam;
-  if (id == kCabIr.id) return &kCabIr;
-  if (id == kBiquad.id) return &kBiquad;
-  if (id == kDelay.id) return &kDelay;
-  if (id == kUnitDelay.id) return &kUnitDelay;
+  for (const NodeType* type : kNodeTypes)
+  {
+    if (id == type->id)
+      return type;
+  }
   return nullptr;
+}
+
+std::vector<const NodeType*> all_node_types()
+{
+  return std::vector<const NodeType*>(std::begin(kNodeTypes), std::end(kNodeTypes));
 }
 
 } // namespace render

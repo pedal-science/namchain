@@ -28,15 +28,15 @@ const graph::NodeSpec* find_node(const graph::Graph& graph, const std::string& i
   return nullptr;
 }
 
-/// \return the index of \p name in the type's settable table, or false when it is not settable.
+/// \return true when \p name is a parameter the node type can ramp on the render path.
 bool settable(const graph::NodeSpec& spec, const std::string& name)
 {
   const NodeType* type = find_node_type(spec.type);
-  if (type == nullptr || type->set_param == nullptr || type->settable_params == nullptr)
+  if (type == nullptr || type->set_param == nullptr)
     return false;
-  for (int i = 0; i < type->settable_param_count; ++i)
-    if (name == type->settable_params[i])
-      return true;
+  for (int i = 0; i < type->param_count; ++i)
+    if (name == type->params[i].id)
+      return type->params[i].rampable;
   return false;
 }
 
@@ -89,8 +89,10 @@ unsigned settable_param_count(const graph::Graph& graph)
   for (const graph::NodeSpec& spec : graph.nodes)
   {
     const NodeType* type = find_node_type(spec.type);
-    if (type != nullptr && type->set_param != nullptr)
-      total += static_cast<unsigned>(std::max(0, type->settable_param_count));
+    if (type == nullptr || type->set_param == nullptr)
+      continue;
+    for (int i = 0; i < type->param_count; ++i)
+      total += type->params[i].rampable ? 1u : 0u;
   }
   return total;
 }
@@ -215,20 +217,45 @@ EditTimeline random_timeline(const graph::Graph& graph, unsigned edits, uint64_t
   if (edits == 0 || frames == 0)
     return timeline;
 
-  std::vector<std::pair<std::string, std::string>> candidates;
+  struct Candidate
+  {
+    std::string node;
+    std::string param;
+    double low = 0.25;
+    double high = 1.5;
+  };
+  std::vector<Candidate> candidates;
   for (const graph::NodeSpec& spec : graph.nodes)
   {
     const NodeType* type = find_node_type(spec.type);
-    if (type == nullptr || type->set_param == nullptr || type->settable_params == nullptr)
+    if (type == nullptr || type->set_param == nullptr)
       continue;
-    for (int p = 0; p < type->settable_param_count; ++p)
-      candidates.emplace_back(spec.id, type->settable_params[p]);
+    for (int p = 0; p < type->param_count; ++p)
+    {
+      // Only what the node can ramp, and only what a value in the generator's range means: a
+      // parameter with declared bounds gets values inside them, so a generated timeline is legal
+      // against the same schema a client validates against.
+      const ParamDesc& param = type->params[p];
+      if (!param.rampable || param.kind != ParamKind::Number || param.hidden)
+        continue;
+      Candidate candidate;
+      candidate.node = spec.id;
+      candidate.param = param.id;
+      // Inside the declared bounds where there are any, so a generated timeline is legal against the
+      // same schema the compiler validates against rather than legal only by luck.
+      if (param.has_min)
+        candidate.low = param.min_inclusive ? param.min : param.min + (param.has_max ? (param.max - param.min) * 0.1 : 1.0);
+      if (param.has_max)
+        candidate.high = param.max_inclusive ? param.max : param.max - (param.has_max ? (param.max - (param.has_min ? param.min : 0.0)) * 0.1 : 1.0);
+      if (candidate.high <= candidate.low)
+        candidate.high = candidate.low + 1.0;
+      candidates.push_back(std::move(candidate));
+    }
   }
   if (candidates.empty())
     return timeline;
 
   std::mt19937_64 rng(seed);
-  std::uniform_real_distribution<double> value_range(0.25, 1.5);
 
   // Even slots with jitter, so consecutive edits are at least half a slot apart: the oracle model
   // needs the previous ramp to have settled before the next edit to the same parameter.
@@ -242,10 +269,10 @@ EditTimeline random_timeline(const graph::Graph& graph, unsigned edits, uint64_t
     op.at_sample = cursor + (rng() % jitter);
     if (op.at_sample >= frames)
       op.at_sample = frames - 1;
-    const auto& chosen = candidates[static_cast<std::size_t>(rng() % candidates.size())];
-    op.node = chosen.first;
-    op.param = chosen.second;
-    op.value = value_range(rng);
+    const Candidate& chosen = candidates[static_cast<std::size_t>(rng() % candidates.size())];
+    op.node = chosen.node;
+    op.param = chosen.param;
+    op.value = std::uniform_real_distribution<double>(chosen.low, chosen.high)(rng);
     timeline.ops.push_back(std::move(op));
     cursor += slot;
   }

@@ -106,6 +106,7 @@ length prefix to get wrong. A request is:
 | method | request | response |
 |---|---|---|
 | `engine.hello` | `{"protocol": 1}` | `role`, `version`, `protocol` (what the server speaks), `features`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol` |
+| `engine.schema` | — | the catalogue: every node type with its ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. See docs/schema.md |
 | `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, and a `chains` array (below) |
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
@@ -149,8 +150,14 @@ be careful with.
 
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
-`bypass`, `guard`, `per_chain_mute`. It grows as the slices land, and absence is how a client degrades
-rather than guesses.
+`bypass`, `guard`, `per_chain_mute`, `schema`. It grows as the slices land, and absence is how a
+client degrades rather than guesses.
+
+A parameter name the engine does not know is refused with the list of what it takes, at load and at
+patch time alike: `node 'g' (nc.gain) has no parameter 'gainz'; it takes 'gain_db', 'gain', 'ramp_ms'
+(alias)`. The catalogue those names come from is `engine.schema`, and docs/schema.md is the reference
+for it — including which parameters a client may stream (a slider) and which it must commit on release
+(a structural edit).
 
 ### One document, several chains
 
@@ -287,7 +294,9 @@ expected.
 
 ## What is built, and what is not
 
-Built: the document protocol — `rig.apply` for a whole document in memory, `rig.get` returning the
+Built: the node schema — every built-in declares its parameters (kind, unit, default, bounds with
+inclusive/exclusive made explicit, step, scale, rampable), the compiler refuses a name it does not
+declare, and `engine.schema` publishes the catalogue (docs/schema.md); the document protocol — `rig.apply` for a whole document in memory, `rig.get` returning the
 engine's parse of what it is running, protocol 2 with `features`, and the per-chain array in
 `engine.status`; the `smooth` op class (a `rig.patch` set_param ramps inside the node, no recompile, no step),
 the offline scripted timeline that measures it (`namchain-render --graph rig.json --timeline
@@ -305,8 +314,11 @@ Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 - no admission control or cost model, so a plan too expensive to dual-render is not rejected before it
   runs, and the fade length is fixed rather than shortened under load — the staggered apply is what
   stands in for it;
-- no parameter schema or catalogue on the wire, so an unknown parameter name is still accepted
-  silently, and an option (string) parameter cannot be patched at all (slice B);
+- no *per-port* parameters on `nc.mix` (a lane's level is a `nc.gain` node in the lane), and no
+  ramping for a filter's coefficients or a delay's read pointer, so changing `freq`/`q`/`gain_db`/`ms`
+  is a structural edit (slice B3/B4);
+- no option (string) parameter can be patched yet, so `mode` and `model` are changed by a reload or a
+  `swap_model` rather than by `set_param` (slice B2's remainder);
 - no lowered view in `rig.get`, because there is nothing to lower yet: a node is a node until the
   macro layer exists (slice E);
 - no TCP listener, so the socket is local to the machine (slice C);

@@ -8,7 +8,11 @@ mute and transitions, channel binding with summing, staggered applies, unchanged
 daemon so a document can be rendered offline end to end. **A3 landed** — `rig.apply` for a whole
 document in memory, `rig.get` returning the engine's parse of what it is running (minted ids,
 `element`, `role`), protocol 2 with `features`, and relative paths resolving against the rigs root for
-an applied document. Slice B (the schema and the catalogue) is next. Follows
+an applied document. **B1 and B2 landed** — every node type declares its parameters, the compiler
+refuses a name it does not declare (or a value outside the declared bounds, or an option outside the
+set, or a missing required parameter), and `engine.schema` publishes the catalogue. Remaining in B:
+per-parameter ramping for the filter and the delay (B3), per-port mix parameters (B4), and
+`health`/`issues` (B5). Follows
 `docs/ljoss-comparison.md` (the analysis) and the seven decisions recorded below. Slices are ordered
 by dependency, not by appeal; each is independently committable and independently testable, and none
 of them requires the app to exist first.
@@ -384,9 +388,9 @@ vector; the staggering is a queue, not a scheduler.
 
 | Commit | Contents |
 |---|---|
-| **B1** | `ParamDesc` + node-type metadata on `NodeType`; every built-in declares its schema; `engine.schema` returns it; `docs/schema.md` |
-| **B2** | Validation against the schema at load *and* at patch: unknown param, unknown option, out of range (schema vs engine limit distinguished), `not_patchable`. Options gain a patch path (string-valued `set_param`, structural) |
-| **B3** | Smooth coverage: `settable_params`/`set_param` for every continuous param of every built-in (biquad `freq`/`q`/`gain_db`, delay `ms`, gains, `nc.output` level, mix port gains) |
+| **B1** ✅ | `ParamDesc` + node-type metadata on `NodeType`; every built-in declares its schema; `engine.schema` returns it; `docs/schema.md` |
+| **B2** ✅ (less the string patch path) | Validation against the schema at load and at patch: unknown param, unknown option, out of range (schema vs engine limit distinguished), missing `required`, unsatisfied `one_of`. Still to do: a patch path for string-valued (option) parameters |
+| **B3** | Smooth coverage. The gains are done (`nc.gain`'s `gain_db` and its linear alias both ramp). What is left needs a *strategy* per node rather than a bit flipped: a biquad's coefficients are not values, so `freq`/`q`/`gain_db` need an in-node crossfade between the old and new coefficient sets; a delay's read pointer needs a crossfade between two taps. Until then both are the structural class and the schema says so |
 | **B4** | `nc.split` gains `mode` (`y` implemented; `aB`/`crossover`/`dynamic` declared and refused); `nc.mix` gains per-port `gain_db`/`mute`/`phase`; ports declare `channels`, non-mono refused |
 | **B5** | `health` + `issues` in `engine.status`; the error-code list documented |
 

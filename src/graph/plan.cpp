@@ -215,6 +215,163 @@ int next_ready(const Indexed& indexed, const std::vector<int>& indegree, const s
 
 } // namespace
 
+namespace
+{
+
+/// The declared parameters of \p type, for an error message that says what to write instead.
+std::string declared_params(const render::NodeType& type)
+{
+  std::string list;
+  for (int i = 0; i < type.param_count; ++i)
+  {
+    if (i != 0)
+      list += ", ";
+    list += "'";
+    list += type.params[i].id;
+    list += "'";
+    if (type.params[i].hidden)
+      list += " (alias)";
+  }
+  return list.empty() ? "none" : list;
+}
+
+bool option_matches(const render::ParamDesc& param, const std::string& value)
+{
+  for (int i = 0; i < param.option_count; ++i)
+  {
+    if (value == param.options[i].value)
+      return true;
+  }
+  for (int i = 0; i < param.alias_count; ++i)
+  {
+    if (value == param.aliases[i])
+      return true;
+  }
+  return false;
+}
+
+/// \brief Check one node's parameters against its type's schema.
+///
+/// This is the rule that stops a parameter name meaning nothing: an unknown key, a value outside the
+/// declared bounds, an option outside the declared set and a missing required parameter are all
+/// rejected here, with the accepted set in the message. Before this, a rig could say `"gainz": 3` and
+/// be published happily -- which from a UI is a knob that does nothing
+/// (docs/ljoss-comparison.md §3.5).
+Validation lint_params(const NodeSpec& spec, const render::NodeType& type)
+{
+  const std::string where = "node '" + spec.id + "' (" + type.id + ")";
+  std::vector<bool> seen(static_cast<std::size_t>(type.param_count), false);
+
+  for (const auto& [key, value] : spec.params)
+  {
+    int index = -1;
+    for (int i = 0; i < type.param_count; ++i)
+    {
+      if (key == type.params[i].id)
+        index = i;
+    }
+    if (index < 0)
+      return Validation::failure(where + " has no parameter '" + key + "'; it takes " + declared_params(type));
+
+    const render::ParamDesc& param = type.params[static_cast<std::size_t>(index)];
+    seen[static_cast<std::size_t>(index)] = true;
+    if (param.kind == render::ParamKind::Option)
+      return Validation::failure(where + ": '" + key + "' is an option, and takes a string");
+
+    if (param.has_min)
+    {
+      const bool below = param.min_inclusive ? value < param.min : value <= param.min;
+      if (below)
+      {
+        return Validation::failure(where + ": '" + key + "' is " + std::to_string(value) + ", and the schema's " +
+                                   (param.min_inclusive ? "minimum is " : "minimum is more than ") +
+                                   std::to_string(param.min));
+      }
+    }
+    if (param.has_max)
+    {
+      const bool above = param.max_inclusive ? value > param.max : value >= param.max;
+      if (above)
+      {
+        return Validation::failure(where + ": '" + key + "' is " + std::to_string(value) + ", and the schema's " +
+                                   (param.max_inclusive ? "maximum is " : "maximum is less than ") +
+                                   std::to_string(param.max));
+      }
+    }
+    if (param.step > 0.0 && param.snap)
+    {
+      const double steps = (value - (param.has_min ? param.min : 0.0)) / param.step;
+      if (!param.has_min && std::abs(steps - std::llround(steps)) > 1e-6)
+        return Validation::failure(where + ": '" + key + "' must be a multiple of " + std::to_string(param.step));
+    }
+  }
+
+  for (const auto& [key, value] : spec.strings)
+  {
+    int index = -1;
+    for (int i = 0; i < type.param_count; ++i)
+    {
+      if (key == type.params[i].id)
+        index = i;
+    }
+    if (index < 0)
+      return Validation::failure(where + " has no parameter '" + key + "'; it takes " + declared_params(type));
+
+    const render::ParamDesc& param = type.params[static_cast<std::size_t>(index)];
+    seen[static_cast<std::size_t>(index)] = true;
+    if (param.kind != render::ParamKind::Option)
+      return Validation::failure(where + ": '" + key + "' is not an option, and takes a number");
+    // An option whose values come from the device's registry (`model`, `ir`) cannot be checked here:
+    // the registry is slice D, and until then any non-empty name is accepted and the loader is what
+    // says no.
+    if (param.options_from == nullptr && !option_matches(param, value))
+    {
+      std::string list;
+      for (int i = 0; i < param.option_count; ++i)
+      {
+        if (i != 0)
+          list += ", ";
+        list += std::string("'") + param.options[i].value + "'";
+      }
+      return Validation::failure(where + ": '" + key + "' is '" + value + "'; it takes " + list);
+    }
+  }
+
+  for (int i = 0; i < type.param_count; ++i)
+  {
+    const render::ParamDesc& param = type.params[static_cast<std::size_t>(i)];
+    if (param.required && !seen[static_cast<std::size_t>(i)])
+      return Validation::failure(where + " needs '" + param.id + "'");
+  }
+
+  // A `one_of` group is a set of alternatives with at least one present: `nc.delay` takes samples or
+  // ms, and neither is individually required.
+  for (int i = 0; i < type.param_count; ++i)
+  {
+    const render::ParamDesc& param = type.params[static_cast<std::size_t>(i)];
+    if (param.one_of == nullptr || seen[static_cast<std::size_t>(i)])
+      continue;
+    bool satisfied = false;
+    std::string group;
+    for (int j = 0; j < type.param_count; ++j)
+    {
+      const render::ParamDesc& other = type.params[static_cast<std::size_t>(j)];
+      if (other.one_of == nullptr || std::string(other.one_of) != param.one_of)
+        continue;
+      if (!group.empty())
+        group += " or ";
+      group += std::string("'") + other.id + "'";
+      satisfied = satisfied || seen[static_cast<std::size_t>(j)];
+    }
+    if (!satisfied)
+      return Validation::failure(where + " needs one of " + group);
+  }
+
+  return Validation{};
+}
+
+} // namespace
+
 Validation validate(const Graph& graph)
 {
   if (graph.nodes.empty())
@@ -224,6 +381,17 @@ Validation validate(const Graph& graph)
   const Indexed indexed = index_graph(graph, validation);
   if (!validation.ok)
     return validation;
+
+  // Parameters are checked against the type's schema before anything else looks at the graph: a node
+  // whose params do not mean anything is a mistake the author can fix, and finding it here is what
+  // keeps it out of the render path's silent-ignore behaviour.
+  for (const NodeSpec& node : graph.nodes)
+  {
+    const render::NodeType* type = indexed.types[static_cast<std::size_t>(indexed.position.at(node.id))];
+    const Validation lint = lint_params(node, *type);
+    if (!lint.ok)
+      return lint;
+  }
 
   int inputs = 0;
   int outputs = 0;
@@ -646,11 +814,13 @@ bool RenderPlan::resolve_param(const std::string& node_id, const std::string& pa
     if (node_ids_[i] != node_id)
       continue;
     const render::NodeType* type = nodes_[i].type;
-    if (type->set_param == nullptr || type->settable_params == nullptr)
+    if (type->set_param == nullptr || type->params == nullptr)
       return false;
-    for (int p = 0; p < type->settable_param_count; ++p)
+    for (int p = 0; p < type->param_count; ++p)
     {
-      if (param != type->settable_params[p])
+      // Only a parameter the node declares rampable can be dispatched: everything else is a
+      // structural edit, which is the whole distinction §5.3 turns on.
+      if (param != type->params[p].id || !type->params[p].rampable || !type->params[p].patchable)
         continue;
       node_index = i;
       param_id = static_cast<uint32_t>(p) + 1;
@@ -666,7 +836,7 @@ bool RenderPlan::set_param(std::size_t node_index, uint32_t param_id, float valu
   if (node_index >= nodes_.size())
     return false;
   const render::NodeType* type = nodes_[node_index].type;
-  if (type->set_param == nullptr || type->settable_params == nullptr)
+  if (type->set_param == nullptr || type->params == nullptr)
     return false;
   return type->set_param(nodes_[node_index].state, param_id, value);
 }

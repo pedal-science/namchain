@@ -151,7 +151,11 @@ TEST_CASE("resolve_param names what is settable and refuses what is not")
   CHECK(plan->resolve_param("g", "gain", index, id));
   CHECK(id != 0);
 
-  CHECK_FALSE(plan->resolve_param("g", "gain_db", index, id)); // settable by name only at build
+  // `gain_db` is the canonical rampable param and `gain` its hidden linear alias: both dispatch, and
+  // a name the type does not declare still does not.
+  CHECK(plan->resolve_param("g", "gain_db", index, id));
+  CHECK_FALSE(plan->resolve_param("g", "ramp_ms", index, id)); // build-only: changing it rebuilds
+  CHECK_FALSE(plan->resolve_param("g", "gainz", index, id));
   CHECK_FALSE(plan->resolve_param("nope", "gain", index, id));
   CHECK_FALSE(plan->resolve_param("in", "gain", index, id)); // nc.input has no params
 

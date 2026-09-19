@@ -108,9 +108,19 @@ TEST_CASE("a timeline parses and names what it cannot honour")
   {
     EditTimeline timeline;
     std::string error;
+    // `ramp_ms` is declared and patchable, but not rampable: it is a smoothing time, so changing it is
+    // a rebuild rather than an edit inside a running plan.
     CHECK_FALSE(namchain::render::parse_timeline_json(
-      R"([{"at_sample":0,"node":"g","param":"gain_db","value":1}])", graph, timeline, error));
-    CHECK(error.find("gain_db") != std::string::npos);
+      R"([{"at_sample":0,"node":"g","param":"ramp_ms","value":10}])", graph, timeline, error));
+    CHECK(error.find("ramp_ms") != std::string::npos);
+  }
+
+  SUBCASE("the canonical gain param is settable too")
+  {
+    EditTimeline timeline;
+    std::string error;
+    CHECK(namchain::render::parse_timeline_json(
+      R"([{"at_sample":0,"node":"g","param":"gain_db","value":-6}])", graph, timeline, error));
   }
 
   SUBCASE("unimplemented op kind")
@@ -144,12 +154,16 @@ TEST_CASE("a generated timeline is deterministic, ordered and only touches setta
     CHECK(first.ops[i].at_sample == second.ops[i].at_sample);
     CHECK(first.ops[i].value == doctest::Approx(second.ops[i].value));
     CHECK(first.ops[i].node == "g");
-    CHECK(first.ops[i].param == "gain");
+    // `gain_db` is the visible rampable one; the hidden linear alias is not offered to a generator,
+    // because two names for one value is a choice for a client rather than for a fuzzer.
+    CHECK(first.ops[i].param == "gain_db");
     CHECK(first.ops[i].at_sample < kFrames);
     if (i > 0)
       CHECK(first.ops[i].at_sample > first.ops[i - 1].at_sample);
   }
-  CHECK(namchain::render::settable_param_count(graph) == 1u);
+  // Two: `gain_db` and its hidden linear alias `gain`. A node with nothing rampable counts zero,
+  // which is what tells a client that every edit to it is structural.
+  CHECK(namchain::render::settable_param_count(graph) == 2u);
 }
 
 TEST_CASE("the timeline renders a ramped edit and the detector passes it")

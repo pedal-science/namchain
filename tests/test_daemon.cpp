@@ -424,10 +424,11 @@ TEST_CASE("rig.patch pushes a ramped set_param and refuses what it cannot apply"
 
   SUBCASE("a param the node cannot ramp takes the structural path instead")
   {
-    // `gain_db` is a *build* parameter: `nc.gain` only ramps `gain`, so the only way to honour this
-    // is to rebuild the node. The router is what decides, and the response says which path it took.
+    // `ramp_ms` is a *build* parameter -- a smoothing time, so changing it is a rebuild rather than a
+    // ramp inside a running plan. The router is what decides, and the response says which path it
+    // took. Both of `nc.gain`'s value parameters, `gain_db` and `gain`, are rampable.
     const auto reply = nlohmann::json::parse(daemon.handle_request(
-      R"({"method":"rig.patch","ops":[{"op":"set_param","node":"g","param":"gain_db","value":3.0}]})"));
+      R"({"method":"rig.patch","ops":[{"op":"set_param","node":"g","param":"ramp_ms","value":10.0}]})"));
     REQUIRE(reply["ok"] == true);
     CHECK(reply["kind"] == "structural");
     CHECK(reply["generation"] == 2);
@@ -1426,4 +1427,105 @@ TEST_CASE("rig.apply refuses a document with no chains and one that does not par
   const auto missing = nlohmann::json::parse(daemon.handle_request(R"({"method":"rig.apply"})"));
   CHECK(missing["ok"] == false);
   CHECK(missing["error"]["code"] == "bad_request");
+}
+
+// ---------------------------------------------------------------------------
+// The catalogue on the wire (docs/ui-integration-plan.md §1.4, slice B)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("engine.schema publishes the catalogue a palette and an inspector are built from")
+{
+  Config config;
+  Daemon daemon(config);
+
+  const auto reply = nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.schema"})"));
+  REQUIRE(reply["ok"] == true);
+  CHECK(reply["protocol"] == 2);
+  CHECK(reply["max_chains"] == namchain::daemon::kMaxChains);
+  // Declared and refused: nothing in the engine carries more than one channel per port, and a client
+  // reads this rather than offering a pan control that would be refused.
+  CHECK(reply["stereo"] == false);
+
+  const nlohmann::json* gain = nullptr;
+  for (const auto& node : reply["nodes"])
+  {
+    if (node["id"] == "nc.gain")
+      gain = &node;
+  }
+  REQUIRE(gain != nullptr);
+  CHECK((*gain)["name"] == "Gain");
+  CHECK((*gain)["category"] == "utility");
+  CHECK((*gain)["kind"] == "primitive");
+  CHECK((*gain)["ports"]["in"][0]["channels"] == 1);
+  // A legal bypass target: which is what lets a client offer the control instead of finding out.
+  CHECK((*gain)["flags"]["bypassable"] == true);
+  CHECK((*gain)["arity"] == nullptr);
+
+  const auto& params = (*gain)["params"];
+  REQUIRE(params.size() == 3u);
+  CHECK(params[0]["id"] == "gain_db");
+  CHECK(params[0]["unit"] == "dB");
+  CHECK(params[0]["rampable"] == true);
+  CHECK(params[0]["min"] == -60.0);
+  CHECK(params[0]["max"] == 24.0);
+  CHECK(params[0]["min_inclusive"] == true);
+  // The linear spelling is the same value under another name, marked so that a generic inspector shows
+  // one knob rather than two.
+  CHECK(params[1]["id"] == "gain");
+  CHECK(params[1]["hidden"] == true);
+  CHECK(params[1]["rampable"] == true);
+  // A smoothing time: declared, patchable, and not rampable, which is what tells a client to commit it
+  // on release rather than streaming it.
+  CHECK(params[2]["id"] == "ramp_ms");
+  CHECK(params[2]["rampable"] == false);
+
+  // An arity node describes its own port count, so an "add a lane" control knows its bounds.
+  for (const auto& node : reply["nodes"])
+  {
+    if (node["id"] != "nc.mix")
+      continue;
+    CHECK(node["arity"]["param"] == "inputs");
+    CHECK(node["arity"]["min"] == 1);
+    CHECK(node["arity"]["max"] == 64);
+    CHECK(node["arity"]["default"] == 2);
+  }
+
+  // An option parameter carries the values *and* their labels, and one whose values live on the device
+  // says where they come from instead (the registry is slice D).
+  for (const auto& node : reply["nodes"])
+  {
+    if (node["id"] == "nc.eq.biquad")
+    {
+      CHECK(node["params"][0]["id"] == "mode");
+      CHECK(node["params"][0]["kind"] == "option");
+      CHECK(node["params"][0]["options"][0]["value"] == "peaking");
+      CHECK(node["params"][0]["options"][0]["label"] == "Peaking");
+      CHECK(node["params"][0]["options_from"] == nullptr);
+    }
+    if (node["id"] == "nc.nam")
+    {
+      CHECK(node["params"][0]["id"] == "model");
+      CHECK(node["params"][0]["required"] == true);
+      CHECK(node["params"][0]["default"] == nullptr); // no default: it must be given
+      CHECK(node["params"][0]["options_from"] == "models");
+    }
+  }
+}
+
+TEST_CASE("an applied document with a parameter that does not exist is refused by name")
+{
+  Config config;
+  Daemon daemon(config);
+
+  const auto reply = nlohmann::json::parse(daemon.handle_request(R"({"method":"rig.apply","document":
+    {"chains":[{"id":"c","nodes":[{"id":"in","type":"nc.input"},
+      {"id":"g","type":"nc.gain","gainz":3.0},
+      {"id":"out","type":"nc.output"}],
+      "connections":[{"from":"in","to":"g"},{"from":"g","to":"out"}]}]}})"));
+  CHECK(reply["ok"] == false);
+  CHECK(reply["error"]["code"] == "compile_failed");
+  const std::string message = reply["error"]["message"];
+  // The whole point of the slice: this used to be published happily and the knob did nothing.
+  CHECK(message.find("gainz") != std::string::npos);
+  CHECK(message.find("gain_db") != std::string::npos);
 }

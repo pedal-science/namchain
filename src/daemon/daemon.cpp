@@ -70,7 +70,101 @@ nlohmann::json protocol_features()
 {
   return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
                                 "structural_crossfade", "smooth_params", "bypass", "guard",
-                                "per_chain_mute"});
+                                "per_chain_mute", "schema"});
+}
+
+/// One node type as `engine.schema` reports it: what a palette offers and what an inspector lays out.
+///
+/// Every parameter carries its kind, unit, default, bounds (with inclusive/exclusive made explicit),
+/// step and whether it can be ramped -- the catalogue a client would otherwise have to guess at, and
+/// the thing that makes "the knob does nothing" impossible rather than merely unlikely
+/// (docs/ui-integration-plan.md §1.4).
+nlohmann::json node_type_schema(const render::NodeType& type)
+{
+  nlohmann::json entry;
+  entry["id"] = type.id;
+  entry["name"] = type.name == nullptr ? type.id : type.name;
+  entry["category"] = type.category == nullptr ? "utility" : type.category;
+  entry["kind"] = "primitive";
+
+  nlohmann::json in_ports = nlohmann::json::array();
+  for (int i = 0; i < type.inputs; ++i)
+  {
+    // An unconnected input is legal and is bound to silence, which is what makes a dry lane a matter
+    // of not wiring it rather than of wiring a special node.
+    in_ports.push_back({{"name", "in" + std::to_string(i)}, {"channels", type.channels}, {"optional", true}});
+  }
+  nlohmann::json out_ports = nlohmann::json::array();
+  for (int i = 0; i < type.outputs; ++i)
+    out_ports.push_back({{"name", "out" + std::to_string(i)}, {"channels", type.channels}, {"optional", false}});
+  entry["ports"] = {{"in", std::move(in_ports)}, {"out", std::move(out_ports)}};
+
+  if (type.arity_param != nullptr)
+  {
+    entry["arity"] = {{"param", type.arity_param},
+                      {"min", type.min_ports},
+                      {"max", type.max_ports},
+                      {"default", type.arity_param == std::string("inputs") ? type.inputs : type.outputs}};
+  }
+  else
+  {
+    entry["arity"] = nullptr;
+  }
+
+  entry["flags"] = {{"stateful", type.create != nullptr},
+                    {"has_lookback", false},
+                    {"has_tail", false},
+                    {"bypassable", type.inputs == 1 && type.outputs == 1},
+                    {"block_delay", type.block_delay}};
+  entry["latency_samples"] = 0;
+  entry["tail_samples"] = 0;
+
+  nlohmann::json params = nlohmann::json::array();
+  for (int i = 0; i < type.param_count; ++i)
+  {
+    const render::ParamDesc& param = type.params[i];
+    nlohmann::json p;
+    p["id"] = param.id;
+    p["name"] = param.name == nullptr ? param.id : param.name;
+    switch (param.kind)
+    {
+    case render::ParamKind::Number: p["kind"] = "number"; break;
+    case render::ParamKind::Option: p["kind"] = "option"; break;
+    case render::ParamKind::Flag: p["kind"] = "flag"; break;
+    }
+    p["unit"] = param.unit == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.unit);
+    // A required parameter, and one of a `one_of` group, have no default: publishing the zero they
+    // happen to be stored with would be a value no node could be built from.
+    p["default"] = (param.required || param.one_of != nullptr) ? nlohmann::json(nullptr)
+                                                              : nlohmann::json(param.default_value);
+    p["min"] = param.has_min ? nlohmann::json(param.min) : nlohmann::json(nullptr);
+    p["min_inclusive"] = param.min_inclusive;
+    p["max"] = param.has_max ? nlohmann::json(param.max) : nlohmann::json(nullptr);
+    p["max_inclusive"] = param.max_inclusive;
+    p["step"] = param.step > 0.0 ? nlohmann::json(param.step) : nlohmann::json(nullptr);
+    p["snap"] = param.snap;
+    p["scale"] = param.scale == render::ParamScale::Log ? "log" : "linear";
+    p["rampable"] = param.rampable;
+    p["patchable"] = param.patchable;
+    p["hidden"] = param.hidden;
+    p["required"] = param.required;
+    p["one_of"] = param.one_of == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.one_of);
+    p["options_from"] = param.options_from == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.options_from);
+    if (param.options != nullptr)
+    {
+      nlohmann::json options = nlohmann::json::array();
+      for (int o = 0; o < param.option_count; ++o)
+        options.push_back({{"value", param.options[o].value}, {"label", param.options[o].label}});
+      p["options"] = std::move(options);
+    }
+    else
+    {
+      p["options"] = nlohmann::json(nullptr);
+    }
+    params.push_back(std::move(p));
+  }
+  entry["params"] = std::move(params);
+  return entry;
 }
 
 /// A local control socket does not need many peers, and an unbounded accept loop is how a daemon
@@ -1208,6 +1302,20 @@ std::string Daemon::handle_request(const std::string& request)
   }
 
   // --- engine.status ------------------------------------------------------
+  if (method == "engine.schema")
+  {
+    // The catalogue. A palette, an inspector and a validator all come from this one answer, so a
+    // node type cannot be invisible to a client or described differently by two of them.
+    nlohmann::json nodes = nlohmann::json::array();
+    for (const render::NodeType* type : render::all_node_types())
+      nodes.push_back(node_type_schema(*type));
+    nlohmann::json body;
+    body["protocol"] = kProtocolVersion;
+    body["nodes"] = std::move(nodes);
+    body["max_chains"] = kMaxChains;
+    body["stereo"] = false; // declared and refused: see NodeType::channels
+    return ok_response(id, body);
+  }
   if (method == "engine.status")
   {
     nlohmann::json status;

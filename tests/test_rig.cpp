@@ -122,7 +122,7 @@ TEST_CASE("a rig parses into node params, string params and connections")
   const std::string text = R"({
     "nodes": [
       { "id": "in",  "type": "nc.input" },
-      { "id": "amp", "type": "nc.nam", "model": "amp.nam", "gain_db": -3.5, "bypass": true },
+      { "id": "amp", "type": "nc.nam", "model": "amp.nam", "bypass": true },
       { "id": "eq",  "type": "nc.eq.biquad", "mode": "highpass", "freq": 90, "q": 0.7 },
       { "id": "out", "type": "nc.output" }
     ],
@@ -139,7 +139,6 @@ TEST_CASE("a rig parses into node params, string params and connections")
   REQUIRE(graph.nodes.size() == 4u);
   CHECK(graph.nodes[1].type == "nc.nam");
   CHECK(graph.nodes[1].strings.at("model") == "amp.nam");
-  CHECK(graph.nodes[1].params.at("gain_db") == doctest::Approx(-3.5));
   // `bypass` is reserved like `id` and `type`: it is a property of the node, not a numeric parameter,
   // so it does not land in the param map.
   CHECK(graph.nodes[1].bypass);

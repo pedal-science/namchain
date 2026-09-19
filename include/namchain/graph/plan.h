@@ -27,11 +27,109 @@ struct CompileOptions
   double sample_rate = 48000.0;
 };
 
+/// The kind of value a parameter holds, which is what a client shows a control for
+/// (docs/ui-integration-plan.md §1.4).
+enum class ParamKind
+{
+  Number, ///< A continuous or stepped quantity.
+  Option, ///< One of a set of named values. Carried in the spec's string params.
+  Flag,   ///< A boolean. Carried as 0 or 1 in the numeric params.
+};
+
+/// How a client should lay a numeric parameter out. Presentation, but presentation the *engine* knows:
+/// a frequency slider is logarithmic, and every client re-deriving that is how two clients disagree.
+enum class ParamScale
+{
+  Linear,
+  Log,
+};
+
+/// One accepted value of an option parameter: the wire value and the label a client shows, which are
+/// not assumed to be the same string.
+struct OptionDesc
+{
+  const char* value = nullptr;
+  const char* label = nullptr;
+};
+
+/// \brief One declared parameter of a node type.
+///
+/// The schema is the catalogue the app builds a palette and an inspector from, and the thing the
+/// compiler validates against: without it an unknown parameter name is accepted silently, which from
+/// a UI is a knob that does nothing (docs/ljoss-comparison.md §3.5).
+///
+/// A parameter's **id** is its position in the node type's array plus one, which is the integer a
+/// ramp dispatch carries on the render path. Nothing on the audio thread compares a string.
+struct ParamDesc
+{
+  const char* id = nullptr;
+  const char* name = nullptr;
+  ParamKind kind = ParamKind::Number;
+  /// `"Hz"`, `"dB"`, `"ms"`, `"%"`, ... or null. A parameter with no unit is a plain quantity.
+  const char* unit = nullptr;
+  /// \brief The effective value when the parameter is absent.
+  ///
+  /// Published so there is exactly one default in the system: the app must never substitute its own,
+  /// and a node built with no parameters must render identically to one built with every declared
+  /// default. `tests/test_schema.cpp` asserts that rather than trusting it.
+  double default_value = 0.0;
+  /// Bounds. `has_*` false means unbounded *by the schema*; the engine's own limits (Nyquist, the
+  /// delay buffer) are separate and the rejection says which one was hit.
+  bool has_min = false;
+  double min = 0.0;
+  bool min_inclusive = true;
+  bool has_max = false;
+  double max = 0.0;
+  bool max_inclusive = true;
+  /// Smallest increment, or 0 for continuous. `snap` decides what an off-grid value means: rounded to
+  /// it, or refused. "Granularity" is ambiguous between the increment and the display precision; this
+  /// is the increment.
+  double step = 0.0;
+  bool snap = false;
+  ParamScale scale = ParamScale::Linear;
+  /// \brief Whether a change can be ramped inside the node with no recompile (§5.3's smooth class).
+  ///
+  /// This is the flag an inspector streams a slider for; a parameter without it is a structural edit,
+  /// dual-rendered and crossfaded, and belongs on a commit-on-release control.
+  bool rampable = false;
+  /// Whether `rig.patch` may name it at all: false is a build-only parameter whose change is a
+  /// rebuild, which is still a patch, so this is the narrower "not addressable" case.
+  bool patchable = true;
+  /// Whether a generic inspector should leave it out (an alias, or an internal knob).
+  bool hidden = false;
+  /// The node cannot be built without it.
+  bool required = false;
+  /// \brief A group name for mutually exclusive alternatives, one of which is required.
+  ///
+  /// `nc.delay` takes `samples` **or** `ms`, which a flat parameter list cannot express; parameters
+  /// sharing a `one_of` group are alternatives and at least one of them must be present.
+  const char* one_of = nullptr;
+  /// For \ref ParamKind::Option: the accepted values. The wire value is what a client sends; `label`
+  /// is what it shows, and they are not assumed to be the same string.
+  const OptionDesc* options = nullptr;
+  int option_count = 0;
+  /// \brief Spellings that are accepted but not advertised.
+  ///
+  /// `nc.eq.biquad` has always accepted `"low_shelf"` for `"lowshelf"`. A schema that advertised every
+  /// spelling would offer a picker with three names for one mode; a schema that rejected them would
+  /// break rigs that work today. Aliases are validated and then ignored, which is the third option.
+  const char* const* aliases = nullptr;
+  int alias_count = 0;
+  /// For an option whose values are not known until runtime: `"models"` or `"irs"`, resolved through
+  /// the device's asset registry (slice D).
+  const char* options_from = nullptr;
+};
+
 /// A node type's vtable. `create`/`destroy` run on the control thread while a plan is built;
 /// `process` is the render path and must not allocate, lock or throw (§3.3).
 struct NodeType
 {
   std::string id;
+  /// What a palette calls it, and what it groups it under. The engine owns these because a node type
+  /// the app cannot name is a node type the app cannot offer -- the alternative is every client
+  /// keeping its own table, which is a table that goes stale silently.
+  const char* name = nullptr;
+  const char* category = nullptr;
   int inputs = 0;
   int outputs = 0;
   /// \param error set when the node cannot be constructed (bad params, missing model, ...).
@@ -72,15 +170,19 @@ struct NodeType
   /// for a thousand ports.
   int min_ports = 1;
   int max_ports = 64;
-  /// \brief The settable parameter names, in id order: name `i` takes id `i + 1`.
+  /// \brief The declared parameters, in id order: `params[i]` has id `i + 1`.
   ///
-  /// Control thread, at compile time: the compiler resolves a rig's param name to the integer id
-  /// that travels on the render path, so nothing there compares a string (§6.1). Null, with a count
-  /// of 0, is a node with nothing to set. A table rather than a name→id function because a tool also
-  /// needs to *enumerate* what can be patched without knowing each node type -- which is how the
-  /// timeline generator and a future `rig.get` learn the settable set.
-  const char* const* settable_params = nullptr;
-  int settable_param_count = 0;
+  /// One table, not two: this is both the schema a client builds a palette and an inspector from and
+  /// the id space the render path dispatches on, because a second list of "the settable ones" would be
+  /// the same fact written twice. Null, with a count of 0, is a node with no parameters.
+  const ParamDesc* params = nullptr;
+  int param_count = 0;
+  /// \brief Channels per port. 1 is mono, which is all the engine has.
+  ///
+  /// Declared and *refused* rather than absent (docs/ui-integration-plan.md §1.4): the compiler
+  /// rejects a type whose ports are wider than the audio path can carry, so the day stereo lands the
+  /// error moves and the schema never had to change shape. Published per port in `engine.schema`.
+  int channels = 1;
   /// \brief Render path: ramp \p value into the node over the node's own smoothing time.
   ///
   /// The value is range-checked by the caller. Returns false for an unknown id, and the node leaves
@@ -94,6 +196,8 @@ struct PortCounts
 {
   int inputs = 0;
   int outputs = 0;
+  /// Channels per port. See \ref NodeType::channels.
+  int channels = 1;
 };
 
 /// \brief Resolve the port counts a node spec actually gets.
@@ -103,11 +207,16 @@ struct PortCounts
 /// than reading `NodeType::inputs`/`outputs` directly, so the two can never disagree about what
 /// port 3 means.
 ///
-/// \return false and set \p error when the parameter is present but is not a whole number in range.
+/// \return false and set \p error when the parameter is present but is not a whole number in range,
+/// or when the type's ports are wider than the engine's audio path.
 bool resolve_ports(const NodeType& type, const graph::NodeSpec& spec, PortCounts& ports, std::string& error);
 
 /// \return the built-in type, or nullptr if the id is unknown.
 const NodeType* find_node_type(const std::string& id);
+
+/// Every registered type, in the order the catalogue reports them. What `engine.schema` serves and
+/// what a test walks to check that each type's schema matches what the node reads.
+std::vector<const NodeType*> all_node_types();
 
 } // namespace render
 

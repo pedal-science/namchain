@@ -53,9 +53,10 @@ std::unique_ptr<namchain::graph::RenderPlan> compile(const Graph& graph, namchai
 TEST_CASE("a node whose output overflows is failed and replaced by its dry input")
 {
   namchain::rt::Arena arena(1 << 16);
-  // 1e38 is a finite float; the product of two of them is not. `nc.gain` accepts the gain (it checks
-  // the gain itself is finite) and then overflows on the first sample it is given.
-  auto plan = compile(gain_chain(1e38), arena, 16);
+  // 16 is the largest gain the schema allows and 1e38 is a finite float; their product is not finite.
+  // The overflow is made with the signal rather than with an out-of-range parameter, because the
+  // schema now refuses the latter long before the guard could see it.
+  auto plan = compile(gain_chain(16.0), arena, 16);
   plan->prewarm();
 
   const std::vector<float> input(16, 1e38f);
