@@ -57,7 +57,37 @@ struct NodeType
   /// The consequence to be aware of: the value such a node reads is pinned to the end of the block
   /// by the memory plan, because its buffer has to survive until the next block's early read.
   bool block_delay = false;
+  /// \brief The spec param that overrides \ref inputs or \ref outputs, when arity is per-spec.
+  ///
+  /// `nc.split` names `outputs` and `nc.mix` names `inputs`; every other type leaves this null and
+  /// keeps the fixed counts above. Resolving the count from the spec rather than hard-coding 1->2 /
+  /// 2->1 is what lets one rig fan out to N parallel chains, and it is the first piece of per-spec
+  /// arity in the node ABI (plan.md §6.1). The named count defaults to the vtable's own value when
+  /// the param is absent, so a rig written before N-way arity still means what it did.
+  const char* arity_param = nullptr;
+  /// Bounds for the resolved count, inclusive. A spec outside them is a compile error rather than a
+  /// silently clamped graph, and the upper bound is what stops a typo from asking the memory plan
+  /// for a thousand ports.
+  int min_ports = 1;
+  int max_ports = 64;
 };
+
+/// \brief A node spec's concrete port counts, after per-spec arity is resolved.
+struct PortCounts
+{
+  int inputs = 0;
+  int outputs = 0;
+};
+
+/// \brief Resolve the port counts a node spec actually gets.
+///
+/// For most types this is the vtable's fixed counts. `nc.split`/`nc.mix` read `outputs`/`inputs`
+/// from the spec, so one rig can fan out to N chains. Both `validate` and `compile` call this rather
+/// than reading `NodeType::inputs`/`outputs` directly, so the two can never disagree about what
+/// port 3 means.
+///
+/// \return false and set \p error when the parameter is present but is not a whole number in range.
+bool resolve_ports(const NodeType& type, const graph::NodeSpec& spec, PortCounts& ports, std::string& error);
 
 /// \return the built-in type, or nullptr if the id is unknown.
 const NodeType* find_node_type(const std::string& id);

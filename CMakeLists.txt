@@ -131,6 +131,8 @@ add_library(namchain OBJECT
   src/graph/plan.cpp
   src/graph/reference.cpp
   src/graph/rig.cpp
+  src/daemon/config.cpp
+  src/daemon/daemon.cpp
   src/latency/latency.cpp
   src/glitch/glitch.cpp
   src/nodes/builtin.cpp
@@ -203,6 +205,14 @@ if(NAMCHAIN_BUILD_TOOLS)
   add_executable(namchain-latency tools/latency/namchain-latency.cpp)
   target_link_libraries(namchain-latency PRIVATE namchain)
   target_compile_options(namchain-latency PRIVATE ${NAMCHAIN_WARN_FLAGS})
+
+  # The reference daemon (plan.md §8.2). Linux only: its control transport is a Unix SEQPACKET
+  # socket plus signalfd, and src/daemon/daemon.cpp is an empty translation unit elsewhere.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(namchaind tools/daemon/namchaind.cpp)
+    target_link_libraries(namchaind PRIVATE namchain)
+    target_compile_options(namchaind PRIVATE ${NAMCHAIN_WARN_FLAGS})
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -258,6 +268,10 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_latency.cpp
     tests/test_glitch.cpp
     tests/test_splice_fader.cpp)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # The daemon's socket/signalfd control loop and its config/rig-resolution surface.
+    target_sources(namchain-tests PRIVATE tests/test_daemon.cpp)
+  endif()
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
   target_include_directories(namchain-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party")

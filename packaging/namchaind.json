@@ -1,0 +1,20 @@
+{
+  "backend": "alsa_raw",
+  "device": "hw:4,0",
+  "sample_rate": 48000,
+  "period_size": 64,
+  "periods": 6,
+  "capture_channels": 1,
+  "playback_channels": 2,
+  "rig": "guitar-chain.json",
+  "rigs_root": "/etc/namchain/rigs",
+  "socket": "/run/namchain/namchaind.sock",
+  "socket_mode": "0660",
+  "rt_priority": 80,
+  "cpu": 3,
+  "lock_memory": true,
+  "output_queue_periods": 4,
+  "output_queue_floor_periods": 2,
+  "device_retry_ms": 250,
+  "verbose": false
+}

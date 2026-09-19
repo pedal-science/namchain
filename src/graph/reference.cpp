@@ -31,12 +31,25 @@ std::unique_ptr<ReferenceRender> ReferenceRender::compile(const Graph& graph, co
   for (std::size_t i = 0; i < graph.nodes.size(); ++i)
     index[graph.nodes[i].id] = static_cast<int>(i);
 
+  // Resolve each node's ports once, the same way the compiler does. `find_node_type` alone gives
+  // only the default for a per-spec arity (`nc.split`/`nc.mix`), so reading `type->inputs` here would
+  // make the oracle disagree with the plan about any N-way fan-out and the disagreement would look
+  // like a compiler bug. validate() has already rejected an out-of-range count, so this cannot fail
+  // for a graph that reached here, but the error path stays for the same reason it exists above.
+  std::vector<render::PortCounts> ports(graph.nodes.size());
+  for (std::size_t i = 0; i < graph.nodes.size(); ++i)
+  {
+    if (!render::resolve_ports(*render::find_node_type(graph.nodes[i].type), graph.nodes[i],
+                               ports[i], error))
+      return nullptr;
+  }
+
   // Flat value numbering, one value per output port -- the same addressing the compiler uses, but
   // that is only an addressing convention; nothing about the layout or the schedule is shared.
   const auto value_of = [&](int node, int port) {
     int base = 0;
     for (int i = 0; i < node; ++i)
-      base += render::find_node_type(graph.nodes[static_cast<std::size_t>(i)].type)->outputs;
+      base += ports[static_cast<std::size_t>(i)].outputs;
     return base + port;
   };
 
@@ -44,11 +57,8 @@ std::unique_ptr<ReferenceRender> ReferenceRender::compile(const Graph& graph, co
   reference->max_quantum_ = options.max_quantum;
 
   int values = 0;
-  for (const NodeSpec& spec : graph.nodes)
-  {
-    const render::NodeType* type = render::find_node_type(spec.type);
-    values += type->outputs;
-  }
+  for (const render::PortCounts& counts : ports)
+    values += counts.outputs;
   reference->values_ = values;
   reference->silence_value_ = values;
 
@@ -61,9 +71,8 @@ std::unique_ptr<ReferenceRender> ReferenceRender::compile(const Graph& graph, co
   std::vector<std::vector<int>> producer_port(graph.nodes.size());
   for (std::size_t i = 0; i < graph.nodes.size(); ++i)
   {
-    const int inputs = render::find_node_type(graph.nodes[i].type)->inputs;
-    producer[i].assign(static_cast<std::size_t>(inputs), -1);
-    producer_port[i].assign(static_cast<std::size_t>(inputs), 0);
+    producer[i].assign(static_cast<std::size_t>(ports[i].inputs), -1);
+    producer_port[i].assign(static_cast<std::size_t>(ports[i].inputs), 0);
   }
   for (const Connection& connection : graph.connections)
   {
@@ -116,15 +125,16 @@ std::unique_ptr<ReferenceRender> ReferenceRender::compile(const Graph& graph, co
     if (type->create != nullptr && plan_node.state == nullptr)
       return nullptr; // create() set `error`
 
-    plan_node.inputs.assign(static_cast<std::size_t>(type->inputs),
+    const render::PortCounts counts = ports[static_cast<std::size_t>(node)];
+    plan_node.inputs.assign(static_cast<std::size_t>(counts.inputs),
                             reference->storage_.data() + reference->silence_value_ * options.max_quantum);
-    plan_node.outputs.reserve(static_cast<std::size_t>(type->outputs) + 1);
-    for (int port = 0; port < type->outputs; ++port)
+    plan_node.outputs.reserve(static_cast<std::size_t>(counts.outputs) + 1);
+    for (int port = 0; port < counts.outputs; ++port)
       plan_node.outputs.push_back(reference->storage_.data() +
                                   static_cast<std::size_t>(value_of(node, port)) * options.max_quantum);
     plan_node.outputs.push_back(nullptr);
 
-    for (int port = 0; port < type->inputs; ++port)
+    for (int port = 0; port < counts.inputs; ++port)
     {
       const int predecessor = producer[static_cast<std::size_t>(node)][static_cast<std::size_t>(port)];
       if (predecessor < 0)
@@ -135,6 +145,8 @@ std::unique_ptr<ReferenceRender> ReferenceRender::compile(const Graph& graph, co
                                                               [static_cast<std::size_t>(port)])) *
           options.max_quantum;
     }
+    // Same input terminator the plan binds: `process_mix` walks inputs until nullptr.
+    plan_node.inputs.push_back(nullptr);
 
     if (spec.type == "nc.input")
       reference->input_node_ = static_cast<int>(reference->nodes_.size());

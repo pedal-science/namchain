@@ -1,6 +1,8 @@
 #include "namchain/graph/plan.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <map>
 #include <string>
 #include <utility>
@@ -8,6 +10,59 @@
 
 namespace namchain
 {
+namespace render
+{
+
+bool resolve_ports(const NodeType& type, const graph::NodeSpec& spec, PortCounts& ports, std::string& error)
+{
+  ports.inputs = type.inputs;
+  ports.outputs = type.outputs;
+  if (type.arity_param == nullptr)
+    return true;
+
+  // The param names the count it overrides. Anything else is a vtable bug, not a rig error, so say
+  // which type so the message points at the node implementation rather than at the rig author.
+  const bool over_inputs = std::strcmp(type.arity_param, "inputs") == 0;
+  const bool over_outputs = std::strcmp(type.arity_param, "outputs") == 0;
+  if (!over_inputs && !over_outputs)
+  {
+    error = "node type '" + type.id + "' declares an unknown arity param '" + type.arity_param + "'";
+    return false;
+  }
+
+  int count = over_inputs ? type.inputs : type.outputs;
+  const auto found = spec.params.find(type.arity_param);
+  if (found != spec.params.end())
+  {
+    const double value = found->second;
+    // A port count is a count, so 2.5 is a mistake and 2.0 written as a float is not. Rejecting the
+    // former rather than truncating it keeps "why is my split only fanning out to two?" from being a
+    // bug report about the parser.
+    if (!std::isfinite(value) || std::floor(value) != value)
+    {
+      error = "node '" + spec.id + "': '" + type.arity_param + "' must be a whole number";
+      return false;
+    }
+    count = static_cast<int>(value);
+  }
+
+  if (count < type.min_ports || count > type.max_ports)
+  {
+    error = "node '" + spec.id + "': '" + type.arity_param + "' must be between " +
+            std::to_string(type.min_ports) + " and " + std::to_string(type.max_ports) + ", got " +
+            std::to_string(count);
+    return false;
+  }
+
+  if (over_inputs)
+    ports.inputs = count;
+  else
+    ports.outputs = count;
+  return true;
+}
+
+} // namespace render
+
 namespace graph
 {
 
@@ -22,17 +77,24 @@ Validation Validation::failure(std::string reason)
 namespace
 {
 
-/// Every node's resolved type, keyed by id, plus its position in `graph.nodes`.
+/// Every node's resolved type and port counts, keyed by id, plus its position in `graph.nodes`.
+///
+/// The ports are stored beside the type rather than read from it later because a per-spec arity
+/// (`nc.split`/`nc.mix`) means `type->inputs`/`type->outputs` are only a default: the graph's
+/// meaning lives in the resolved counts, and every pass -- validation, liveness, colouring, binding
+/// -- has to use the same ones.
 struct Indexed
 {
   std::map<std::string, int> position;
   std::vector<const render::NodeType*> types;
+  std::vector<render::PortCounts> ports;
 };
 
 Indexed index_graph(const Graph& graph, Validation& validation)
 {
   Indexed indexed;
   indexed.types.reserve(graph.nodes.size());
+  indexed.ports.reserve(graph.nodes.size());
 
   for (const NodeSpec& node : graph.nodes)
   {
@@ -52,8 +114,15 @@ Indexed index_graph(const Graph& graph, Validation& validation)
       validation = Validation::failure("unknown node type '" + node.type + "' on node '" + node.id + "'");
       return indexed;
     }
+    render::PortCounts ports;
+    if (!render::resolve_ports(*type, node, ports, validation.message))
+    {
+      validation.ok = false;
+      return indexed;
+    }
     indexed.position[node.id] = static_cast<int>(indexed.types.size());
     indexed.types.push_back(type);
+    indexed.ports.push_back(ports);
   }
   return indexed;
 }
@@ -142,17 +211,17 @@ Validation validate(const Graph& graph)
     if (to == indexed.position.end())
       return Validation::failure("connection to unknown node '" + connection.to + "'");
 
-    const render::NodeType* from_type = indexed.types[static_cast<std::size_t>(from->second)];
-    const render::NodeType* to_type = indexed.types[static_cast<std::size_t>(to->second)];
-    if (connection.from_port < 0 || connection.from_port >= from_type->outputs)
+    const render::PortCounts from_ports = indexed.ports[static_cast<std::size_t>(from->second)];
+    const render::PortCounts to_ports = indexed.ports[static_cast<std::size_t>(to->second)];
+    if (connection.from_port < 0 || connection.from_port >= from_ports.outputs)
       return Validation::failure("node '" + connection.from + "' has no output port " +
                                  std::to_string(connection.from_port));
-    if (connection.to_port < 0 || connection.to_port >= to_type->inputs)
+    if (connection.to_port < 0 || connection.to_port >= to_ports.inputs)
       return Validation::failure("node '" + connection.to + "' has no input port " +
                                  std::to_string(connection.to_port));
-    if (from_type->outputs == 0)
+    if (from_ports.outputs == 0)
       return Validation::failure("node '" + connection.from + "' produces no output");
-    if (to_type->inputs == 0)
+    if (to_ports.inputs == 0)
       return Validation::failure("node '" + connection.to + "' accepts no input");
 
     // Two connections into one port leave the graph meaning "whichever one the compiler happened to
@@ -264,16 +333,16 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   const auto value_of = [&indexed](int node, int port) {
     int base = 0;
     for (int i = 0; i < node; ++i)
-      base += indexed.types[static_cast<std::size_t>(i)]->outputs;
+      base += indexed.ports[static_cast<std::size_t>(i)].outputs;
     return base + port;
   };
   int value_count = 0;
-  for (const render::NodeType* type : indexed.types)
-    value_count += type->outputs;
+  for (const render::PortCounts& ports : indexed.ports)
+    value_count += ports.outputs;
 
   std::vector<int> owner(value_count, -1);
-  for (std::size_t node = 0; node < indexed.types.size(); ++node)
-    for (int port = 0; port < indexed.types[node]->outputs; ++port)
+  for (std::size_t node = 0; node < indexed.ports.size(); ++node)
+    for (int port = 0; port < indexed.ports[node].outputs; ++port)
       owner[static_cast<std::size_t>(value_of(static_cast<int>(node), port))] = static_cast<int>(node);
 
   // Liveness: a value is live from its definition until the last node that consumes it. An unused
@@ -307,7 +376,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   for (const int node : order)
   {
     const int def_position = position_of[static_cast<std::size_t>(node)];
-    for (int port = 0; port < indexed.types[static_cast<std::size_t>(node)]->outputs; ++port)
+    for (int port = 0; port < indexed.ports[static_cast<std::size_t>(node)].outputs; ++port)
     {
       const int value = value_of(node, port);
       int chosen = -1;
@@ -363,11 +432,15 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
     if (type->create != nullptr && plan_node.state == nullptr)
       return nullptr; // create() set `error`
 
-    plan_node.inputs.assign(static_cast<std::size_t>(type->inputs), plan->buffers_[static_cast<std::size_t>(silence_buffer)]);
-    plan_node.outputs.reserve(static_cast<std::size_t>(type->outputs) + 1);
-    for (int port = 0; port < type->outputs; ++port)
+    const render::PortCounts ports = indexed.ports[static_cast<std::size_t>(node)];
+    plan_node.inputs.assign(static_cast<std::size_t>(ports.inputs), plan->buffers_[static_cast<std::size_t>(silence_buffer)]);
+    plan_node.outputs.reserve(static_cast<std::size_t>(ports.outputs) + 1);
+    for (int port = 0; port < ports.outputs; ++port)
       plan_node.outputs.push_back(plan->buffers_[static_cast<std::size_t>(colour[static_cast<std::size_t>(value_of(node, port))])]);
-    plan_node.outputs.push_back(nullptr); // terminator: process_split walks until nullptr
+    // Terminators on both sides: `process_split` walks outputs until nullptr, `process_mix` walks
+    // inputs the same way. Binding below is by port index, so the input terminator goes on last.
+    plan_node.outputs.push_back(nullptr);
+    plan_node.inputs.push_back(nullptr);
 
     plan->nodes_.push_back(std::move(plan_node));
   }
@@ -400,7 +473,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   for (const int node : order)
   {
     std::vector<int> ports;
-    for (int port = 0; port < indexed.types[static_cast<std::size_t>(node)]->outputs; ++port)
+    for (int port = 0; port < indexed.ports[static_cast<std::size_t>(node)].outputs; ++port)
       ports.push_back(colour[static_cast<std::size_t>(value_of(node, port))]);
     plan->output_buffers_.push_back(std::move(ports));
   }

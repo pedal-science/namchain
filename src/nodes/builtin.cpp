@@ -146,8 +146,15 @@ void process_split(void*, const float* const* in, float* const* out, int frames)
 
 void process_mix(void*, const float* const* in, float* const* out, int frames) noexcept
 {
-  for (int i = 0; i < frames; ++i)
-    out[0][i] = in[0][i] + in[1][i];
+  // N inputs, terminated by nullptr. Accumulating rather than writing in[0] + in[1] is what lets a
+  // rig sum as many chains as its `inputs` param declares.
+  std::fill(out[0], out[0] + frames, 0.0f);
+  for (int port = 0; in[port] != nullptr; ++port)
+  {
+    const float* source = in[port];
+    for (int i = 0; i < frames; ++i)
+      out[0][i] += source[i];
+  }
 }
 
 // --- the DSP-backed nodes (nc.nam, nc.cab.ir) ------------------------------
@@ -647,12 +654,17 @@ void process_unit_delay(void*, const float* const* in, float* const* out, int fr
 }
 
 // Field order matches NodeType: id, inputs, outputs, create, destroy, process, describe,
-// set_block_input, block_delay.
+// set_block_input, block_delay, arity_param, min_ports, max_ports.
 const NodeType kInput{"nc.input", 0, 1, create_input, destroy_input, process_input, nullptr, set_block_input};
 const NodeType kOutput{"nc.output", 1, 0, nullptr, nullptr, process_marker};
 const NodeType kGain{"nc.gain", 1, 1, create_gain, destroy_gain, process_gain};
-const NodeType kSplit{"nc.split", 1, 2, nullptr, nullptr, process_split};
-const NodeType kMix{"nc.mix", 2, 1, nullptr, nullptr, process_mix};
+// `nc.split`/`nc.mix` are the per-spec arity nodes (plan.md §6.1): the fan-out is the rig's
+// `"outputs"`/`"inputs"` param rather than a fixed 2, which is what makes N parallel chains a
+// first-class shape. The default stays 2, so a rig written before this means exactly what it did.
+const NodeType kSplit{.id = "nc.split", .inputs = 1, .outputs = 2, .process = process_split,
+                      .arity_param = "outputs", .min_ports = 1, .max_ports = 64};
+const NodeType kMix{.id = "nc.mix", .inputs = 2, .outputs = 1, .process = process_mix,
+                    .arity_param = "inputs", .min_ports = 1, .max_ports = 64};
 const NodeType kNam{"nc.nam", 1, 1, create_nam, destroy_dsp, process_dsp, describe_dsp};
 const NodeType kCabIr{"nc.cab.ir", 1, 1, create_cab_ir, destroy_dsp, process_dsp, describe_dsp};
 const NodeType kBiquad{"nc.eq.biquad", 1, 1, create_biquad, destroy_biquad, process_biquad};

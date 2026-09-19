@@ -16,6 +16,7 @@
 #include "NAM/get_dsp.h"
 
 #include "namchain/graph/plan.h"
+#include "namchain/graph/reference.h"
 #include "namchain/rt/arena.h"
 #include "namchain/rt_check.h"
 
@@ -267,6 +268,92 @@ TEST_CASE("split fans out and mix sums")
   // Split duplicates, mix sums the two copies.
   for (const float value : output)
     CHECK(value == doctest::Approx(0.5f));
+}
+
+// ---------------------------------------------------------------------------
+// Per-spec arity: nc.split / nc.mix fan out to N, not just two
+// ---------------------------------------------------------------------------
+
+TEST_CASE("split and mix carry N-way fan-out from the rig, and the oracle agrees")
+{
+  namchain::rt::Arena arena(1 << 16);
+
+  // in -> split(4) -> four gains -> mix(4) -> out. Each branch scales the same signal, so the sum is
+  // exactly the sum of the gains -- any dropped or mis-bound port shows up as the wrong number.
+  Graph g;
+  NodeSpec split = node("sp", "nc.split");
+  split.params["outputs"] = 4;
+  NodeSpec mix = node("mix", "nc.mix");
+  mix.params["inputs"] = 4;
+  g.nodes = {node("in", "nc.input"), split};
+  for (int i = 0; i < 4; ++i)
+  {
+    NodeSpec gain = node("g" + std::to_string(i), "nc.gain");
+    gain.params["gain"] = static_cast<double>(i) + 1.0;
+    g.nodes.push_back(gain);
+  }
+  g.nodes.push_back(mix);
+  g.nodes.push_back(node("out", "nc.output"));
+
+  g.connections.push_back({"in", 0, "sp", 0});
+  for (int i = 0; i < 4; ++i)
+  {
+    g.connections.push_back({"sp", i, "g" + std::to_string(i), 0});
+    g.connections.push_back({"g" + std::to_string(i), 0, "mix", i});
+  }
+  g.connections.push_back({"mix", 0, "out", 0});
+
+  CHECK(namchain::graph::validate(g).ok);
+  auto plan = compile(g, arena);
+
+  namchain::render::CompileOptions options;
+  options.max_quantum = 64;
+  std::string reference_error;
+  auto reference = namchain::graph::ReferenceRender::compile(g, options, reference_error);
+  REQUIRE_MESSAGE(reference != nullptr, reference_error);
+
+  const int frames = 16;
+  std::vector<float> input(static_cast<std::size_t>(frames), 0.1f);
+  std::vector<float> output(static_cast<std::size_t>(frames), 0.0f);
+  std::vector<float> oracle(static_cast<std::size_t>(frames), 0.0f);
+  plan->execute(input.data(), output.data(), frames);
+  reference->execute(input.data(), oracle.data(), frames);
+
+  CHECK(output == oracle);
+  for (const float value : output)
+    CHECK(value == doctest::Approx(0.1f * 10.0f)); // 1 + 2 + 3 + 4
+}
+
+TEST_CASE("arity defaults to two and rejects a count it cannot mean")
+{
+  namchain::rt::Arena arena(1 << 16);
+
+  // A rig written before N-way arity, or one that simply omits the count, still means 1->2 / 2->1.
+  {
+    Graph g;
+    g.nodes = {node("in", "nc.input"), node("sp", "nc.split"), node("mix", "nc.mix"), node("out", "nc.output")};
+    g.connections = {{"in", 0, "sp", 0}, {"sp", 0, "mix", 0}, {"sp", 1, "mix", 1}, {"mix", 0, "out", 0}};
+    CHECK(namchain::graph::validate(g).ok);
+    CHECK(compile(g, arena) != nullptr);
+  }
+
+  const auto rejected = [](const std::string& type, const char* param, double value) {
+    Graph g;
+    NodeSpec spec = node("n", type);
+    spec.params[param] = value;
+    g.nodes = {node("in", "nc.input"), spec, node("out", "nc.output")};
+    g.connections = {{"in", 0, "n", 0}, {"n", 0, "out", 0}};
+    return namchain::graph::validate(g);
+  };
+
+  // Zero ports would make the node produce or accept nothing; 65 is past the compile-time bound; 2.5
+  // is a count written as a fraction, which is a mistake rather than something to truncate.
+  CHECK_FALSE(rejected("nc.split", "outputs", 0).ok);
+  CHECK_FALSE(rejected("nc.split", "outputs", 65).ok);
+  CHECK_FALSE(rejected("nc.split", "outputs", 2.5).ok);
+  CHECK_FALSE(rejected("nc.mix", "inputs", 0).ok);
+  CHECK_FALSE(rejected("nc.mix", "inputs", 1000).ok);
+  CHECK(rejected("nc.split", "outputs", 64).ok);
 }
 
 TEST_CASE("execution is deterministic and allocation-free")

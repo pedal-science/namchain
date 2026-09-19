@@ -1,0 +1,52 @@
+[Unit]
+Description=namchain headless guitar-chain engine
+Documentation=man:namchaind(1)
+# Do NOT bind this to a device unit (BindsTo=/Requires= on dev-snd-*). The daemon is written to
+# survive the interface being unplugged -- it closes the device, reports state "lost" and reopens it
+# when it returns -- and a device binding would stop the service at exactly that moment.
+After=sound.target
+Wants=sound.target
+# The unit reads its configuration from this file. Boot without it is skipped rather than looping in
+# a restart storm; install packaging/namchaind.json there (or drop in an ExecStart override).
+ConditionPathExists=/etc/namchain/namchaind.json
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/namchaind --config /etc/namchain/namchaind.json
+# SIGHUP re-reads the configured rig (docs/rig-pipeline.md §5.1 item 5), which is what
+# `systemctl reload namchaind` should mean.
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=always
+RestartSec=1
+
+# A systemd service does not get pam_limits (docs/tuning.md), so the rlimits have to be here or the
+# render thread's sched_setscheduler(SCHED_FIFO) is refused and the daemon silently runs
+# SCHED_OTHER. LimitMEMLOCK is what makes mlockall(MCL_CURRENT) succeed.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+# The plan asks for the service-level FIFO policy (plan.md §8.2). The daemon also applies SCHED_FIFO
+# to its render thread itself; drop these two lines if you would rather the control thread stay
+# SCHED_OTHER and only the render thread be real-time.
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=80
+
+# /run/namchain is where the control socket lives (RuntimeDirectoryMode 0750, socket 0660). It is
+# created on start and removed on stop, so a stale socket can never be the reason a start fails.
+RuntimeDirectory=namchain
+RuntimeDirectoryMode=0750
+
+# Rig specs and model files. Point --rigs-root at the directory tree that holds them.
+# ReadWritePaths=/etc/namchain
+# ProtectSystem=strict
+# ProtectHome=yes
+# PrivateTmp=yes
+# SupplementaryGroups=audio
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=namchaind
+
+[Install]
+WantedBy=multi-user.target
