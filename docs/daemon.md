@@ -1,10 +1,13 @@
 # namchaind: the reference daemon
 
-**Status:** M1 skeleton, built and tested. `namchaind` starts an audio backend, compiles a rig, runs
-it on a dedicated real-time thread, and serves a Unix-socket control protocol. It reloads on
-`SIGHUP` and survives the interface being unplugged. It does **not** yet have the M2 transition
-machinery, so a structural reload is a cold swap at a block boundary and can click; §"What is not
-built" is the honest list.
+**Status:** built and tested, M2 in progress. `namchaind` starts an audio backend, compiles a
+**document of up to eight chains** into one plan per chain, runs them on a dedicated real-time
+thread, and serves a Unix-socket control protocol. A parameter edit is ramped inside its node with no
+recompile; a structural change — a reload, a patch that alters the graph, a model swap, a bypass — is
+dual-rendered and equal-power crossfaded, one chain at a time. Bypass keeps the node running so its
+state stays warm. Every node's output is guarded for non-finite samples. The daemon reloads on
+`SIGHUP` and survives the interface being unplugged. §"What is built, and what is not" is the honest
+list.
 
 The pieces:
 
@@ -14,7 +17,8 @@ The pieces:
 | `include/namchain/daemon/{config,daemon}.h`, `src/daemon/{config,daemon}.cpp` | config parsing, rig resolution, the render thread and the control loop |
 | `packaging/systemd/namchaind.service` | the unit: rlimits, `Restart=always`, `RuntimeDirectory` |
 | `packaging/namchaind.json` | an example config to install at `/etc/namchain/namchaind.json` |
-| `tests/test_daemon.cpp` | config, protocol and end-to-end tests against the `null` backend |
+| `tests/test_document.cpp` | the document envelope and node identity, without a daemon |
+| `tests/test_daemon.cpp` | config, protocol and end-to-end tests against the `null` and `file` backends |
 
 ## Run it
 
@@ -37,6 +41,12 @@ cp build/generated/two-chains.json /tmp/nc/rigs/
 threads, the plan publication and the socket work before a device is in the picture. The default
 backend is `alsa_raw`.
 
+`--backend file` renders a document offline, start to finish, with the same engine, the same channel
+binding and the same summing as the device path — `--capture-path in.wav --playback-path out.wav`,
+with `--capture-channels 2 --playback-channels 2` for a two-chain rig. It stops when the input runs
+out and writes the output WAV on the way out, which is how the multi-chain tests assert where each
+chain's audio landed rather than only that it ran.
+
 The startup sequence is the one plan.md §8.2 asks for: read and compile the rig, prewarm every node
 on the control thread, publish the plan, **then** open and start the device. The first block never
 pays a node's cold-start cost.
@@ -55,8 +65,10 @@ silently ignored.
 | `sample_rate` | `48000` | |
 | `period_size` | `64` | quantum in frames |
 | `periods` | `4` | device buffer length in periods |
-| `capture_channels` | `1` | requested; the daemon decodes channel 0 |
-| `playback_channels` | `1` | requested; the daemon encodes channel 0 and zeroes the rest |
+| `capture_channels` | `1` | requested; the daemon decodes the channel each chain names |
+| `playback_channels` | `1` | requested; each chain writes the channel it names, and the rest is zeroed |
+| `capture_path` | *(empty)* | `file` backend only: the input WAV |
+| `playback_path` | *(empty)* | `file` backend only: the output WAV, written when the input runs out |
 | `rig` | *(empty)* | startup rig; empty starts silent and waits for `rig.load` |
 | `rigs_root` | `/etc/namchain/rigs` | the directory a `rig.load` **name** resolves under |
 | `socket` | `/run/namchain/namchaind.sock` | Unix `SOCK_SEQPACKET` control socket |
@@ -94,15 +106,65 @@ length prefix to get wrong. A request is:
 | method | request | response |
 |---|---|---|
 | `engine.hello` | `{"protocol": 1}` | `role`, `version`, negotiated `protocol`; a mismatch is `unsupported_protocol` |
-| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips` |
-| `engine.mute` | `{"mute": true\|false}` | the new state |
+| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, and a `chains` array (below) |
+| `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `rig.load` | `{"rig": "name.json"}` | compiled and published; returns `rig`, `generation` |
-| `rig.patch` | `{"ops": [...]}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass` | `kind` (`smooth` or `structural`), `applied`, `generation` |
+| `rig.patch` | `{"ops": [...], "chain": "id"?}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass` | `kind` (`smooth` or `structural`), `applied`, `chain`, `generation` |
 | `rig.get` | — | the current rig path, generation, `loaded` |
 
 Unknown fields are ignored; an unknown method is `unknown_method`. A malformed message never kills
 the connection or the daemon.
+
+`chain` is optional for a document with one chain and **required** when there are several: a patch or
+a mute that did not say which chain would otherwise edit an arbitrary one, and guessing is not a
+service. An unknown chain is `unknown_chain` and names the one that was asked for.
+
+### One document, several chains
+
+A rig spec may hold up to `max_chains` (8) chains, each with an id the client owns, an input and an
+output device channel, and its own graph (docs/rig-pipeline.md §2). What that means at runtime:
+
+- **One plan per chain, one generation per document.** Every chain is compiled, prewarmed and bound
+  before anything becomes visible, and a document that fails to compile anywhere fails whole — the
+  running document keeps rendering.
+- **Two chains may read the same input channel**, and **two chains writing one channel are summed**,
+  with the sum clamped on the way to the device. That is what makes a guitar chain and a vocal chain
+  two rows of one mixer rather than a fight over a channel.
+- **A document apply crossfades its chains one at a time.** With no admission control, dual-rendering
+  every changed chain at once is how a two-chain rig asks for three times the CPU it has; the stagger
+  keeps the peak at two of the *largest* chain instead. `engine.status` reports
+  `max_concurrent_transitions`, which is that rule as a number: 1 means it has never overlapped. The
+  cost is that applying a document takes up to `chains × fade_ms` rather than `fade_ms`.
+- **A chain whose graph and channels did not change is not replanned and does not fade.** A patch to
+  the guitar chain leaves the vocal chain's plan, its models and its generation exactly where they
+  were. A publish that changes nothing at all does not advance the generation, so reloading the same
+  file reports that nothing happened rather than leaving a client waiting for an adoption that will
+  never come.
+- **Per-chain mute keeps the chain running.** Its output is dropped from the bus after the chain has
+  run, for the same reason `engine.mute` zeroes after the chain: a muted chain whose inference is
+  skipped freezes its state and clicks on unmute (G14).
+- **A chain the new document does not have stops immediately.** Its plans are retired rather than
+  faded — a removal is not a transition between two plans, and inventing a fade-to-silence path for it
+  would be a mechanism nothing else needs. A client that wants the removal to be gradual mutes the
+  chain first, which is a ramp.
+- **A chain's channels must exist.** A chain naming a capture or playback channel beyond
+  `capture_channels`/`playback_channels` is refused at load with a message naming the chain, and a
+  device that turns out to give fewer channels than configured is refused when it is opened — reading
+  a channel that is not there is not something to discover on the audio thread.
+
+`engine.status` therefore carries a `chains` array, in the document's order, one entry per chain:
+
+```json
+{ "id": "voc", "name": "Vocal", "input_channel": 1, "output_channel": 1,
+  "generation": 3, "audible_generation": 3, "adopted_generation": 3, "target_generation": 3,
+  "transition_active": false, "muted": false, "failed_nodes": 0, "guard_trips": 0 }
+```
+
+The document-level `generation`, `adopted_generation`, `audible_generation`, `transition_active` and
+`failed_nodes`/`guard_trips` are derived from those: `audible_generation` is the *previous* document
+generation while any chain is still moving, so it means "the generation the device is hearing" even
+in the middle of an apply. `max_chains` is the limit, published rather than assumed.
 
 `mute` zeroes the *emitted* copy **after** the chain has run: a muted chain whose inference is
 skipped freezes the model's state and clicks on unmute (plan.md G14).
@@ -196,14 +258,26 @@ expected.
 Built: the `smooth` op class (a `rig.patch` set_param ramps inside the node, no recompile, no step),
 the offline scripted timeline that measures it (`namchain-render --graph rig.json --timeline
 edits.json`, or `--torture N --seed S`, judged by the glitch detector), the structural dual-render
-crossfade that a `rig.load` or SIGHUP reload takes, the structural patch protocol
-(`add_node`/`remove_node`/`connect`/`disconnect`/`rewire`/`swap_model`/`bypass` and a non-rampable
-`set_param`), and the per-node non-finite guard. See docs/transitions.md.
+crossfade that a `rig.load`, a SIGHUP reload or a structural patch takes, the structural patch
+protocol (`add_node`/`remove_node`/`connect`/`disconnect`/`rewire`/`swap_model`/`bypass` and a
+non-rampable `set_param`), the per-node non-finite guard, and — since slice A2 of
+docs/ui-integration-plan.md — documents of up to eight chains with per-chain plans, per-chain
+generations, per-chain mute and device-channel binding, applied with staggered crossfades and with
+unchanged chains left alone. See docs/transitions.md.
 
 Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 
 - no `tail_hold` for a bypassed node with a tail (no built-in has one yet);
 - no admission control or cost model, so a plan too expensive to dual-render is not rejected before it
-  runs, and the fade length is fixed rather than shortened under load;
+  runs, and the fade length is fixed rather than shortened under load — the staggered apply is what
+  stands in for it;
+- no per-chain *patching* protocol beyond the request-level `chain` (a patch is one chain's graph, and
+  a document apply is the whole thing), no `rig.apply` for a document on the wire, and no `rig.get`
+  that returns the graph;
+- no parameter schema or catalogue on the wire, so an unknown parameter name is still accepted
+  silently (slice B);
+- no TCP listener, so the socket is local to the machine (slice C);
+- no model/IR registry, so a model is a path rather than a device-library id (slice D);
+- no macros, so a block that is really a subgraph has to be written out as one (slice E);
 - no telemetry subscription and no `scene.*`, `model.*`, `bench.run` methods;
 - no state-accurate NAM warm start (M3), so `swap_model` crossfades rather than replaying history.

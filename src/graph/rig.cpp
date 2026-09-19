@@ -438,5 +438,32 @@ bool load_graph_json(const std::string& path, Graph& graph, std::string& error)
   return true;
 }
 
+bool same_graph(const Graph& a, const Graph& b)
+{
+  if (a.nodes.size() != b.nodes.size() || a.connections.size() != b.connections.size())
+    return false;
+
+  // Everything a compile reads, including the identity fields: `element` and `role` are part of what a
+  // client authored, and a document that changed only those is a change worth republishing (an op can
+  // name an element). Node order is compared too -- a reordering is semantically free but it is not
+  // the *same document*, and treating it as one would silently ignore an edit.
+  for (std::size_t i = 0; i < a.nodes.size(); ++i)
+  {
+    const NodeSpec& x = a.nodes[i];
+    const NodeSpec& y = b.nodes[i];
+    if (x.id != y.id || x.type != y.type || x.params != y.params || x.strings != y.strings ||
+        x.bypass != y.bypass || x.element != y.element || x.role != y.role)
+      return false;
+  }
+  for (std::size_t i = 0; i < a.connections.size(); ++i)
+  {
+    const Connection& x = a.connections[i];
+    const Connection& y = b.connections[i];
+    if (x.from != y.from || x.from_port != y.from_port || x.to != y.to || x.to_port != y.to_port)
+      return false;
+  }
+  return true;
+}
+
 } // namespace graph
 } // namespace namchain

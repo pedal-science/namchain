@@ -89,5 +89,14 @@ struct Validation
 /// cycles. Cost and param-range checks belong to the compiler.
 Validation validate(const Graph& graph);
 
+/// \brief True when two graphs would compile to the same plan: same nodes, same parameters, same
+/// connections, in the same order.
+///
+/// Used to decide whether a publish changes anything. A document whose unchanged chains are
+/// published again would otherwise recompile them -- reloading every model on the control thread --
+/// and crossfade them, which is both expensive and audible for a chain nobody edited
+/// (docs/ui-integration-plan.md §1.1).
+bool same_graph(const Graph& a, const Graph& b);
+
 } // namespace graph
 } // namespace namchain

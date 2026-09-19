@@ -229,7 +229,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "rigs_root",  "socket",      "socket_mode",     "rt_priority",
                                       "cpu",        "lock_memory",  "output_queue_periods",
                                       "output_queue_floor_periods", "fade_ms", "device_retry_ms",
-                                      "reclamation_timeout_ms", "verbose"};
+                                      "reclamation_timeout_ms", "verbose", "capture_path", "playback_path"};
   for (const auto& [key, value] : doc.items())
   {
     bool known = false;
@@ -253,6 +253,8 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
   }
 
   if (!read_string(doc, "device", config.device, path, error) ||
+      !read_string(doc, "capture_path", config.capture_path, path, error) ||
+      !read_string(doc, "playback_path", config.playback_path, path, error) ||
       !read_string(doc, "rig", config.rig, path, error) ||
       !read_string(doc, "rigs_root", config.rigs_root, path, error) ||
       !read_string(doc, "socket", config.socket_path, path, error))
@@ -319,6 +321,16 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
   if (name == "device")
   {
     config.device = value;
+    return true;
+  }
+  if (name == "capture-path")
+  {
+    config.capture_path = value;
+    return true;
+  }
+  if (name == "playback-path")
+  {
+    config.playback_path = value;
     return true;
   }
   if (name == "rig")

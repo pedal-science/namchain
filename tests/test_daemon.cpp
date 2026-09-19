@@ -25,6 +25,7 @@
 
 #include "namchain/daemon/config.h"
 #include "namchain/daemon/daemon.h"
+#include "namchain/wav.h"
 
 namespace
 {
@@ -713,4 +714,532 @@ TEST_CASE("the daemon stays up and reports lost when the device cannot be opened
   CHECK(status["ok"] == true);
   CHECK(status["status"]["blocks"] == 0);
   CHECK(daemon.device_state() == namchain::daemon::DeviceState::Lost);
+}
+
+// ---------------------------------------------------------------------------
+// More than one chain (docs/ui-integration-plan.md §1.1, slice A2)
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// A two-chain document: guitar on capture channel 0, vocal on capture channel 1, each an
+/// `nc.input -> nc.gain -> nc.output` chain at the given gain, writing the given playback channels.
+///
+/// Built with nlohmann rather than a string literal so a test can vary one thing at a time and the
+/// difference between two documents is visible in the call.
+std::string two_chain_document(double guitar_gain, double vocal_gain, int guitar_out, int vocal_out)
+{
+  const auto chain = [](const char* id, int in_channel, int out_channel, double gain) {
+    nlohmann::json c;
+    c["id"] = id;
+    c["input_channel"] = in_channel;
+    c["output_channel"] = out_channel;
+    c["nodes"] = nlohmann::json::array({
+      {{"id", "in"}, {"type", "nc.input"}},
+      {{"id", "g"}, {"type", "nc.gain"}, {"gain", gain}},
+      {{"id", "out"}, {"type", "nc.output"}},
+    });
+    c["connections"] = nlohmann::json::array({
+      {{"from", "in"}, {"to", "g"}},
+      {{"from", "g"}, {"to", "out"}},
+    });
+    return c;
+  };
+
+  nlohmann::json document;
+  document["name"] = "Two chains";
+  document["chains"] = nlohmann::json::array(
+    {chain("gtr", 0, guitar_out, guitar_gain), chain("voc", 1, vocal_out, vocal_gain)});
+  return document.dump();
+}
+
+/// A stereo WAV of constant values, so a channel's destination is obvious in the output.
+void write_stereo_wav(const std::filesystem::path& path, unsigned frames, float left, float right)
+{
+  std::vector<float> interleaved;
+  interleaved.reserve(static_cast<std::size_t>(frames) * 2);
+  for (unsigned i = 0; i < frames; ++i)
+  {
+    interleaved.push_back(left);
+    interleaved.push_back(right);
+  }
+  std::string error;
+  REQUIRE_MESSAGE(namchain::save_wav_float32(path.string(), interleaved.data(), frames, 2, 48000.0, error), error);
+}
+
+std::vector<float> read_wav(const std::filesystem::path& path, unsigned& channels)
+{
+  std::vector<float> interleaved;
+  double rate = 0.0;
+  std::string error;
+  REQUIRE_MESSAGE(namchain::load_wav(path.string(), interleaved, channels, rate, error), error);
+  return interleaved;
+}
+
+/// Run a `file` backend daemon to the end of its input and wait for the render thread to finish, which
+/// is when the output WAV has been written. No control loop is needed: `handle_request` is the control
+/// thread's work and no other thread is doing it.
+///
+/// "Closed" alone is not enough to wait for: it is also the state *before* the device is opened, and a
+/// loaded machine makes that window wide enough to observe. A block count is what distinguishes a
+/// device that has been and gone from one that has not arrived yet.
+void run_to_end(Daemon& daemon)
+{
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  for (int attempt = 0; attempt < 4000; ++attempt)
+  {
+    const auto reply = nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.status"})"));
+    if (reply["status"]["state"] == "closed" && reply["status"]["blocks"].get<uint64_t>() > 0)
+      return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  FAIL("the file backend never ran out of input");
+}
+
+Config file_backend_config(const TempDir& dir, unsigned capture_channels, unsigned playback_channels)
+{
+  Config config;
+  config.backend = BackendKind::File;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.capture_path = (dir.path / "in.wav").string();
+  config.playback_path = (dir.path / "out.wav").string();
+  config.capture_channels = capture_channels;
+  config.playback_channels = playback_channels;
+  config.sample_rate = 48000;
+  config.period_size = 64;
+  config.periods = 4;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  return config;
+}
+
+} // namespace
+
+TEST_CASE("a document runs its chains on the channels it names")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "two.json", two_chain_document(0.5, 0.25, /*guitar_out=*/0, /*vocal_out=*/1));
+  write_stereo_wav(dir.path / "in.wav", 128, /*left=*/1.0f, /*right=*/0.5f);
+
+  Config config = file_backend_config(dir, 2, 2);
+  config.rigs_root = root.string();
+  config.rig = (root / "two.json").string();
+
+  Daemon daemon(config);
+  run_to_end(daemon);
+
+  unsigned channels = 0;
+  const std::vector<float> output = read_wav(dir.path / "out.wav", channels);
+  REQUIRE(channels == 2u);
+  REQUIRE(output.size() >= 128u * 2u);
+
+  // Guitar: channel 0 in at 1.0 through a gain of 0.5, out on channel 0. Vocal: channel 1 in at 0.5
+  // through 0.25, out on channel 1. Each chain read its own input and wrote its own output.
+  for (unsigned i = 0; i < 128; ++i)
+  {
+    CHECK(output[i * 2 + 0] == doctest::Approx(0.5f));
+    CHECK(output[i * 2 + 1] == doctest::Approx(0.125f));
+  }
+
+  const auto status = nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.status"})"));
+  REQUIRE(status["status"]["chains"].size() == 2u);
+  CHECK(status["status"]["chains"][0]["id"] == "gtr");
+  CHECK(status["status"]["chains"][0]["input_channel"] == 0);
+  CHECK(status["status"]["chains"][0]["output_channel"] == 0);
+  CHECK(status["status"]["chains"][1]["id"] == "voc");
+  CHECK(status["status"]["chains"][1]["input_channel"] == 1);
+  CHECK(status["status"]["chains"][1]["output_channel"] == 1);
+  CHECK(status["status"]["max_chains"] == namchain::daemon::kMaxChains);
+}
+
+TEST_CASE("two chains writing one channel are summed")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "two.json", two_chain_document(0.5, 0.25, /*guitar_out=*/0, /*vocal_out=*/0));
+  write_stereo_wav(dir.path / "in.wav", 128, /*left=*/1.0f, /*right=*/0.5f);
+
+  Config config = file_backend_config(dir, 2, 2);
+  config.rigs_root = root.string();
+  config.rig = (root / "two.json").string();
+
+  Daemon daemon(config);
+  run_to_end(daemon);
+
+  unsigned channels = 0;
+  const std::vector<float> output = read_wav(dir.path / "out.wav", channels);
+  REQUIRE(channels == 2u);
+
+  // 1.0 * 0.5 + 0.5 * 0.25 = 0.625 on channel 0, and nothing on channel 1: a shared output channel is
+  // a sum, not a race, and the channel nobody writes stays silent.
+  CHECK(output[0] == doctest::Approx(0.625f));
+  CHECK(output[1] == doctest::Approx(0.0f));
+}
+
+TEST_CASE("a chain that names a channel the engine does not have is refused")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "two.json", two_chain_document(0.5, 0.25, 0, 1));
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.capture_channels = 1; // the vocal chain wants channel 1
+  config.playback_channels = 1;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+
+  const auto reply = nlohmann::json::parse(
+    daemon.handle_request(R"({"id":"l","method":"rig.load","rig":"two.json"})"));
+  CHECK(reply["ok"] == false);
+  CHECK(reply["error"]["code"] == "compile_failed");
+  const std::string message = reply["error"]["message"];
+  CHECK(message.find("chain 'voc'") != std::string::npos);
+  CHECK(message.find("capture_channels") != std::string::npos);
+}
+
+TEST_CASE("a document apply transitions its chains one at a time")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "a.json", two_chain_document(0.5, 0.5, 0, 1));
+  write_file(root / "b.json", two_chain_document(0.25, 0.25, 0, 1));
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "a.json").string();
+  config.capture_channels = 2;
+  config.playback_channels = 2;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  // Long enough that the stagger is observable from another thread over a socket.
+  config.fade_ms = 40.0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() == 1;
+  }));
+
+  const auto loaded =
+    nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"rig.load","rig":"b.json"})"));
+  REQUIRE(loaded["ok"] == true);
+  REQUIRE(loaded["generation"] == 2);
+
+  // Sample the status while the apply works through the chains. The evidence is the per-chain
+  // *generations* rather than the transition flags: a status response is built on the control thread
+  // while the render thread mutates those flags, so a snapshot can straddle the moment one chain's
+  // fade ends and the next begins. Generations only ever move forward, and only in this order --
+  // chain 0 reaching generation 2 while chain 1 is still on 1 is the stagger itself, and it lasts for
+  // a whole fade rather than an instant.
+  bool saw_staggered = false;
+  bool saw_second_before_first = false;
+  for (int attempt = 0; attempt < 400; ++attempt)
+  {
+    const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+    const auto& status = reply["status"];
+    const uint64_t first = status["chains"][0]["audible_generation"].get<uint64_t>();
+    const uint64_t second = status["chains"][1]["audible_generation"].get<uint64_t>();
+    saw_staggered = saw_staggered || (first == 2 && second == 1);
+    saw_second_before_first = saw_second_before_first || (first == 1 && second == 2);
+    if (first == 2 && second == 2)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+
+  CHECK_MESSAGE(saw_staggered, "the second chain reached the new document before the first had settled");
+  CHECK_FALSE(saw_second_before_first); // chain 1 must never overtake chain 0
+
+  const bool settled = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["transition_active"] == false && status["audible_generation"].get<uint64_t>() == 2 &&
+           status["chains"][0]["audible_generation"].get<uint64_t>() == 2 &&
+           status["chains"][1]["audible_generation"].get<uint64_t>() == 2;
+  });
+  CHECK_MESSAGE(settled, "the document never finished being applied");
+
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  CHECK(status["status"]["transitions_started"].get<uint64_t>() == 2);
+  CHECK(status["status"]["generation"] == 2);
+  CHECK(status["status"]["adopted_generation"] == 2);
+  // The rule the stagger exists for, as a number rather than a promise: two chains changed, and never
+  // two crossfades at once.
+  CHECK(status["status"]["max_concurrent_transitions"] == 1);
+}
+
+TEST_CASE("a patch to one chain leaves the other chain's plan alone")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "two.json", two_chain_document(0.5, 0.25, 0, 1));
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "two.json").string();
+  config.capture_channels = 2;
+  config.playback_channels = 2;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() == 1;
+  }));
+
+  // Smooth, on one chain, by chain id.
+  const auto smooth = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"id":"p","method":"rig.patch","chain":"gtr","ops":[{"op":"set_param","node":"g","param":"gain","value":0.75}]})"));
+  REQUIRE(smooth["ok"] == true);
+  CHECK(smooth["kind"] == "smooth");
+  CHECK(smooth["chain"] == "gtr");
+  const bool applied = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["params_applied"].get<uint64_t>() == 1;
+  });
+  CHECK_MESSAGE(applied, "the render thread never applied the parameter edit");
+
+  // Structural, on the same chain: a new node means a new plan for it and nothing for the other.
+  const auto structural = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"id":"q","method":"rig.patch","chain":"gtr","ops":[{"op":"add_node","id":"g2","type":"nc.gain","gain":0.5},
+       {"op":"connect","from":"g","to":"g2"},{"op":"rewire","from":"g2","to":"out"}]})"));
+  REQUIRE(structural["ok"] == true);
+  CHECK(structural["kind"] == "structural");
+  REQUIRE(structural["generation"] == 2);
+
+  const bool settled = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["chains"][0]["audible_generation"].get<uint64_t>() == 2 && status["transition_active"] == false;
+  });
+  CHECK_MESSAGE(settled, "the patched chain never finished its transition");
+
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  CHECK(status["status"]["chains"][0]["generation"] == 2);
+  CHECK(status["status"]["chains"][1]["generation"] == 1); // untouched: not replanned, not faded
+  CHECK(status["status"]["chains"][1]["audible_generation"] == 1);
+  // One transition for the whole apply: the untouched chain was never even queued behind it.
+  CHECK(status["status"]["transitions_started"].get<uint64_t>() == 1);
+
+  // A patch with no chain, on a rig with several chains, is refused rather than guessing.
+  const auto ambiguous = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"id":"r","method":"rig.patch","ops":[{"op":"set_param","node":"g","param":"gain","value":0.5}]})"));
+  CHECK(ambiguous["ok"] == false);
+  CHECK(ambiguous["error"]["code"] == "unknown_chain");
+}
+
+TEST_CASE("per-chain mute is resolved, reported, and refused for a chain that does not exist")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "two.json", two_chain_document(0.5, 0.25, 0, 1));
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "two.json").string();
+  config.capture_channels = 2;
+  config.playback_channels = 2;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() == 1;
+  }));
+
+  const auto muted = nlohmann::json::parse(
+    call(config.socket_path, R"({"id":"m","method":"engine.mute","chain":"voc","mute":true})"));
+  CHECK(muted["ok"] == true);
+  CHECK(muted["chain"] == "voc");
+
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  CHECK(status["status"]["chains"][0]["muted"] == false);
+  CHECK(status["status"]["chains"][1]["muted"] == true);
+  // The global mute is a different thing and stays off: muting one chain is not muting the engine.
+  CHECK(status["status"]["mute"] == false);
+
+  const auto unknown = nlohmann::json::parse(
+    call(config.socket_path, R"({"id":"m2","method":"engine.mute","chain":"bass","mute":true})"));
+  CHECK(unknown["ok"] == false);
+  CHECK(unknown["error"]["code"] == "unknown_chain");
+
+  const auto unmuted = nlohmann::json::parse(
+    call(config.socket_path, R"({"id":"m3","method":"engine.mute","chain":"voc","mute":false})"));
+  CHECK(unmuted["ok"] == true);
+  const auto after = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  CHECK(after["status"]["chains"][1]["muted"] == false);
+}
+
+TEST_CASE("a document that changes nothing does not advance the generation")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "a.json", kGainRig);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "a.json").string();
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() == 1;
+  }));
+
+  // Reloading the same rig is not an edit: nothing is recompiled, nothing fades, and a client polling
+  // for adoption does not see a generation that will never arrive.
+  const auto again =
+    nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"rig.load","rig":"a.json"})"));
+  CHECK(again["ok"] == true);
+  CHECK(again["generation"] == 1);
+
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  CHECK(status["status"]["transition_active"] == false);
+  CHECK(status["status"]["transitions_started"].get<uint64_t>() == 0);
+
+  // A real change still publishes.
+  write_file(root / "a.json", kSecondRig);
+  const auto changed =
+    nlohmann::json::parse(call(config.socket_path, R"({"id":"l2","method":"rig.load","rig":"a.json"})"));
+  CHECK(changed["ok"] == true);
+  CHECK(changed["generation"] == 2);
+}
+
+TEST_CASE("a document with fewer chains drops the ones that are gone and keeps running")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "two.json", two_chain_document(0.5, 0.25, 0, 1));
+  write_file(root / "one.json", kGainRig);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "two.json").string();
+  config.capture_channels = 2;
+  config.playback_channels = 2;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["chains"].size() == 2u;
+  }));
+
+  const auto loaded =
+    nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"rig.load","rig":"one.json"})"));
+  REQUIRE(loaded["ok"] == true);
+
+  const bool dropped = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["chains"].size() == 1u && status["chains"][0]["id"] == "main";
+  });
+  CHECK_MESSAGE(dropped, "the chain that the new document does not have is still reported");
+
+  // The engine is still rendering, with one chain, at the new generation.
+  const bool running = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() == 2 &&
+           status["transition_active"] == false;
+  });
+  CHECK_MESSAGE(running, "the engine did not settle after losing a chain");
 }

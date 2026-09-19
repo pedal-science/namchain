@@ -28,6 +28,13 @@ struct Config
   unsigned periods = 4;
   unsigned capture_channels = 1;
   unsigned playback_channels = 1;
+  /// The `file` backend's input and output WAVs. Empty for the device backends, which use \ref device.
+  ///
+  /// This is what makes `namchaind --backend file` an offline render of a whole document -- every
+  /// chain, its channel binding and its summing included -- rather than something only the soak tool
+  /// could do, and it is how the multi-chain channel tests assert where each chain's audio landed.
+  std::string capture_path;
+  std::string playback_path;
   /// The startup rig, read synchronously before the clock starts (rig-pipeline.md §5.1 item 2). An
   /// absolute path is taken as written; a bare name resolves under \ref rigs_root. Empty means the
   /// daemon starts silent and waits for a `rig.load`.

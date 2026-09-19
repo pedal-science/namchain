@@ -468,14 +468,18 @@ license position for less code. Real round-trip latency comparisons decide the d
   resampler) are supported by inserting compensating delays on parallel paths at compile time (PDC),
   so crossfades stay phase-aligned (G21).
 
-**Built so far (2026-09-19, slice A1 of docs/ui-integration-plan.md):** the document half of the
+**Built so far (2026-09-19, slices A1 and A2 of docs/ui-integration-plan.md):** the document half of the
 chain model — a rig spec may name several chains, each with a client-owned id, an input and output
 device channel, and its own graph — plus the identity model that goes with it: `element` is the
 client's name for a block and is stored and returned verbatim, `role` says which node of it a node
 is, and `id` is minted by the engine when a client does not write one. The parser, the document-level
-validation (with the chain named in any failure) and the tests are in. Per-chain plans, per-chain
-generations, channel binding and the protocol that reads a document back are A2 and A3; a chain's
-`input_channel`/`output_channel` are parsed and validated today but not yet bound to the device.
+validation (with the chain named in any failure) and the tests are in. The engine half is in as well: `namchaind` compiles one plan per chain (up to
+eight), binds each chain to the device channels it names (two chains writing one channel are summed),
+gives each chain its own generation, mute and transition, applies a document with the chains
+crossfaded **one at a time** so the peak cost stays at two of the largest chain, and leaves a chain
+whose graph did not change unreplanned and unfaded. A chain the new document does not have stops
+immediately. Still to come: the protocol that puts a whole document on the wire and reads one back
+(`rig.apply`/`rig.get`, A3), and per-chain patching beyond the request-level `chain`.
 
 ### 5.2 Compile pipeline (control thread)
 

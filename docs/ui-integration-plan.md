@@ -2,7 +2,11 @@
 
 **Status:** in progress. **A1 landed** — the document envelope (a name and N chains with ids and
 device channels), three-space node identity (`element`/`role`/`id`), chain-named validation, and
-`tests/test_document.cpp`. A2 (per-chain plans, generations, channel binding) is next. Follows
+`tests/test_document.cpp`. **A2 landed** — one plan per chain in the daemon, per-chain generations,
+mute and transitions, channel binding with summing, staggered applies, unchanged chains left alone,
+`engine.status.chains`, `rig.patch`'s request-level `chain`, and the `file` backend wired into the
+daemon so a document can be rendered offline end to end. A3 (the protocol: `rig.apply`, `rig.get`,
+protocol 2, `features`) is next. Follows
 `docs/ljoss-comparison.md` (the analysis) and the seven decisions recorded below. Slices are ordered
 by dependency, not by appeal; each is independently committable and independently testable, and none
 of them requires the app to exist first.
@@ -345,7 +349,7 @@ what it is running.
 | Commit | Contents |
 |---|---|
 | **A1** ✅ | IR: `NodeSpec.element` / `NodeSpec.role`, optional `id`, reserved-key list; `Graph` unchanged. Parser: chain envelope with single-graph back-compat. `graph::validate` gains chain context in messages |
-| **A2** | Compiler/daemon: per-chain plan slots, per-chain generation, adoption and transition, staggered multi-chain transitions, channel binding and summing, per-chain mute + global mute/panic, `nc.output` level/mute params |
+| **A2** ✅ | Compiler/daemon: per-chain plan slots, per-chain generation, adoption and transition, staggered multi-chain transitions, channel binding and summing, per-chain mute + global mute/panic. A chain the new document does not have stops immediately, which is stated rather than faded. The `file` backend is wired into the daemon so a document renders end to end offline |
 | **A3** | Protocol 2: `engine.hello` (version + `features`), `rig.apply` (whole document, in memory), `rig.get` (document + per-chain status, optional lowered view), `engine.status.chains`; `chain` on patch ops; docs (`docs/daemon.md`, `docs/rig-pipeline.md`, `plan.md`) |
 
 **Files:** `include/namchain/graph/{graph,rig,patch}.h`, `src/graph/{rig,plan,patch}.cpp`,
@@ -511,8 +515,14 @@ tree; and any serialisation change beyond the envelope in §1.1.
    unknown metadata, and the app must never rehydrate its library from it. Recommended: yes, with
    `rig.get` echoing the document generously for debugging but documented as non-authoritative.
 6. **`element` defaults to `id`** so hand-written rigs need no new field. Recommended: yes.
-7. **`nc.output` params** (`level_db`, `mute`) as document params, while *chain* mute is runtime
-   state. Recommended: yes; the first is the app's output fader, the second is the footswitch.
+7. ~~**`nc.output` params** (`level_db`, `mute`) as document params, while *chain* mute is runtime
+   state.~~ **Revised, and implemented that way:** an output fader is a `nc.gain` node in the
+   flattened graph, and chain silence is the engine's per-chain mute. The reason is the compiler's
+   output binding: the plan's output *is* the buffer feeding `nc.output`'s input port
+   (`src/graph/plan.cpp`), which may also feed another consumer, so a gain on that node would have to
+   scale a shared buffer in place. Making `nc.output` 1→1 to give it its own buffer would change how
+   the plan's output is bound, for a knob a `nc.gain` already provides — ramped, and with a schema
+   entry of its own. The fader still exists; it is one node further up.
 8. **`nc.gain`'s canonical param becomes `gain_db`** (dB, rampable, visible) with the existing linear
    `gain` kept as a hidden rampable alias — the reverse of today, where `gain` is the settable one and
    `gain_db` is build-only. Recommended: yes, because dB is the unit a player thinks in and the alias

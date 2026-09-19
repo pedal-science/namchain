@@ -229,11 +229,13 @@ void Daemon::close_socket()
   }
 }
 
-bool Daemon::push_slot(PlanSlot* slot)
+bool Daemon::push_slot(uint32_t chain, uint32_t chain_count, PlanSlot* slot)
 {
   PlanCommand command;
   command.kind = PlanCommand::Kind::PublishPlan;
   command.slot = slot;
+  command.chain = chain;
+  command.chain_count = chain_count;
   if (commands_.push(command))
     return true;
   // A full command ring means the render thread is not draining, which is an engine bug rather than
@@ -244,9 +246,64 @@ bool Daemon::push_slot(PlanSlot* slot)
   return false;
 }
 
-bool Daemon::publish_param(const std::string& node, const std::string& param, double value, std::string& error)
+int Daemon::find_chain(const std::string& chain_id) const
 {
-  if (last_published_ == nullptr || last_published_->plan == nullptr)
+  for (std::size_t i = 0; i < current_document_.chains.size(); ++i)
+  {
+    if (current_document_.chains[i].id == chain_id)
+      return static_cast<int>(i);
+  }
+  return -1;
+}
+
+int Daemon::find_chain_with_node(const std::string& node) const
+{
+  int found = -1;
+  for (std::size_t i = 0; i < published_slots_.size(); ++i)
+  {
+    const PlanSlot* slot = published_slots_[i];
+    if (slot == nullptr || slot->plan == nullptr)
+      continue;
+    const std::vector<std::string>& ids = slot->plan->node_ids();
+    if (std::find(ids.begin(), ids.end(), node) == ids.end())
+      continue;
+    if (found >= 0)
+      return -2; // more than one chain holds it, and guessing would edit an arbitrary one
+    found = static_cast<int>(i);
+  }
+  return found;
+}
+
+bool Daemon::publish_param(const std::string& chain_id, const std::string& node, const std::string& param,
+                           double value, std::string& error)
+{
+  int index = -1;
+  if (!chain_id.empty())
+  {
+    index = find_chain(chain_id);
+    if (index < 0)
+    {
+      error = "no chain '" + chain_id + "'";
+      return false;
+    }
+  }
+  else
+  {
+    index = find_chain_with_node(node);
+    if (index == -2)
+    {
+      error = "node '" + node + "' is in more than one chain; name the chain";
+      return false;
+    }
+    if (index < 0)
+    {
+      error = "no chain holds a node '" + node + "'";
+      return false;
+    }
+  }
+
+  PlanSlot* slot = published_slots_[static_cast<std::size_t>(index)];
+  if (slot == nullptr || slot->plan == nullptr)
   {
     error = "no plan is loaded; rig.load first";
     return false;
@@ -262,7 +319,7 @@ bool Daemon::publish_param(const std::string& node, const std::string& param, do
   // thread; that is the whole point of the command.
   std::size_t node_index = 0;
   uint32_t param_id = 0;
-  if (!last_published_->plan->resolve_param(node, param, node_index, param_id))
+  if (!slot->plan->resolve_param(node, param, node_index, param_id))
   {
     error = "node '" + node + "' has no settable param '" + param + "'";
     return false;
@@ -270,7 +327,8 @@ bool Daemon::publish_param(const std::string& node, const std::string& param, do
 
   PlanCommand command;
   command.kind = PlanCommand::Kind::SetParam;
-  command.generation = last_published_->generation;
+  command.chain = static_cast<uint32_t>(index);
+  command.generation = slot->generation;
   command.node = static_cast<uint32_t>(node_index);
   command.param = param_id;
   command.value = static_cast<float>(value);
@@ -284,50 +342,151 @@ bool Daemon::publish_param(const std::string& node, const std::string& param, do
 
 bool Daemon::load_rig(const std::string& rig_path, std::string& error)
 {
-  graph::Graph graph;
-  if (!graph::load_graph_json(rig_path, graph, error))
+  graph::Document document;
+  if (!graph::load_document_json(rig_path, document, error))
     return false;
-  return publish_graph(graph, rig_path, error);
+  return publish_document(document, rig_path, error);
 }
 
-bool Daemon::publish_graph(const graph::Graph& graph, const std::string& label, std::string& error)
+bool Daemon::publish_document(const graph::Document& document, const std::string& label, std::string& error)
 {
+  const graph::Validation validation = graph::validate(document);
+  if (!validation.ok)
+  {
+    error = validation.message;
+    return false;
+  }
+  if (document.chains.size() > static_cast<std::size_t>(kMaxChains))
+  {
+    error = "a document may hold at most " + std::to_string(kMaxChains) + " chains, this one has " +
+            std::to_string(document.chains.size());
+    return false;
+  }
+
   render::CompileOptions options;
   options.max_quantum = static_cast<int>(config_.period_size);
   options.sample_rate = static_cast<double>(config_.sample_rate);
 
-  auto slot = std::make_unique<PlanSlot>(kArenaBytes);
-  slot->plan = graph::RenderPlan::compile(graph, options, slot->arena, error);
-  if (slot->plan == nullptr)
-    return false;
-
-  // The first process() call on a freshly built node is tens of times its steady-state cost, and a
-  // stall that long can drain the device ring. It is control-thread work, before publication (§3.3).
-  slot->plan->prewarm();
-  slot->rig = label;
-  const uint64_t generation = generation_ + 1;
-  slot->generation = generation;
-
-  PlanSlot* raw = slot.get();
-  const int buffers = slot->plan->buffer_count();
-  if (!push_slot(slot.release()))
+  // Which chains actually changed. An unchanged chain keeps the plan it has: republishing it would
+  // recompile it -- reloading every model on this thread -- and crossfade it, for an edit somebody
+  // made to a different chain.
+  std::vector<bool> changed(document.chains.size(), true);
+  std::size_t changed_count = document.chains.size();
+  if (document.chains.size() == current_document_.chains.size())
   {
-    error = "the publication ring is full; the render thread is not consuming plans";
+    changed_count = 0;
+    for (std::size_t i = 0; i < document.chains.size(); ++i)
+    {
+      const graph::Chain& before = current_document_.chains[i];
+      const graph::Chain& after = document.chains[i];
+      changed[i] = before.id != after.id || before.name != after.name ||
+                   before.input_channel != after.input_channel ||
+                   before.output_channel != after.output_channel || !graph::same_graph(before.graph, after.graph);
+      if (changed[i])
+        ++changed_count;
+    }
+  }
+
+  if (changed_count == 0 && published_slots_.size() == document.chains.size())
+  {
+    // Nothing about the running document would change. The label is still worth recording -- it is
+    // what a later patch republishes under -- but the generation does not advance, because no new
+    // plan exists and a client that polls for adoption should not see one.
+    current_rig_ = label;
+    return true;
+  }
+
+  // Room for every chain's command before any of them is pushed: a document publish is all-or-nothing,
+  // and half a document installed is the one outcome worse than a rejected one.
+  if (commands_.size() + changed_count > commands_.capacity())
+  {
+    error = "the command ring is full; the render thread is not consuming plans";
     return false;
   }
-  // Only now does anything about the running engine change. A failed compile or a full ring leaves
-  // the previous graph, plan and generation exactly as they were.
+
+  const uint64_t generation = generation_ + 1;
+  std::vector<std::unique_ptr<PlanSlot>> built;
+  for (const graph::Chain& chain : document.chains)
+  {
+    if (chain.input_channel >= static_cast<int>(config_.capture_channels))
+    {
+      error = "chain '" + chain.id + "' reads capture channel " + std::to_string(chain.input_channel) +
+              ", but capture_channels is " + std::to_string(config_.capture_channels);
+      return false;
+    }
+    if (chain.output_channel >= static_cast<int>(config_.playback_channels))
+    {
+      error = "chain '" + chain.id + "' writes playback channel " + std::to_string(chain.output_channel) +
+              ", but playback_channels is " + std::to_string(config_.playback_channels);
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < document.chains.size(); ++i)
+  {
+    if (!changed[i])
+      continue;
+    const graph::Chain& chain = document.chains[i];
+    auto slot = std::make_unique<PlanSlot>(kArenaBytes);
+    slot->plan = graph::RenderPlan::compile(chain.graph, options, slot->arena, error);
+    if (slot->plan == nullptr)
+    {
+      error = "chain '" + chain.id + "': " + error;
+      return false;
+    }
+    // The first process() call on a freshly built node is tens of times its steady-state cost, and a
+    // stall that long can drain the device ring. It is control-thread work, before publication (§3.3).
+    slot->plan->prewarm();
+    slot->input_channel = chain.input_channel;
+    slot->output_channel = chain.output_channel;
+    slot->generation = generation;
+    built.push_back(std::move(slot));
+  }
+
+  // Every plan exists, is prewarmed and is bound before any of them becomes visible. The pushes cannot
+  // fail: the room for all of them was checked above and this thread is the only producer.
+  std::vector<PlanSlot*> raw;
+  raw.reserve(document.chains.size());
+  std::size_t next_built = 0;
+  for (std::size_t i = 0; i < document.chains.size(); ++i)
+  {
+    if (!changed[i])
+    {
+      raw.push_back(published_slots_[i]); // still owned by the render thread or the reclaimer
+      continue;
+    }
+    PlanSlot* slot = built[next_built++].release();
+    if (!push_slot(static_cast<uint32_t>(i), static_cast<uint32_t>(document.chains.size()), slot))
+    {
+      error = "the publication ring is full; the render thread is not consuming plans";
+      return false;
+    }
+    raw.push_back(slot);
+  }
+
+  // Only now does anything about the running engine change. A failed compile, a chain whose channels
+  // are not available, or a full ring leaves the previous document, plans and generation as they were.
   generation_ = generation;
   current_rig_ = label;
-  current_graph_ = graph;
-  last_published_ = raw;
+  current_document_ = document;
+  published_slots_ = std::move(raw);
+  last_published_ = &current_document_;
 
   if (config_.verbose)
   {
-    std::fprintf(stderr, "[namchaind] published %s (generation %llu, %d buffers)\n", label.c_str(),
-                 static_cast<unsigned long long>(generation_), buffers);
+    std::fprintf(stderr, "[namchaind] published %s (generation %llu, %zu chain%s, %zu replanned)\n", label.c_str(),
+                 static_cast<unsigned long long>(generation_), document.chains.size(),
+                 document.chains.size() == 1 ? "" : "s", built.size());
   }
   return true;
+}
+
+bool Daemon::publish_graph(const graph::Graph& graph, const std::string& label, std::string& error)
+{
+  graph::Document document;
+  document.chains.push_back(graph::Chain{});
+  document.chains.back().id = "main";
+  document.chains.back().graph = graph;
+  return publish_document(document, label, error);
 }
 
 bool Daemon::start(std::string& error)
@@ -406,22 +565,24 @@ void Daemon::stop()
     if (command.kind == PlanCommand::Kind::PublishPlan)
       delete command.slot;
 
-  if (current_slot_ != nullptr)
+  for (int i = 0; i < kMaxChains; ++i)
   {
-    delete current_slot_;
-    current_slot_ = nullptr;
+    for (PlanSlot** slot : {&chains_[i].current, &chains_[i].next, &chains_[i].pending})
+    {
+      if (*slot == nullptr)
+        continue;
+      delete *slot;
+      *slot = nullptr;
+    }
   }
-  if (next_slot_ != nullptr)
-  {
-    delete next_slot_;
-    next_slot_ = nullptr;
-  }
-  if (pending_slot_ != nullptr)
-  {
-    delete pending_slot_;
-    pending_slot_ = nullptr;
-  }
+  chain_count_ = 0;
+  transitioning_chain_ = -1;
   transition_active_.store(false);
+  audible_generation_.store(0);
+  target_generation_.store(0);
+  adopted_generation_.store(0);
+  failed_nodes_.store(0);
+  guard_trips_.store(0);
   last_published_ = nullptr;
   close_socket();
   if (signal_fd_ >= 0)
@@ -465,6 +626,8 @@ bool Daemon::open_device(std::string& error)
   backend.require_exact_period = true; // §9.5: a silently rounded quantum is not acceptable
   backend.output_queue_periods = config_.output_queue_periods;
   backend.output_queue_floor_periods = config_.output_queue_floor_periods;
+  backend.input_path = config_.capture_path;
+  backend.output_path = config_.playback_path;
 
   device_ = open_backend(backend, config_.backend, error);
   if (device_ == nullptr)
@@ -487,20 +650,52 @@ bool Daemon::open_device(std::string& error)
     close_device();
     return false;
   }
+  // A chain may read any channel the *configuration* promised, and each chain's channel was checked
+  // against that at publish time. A device that gives fewer would make those reads read past the end
+  // of a frame, so it is refused rather than silently remapped (the same argument as the period size).
+  if (info.capture_channels < config_.capture_channels)
+  {
+    error = "device gave " + std::to_string(info.capture_channels) + " capture channels, configured for " +
+            std::to_string(config_.capture_channels);
+    close_device();
+    return false;
+  }
+  if (info.playback_channels < config_.playback_channels)
+  {
+    error = "device gave " + std::to_string(info.playback_channels) + " playback channels, configured for " +
+            std::to_string(config_.playback_channels);
+    close_device();
+    return false;
+  }
 
   // Sized before the stream starts, and before mlockall covers them.
+  device_finished_ = false;
   capture_buffer_.assign(static_cast<std::size_t>(config_.period_size) * info.capture_bytes_per_frame, 0);
   playback_buffer_.assign(static_cast<std::size_t>(config_.period_size) * info.playback_bytes_per_frame, 0);
-  mono_in_.assign(config_.period_size, 0.0f);
-  mono_out_.assign(config_.period_size, 0.0f);
-  mono_old_.assign(config_.period_size, 0.0f);
-  mono_new_.assign(config_.period_size, 0.0f);
+  bus_.assign(static_cast<std::size_t>(config_.period_size) * info.playback_channels, 0.0f);
+  for (ChainRuntime& chain : chains_)
+  {
+    chain.in.assign(config_.period_size, 0.0f);
+    chain.out.assign(config_.period_size, 0.0f);
+    chain.old.assign(config_.period_size, 0.0f);
+    chain.incoming.assign(config_.period_size, 0.0f);
+  }
 
   active_rate_.store(info.sample_rate);
   active_period_.store(info.period_size);
   active_capture_channels_.store(info.capture_channels);
   active_playback_channels_.store(info.playback_channels);
   return true;
+}
+
+void Daemon::finish_device(std::string& /*error*/)
+{
+  if (device_ == nullptr || device_finished_)
+    return;
+  device_finished_ = true;
+  std::string reason;
+  if (!device_->finish(reason) && config_.verbose)
+    std::fprintf(stderr, "[namchaind] finishing the device failed: %s\n", reason.c_str());
 }
 
 void Daemon::close_device()
@@ -524,59 +719,146 @@ void Daemon::fail_device(const std::string& reason)
   set_device_state(DeviceState::Lost);
 }
 
-void Daemon::start_transition(PlanSlot* next)
+void Daemon::start_transition(int index, PlanSlot* next)
 {
-  next_slot_ = next;
+  ChainRuntime& chain = chains_[index];
+  chain.next = next;
   unsigned rate = active_rate_.load();
   if (rate == 0)
     rate = config_.sample_rate;
   const int fade = static_cast<int>(std::llround(config_.fade_ms * static_cast<double>(rate) / 1000.0));
-  crossfade_.start(fade);
-  target_generation_.store(next->generation);
+  chain.crossfade.start(fade);
+  chain.target_generation.store(next->generation);
   // "Adopted" means the render thread has taken the plan up, which for a structural change is the
   // moment it starts fading in, not the moment the fade closes.
-  adopted_generation_.store(next->generation);
-  transition_active_.store(true);
+  chain.adopted_generation.store(next->generation);
+  chain.transition_active.store(true);
+  transitioning_chain_ = index;
   transitions_started_.fetch_add(1);
+  update_aggregate_state();
 }
 
-void Daemon::finish_transition()
+void Daemon::finish_transition(int index)
 {
-  if (current_slot_ != nullptr)
-    reclaimer_.retire(current_slot_, &delete_plan_slot);
-  current_slot_ = next_slot_;
-  next_slot_ = nullptr;
-  if (current_slot_ != nullptr)
-    audible_generation_.store(current_slot_->generation);
-  transition_active_.store(false);
+  ChainRuntime& chain = chains_[index];
+  if (chain.current != nullptr)
+    reclaimer_.retire(chain.current, &delete_plan_slot);
+  chain.current = chain.next;
+  chain.next = nullptr;
+  chain.transition_active.store(false);
+  if (chain.current != nullptr)
+    chain.audible_generation.store(chain.current->generation);
+  if (transitioning_chain_ == index)
+    transitioning_chain_ = -1;
 
   // A publish that arrived while this fade was in flight starts now, from the plan that has just
-  // become audible. Nothing is lost and nothing nests: one structural transition at a time.
-  if (pending_slot_ != nullptr)
+  // become audible. Nothing is lost and nothing nests: one structural transition at a time, so a
+  // document apply works through its chains one after another rather than all at once.
+  start_queued_transition();
+  update_aggregate_state();
+}
+
+void Daemon::start_queued_transition()
+{
+  if (transitioning_chain_ >= 0)
+    return;
+  for (int i = 0; i < chain_count_; ++i)
   {
-    PlanSlot* pending = pending_slot_;
-    pending_slot_ = nullptr;
-    start_transition(pending);
+    ChainRuntime& chain = chains_[i];
+    if (chain.pending == nullptr)
+      continue;
+    PlanSlot* pending = chain.pending;
+    chain.pending = nullptr;
+    start_transition(i, pending);
+    return;
   }
+  update_aggregate_state();
+}
+
+void Daemon::drop_chain(int index)
+{
+  ChainRuntime& chain = chains_[index];
+  if (chain.current == nullptr && chain.next == nullptr && chain.pending == nullptr)
+    return;
+
+  // A chain the new document does not have stops now. Its plans are retired rather than faded: a
+  // removal is not a transition from one plan to another, and fading it would mean inventing a
+  // fade-to-silence path that nothing else needs (docs/ui-integration-plan.md §1.1). A client that
+  // wants the removal to be gradual mutes the chain first, which is a ramp.
+  if (chain.next != nullptr)
+  {
+    reclaimer_.retire(chain.next, &delete_plan_slot);
+    chain.next = nullptr;
+  }
+  if (chain.pending != nullptr)
+  {
+    reclaimer_.retire(chain.pending, &delete_plan_slot);
+    chain.pending = nullptr;
+  }
+  if (chain.current != nullptr)
+  {
+    reclaimer_.retire(chain.current, &delete_plan_slot);
+    chain.current = nullptr;
+  }
+  chain.transition_active.store(false);
+  chain.audible_generation.store(0);
+  chain.target_generation.store(0);
+  chain.adopted_generation.store(0);
+  if (transitioning_chain_ == index)
+    transitioning_chain_ = -1;
+  start_queued_transition();
+}
+
+void Daemon::update_aggregate_state()
+{
+  // The document-level fields answer one question each: is anything still moving, and what is the
+  // device actually hearing. `audible_generation` is therefore the document generation only once
+  // every chain has settled at it, and the previous one while a staggered apply is still working.
+  bool moving = false;
+  unsigned fading = 0;
+  for (int i = 0; i < chain_count_; ++i)
+  {
+    if (chains_[i].transition_active.load())
+      ++fading;
+    if (chains_[i].transition_active.load() || chains_[i].pending != nullptr)
+      moving = true;
+  }
+  if (fading > max_concurrent_transitions_.load())
+    max_concurrent_transitions_.store(fading);
+  transition_active_.store(moving);
+  audible_generation_.store(moving ? previous_generation_ : rendered_generation_);
+  target_generation_.store(rendered_generation_);
+
+  // "Adopted" is the document the render thread has taken up: every chain's command has been
+  // processed, whether it started a fade or is waiting its turn.
+  adopted_generation_.store(rendered_generation_);
 }
 
 void Daemon::drain_commands()
 {
+  bool published = false;
   PlanCommand command;
   while (commands_.pop(command))
   {
     if (command.kind == PlanCommand::Kind::SetParam)
     {
-      // The command names the generation it was resolved against. During a transition two plans are
-      // live, so the edit goes to whichever of them it names; a plan a structural reload has already
-      // superseded is counted as stale rather than applied to the wrong chain.
+      // The command names the chain and the generation it was resolved against. During a transition
+      // two plans are live for that chain, so the edit goes to whichever of them it names; a plan a
+      // structural publish has already superseded is counted as stale rather than applied to the
+      // wrong chain.
+      if (command.chain >= static_cast<uint32_t>(kMaxChains))
+      {
+        params_stale_.fetch_add(1);
+        continue;
+      }
+      ChainRuntime& chain = chains_[command.chain];
       graph::RenderPlan* plan = nullptr;
-      if (current_slot_ != nullptr && current_slot_->generation == command.generation)
-        plan = current_slot_->plan.get();
-      else if (next_slot_ != nullptr && next_slot_->generation == command.generation)
-        plan = next_slot_->plan.get();
-      else if (pending_slot_ != nullptr && pending_slot_->generation == command.generation)
-        plan = pending_slot_->plan.get();
+      if (chain.current != nullptr && chain.current->generation == command.generation)
+        plan = chain.current->plan.get();
+      else if (chain.next != nullptr && chain.next->generation == command.generation)
+        plan = chain.next->plan.get();
+      else if (chain.pending != nullptr && chain.pending->generation == command.generation)
+        plan = chain.pending->plan.get();
 
       if (plan != nullptr && plan->set_param(command.node, command.param, command.value))
         params_applied_.fetch_add(1);
@@ -586,32 +868,64 @@ void Daemon::drain_commands()
     }
 
     PlanSlot* next = command.slot;
-    if (next == nullptr)
+    if (next == nullptr || command.chain >= static_cast<uint32_t>(kMaxChains))
       continue;
 
-    if (current_slot_ == nullptr)
+    // The document's shape comes from the commands themselves, so the render thread never reads a
+    // count the control thread could move under it mid-drain. A slot from a generation this thread has
+    // not seen is a new document: remember where the last settled one was, because
+    // `audible_generation` reports that until every chain has moved (see update_aggregate_state).
+    if (next->generation != rendered_generation_)
     {
-      // The first plan has nothing to fade from: adopt it. This is the startup rig, and the device
-      // has not produced a block yet.
-      current_slot_ = next;
-      audible_generation_.store(next->generation);
-      adopted_generation_.store(next->generation);
-      target_generation_.store(next->generation);
+      previous_generation_ = rendered_generation_;
+      rendered_generation_ = next->generation;
+    }
+    if (command.chain_count > 0 && command.chain_count <= static_cast<uint32_t>(kMaxChains))
+      chain_count_ = static_cast<int>(command.chain_count);
+    published = true;
+
+    const int index = static_cast<int>(command.chain);
+    ChainRuntime& chain = chains_[index];
+
+    if (chain.current == nullptr)
+    {
+      // Nothing to fade from: adopt it. This is the startup rig, and the first appearance of a chain
+      // added by a document -- the device has not produced a block, or the chain is new.
+      chain.next = nullptr;
+      chain.current = next;
+      chain.audible_generation.store(next->generation);
+      chain.adopted_generation.store(next->generation);
+      chain.target_generation.store(next->generation);
+      chain.transition_active.store(false);
       continue;
     }
 
-    if (transition_active_.load())
+    if (chain.next != nullptr || transitioning_chain_ >= 0)
     {
-      // One structural transition in flight. A burst coalesces to the newest request (the stale one
-      // is retired here) rather than nesting fades, which is what rig-pipeline.md §5.3 asks for.
-      if (pending_slot_ != nullptr)
-        reclaimer_.retire(pending_slot_, &delete_plan_slot);
-      pending_slot_ = next;
+      // This chain is fading, or another one is and this daemon fades one chain at a time. A burst
+      // coalesces to the newest request (the superseded plan is retired here) rather than nesting
+      // fades, which is what rig-pipeline.md §5.3 asks for -- and staggering is what keeps the peak
+      // cost of a document apply at two of the largest chain instead of two of the whole document,
+      // with no admission control to lean on.
+      if (chain.pending != nullptr)
+        reclaimer_.retire(chain.pending, &delete_plan_slot);
+      chain.pending = next;
+      chain.target_generation.store(next->generation);
       continue;
     }
 
-    start_transition(next);
+    start_transition(index, next);
   }
+
+  // A document with fewer chains than the last one: the chains that are gone stop now. Done after the
+  // drain rather than per command, so a document is never half-dropped while its own commands are
+  // still arriving.
+  if (published)
+  {
+    for (int i = chain_count_; i < kMaxChains; ++i)
+      drop_chain(i);
+  }
+  update_aggregate_state();
 }
 
 void Daemon::render_loop()
@@ -660,6 +974,7 @@ void Daemon::render_loop()
     if (info.capture_exhausted)
     {
       // A file backend that ran out of input. Not a device loss; there is simply no more audio.
+      finish_device(error);
       close_device();
       set_device_state(DeviceState::Closed);
       break;
@@ -687,50 +1002,89 @@ void Daemon::render_loop()
       drain_commands();
 
       const std::size_t width = info.bytes_per_sample;
-      for (unsigned i = 0; i < info.period_size; ++i)
-        mono_in_[i] = pcm_decode(capture_buffer_.data() + static_cast<std::size_t>(i) * info.capture_channels * width,
-                                 info.format);
+      const int frames = static_cast<int>(info.period_size);
+      std::fill(bus_.begin(), bus_.end(), 0.0f);
 
-      if (transition_active_.load() && current_slot_ != nullptr && next_slot_ != nullptr)
+      for (int c = 0; c < chain_count_; ++c)
       {
-        // Dual-render: both plans run on the same input, and their chain outputs are equal-power
-        // crossfaded. Both keep running for the whole fade (a chain that stops mid-transition
-        // freezes its state and would step on the way out).
-        current_slot_->plan->execute(mono_in_.data(), mono_old_.data(), static_cast<int>(info.period_size));
-        next_slot_->plan->execute(mono_in_.data(), mono_new_.data(), static_cast<int>(info.period_size));
-        crossfade_.mix(mono_old_.data(), mono_new_.data(), mono_out_.data(), static_cast<int>(info.period_size));
-        // mix() has finished reading mono_old_, so the old plan can be retired here; the control
-        // thread frees it after the reclaimer's grace window.
-        if (!crossfade_.active())
-          finish_transition();
-      }
-      else if (current_slot_ != nullptr)
-      {
-        current_slot_->plan->execute(mono_in_.data(), mono_out_.data(), static_cast<int>(info.period_size));
-      }
-      else
-      {
-        std::fill(mono_out_.begin(), mono_out_.end(), 0.0f);
+        ChainRuntime& chain = chains_[c];
+        if (chain.current == nullptr)
+          continue;
+
+        // Which channel a chain reads is the *incoming* plan's business when a transition is running:
+        // a document that moved a chain to another input channel means the new plan hears the new
+        // channel from the moment it starts fading in, rather than a fade between two inputs.
+        const PlanSlot* source = chain.next != nullptr ? chain.next : chain.current;
+        const unsigned channel = static_cast<unsigned>(source->input_channel);
+        for (unsigned i = 0; i < info.period_size; ++i)
+          chain.in[i] = pcm_decode(capture_buffer_.data() +
+                                     (static_cast<std::size_t>(i) * info.capture_channels + channel) * width,
+                                   info.format);
+
+        if (chain.next != nullptr)
+        {
+          // Dual-render: both plans run on the same input, and their chain outputs are equal-power
+          // crossfaded. Both keep running for the whole fade (a chain that stops mid-transition
+          // freezes its state and would step on the way out).
+          chain.current->plan->execute(chain.in.data(), chain.old.data(), frames);
+          chain.next->plan->execute(chain.in.data(), chain.incoming.data(), frames);
+          chain.crossfade.mix(chain.old.data(), chain.incoming.data(), chain.out.data(), frames);
+          // mix() has finished reading old, so the outgoing plan can be retired here; the control
+          // thread frees it after the reclaimer's grace window.
+          if (!chain.crossfade.active())
+            finish_transition(c);
+        }
+        else
+        {
+          chain.current->plan->execute(chain.in.data(), chain.out.data(), frames);
+        }
+
+        // Mute is a zeroing of the *emitted* copy, applied after execute so the chain keeps running:
+        // a muted chain whose inference is skipped freezes state and clicks on unmute (G14). It is
+        // also why this is a skip rather than a reason not to execute at all.
+        if (chain.mute.load())
+          continue;
+
+        float* destination = bus_.data() + static_cast<std::size_t>(source->output_channel) * info.period_size;
+        for (int i = 0; i < frames; ++i)
+          destination[i] += chain.out[static_cast<std::size_t>(i)];
       }
 
-      // Mute is a zeroing of the *emitted* copy, applied after execute so the chain keeps running:
-      // a muted slot whose inference is skipped freezes state and clicks on unmute (G14).
+      // Global mute, after every chain has run, for the same reason a per-chain mute is a skip.
       if (mute_.load())
-        std::fill(mono_out_.begin(), mono_out_.end(), 0.0f);
+        std::fill(bus_.begin(), bus_.end(), 0.0f);
 
+      // One encode for the whole bus: two chains writing one channel are summed, and pcm_encode
+      // clamps, so a sum that exceeds full scale saturates rather than wrapping.
       std::fill(playback_buffer_.begin(), playback_buffer_.end(), 0);
       for (unsigned i = 0; i < info.period_size; ++i)
-        pcm_encode(playback_buffer_.data() + static_cast<std::size_t>(i) * info.playback_channels * width,
-                   info.format, mono_out_[i]);
+      {
+        for (unsigned c = 0; c < info.playback_channels; ++c)
+        {
+          pcm_encode(playback_buffer_.data() +
+                       (static_cast<std::size_t>(i) * info.playback_channels + c) * width,
+                     info.format, bus_[static_cast<std::size_t>(c) * info.period_size + i]);
+        }
+      }
     }
 
     // Outside the RT scope: the guard's counters are read for a report, not needed to render a block,
-    // and the scope is kept to the work that has a deadline. `current_slot_` is the audible plan
-    // (the incoming one once a fade has closed).
-    if (current_slot_ != nullptr)
+    // and the scope is kept to the work that has a deadline. Summed across the audible chains, because
+    // "a node is failed" is a fact about the rig rather than about one chain.
     {
-      failed_nodes_.store(static_cast<unsigned>(current_slot_->plan->failed_node_count()));
-      guard_trips_.store(current_slot_->plan->guard_trips());
+      unsigned failed = 0;
+      uint64_t trips = 0;
+      for (int c = 0; c < chain_count_; ++c)
+      {
+        if (chains_[c].current == nullptr)
+          continue;
+        failed += chains_[c].current->plan->failed_node_count();
+        trips += chains_[c].current->plan->guard_trips();
+        chains_[c].failed_nodes.store(static_cast<unsigned>(chains_[c].current->plan->failed_node_count()));
+        chains_[c].guard_trips.store(chains_[c].current->plan->guard_trips());
+      }
+      failed_nodes_.store(failed);
+      guard_trips_.store(trips);
     }
 
     if (device_->try_write_playback(playback_buffer_.data(), info.period_size, error) < 0)
@@ -746,6 +1100,9 @@ void Daemon::render_loop()
     xruns_.store(device_->driver_xruns());
   }
 
+  // Give the backend its chance to write what it accumulated (a `file` backend's output WAV) before
+  // the object is destroyed. A device backend has nothing to finish, and says so by doing nothing.
+  finish_device(error);
   close_device();
 }
 
@@ -841,7 +1198,35 @@ std::string Daemon::handle_request(const std::string& request)
     status["audible_generation"] = audible_generation_.load();
     status["target_generation"] = target_generation_.load();
     status["transitions_started"] = transitions_started_.load();
+    status["max_concurrent_transitions"] = max_concurrent_transitions_.load();
     status["fade_ms"] = config_.fade_ms;
+
+    // One entry per chain, in the document's order. This is where a client learns what its document
+    // became: the chain ids it owns, the channels it was bound to, and how far each chain has got
+    // through its own transition. The document-level fields above are derived from these, so a client
+    // can read either the whole picture or one chain's.
+    nlohmann::json chain_list = nlohmann::json::array();
+    for (std::size_t i = 0; i < current_document_.chains.size() && i < static_cast<std::size_t>(kMaxChains); ++i)
+    {
+      const graph::Chain& chain = current_document_.chains[i];
+      const ChainRuntime& runtime = chains_[i];
+      nlohmann::json entry;
+      entry["id"] = chain.id;
+      entry["name"] = chain.name;
+      entry["input_channel"] = chain.input_channel;
+      entry["output_channel"] = chain.output_channel;
+      entry["generation"] = published_slots_[i] == nullptr ? 0 : published_slots_[i]->generation;
+      entry["audible_generation"] = runtime.audible_generation.load();
+      entry["adopted_generation"] = runtime.adopted_generation.load();
+      entry["target_generation"] = runtime.target_generation.load();
+      entry["transition_active"] = runtime.transition_active.load();
+      entry["muted"] = runtime.mute.load();
+      entry["failed_nodes"] = runtime.failed_nodes.load();
+      entry["guard_trips"] = runtime.guard_trips.load();
+      chain_list.push_back(std::move(entry));
+    }
+    status["chains"] = std::move(chain_list);
+    status["max_chains"] = kMaxChains;
     nlohmann::json body;
     body["status"] = status;
     return ok_response(id, body);
@@ -857,8 +1242,23 @@ std::string Daemon::handle_request(const std::string& request)
         return error_response(id, "bad_request", "'mute' must be a boolean");
       muted = doc["mute"].get<bool>();
     }
-    mute_.store(muted);
     nlohmann::json body;
+    if (doc.contains("chain"))
+    {
+      // Per-chain mute: the chain keeps running and keeps its state warm, and only its contribution
+      // to the output bus is dropped (G14). Resolved here, so a chain that does not exist is an error
+      // rather than a silently ignored mute.
+      if (!doc["chain"].is_string())
+        return error_response(id, "bad_request", "'chain' must be a string");
+      const int index = find_chain(doc["chain"].get<std::string>());
+      if (index < 0)
+        return error_response(id, "unknown_chain", "no chain '" + doc["chain"].get<std::string>() + "'");
+      chains_[static_cast<std::size_t>(index)].mute.store(muted);
+      body["mute"] = muted;
+      body["chain"] = doc["chain"];
+      return ok_response(id, body);
+    }
+    mute_.store(muted);
     body["mute"] = muted;
     return ok_response(id, body);
   }
@@ -902,7 +1302,30 @@ std::string Daemon::handle_request(const std::string& request)
   {
     if (!doc.contains("ops") || !doc["ops"].is_array())
       return error_response(id, "bad_request", "rig.patch needs an 'ops' array");
-    if (current_graph_.nodes.empty() || last_published_ == nullptr)
+    if (current_document_.chains.empty() || published_slots_.empty())
+      return error_response(id, "patch_rejected", "no plan is loaded; rig.load first");
+
+    // Which chain this patch is against. With one chain it is obvious; with several it must be said,
+    // because guessing would edit an arbitrary one of them (docs/ui-integration-plan.md §1.3).
+    std::size_t chain_index = 0;
+    if (doc.contains("chain"))
+    {
+      if (!doc["chain"].is_string())
+        return error_response(id, "bad_request", "'chain' must be a string");
+      const int found = find_chain(doc["chain"].get<std::string>());
+      if (found < 0)
+        return error_response(id, "unknown_chain", "no chain '" + doc["chain"].get<std::string>() + "'");
+      chain_index = static_cast<std::size_t>(found);
+    }
+    else if (current_document_.chains.size() > 1)
+    {
+      return error_response(id, "unknown_chain",
+                            "this rig has " + std::to_string(current_document_.chains.size()) +
+                              " chains; rig.patch needs a 'chain'");
+    }
+    const std::string chain_id = current_document_.chains[chain_index].id;
+    const PlanSlot* target = published_slots_[chain_index];
+    if (target == nullptr || target->plan == nullptr)
       return error_response(id, "patch_rejected", "no plan is loaded; rig.load first");
 
     // Route by op class (§5.3). If every op is a `set_param` the live plan can dispatch, the whole
@@ -928,8 +1351,8 @@ std::string Daemon::handle_request(const std::string& request)
       }
       std::size_t node_index = 0;
       uint32_t param_id = 0;
-      if (!last_published_->plan->resolve_param(op["node"].get<std::string>(),
-                                                op["param"].get<std::string>(), node_index, param_id))
+      if (!target->plan->resolve_param(op["node"].get<std::string>(), op["param"].get<std::string>(),
+                                       node_index, param_id))
         smooth = false;
     }
 
@@ -939,7 +1362,7 @@ std::string Daemon::handle_request(const std::string& request)
       for (const nlohmann::json& op : doc["ops"])
       {
         std::string error;
-        if (!publish_param(op["node"].get<std::string>(), op["param"].get<std::string>(),
+        if (!publish_param(chain_id, op["node"].get<std::string>(), op["param"].get<std::string>(),
                            op["value"].get<double>(), error))
         {
           return error_response(id, "patch_rejected", "ops[" + std::to_string(applied) + "]: " + error);
@@ -949,24 +1372,28 @@ std::string Daemon::handle_request(const std::string& request)
       nlohmann::json body;
       body["kind"] = "smooth";
       body["applied"] = applied;
+      body["chain"] = chain_id;
       body["generation"] = generation_;
       return ok_response(id, body);
     }
 
-    graph::Graph patched = current_graph_;
+    // The structural class. Only the named chain's graph changes, so only that chain is replanned and
+    // crossfaded: publish_document compares each chain and leaves the others' plans alone.
+    graph::Document patched = current_document_;
     graph::PatchContext context;
     // A model path in a patch is relative to the rig being patched, the same rule a rig's own model
     // paths follow, so the two agree about where models live.
     context.base_dir = std::filesystem::path(current_rig_).parent_path().string();
     std::string error;
-    if (!graph::apply_patch(patched, doc["ops"].dump(), context, error))
+    if (!graph::apply_patch(patched.chains[chain_index].graph, doc["ops"].dump(), context, error))
       return error_response(id, "patch_rejected", error);
-    if (!publish_graph(patched, current_rig_, error))
+    if (!publish_document(patched, current_rig_, error))
       return error_response(id, "compile_failed", error);
 
     nlohmann::json body;
     body["kind"] = "structural";
     body["applied"] = static_cast<unsigned>(doc["ops"].size());
+    body["chain"] = chain_id;
     body["generation"] = generation_;
     return ok_response(id, body);
   }
