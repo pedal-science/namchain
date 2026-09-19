@@ -122,7 +122,7 @@ TEST_CASE("a rig parses into node params, string params and connections")
   const std::string text = R"({
     "nodes": [
       { "id": "in",  "type": "nc.input" },
-      { "id": "amp", "type": "nc.nam", "model": "amp.nam", "gain_db": -3.5, "bypass": false },
+      { "id": "amp", "type": "nc.nam", "model": "amp.nam", "gain_db": -3.5, "bypass": true },
       { "id": "eq",  "type": "nc.eq.biquad", "mode": "highpass", "freq": 90, "q": 0.7 },
       { "id": "out", "type": "nc.output" }
     ],
@@ -140,8 +140,10 @@ TEST_CASE("a rig parses into node params, string params and connections")
   CHECK(graph.nodes[1].type == "nc.nam");
   CHECK(graph.nodes[1].strings.at("model") == "amp.nam");
   CHECK(graph.nodes[1].params.at("gain_db") == doctest::Approx(-3.5));
-  // A boolean is a number here; there is no third kind of parameter to invent.
-  CHECK(graph.nodes[1].params.at("bypass") == doctest::Approx(0.0));
+  // `bypass` is reserved like `id` and `type`: it is a property of the node, not a numeric parameter,
+  // so it does not land in the param map.
+  CHECK(graph.nodes[1].bypass);
+  CHECK(graph.nodes[1].params.count("bypass") == 0u);
   CHECK(graph.nodes[2].strings.at("mode") == "highpass");
   CHECK(graph.nodes[2].params.at("freq") == doctest::Approx(90.0));
   REQUIRE(graph.connections.size() == 3u);

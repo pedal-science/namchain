@@ -163,12 +163,6 @@ TEST_CASE("a patch names what it cannot do instead of doing nothing")
     CHECK_FALSE(namchain::graph::apply_patch(graph, R"([{"op":"explode","node":"g"}])", context, error));
     CHECK(error.find("unknown op") != std::string::npos);
   }
-  SUBCASE("bypass is named, not ignored")
-  {
-    CHECK_FALSE(namchain::graph::apply_patch(
-      graph, R"([{"op":"bypass","node":"g","bypass":true}])", context, error));
-    CHECK(error.find("not implemented") != std::string::npos);
-  }
   SUBCASE("duplicate id")
   {
     CHECK_FALSE(namchain::graph::apply_patch(
@@ -186,6 +180,28 @@ TEST_CASE("a patch names what it cannot do instead of doing nothing")
     CHECK_FALSE(namchain::graph::apply_patch(graph, R"({"op":"connect"})", context, error));
     CHECK(error.find("array") != std::string::npos);
   }
+}
+
+TEST_CASE("the bypass op sets and clears the flag")
+{
+  Graph graph = base();
+  PatchContext context;
+  std::string error;
+
+  // `{"op":"bypass","node":"g"}` means enable; an explicit false un-bypasses.
+  REQUIRE_MESSAGE(namchain::graph::apply_patch(graph, R"([{"op":"bypass","node":"g"}])", context, error), error);
+  CHECK(graph.nodes[1].bypass);
+
+  REQUIRE_MESSAGE(
+    namchain::graph::apply_patch(graph, R"([{"op":"bypass","node":"g","bypass":false}])", context, error), error);
+  CHECK_FALSE(graph.nodes[1].bypass);
+
+  CHECK_FALSE(
+    namchain::graph::apply_patch(graph, R"([{"op":"bypass","node":"g","bypass":"yes"}])", context, error));
+  CHECK(error.find("boolean") != std::string::npos);
+
+  CHECK_FALSE(namchain::graph::apply_patch(graph, R"([{"op":"bypass","node":"ghost"}])", context, error));
+  CHECK(error.find("unknown node") != std::string::npos);
 }
 
 TEST_CASE("a failed op list may half-apply its own copy, which is why the caller copies")

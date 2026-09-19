@@ -19,6 +19,13 @@ struct NodeSpec
   /// Params that are not numbers: a model path, for instance. Kept separate so the numeric path
   /// stays a plain map lookup rather than a variant.
   std::map<std::string, std::string> strings;
+  /// \brief The node is bypassed: it still runs -- so its state stays warm and un-bypassing does not
+  /// step on stale state (plan.md G14) -- but its output is replaced by its dry input.
+  ///
+  /// Only a 1->1 node can be bypassed; the compiler rejects anything else, because "the dry path" of
+  /// a fan-out or a mixer is not a single signal. Carried in the IR rather than applied by rewriting
+  /// connections, so un-bypass is one flag and the original graph is never lost.
+  bool bypass = false;
 };
 
 /// `from`'s output port \ref from_port feeds `to`'s input port \ref to_port.

@@ -724,6 +724,15 @@ void Daemon::render_loop()
                    info.format, mono_out_[i]);
     }
 
+    // Outside the RT scope: the guard's counters are read for a report, not needed to render a block,
+    // and the scope is kept to the work that has a deadline. `current_slot_` is the audible plan
+    // (the incoming one once a fade has closed).
+    if (current_slot_ != nullptr)
+    {
+      failed_nodes_.store(static_cast<unsigned>(current_slot_->plan->failed_node_count()));
+      guard_trips_.store(current_slot_->plan->guard_trips());
+    }
+
     if (device_->try_write_playback(playback_buffer_.data(), info.period_size, error) < 0)
     {
       if (!running_.load())
@@ -822,6 +831,8 @@ std::string Daemon::handle_request(const std::string& request)
     status["retired_pending"] = static_cast<std::uint64_t>(reclaimer_.pending());
     status["params_applied"] = params_applied_.load();
     status["params_stale"] = params_stale_.load();
+    status["failed_nodes"] = failed_nodes_.load();
+    status["guard_trips"] = guard_trips_.load();
     // Two honest labels: parameter edits are ramped inside the node (no recompile, no step); a
     // structural reload is dual-rendered and equal-power crossfaded for fade_ms.
     status["param_edits"] = "ramped";

@@ -94,11 +94,11 @@ length prefix to get wrong. A request is:
 | method | request | response |
 |---|---|---|
 | `engine.hello` | `{"protocol": 1}` | `role`, `version`, negotiated `protocol`; a mismatch is `unsupported_protocol` |
-| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale` |
+| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips` |
 | `engine.mute` | `{"mute": true\|false}` | the new state |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `rig.load` | `{"rig": "name.json"}` | compiled and published; returns `rig`, `generation` |
-| `rig.patch` | `{"ops": [...]}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model` | `kind` (`smooth` or `structural`), `applied`, `generation` |
+| `rig.patch` | `{"ops": [...]}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass` | `kind` (`smooth` or `structural`), `applied`, `generation` |
 | `rig.get` | — | the current rig path, generation, `loaded` |
 
 Unknown fields are ignored; an unknown method is `unknown_method`. A malformed message never kills
@@ -122,11 +122,15 @@ skipped freezes the model's state and clicks on unmute (plan.md G14).
   A burst coalesces to the newest: one transition in flight, one pending.
 
 `add_node` takes a node object in the rig's own syntax, parsed by the same parser, so a patched node
-and a declared node mean the same thing. `rewire` repoints one input port. A patch is **all-or-
-nothing**: a rejected op or a graph the compiler will not accept leaves the running plan rendering
-exactly as it was, and `generation` unchanged. `bypass` is refused by name rather than ignored,
-because a client that gets "ok" would believe the node is out of the signal path when it still is.
-The full op list and semantics are in docs/transitions.md.
+and a declared node mean the same thing. `rewire` repoints one input port. `bypass` sets a flag: the
+node **keeps running** so its state stays warm, and its output becomes its dry input — which is why
+un-bypassing does not step (plan.md G14). A patch is **all-or-nothing**: a rejected op or a graph the
+compiler will not accept leaves the running plan rendering exactly as it was, and `generation`
+unchanged. The full op list and semantics are in docs/transitions.md.
+
+Every node's output is scanned for non-finite samples; a node that returns one is taken out of the
+signal path for good and reported as `failed_nodes`/`guard_trips` in `engine.status`. A well-behaved
+rig reports zero — which is the number to check first when audio is not what a patch expected.
 
 ### Rig names and trust
 
@@ -192,13 +196,13 @@ expected.
 Built: the `smooth` op class (a `rig.patch` set_param ramps inside the node, no recompile, no step),
 the offline scripted timeline that measures it (`namchain-render --graph rig.json --timeline
 edits.json`, or `--torture N --seed S`, judged by the glitch detector), the structural dual-render
-crossfade that a `rig.load` or SIGHUP reload takes, and the structural patch protocol
-(`add_node`/`remove_node`/`connect`/`disconnect`/`rewire`/`swap_model` and a non-rampable
-`set_param`). See docs/transitions.md.
+crossfade that a `rig.load` or SIGHUP reload takes, the structural patch protocol
+(`add_node`/`remove_node`/`connect`/`disconnect`/`rewire`/`swap_model`/`bypass` and a non-rampable
+`set_param`), and the per-node non-finite guard. See docs/transitions.md.
 
 Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 
-- no `bypass`/enable and no `nc.bypass` dry path (the op is refused by name);
+- no `tail_hold` for a bypassed node with a tail (no built-in has one yet);
 - no admission control or cost model, so a plan too expensive to dual-render is not rejected before it
   runs, and the fade length is fixed rather than shortened under load;
 - no telemetry subscription and no `scene.*`, `model.*`, `bench.run` methods;

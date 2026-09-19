@@ -389,6 +389,52 @@ TEST_CASE("execution is deterministic and allocation-free")
   CHECK(namchain::rt_deallocation_count() == 0);
 }
 
+TEST_CASE("a bypassed node keeps its place but its output is dry, and the oracle agrees")
+{
+  namchain::rt::Arena arena(1 << 16);
+  Graph g;
+  NodeSpec gain = node("g", "nc.gain");
+  gain.params["gain"] = 0.0; // if bypass did nothing, the output would be silence
+  gain.bypass = true;
+  g.nodes = {node("in", "nc.input"), gain, node("out", "nc.output")};
+  g.connections = {{"in", 0, "g", 0}, {"g", 0, "out", 0}};
+
+  auto plan = compile(g, arena);
+  // The node is not removed from the plan: keeping it there is what keeps its state warm (G14).
+  CHECK(plan->nodes().size() == 3u);
+  CHECK(plan->nodes()[1].bypass);
+
+  namchain::render::CompileOptions options;
+  options.max_quantum = 64;
+  std::string reference_error;
+  auto reference = namchain::graph::ReferenceRender::compile(g, options, reference_error);
+  REQUIRE_MESSAGE(reference != nullptr, reference_error);
+
+  const int frames = 16;
+  std::vector<float> input(static_cast<std::size_t>(frames), 0.6f);
+  std::vector<float> output(static_cast<std::size_t>(frames), 0.0f);
+  std::vector<float> oracle(static_cast<std::size_t>(frames), 0.0f);
+  plan->execute(input.data(), output.data(), frames);
+  reference->execute(input.data(), oracle.data(), frames);
+
+  for (const float value : output)
+    CHECK(value == doctest::Approx(0.6f)); // the dry input, not the 0.0 gain
+  CHECK(output == oracle);
+}
+
+TEST_CASE("only a 1->1 node can be bypassed")
+{
+  Graph g;
+  NodeSpec mix = node("mix", "nc.mix");
+  mix.bypass = true;
+  g.nodes = {node("in", "nc.input"), mix, node("out", "nc.output")};
+  g.connections = {{"in", 0, "mix", 0}, {"mix", 0, "out", 0}};
+
+  const namchain::graph::Validation result = namchain::graph::validate(g);
+  CHECK_FALSE(result.ok);
+  CHECK(result.message.find("cannot be bypassed") != std::string::npos);
+}
+
 // ---------------------------------------------------------------------------
 // nc.nam
 // ---------------------------------------------------------------------------

@@ -216,6 +216,18 @@ void process_mix(void*, const float* const* in, float* const* out, int frames) n
   }
 }
 
+// --- nc.bypass -------------------------------------------------------------
+//
+// A 1->1 pass-through: an explicit dry path a rig can place in the chain. It is *not* how
+// `bypass: true` is implemented -- a bypassed node keeps running and has its output replaced by its
+// input (RenderPlan::execute), because keeping it running is what keeps a stateful node warm for the
+// un-bypass (G14). This type is that same substitution for a node that has no state to keep.
+
+void process_bypass(void*, const float* const* in, float* const* out, int frames) noexcept
+{
+  std::copy(in[0], in[0] + frames, out[0]);
+}
+
 // --- the DSP-backed nodes (nc.nam, nc.cab.ir) ------------------------------
 //
 // Both wrap a vendored-core `nam::DSP` and differ only in how that DSP is produced: a `.nam` file
@@ -729,6 +741,7 @@ const NodeType kSplit{.id = "nc.split", .inputs = 1, .outputs = 2, .process = pr
                       .arity_param = "outputs", .min_ports = 1, .max_ports = 64};
 const NodeType kMix{.id = "nc.mix", .inputs = 2, .outputs = 1, .process = process_mix,
                     .arity_param = "inputs", .min_ports = 1, .max_ports = 64};
+const NodeType kBypass{"nc.bypass", 1, 1, nullptr, nullptr, process_bypass};
 const NodeType kNam{"nc.nam", 1, 1, create_nam, destroy_dsp, process_dsp, describe_dsp};
 const NodeType kCabIr{"nc.cab.ir", 1, 1, create_cab_ir, destroy_dsp, process_dsp, describe_dsp};
 const NodeType kBiquad{"nc.eq.biquad", 1, 1, create_biquad, destroy_biquad, process_biquad};
@@ -744,6 +757,7 @@ const NodeType* find_node_type(const std::string& id)
   if (id == kGain.id) return &kGain;
   if (id == kSplit.id) return &kSplit;
   if (id == kMix.id) return &kMix;
+  if (id == kBypass.id) return &kBypass;
   if (id == kNam.id) return &kNam;
   if (id == kCabIr.id) return &kCabIr;
   if (id == kBiquad.id) return &kBiquad;

@@ -99,6 +99,15 @@ bool parse_graph_json(const std::string& text, Graph& graph, std::string& error)
     NodeSpec spec;
     spec.id = object["id"].get<std::string>();
     spec.type = object["type"].get<std::string>();
+    if (object.contains("bypass"))
+    {
+      if (!object["bypass"].is_boolean())
+      {
+        error = at(where, "'bypass' must be a boolean");
+        return false;
+      }
+      spec.bypass = object["bypass"].get<bool>();
+    }
 
     // Explicit blocks first, so an inline shorthand key can still override one of them.
     for (const char* block : {"params", "strings"})
@@ -135,7 +144,7 @@ bool parse_graph_json(const std::string& text, Graph& graph, std::string& error)
 
     for (const auto& [key, value] : object.items())
     {
-      if (key == "id" || key == "type" || key == "params" || key == "strings")
+      if (key == "id" || key == "type" || key == "params" || key == "strings" || key == "bypass")
         continue;
       if (value.is_number())
         spec.params[key] = value.get<double>();

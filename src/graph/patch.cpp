@@ -243,6 +243,34 @@ bool op_swap_model(Graph& graph, const nlohmann::json& op, const std::string& wh
   return true;
 }
 
+bool op_bypass(Graph& graph, const nlohmann::json& op, const std::string& where, std::string& error)
+{
+  std::string id;
+  if (!node_reference(op, where, id, error))
+    return false;
+  NodeSpec* spec = find_node(graph, id);
+  if (spec == nullptr)
+  {
+    error = where + ": unknown node '" + id + "'";
+    return false;
+  }
+  // `{"op":"bypass","node":"g"}` means enable; an explicit `"bypass": false` un-bypasses. Whether the
+  // node *can* be bypassed is the compiler's check (only a 1->1 node has a dry path), so the flag is
+  // set here and validation refuses an impossible one with the node's name -- one authority, not two.
+  bool bypass = true;
+  if (op.contains("bypass"))
+  {
+    if (!op["bypass"].is_boolean())
+    {
+      error = where + ": 'bypass' must be a boolean";
+      return false;
+    }
+    bypass = op["bypass"].get<bool>();
+  }
+  spec->bypass = bypass;
+  return true;
+}
+
 bool op_set_param(Graph& graph, const nlohmann::json& op, const std::string& where, std::string& error)
 {
   std::string id;
@@ -321,12 +349,7 @@ bool apply_patch(Graph& graph, const std::string& ops_json, const PatchContext& 
     else if (kind == "set_param")
       ok = op_set_param(graph, op, where, reason);
     else if (kind == "bypass")
-    {
-      // Deliberately not a silent no-op: a client that asks to bypass and gets "ok" would believe
-      // the node is out of the signal path when it is still in it.
-      error = where + ": 'bypass' is not implemented yet (it needs an nc.bypass dry path)";
-      return false;
-    }
+      ok = op_bypass(graph, op, where, reason);
     else
     {
       error = where + ": unknown op '" + kind + "'";

@@ -453,13 +453,13 @@ TEST_CASE("rig.patch pushes a ramped set_param and refuses what it cannot apply"
     CHECK(status["status"]["generation"] == 1);
   }
 
-  SUBCASE("bypass is named rather than silently ignored")
+  SUBCASE("bypass takes the structural path, because the plan changes")
   {
-    const auto reply = nlohmann::json::parse(daemon.handle_request(
-      R"({"method":"rig.patch","ops":[{"op":"bypass","node":"g","bypass":true}]})"));
-    CHECK(reply["ok"] == false);
-    CHECK(reply["error"]["code"] == "patch_rejected");
-    CHECK(reply["error"]["message"].get<std::string>().find("not implemented") != std::string::npos);
+    const auto reply = nlohmann::json::parse(
+      daemon.handle_request(R"({"method":"rig.patch","ops":[{"op":"bypass","node":"g"}]})"));
+    REQUIRE(reply["ok"] == true);
+    CHECK(reply["kind"] == "structural");
+    CHECK(reply["generation"] == 2);
   }
 }
 
@@ -649,6 +649,30 @@ TEST_CASE("a structural rig.patch rebuilds the running rig and crossfades into i
   REQUIRE(smooth["ok"] == true);
   CHECK(smooth["kind"] == "smooth");
   CHECK(smooth["generation"] == 2);
+
+  // Bypass is structural: the plan changes, so the render thread crossfades into the new one.
+  const auto bypass = nlohmann::json::parse(call(
+    config.socket_path, R"({"id":"b","method":"rig.patch","ops":[{"op":"bypass","node":"g2"}]})"));
+  REQUIRE(bypass["ok"] == true);
+  CHECK(bypass["kind"] == "structural");
+  CHECK(bypass["generation"] == 3);
+
+  const bool bypassed = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["transition_active"] == false && status["audible_generation"].get<uint64_t>() == 3;
+  });
+  CHECK_MESSAGE(bypassed, "the render thread never finished the bypass transition");
+
+  // The guard reports through status, and a well-behaved rig reports zero.
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  CHECK(status["status"]["failed_nodes"] == 0);
+  CHECK(status["status"]["guard_trips"] == 0);
+
+  // Un-bypass restores the node: another structural change, another generation.
+  const auto restored = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"id":"r","method":"rig.patch","ops":[{"op":"bypass","node":"g2","bypass":false}]})"));
+  REQUIRE(restored["ok"] == true);
+  CHECK(restored["generation"] == 4);
 }
 
 TEST_CASE("the daemon stays up and reports lost when the device cannot be opened")

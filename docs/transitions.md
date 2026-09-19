@@ -1,22 +1,22 @@
 # Transitions: the op classes, the timeline, and the detector
 
-**Status:** the `smooth` op class, its offline harness, the structural dual-render crossfade, and the
-structural patch protocol are built. Bypass/enable is not, warm-start model swapping is not (M3), and
-neither is admission control. This document is the operational half of docs/rig-pipeline.md §4–§5,
-which is the design half. Read that for *why*; read this for *what runs*.
+**Status:** the `smooth` op class, its offline harness, the structural dual-render crossfade, the
+structural patch protocol, bypass and the non-finite guard are built. Warm-start model swapping is not
+(M3), and neither is admission control. This document is the operational half of
+docs/rig-pipeline.md §4–§5, which is the design half. Read that for *why*; read this for *what runs*.
 
 ## The four op classes (plan.md §5.3)
 
 | edit | mechanism | state |
 |---|---|---|
 | Parameter change, `smooth` class | per-sample ramp inside the node's param slot | **built** — `NodeType::set_param`, no recompile, no step |
-| Bypass / enable | equal-power crossfade to/from dry | not built — `bypass` is refused by name, not ignored |
+| Bypass / enable | equal-power crossfade to/from dry | **built** — a `bypass` flag in the IR; the node keeps running and its output is replaced by its dry input |
 | Model swap in `nc.nam` | warm start, then a short crossfade | **partial** — the `swap_model` op rebuilds the node and crossfades; warm start is M3, so it is not yet state-accurate |
 | Rewire / add / remove / scene recall | dual-render old and new plan, equal-power crossfade, retire | **built** — `graph::apply_patch` builds the modified graph, `rt::Crossfade` carries it |
 
 `engine.status` says which is which: `"param_edits": "ramped"`, `"structural_transitions":
 "crossfade"`, plus `transition_active`, `audible_generation` and `target_generation` while a fade is
-in flight.
+in flight, and `failed_nodes`/`guard_trips` from the non-finite guard.
 
 ## The patch protocol
 
@@ -33,7 +33,7 @@ leaves the running plan rendering exactly as it was.
 | `rewire` | repoints one input port: the existing driver is removed and the named output drives it |
 | `swap_model` | writes `model`/`ir` on a model node and rebuilds it (crossfaded, not warm-started) |
 | `set_param` | routed: see below |
-| `bypass` | refused with a reason until the dry path exists |
+| `bypass` | sets a flag in the IR; the node keeps running and its output becomes its dry input |
 
 **The router is the op class.** If *every* op is a `set_param` that the live plan's vtable can
 dispatch (`RenderPlan::resolve_param`), the whole patch is the smooth class: one POD record per op on
@@ -46,6 +46,44 @@ Param *names* on the structural path are not validated beyond the node's own bui
 a rig, a numeric param no node uses is accepted and has no effect. Rejecting it needs the per-node
 parameter schema that plan.md §6.1's `params_schema_json` promises; until then the smooth router is
 the only place a name is checked.
+
+## Bypass
+
+`NodeSpec::bypass` is a flag in the IR, not a connection rewrite, so un-bypass is one flag and the
+original graph is never lost. A bypassed node **keeps running** — the compiler still creates it and
+calls its `process` — and its output is then replaced by its dry input
+(`graph::substitute_dry`). That is the whole design, and it is what keeps the node's state warm:
+
+- Removing the node from the plan instead would be simpler, and would freeze its state. A NAM model
+  un-bypassed after a minute of silence would then start from a stale history — plan.md G14's "skipping
+  inference freezes state and glitches on unmute".
+- A node with several inputs has no single dry signal, so only a 1→1 node can be bypassed; the compiler
+  refuses the rest by name rather than guessing a port.
+- The equal-power part of "crossfade to/from dry" is the *structural transition* above, not a second
+  crossfade inside the node: bypass changes the plan, the render thread dual-renders and crossfades.
+- The plan also asks a tail node to keep ringing through a bypass (`tail_hold`). No built-in has a tail
+  yet, and the flag has no tail state, so that is deferred to the reverb/tail work.
+
+`nc.bypass` also exists as an ordinary 1→1 pass-through node, for a rig that wants an explicit dry
+path. It is not how `bypass: true` is implemented.
+
+## The non-finite guard
+
+Every node's output is scanned for non-finite samples after it runs. One compare per sample, against
+buffers the node has just written and so are hot in cache. A node that returns NaN or infinity is
+**taken out of the signal path for the rest of the plan's life** and reported
+(`failed_node_count()`, `guard_trips()`, surfaced as `engine.status`'s `failed_nodes` and
+`guard_trips`), and its output is replaced by its dry input.
+
+The plan says "always on for third-party nodes"; it is on for every node, because the scan is cheap
+relative to the work that produced the samples and a NaN that reaches the device is not a degradation
+the never-silence guarantee covers. A failed node is not run again — a deliberate exception to G14's
+"keep it running", because a node whose output cannot be trusted is not a node whose state is worth
+keeping warm.
+
+The oracle deliberately does **not** mirror the guard. It mirrors bypass (that is a different graph),
+but a node returning NaN is a runtime fault rather than a different graph to compare against, so an
+oracle comparison that fails because a node failed is telling the truth.
 
 ## The structural transition
 
@@ -175,12 +213,12 @@ full 60 s / 500-edit torture becomes a routine run.
 
 ## What is next
 
-1. **Bypass/enable** and an `nc.bypass` dry path, plus the per-node non-finite guard. `bypass` is
-   currently refused by name rather than ignored, because a client that gets "ok" would believe the
-   node is out of the signal path when it is still in it.
-2. **Admission control and the deferred-commit scheduler** (§5.3, §5.4): `worst_case_block`, the 70 %
+1. **Admission control and the deferred-commit scheduler** (§5.3, §5.4): `worst_case_block`, the 70 %
    budget, shorten-fade -> drop-warming -> slim -> reject-with-reason. The cost model it needs does
-   not exist yet. Today the fade is fixed and an expensive dual-render is admitted.
+   not exist yet. Today the fade is fixed and an expensive dual-render is admitted — including a
+   bypassed node, which deliberately keeps costing CPU to stay warm.
+2. The **tail path**: a `tail_hold` for a bypassed node with a tail, which needs the first tail node
+   (reverb, M5) to have anything to hold.
 3. A **structural op in the timeline**, so the offline harness can drive a plan change and the
    detector can judge it per edit. Today the transition is measured by `tests/test_crossfade.cpp`
    with two compiled plans and the same primitive; the timeline knows only `set_param`.

@@ -121,6 +121,10 @@ std::unique_ptr<ReferenceRender> ReferenceRender::compile(const Graph& graph, co
 
     PlanNode plan_node;
     plan_node.type = type;
+    // The oracle mirrors the plan's bypass: the node runs and its output is replaced by its input.
+    // It does *not* mirror the non-finite guard, deliberately: the oracle is the ideal graph, and a
+    // node that returns NaN is a runtime fault, not a different graph to compare against.
+    plan_node.bypass = spec.bypass;
     plan_node.state = type->create == nullptr ? nullptr : type->create(spec, options, error);
     if (type->create != nullptr && plan_node.state == nullptr)
       return nullptr; // create() set `error`
@@ -178,7 +182,11 @@ void ReferenceRender::execute(const float* input, float* output, int frames) noe
   }
 
   for (PlanNode& node : nodes_)
+  {
     node.type->process(node.state, node.inputs.data(), node.outputs.data(), frames);
+    if (node.bypass)
+      substitute_dry(node, frames);
+  }
 
   if (output_value_ >= 0 && output != nullptr)
   {

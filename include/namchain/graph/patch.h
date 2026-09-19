@@ -37,6 +37,7 @@ struct PatchContext
 ///   {"op":"rewire","from":"g2","to":"out","to_port":0}  // repoint that input port
 ///   {"op":"swap_model","node":"amp","model":"other.nam"}
 ///   {"op":"set_param","node":"g","param":"gain","value":0.5}
+///   {"op":"bypass","node":"g","bypass":true}           // omit "bypass" to enable
 ///
 /// The graph is modified in place and **may be left half-applied** if this returns false: callers
 /// that need all-or-nothing apply it to a copy (the daemon does), which is why the mutation is kept

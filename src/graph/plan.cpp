@@ -74,8 +74,37 @@ Validation Validation::failure(std::string reason)
   return result;
 }
 
+void substitute_dry(PlanNode& node, int frames) noexcept
+{
+  // The input terminator means "at least one real input" is `size() > 1`, and inputs[0] is bound to
+  // the silence buffer rather than left null for an unconnected port -- so a dry copy is always
+  // reading valid memory.
+  const bool has_input = node.inputs.size() > 1 && node.inputs[0] != nullptr;
+  for (std::size_t port = 0; port + 1 < node.outputs.size(); ++port)
+  {
+    if (has_input)
+      std::copy(node.inputs[0], node.inputs[0] + frames, node.outputs[port]);
+    else
+      std::fill(node.outputs[port], node.outputs[port] + frames, 0.0f);
+  }
+}
+
 namespace
 {
+
+/// All of a node's outputs finite? The non-finite guard's scan: one compare per sample, on buffers
+/// the node has just written and which are therefore hot in cache.
+bool outputs_finite(const PlanNode& node, int frames) noexcept
+{
+  for (std::size_t port = 0; port + 1 < node.outputs.size(); ++port)
+  {
+    const float* out = node.outputs[port];
+    for (int i = 0; i < frames; ++i)
+      if (!std::isfinite(out[i]))
+        return false;
+  }
+  return true;
+}
 
 /// Every node's resolved type and port counts, keyed by id, plus its position in `graph.nodes`.
 ///
@@ -112,6 +141,15 @@ Indexed index_graph(const Graph& graph, Validation& validation)
     if (type == nullptr)
     {
       validation = Validation::failure("unknown node type '" + node.type + "' on node '" + node.id + "'");
+      return indexed;
+    }
+    // A bypass replaces the node's output with its input, which is only a signal for a 1->1 node: a
+    // fan-out has several outputs and a mixer several inputs, and picking one would be a guess. The
+    // check is here because this is the one place every pass gets its types from.
+    if (node.bypass && (type->inputs != 1 || type->outputs != 1))
+    {
+      validation = Validation::failure("node '" + node.id + "' (" + type->id +
+                                       ") cannot be bypassed: only 1->1 nodes have a dry path");
       return indexed;
     }
     render::PortCounts ports;
@@ -405,6 +443,9 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
 
   auto plan = std::unique_ptr<RenderPlan>(new RenderPlan());
   plan->max_quantum_ = max_quantum;
+  plan->failed_ = std::vector<std::atomic<bool>>(graph.nodes.size());
+  for (std::atomic<bool>& flag : plan->failed_)
+    flag.store(false, std::memory_order_relaxed);
   plan->buffers_.reserve(static_cast<std::size_t>(total_buffers));
   for (int i = 0; i < total_buffers; ++i)
   {
@@ -425,6 +466,9 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
 
     PlanNode plan_node;
     plan_node.type = type;
+    // Bypass runs the node and replaces its output (see execute), so `create` still runs: the node's
+    // state must stay warm for the un-bypass.
+    plan_node.bypass = spec.bypass;
     // A null `create` means the type carries no state at all (nc.input, nc.split, ...). Using the
     // vtable rather than a list of ids keeps this honest as node types are added: a type that does
     // have a constructor and fails to allocate is an error, and cannot be mistaken for a marker.
@@ -500,6 +544,15 @@ const std::vector<int>& RenderPlan::output_buffer_of(std::size_t node_index) con
   return node_index < output_buffers_.size() ? output_buffers_[node_index] : empty;
 }
 
+std::size_t RenderPlan::failed_node_count() const noexcept
+{
+  std::size_t count = 0;
+  for (const std::atomic<bool>& flag : failed_)
+    if (flag.load(std::memory_order_relaxed))
+      ++count;
+  return count;
+}
+
 void RenderPlan::execute(const float* input, float* output, int frames) noexcept
 {
   // Contract: frames <= max_quantum(), which is what every node was created for.
@@ -514,8 +567,36 @@ void RenderPlan::execute(const float* input, float* output, int frames) noexcept
       node.type->set_block_input(node.state, input);
   }
 
-  for (PlanNode& node : nodes_)
+  for (std::size_t i = 0; i < nodes_.size(); ++i)
+  {
+    PlanNode& node = nodes_[i];
+    // A node the guard has already failed is not run again: its output is dry for the rest of the
+    // plan's life, and re-running it would only re-produce the fault. This is a deliberate exception
+    // to G14's "keep it running": a node whose output cannot be trusted is not a node whose state is
+    // worth keeping warm.
+    if (failed_[i].load(std::memory_order_relaxed))
+    {
+      substitute_dry(node, frames);
+      continue;
+    }
+
     node.type->process(node.state, node.inputs.data(), node.outputs.data(), frames);
+
+    // The guard is on for every node, not only third-party ones: one compare per sample against
+    // buffers the node has just written, on top of the work that produced them. A node that returns
+    // a non-finite sample is out of the signal path for good and reported; the alternative is
+    // NaN propagating into every consumer and out of the device.
+    if (!outputs_finite(node, frames))
+    {
+      failed_[i].store(true, std::memory_order_relaxed);
+      guard_trips_.fetch_add(1, std::memory_order_relaxed);
+      substitute_dry(node, frames);
+      continue;
+    }
+
+    if (node.bypass)
+      substitute_dry(node, frames);
+  }
 
   if (output_buffer_ >= 0 && output != nullptr)
     std::copy(buffers_[static_cast<std::size_t>(output_buffer_)],

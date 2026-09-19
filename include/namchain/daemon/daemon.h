@@ -221,6 +221,9 @@ private:
   /// plan they named had already been superseded.
   std::atomic<uint64_t> params_applied_{0};
   std::atomic<uint64_t> params_stale_{0};
+  /// The audible plan's non-finite guard: nodes it has failed, and how many times it tripped.
+  std::atomic<unsigned> failed_nodes_{0};
+  std::atomic<uint64_t> guard_trips_{0};
   std::atomic<unsigned> active_rate_{0};
   std::atomic<unsigned> active_period_{0};
   std::atomic<unsigned> active_capture_channels_{0};

@@ -30,10 +30,12 @@ Graph chain_graph(const std::string& model_path, unsigned instances);
 /// }
 /// \endcode
 ///
-/// `id` and `type` are reserved; every other key of a node object is a parameter. A number or a
-/// boolean becomes a numeric param, a string becomes a string param -- so a model path does not
-/// need a separate block. Explicit `"params"`/`"strings"` objects are also accepted for the cases
-/// where the distinction matters. `from_port`/`to_port` default to 0.
+/// `id`, `type` and `bypass` are reserved; every other key of a node object is a parameter. A number
+/// or a boolean becomes a numeric param, a string becomes a string param -- so a model path does not
+/// need a separate block. `bypass` is a boolean property of the node (it keeps running with its dry
+/// input substituted), not a parameter, so it does not land in the param map. Explicit
+/// `"params"`/`"strings"` objects are also accepted for the cases where the distinction matters.
+/// `from_port`/`to_port` default to 0.
 bool parse_graph_json(const std::string& text, Graph& graph, std::string& error);
 
 /// \brief Load a rig from a file. \see parse_graph_json

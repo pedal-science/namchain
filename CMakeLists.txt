@@ -267,6 +267,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_rt_primitives.cpp
     tests/test_graph.cpp
     tests/test_patch.cpp
+    tests/test_guard.cpp
     tests/test_nodes.cpp
     tests/test_rig.cpp
     tests/test_latency.cpp

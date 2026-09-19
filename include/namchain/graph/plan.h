@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -123,7 +124,22 @@ struct PlanNode
   void* state = nullptr;
   std::vector<const float*> inputs;
   std::vector<float*> outputs;
+  /// \brief The node is bypassed: it still runs, but its output is replaced by its dry input.
+  ///
+  /// Set from `NodeSpec::bypass` at compile time and read-only on the render path. The node is *not*
+  /// removed from the plan -- keeping it there is what keeps its state warm (plan.md G14), and it is
+  /// what makes un-bypassing a crossfade back to a node that never stopped running.
+  bool bypass = false;
 };
+
+/// \brief Overwrite a node's outputs with its dry input, or with silence when it has none.
+///
+/// The substitution behind both bypass and the non-finite guard. A node with one input takes that
+/// input as its dry path; a node with several cannot name one dry signal, so it is zeroed -- the
+/// honest answer for a node whose output cannot be trusted. Nodes with no output ports are untouched.
+///
+/// Render path: no allocation, no lock.
+void substitute_dry(PlanNode& node, int frames) noexcept;
 
 /// \brief An immutable, fully allocated render plan.
 ///
@@ -183,6 +199,15 @@ public:
   std::size_t buffer_bytes() const noexcept;
   const std::vector<PlanNode>& nodes() const noexcept { return nodes_; }
 
+  /// \brief Nodes the non-finite guard has taken out of the signal path.
+  ///
+  /// Control thread (or a report); the render thread flips the flags. A failed node's output is its
+  /// dry input for the rest of the plan's life.
+  std::size_t failed_node_count() const noexcept;
+  /// How many times the guard tripped. Counted separately from \ref failed_node_count because a
+  /// second trip on an already-failed node is not a second failure.
+  uint64_t guard_trips() const noexcept { return guard_trips_.load(std::memory_order_relaxed); }
+
   /// Debug/inspection: the buffer index each node output was coloured onto.
   const std::vector<int>& output_buffer_of(std::size_t node_index) const;
 
@@ -192,6 +217,11 @@ private:
   std::vector<PlanNode> nodes_;    // topological order
   std::vector<std::string> node_ids_; // parallel to nodes_, for id -> index resolution
   std::vector<float*> buffers_;    // all from the arena
+  /// Per node, whether the non-finite guard has failed it. Written by the render thread, read for a
+  /// report; an atomic per node rather than a `PlanNode` field because `PlanNode` lives in a vector
+  /// and `std::atomic` is not movable.
+  std::vector<std::atomic<bool>> failed_;
+  std::atomic<uint64_t> guard_trips_{0};
   int input_node_ = -1;            // index in nodes_ whose block input is sampled from the graph
   int output_buffer_ = -1;         // buffer the graph output is read from
   int max_quantum_ = 0;
