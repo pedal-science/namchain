@@ -368,3 +368,32 @@ TEST_CASE("schema bounds, options, required parameters and one_of groups are enf
     CHECK(error.find("freq") != std::string::npos);
   }
 }
+
+TEST_CASE("a node type wider than the audio path is refused by name")
+{
+  // Every built-in is mono, so this is the guard rather than a case in the field: declared and refused
+  // is a promise about the day a stereo node appears, and a promise with no test is a comment
+  // (docs/ui-integration-plan.md §1.4).
+  namchain::render::NodeType stereo;
+  stereo.id = "test.stereo";
+  stereo.inputs = 1;
+  stereo.outputs = 1;
+  stereo.channels = 2;
+
+  namchain::render::PortCounts ports;
+  std::string error;
+  const NodeSpec spec = [] {
+    NodeSpec node;
+    node.id = "n";
+    node.type = "test.stereo";
+    return node;
+  }();
+  CHECK_FALSE(namchain::render::resolve_ports(stereo, spec, ports, error));
+  CHECK(error.find("stereo") != std::string::npos);
+  CHECK(error.find("mono") != std::string::npos);
+
+  // And the same type at one channel resolves, so the guard is about the width rather than the type.
+  stereo.channels = 1;
+  CHECK(namchain::render::resolve_ports(stereo, spec, ports, error));
+  CHECK(ports.channels == 1);
+}

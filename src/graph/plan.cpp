@@ -19,6 +19,20 @@ bool resolve_ports(const NodeType& type, const graph::NodeSpec& spec, PortCounts
 {
   ports.inputs = type.inputs;
   ports.outputs = type.outputs;
+  ports.channels = type.channels;
+
+  // Declared and refused (docs/ui-integration-plan.md §1.4). Every built-in is mono today, so this is
+  // unreachable -- which is the point of writing it now rather than on the day the first stereo node
+  // appears: the error already exists, it says what the audio path cannot carry, and the schema
+  // already publishes the number a client sees.
+  if (type.channels != 1)
+  {
+    error = "node type '" + type.id + "' declares " + std::to_string(type.channels) +
+            " channels per port; the engine's audio path is mono, and multichannel ports arrive with "
+            "the multichannel work";
+    return false;
+  }
+
   if (type.arity_param == nullptr)
     return true;
 
