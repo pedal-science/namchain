@@ -194,16 +194,13 @@ enclosure and gives up the isolation. Rejected for the first build.
 
 ## What not to assume
 
-- This is **not** a Raspberry Pi. Pi-specific overlays, `config.txt` entries and
-  HAT conventions do not apply.
-- This is **not** aarch64. Anything assuming 64-bit ARM needs checking.
-- The codec board is **not** stock — AVDD-ISO is cut, and the input shunt caps may
-  have been changed.
+- `tib` is **not** a Raspberry Pi. Pi-specific overlays, `config.txt` entries and HAT conventions do not apply.
+- `tib` is **not** aarch64. Anything assuming 64-bit ARM needs checking.
+- The codec board is **not** stock — AVDD-ISO is cut, and the input shunt caps may have been changed.
 
 ---
 
 ## References
 
-- Block diagram: `docs/diagrams/` (draw.io source, two-layer: blocks and connections,
-  with non-component junction squares on the connection layer)
-- SparkFun WM8960 Audio Codec Breakout schematic v1.0
+- Block diagram: `docs/diagrams/nam-pedal-block-diagram.drawio` (draw.io source, two-layer: blocks and connections, with non-component junction squares on the connection layer - formatted according to preference. Don't break the formatting. If the diagram is confusing, try rendering an image and reading that, and/or ask the user.)
+- SparkFun WM8960 Audio Codec Breakout schematic v1.0: `../../third_party/Sf0f3f866da8b43c08a0386312b0891a1B.pdf`
