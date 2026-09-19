@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "namchain/graph/rig.h"
+
 namespace namchain
 {
 namespace render
@@ -295,6 +297,33 @@ Validation validate(const Graph& graph)
     return Validation::failure("graph contains a cycle");
 
   return validation;
+}
+
+Validation validate(const Document& document)
+{
+  if (document.chains.empty())
+    return Validation::failure("a document needs at least one chain");
+
+  std::map<std::string, bool> seen;
+  for (const Chain& chain : document.chains)
+  {
+    // The chain is named in every failure below, because "a chain needs exactly one nc.input" is not
+    // something a client with two chains can act on (docs/ui-integration-plan.md §1.1).
+    if (chain.id.empty())
+      return Validation::failure("a chain has no id");
+    const std::string where = "chain '" + chain.id + "'";
+    if (!seen.emplace(chain.id, true).second)
+      return Validation::failure("two chains share the id '" + chain.id + "'");
+    if (chain.input_channel < 0)
+      return Validation::failure(where + " has a negative input_channel");
+    if (chain.output_channel < 0)
+      return Validation::failure(where + " has a negative output_channel");
+
+    const Validation inner = validate(chain.graph);
+    if (!inner.ok)
+      return Validation::failure(where + ": " + inner.message);
+  }
+  return Validation{};
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "namchain/graph/graph.h"
 
@@ -16,30 +17,95 @@ namespace graph
 /// all exercise the same compiler and the same render plan.
 Graph chain_graph(const std::string& model_path, unsigned instances);
 
-/// \brief Parse a rig from JSON text.
+/// \brief One signal path: a graph, plus what the device and the document know about it.
+///
+/// A chain is compiled into one plan. Two chains are two plans, rendered independently, which is how
+/// a guitar and a vocal path live in one rig (docs/ui-integration-plan.md §1.1).
+struct Chain
+{
+  /// Client-owned, opaque, unique within the document. Never parsed.
+  std::string id;
+  /// Free text, for a client's own display.
+  std::string name;
+  /// Which captured device channel this chain reads. Two chains may read the same one.
+  int input_channel = 0;
+  /// Which playback channel it writes. Two chains writing the same one are summed.
+  int output_channel = 0;
+  Graph graph;
+};
+
+/// \brief A whole document: zero or more chains, and nothing the engine needs beyond them.
+///
+/// The name is free text; there is no other rig-level metadata in the IR, because everything else a
+/// client stores (layout, timestamps, presentation) is the client's business and `rig.get` is a
+/// diagnostic rather than a document store.
+struct Document
+{
+  std::string name;
+  std::vector<Chain> chains;
+};
+
+/// \brief Parse a document from JSON text.
 ///
 /// Schema:
 /// \code
 /// {
-///   "nodes": [
-///     { "id": "in",  "type": "nc.input" },
-///     { "id": "amp", "type": "nc.nam", "model": "amp.nam" },
-///     { "id": "out", "type": "nc.output" }
-///   ],
-///   "connections": [ { "from": "in", "to": "amp" }, { "from": "amp", "to": "out" } ]
+///   "name": "Guitar + Vocal",
+///   "chains": [
+///     { "id": "gtr", "name": "Guitar", "input_channel": 0, "output_channel": 0,
+///       "nodes": [ { "id": "in", "type": "nc.input" }, ... ],
+///       "connections": [ { "from": "in", "to": "amp" }, ... ] }
+///   ]
 /// }
 /// \endcode
 ///
-/// `id`, `type` and `bypass` are reserved; every other key of a node object is a parameter. A number
-/// or a boolean becomes a numeric param, a string becomes a string param -- so a model path does not
-/// need a separate block. `bypass` is a boolean property of the node (it keeps running with its dry
-/// input substituted), not a parameter, so it does not land in the param map. Explicit
-/// `"params"`/`"strings"` objects are also accepted for the cases where the distinction matters.
-/// `from_port`/`to_port` default to 0.
+/// A document that is a bare graph -- top-level `nodes`/`connections`, no `chains` -- is one chain
+/// with id `"main"` on channels 0 and 0. Everything committed before documents existed is in that
+/// shape, so this is the compatibility rule rather than a special case.
+///
+/// A node's `id`, `type` and `bypass` are reserved, as are `element` and `role`; every other key of a
+/// node object is a parameter. A number or a boolean becomes a numeric param, a string becomes a
+/// string param -- so a model path does not need a separate block. `bypass` is a boolean property of
+/// the node (it keeps running with its dry input substituted), not a parameter, so it does not land
+/// in the param map. Explicit `"params"`/`"strings"` objects are also accepted for the cases where
+/// the distinction matters. `from_port`/`to_port` default to 0.
+///
+/// \par Identity
+/// `element` is the client's own name for the thing this node belongs to (a block, a lane, a
+/// parallel section). It is stored and returned verbatim and never interpreted; see
+/// \ref NodeSpec::element. `role` says which node of that element this is.
+///
+/// A node's `id` may be **omitted** when it has an `element`: the engine then mints one from the
+/// element and the role (`"<element>"`, or `"<element>/<role>"`), disambiguating with `~2`, `~3` ...
+/// if that name is taken. Because the id is minted rather than composed by the client, nothing needs
+/// a reserved character or a forbidden spelling in a client's own names.
+///
+/// The rule of thumb is that **minting is for a node the client does not have to name**: a node whose
+/// connections the client also writes needs an explicit `id`, because a connection names nodes. That
+/// covers the two cases that matter -- a macro, which the engine lowers into primitives and wires
+/// itself, and a document whose author addresses nodes by `element` and `role`. A node with neither
+/// an `id` nor an `element` is an error: there would be nothing to call it.
+bool parse_document_json(const std::string& text, Document& document, std::string& error);
+
+/// \brief Load a document from a file. \see parse_document_json
+bool load_document_json(const std::string& path, Document& document, std::string& error);
+
+/// \brief Parse a single-chain rig: a document that must hold exactly one chain.
+///
+/// The long-standing entry point, kept because most callers -- the offline tools, the patch ops, the
+/// tests -- have no interest in chains. It accepts both the bare-graph shape and an envelope with one
+/// chain, and rejects an envelope with more with a message that says how many it found.
 bool parse_graph_json(const std::string& text, Graph& graph, std::string& error);
 
-/// \brief Load a rig from a file. \see parse_graph_json
+/// \brief Load a single-chain rig from a file. \see parse_graph_json
 bool load_graph_json(const std::string& path, Graph& graph, std::string& error);
+
+/// \brief Structural checks over a whole document, with the chain named in any failure.
+///
+/// One chain, one plan: the per-chain checks are \ref validate(const Graph&) unchanged, and this adds
+/// only what is a property of the document -- that there is at least one chain, that chain ids are
+/// present and unique, that the channel numbers are not negative.
+Validation validate(const Document& document);
 
 } // namespace graph
 } // namespace namchain

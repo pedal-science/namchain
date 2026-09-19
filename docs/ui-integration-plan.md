@@ -1,8 +1,11 @@
 # UI integration plan: the namchain changes ljoss needs
 
-**Status:** plan, not started. Follows `docs/ljoss-comparison.md` (the analysis) and the seven
-decisions recorded below. Slices are ordered by dependency, not by appeal; each is independently
-committable and independently testable, and none of them requires the app to exist first.
+**Status:** in progress. **A1 landed** — the document envelope (a name and N chains with ids and
+device channels), three-space node identity (`element`/`role`/`id`), chain-named validation, and
+`tests/test_document.cpp`. A2 (per-chain plans, generations, channel binding) is next. Follows
+`docs/ljoss-comparison.md` (the analysis) and the seven decisions recorded below. Slices are ordered
+by dependency, not by appeal; each is independently committable and independently testable, and none
+of them requires the app to exist first.
 
 ---
 
@@ -341,7 +344,7 @@ what it is running.
 
 | Commit | Contents |
 |---|---|
-| **A1** | IR: `NodeSpec.element` / `NodeSpec.role`, optional `id`, reserved-key list; `Graph` unchanged. Parser: chain envelope with single-graph back-compat. `graph::validate` gains chain context in messages |
+| **A1** ✅ | IR: `NodeSpec.element` / `NodeSpec.role`, optional `id`, reserved-key list; `Graph` unchanged. Parser: chain envelope with single-graph back-compat. `graph::validate` gains chain context in messages |
 | **A2** | Compiler/daemon: per-chain plan slots, per-chain generation, adoption and transition, staggered multi-chain transitions, channel binding and summing, per-chain mute + global mute/panic, `nc.output` level/mute params |
 | **A3** | Protocol 2: `engine.hello` (version + `features`), `rig.apply` (whole document, in memory), `rig.get` (document + per-chain status, optional lowered view), `engine.status.chains`; `chain` on patch ops; docs (`docs/daemon.md`, `docs/rig-pipeline.md`, `plan.md`) |
 

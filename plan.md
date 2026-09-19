@@ -468,6 +468,15 @@ license position for less code. Real round-trip latency comparisons decide the d
   resampler) are supported by inserting compensating delays on parallel paths at compile time (PDC),
   so crossfades stay phase-aligned (G21).
 
+**Built so far (2026-09-19, slice A1 of docs/ui-integration-plan.md):** the document half of the
+chain model — a rig spec may name several chains, each with a client-owned id, an input and output
+device channel, and its own graph — plus the identity model that goes with it: `element` is the
+client's name for a block and is stored and returned verbatim, `role` says which node of it a node
+is, and `id` is minted by the engine when a client does not write one. The parser, the document-level
+validation (with the chain named in any failure) and the tests are in. Per-chain plans, per-chain
+generations, channel binding and the protocol that reads a document back are A2 and A3; a chain's
+`input_channel`/`output_channel` are parsed and validated today but not yet bound to the device.
+
 ### 5.2 Compile pipeline (control thread)
 
 `JSON rig` → parse/validate → IR → lint (cycles, arity, param ranges, missing models) → **lower**
@@ -491,15 +500,20 @@ ports, determinism, zero allocations inside an `RtScope`, and `nc.nam` producing
 running the model directly.
 
 **Rigs are JSON** (`src/graph/rig.cpp`, §5.1's `Graph` IR): `{"nodes": [...], "connections": [...]}`,
-where a node's `id` and `type` are reserved and every other key is a parameter — a number or boolean
-becomes a numeric param, a string becomes a string param, so `"model": "amp.nam"` needs no wrapper.
-Explicit `"params"`/`"strings"` objects are also accepted. A structured value (an array) is rejected
-rather than dropped, because dropping it would compile and run while quietly ignoring what the rig
-author meant. Relative paths in string params resolve against the rig's own directory first, so an
-example rig copied next to its models needs no editing (the committed `rigs/*.json` are copied into
-the generated-fixture directory by CMake for exactly this reason). `chain_graph(model, n)` builds the
-`nc.input → n × nc.nam → nc.output` chain that `--model --instances N` means, so the CLI, the offline
-renders and the unit tests all go through the same compiler rather than each having its own loop.
+where a node's `id`, `type`, `bypass`, `element` and `role` are reserved and every other key is a
+parameter — a number or boolean becomes a numeric param, a string becomes a string param, so
+`"model": "amp.nam"` needs no wrapper. Explicit `"params"`/`"strings"` objects are also accepted. A
+document may carry several chains (`{"name": …, "chains": [{"id", "input_channel", "output_channel",
+"nodes", "connections"}]}`), and a bare `{"nodes", "connections"}` is one chain called `"main"`; a
+node's `element` is the client's opaque name for the block it belongs to, kept verbatim, and the
+engine mints the node's `id` if the client does not supply one (docs/rig-pipeline.md §2). A
+structured value (an array) is rejected rather than dropped, because dropping it would compile and
+run while quietly ignoring what the rig author meant. Relative paths in string params resolve against
+the rig's own directory first, so an example rig copied next to its models needs no editing (the
+committed `rigs/*.json` are copied into the generated-fixture directory by CMake for exactly this
+reason). `chain_graph(model, n)` builds the `nc.input → n × nc.nam → nc.output` chain that
+`--model --instances N` means, so the CLI, the offline renders and the unit tests all go through the
+same compiler rather than each having its own loop.
 
 **Feedback is a schedule property, not a node's memory** (`nc.unit_delay`, marked `block_delay` in its
 vtable). §5.1 wants cycles to be a compile error, which leaves the question of how a feedback loop is

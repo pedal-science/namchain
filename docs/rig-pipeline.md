@@ -15,19 +15,31 @@ The audio-side command ring is drained at the top of each block and carries plan
 parameter dispatches. The last section says exactly which is which, so nothing here is mistaken for
 running code.
 
-**Names.** Three stages, three words, because using one word for all of them is how a conversation
+Since docs/ui-integration-plan.md was agreed, the **document** layer has begun to land ahead of the
+engine half: a rig spec may hold a name and several **chains**, each with a client-owned id, two
+device channels and its own graph, and node identity is three separate things (`element`, `role`,
+`id`) with the engine minting the id when a client does not want to write one. The parser and
+`validate(Document)` are done and tested; per-chain plans, per-chain generations and channel binding
+are slice A2, and the protocol that reads a document back is A3.
+
+**Names.** Four stages, four words, because using one word for all of them is how a conversation
 about latency ends up talking about the wrong thing:
 
 | | what it is | where it lives |
 |---|---|---|
 | **rig spec** | the JSON document, on disk or on the wire | `rigs/*.json`, the `rig.load` request body |
-| **`Graph`** | the parsed, validated in-memory IR | `include/namchain/graph/graph.h` |
+| **`Document`** | the parsed envelope: a name and one or more `Chain`s, each with its channels and a `Graph` | `include/namchain/graph/rig.h` |
+| **`Graph`** | the parsed, validated in-memory IR — one chain's nodes and connections | `include/namchain/graph/graph.h` |
 | **`RenderPlan`** | the compiled, immutable execution artifact | `include/namchain/graph/plan.h` |
 
-One wrinkle worth knowing: plan §5.1 reserves "Rig" for a future *superset* — a set of chains plus
-scenes — whereas today one rig spec is one graph is exactly one chain (enforced: exactly one
-`nc.input` and one `nc.output`, `src/graph/plan.cpp`). Calling the document a **rig spec** sidesteps
-that collision; "Rig" can then mean the superset without ambiguity.
+One wrinkle worth knowing: plan §5.1 reserves "Rig" for a superset — a set of chains plus scenes —
+and docs/ui-integration-plan.md is building its first half. What exists today is the **document**:
+the parser understands a name and N chains, each with its own id, channels and graph, and
+`validate(Document)` checks the document-level rules and names the chain in any failure. What does
+*not* exist yet is the engine half: the compiler still takes one `Graph`, the daemon still holds one
+plan slot, and a chain's `input_channel`/`output_channel` are parsed and validated but not yet bound
+to device channels (that is slice A2 of the plan). Calling the document a **rig spec** sidesteps the
+collision between the two meanings of "Rig" while that lands.
 
 ---
 
@@ -39,25 +51,64 @@ resolves against the **rig spec's own directory** first, so an example rig copie
 needs no editing. The committed `rigs/*.json` are copied into the generated-fixture directory in CI
 for exactly this reason.
 
-`load_graph_json(path, Graph&, error)` in `include/namchain/graph/rig.h`.
+`load_document_json(path, Document&, error)` in `include/namchain/graph/rig.h`, and
+`load_graph_json(path, Graph&, error)` for the single-chain callers that are most of them.
 
 ## 2. Parse a rig spec
 
+A rig spec is a **document**: a name, and one or more **chains**, each chain a graph plus the two
+device channels it reads and writes and an id the client owns.
+
+```json
+{
+  "name": "Guitar + Vocal",
+  "chains": [
+    { "id": "gtr", "name": "Guitar", "input_channel": 0, "output_channel": 0,
+      "nodes": [ … ], "connections": [ … ] }
+  ]
+}
+```
+
+A document that is a **bare graph** — top-level `nodes`/`connections` and no `chains` — is one chain
+with id `"main"` on channels 0 and 0. That is a compatibility rule rather than a special case: every
+rig committed before chains existed is in that shape, and `parse_graph_json` (which most callers,
+including the offline tools and the patch ops, still use) accepts either shape and insists on exactly
+one chain.
+
 Text to `Graph`: nodes `{id, type, params}` and connections `{from, from_port, to, to_port}`, where
-`id` and `type` are reserved and every other key is a parameter — a number or boolean becomes a
-numeric param, a string becomes a string param, so `"model": "amp.nam"` needs no wrapper. Explicit
-`"params"`/`"strings"` objects are also accepted.
+`id`, `type`, `bypass`, `element` and `role` are reserved and every other key is a parameter — a
+number or boolean becomes a numeric param, a string becomes a string param, so `"model": "amp.nam"`
+needs no wrapper. Explicit `"params"`/`"strings"` objects are also accepted.
+
+**Identity** (docs/ui-integration-plan.md §1.2) is deliberately three separate things, and none of
+them is composed out of another:
+
+| | owner | what it is |
+|---|---|---|
+| `element` | the client | the document thing this node belongs to — a block, a lane, a parallel section. Opaque, stored and returned verbatim, never parsed, and **not** required to be unique: several nodes may share one element, which is the normal case once a macro lowers into primitives. Defaults to the node's `id` |
+| `role` | the engine, declared per node type | which node of that element this is (`"line"`, `"ts.bass"`). Empty for a node that is its own element |
+| `id` | the engine | the node's name inside the graph. **May be omitted** when the node has an `element`: the engine mints `"<element>"` or `"<element>/<role>"`, disambiguating with `~2`, `~3`. No client addresses it, so nothing depends on its spelling, and no character has to be forbidden in a client's own ids |
+
+The rule of thumb for minting: it is for a node the client does not have to **name**. A connection
+names nodes, so a client that writes the connections writes the ids; a client that addresses nodes by
+`element` and `role` — which is what a macro user does, and what the engine itself does when it wires
+up a lowering — never needs to know an engine node id at all. A node with neither an `id` nor an
+`element` is an error, because there would be nothing to call it. A client's `element` may be a UUID
+with punctuation in it; nothing looks inside it.
 
 A structured value (an array or object) is **rejected rather than dropped**, because silently
-ignoring a nested object would compile and run while discarding what the rig author meant. Relative
-paths resolve as described above.
+ignoring a nested object would compile and run while discarding what the rig author meant. So is a
+document that carries both `chains` and a top-level `nodes`. Relative paths resolve as described
+above, per chain.
 
 Then structural validation: unknown node type, duplicate id, dangling connection, port out of range,
 two connections into one input port, cycles (rejected via Kahn's algorithm), and exactly one input
-and one output node. Errors are structured strings — nothing throws across the boundary, which is
-what lets a failed load be reported to a client instead of killing the daemon.
+and one output node — **per chain**, with the chain named in any failure. Errors are structured
+strings — nothing throws across the boundary, which is what lets a failed load be reported to a
+client instead of killing the daemon.
 
-`parse_graph_json(text, Graph&, error)` and the validation pass in `src/graph/plan.cpp`.
+`parse_document_json`/`validate(const Document&)` and the validation pass in `src/graph/plan.cpp`,
+with `tests/test_document.cpp` covering the envelope and the identity rules.
 
 ## 3. Compile a rig spec
 
@@ -202,9 +253,10 @@ The mechanisms, in the order they matter:
 
 | stage | state |
 |---|---|
-| load | **implemented** — `load_graph_json` |
-| parse | **implemented** — `parse_graph_json` plus full structural validation |
-| compile | **implemented** for validation, Kahn ordering, liveness/colouring, arena allocation and pointer binding; lowering, PDC and the cost model still to come |
+| load | **implemented** — `load_document_json`, and `load_graph_json` for single-chain callers |
+| parse | **implemented** — `parse_document_json` (name plus N chains, ids and device channels) and `parse_graph_json`; full structural validation per chain, with the chain named in the failure, plus the document-level rules in `validate(const Document&)` |
+| identity | **implemented** — `element` (client-owned, opaque, may repeat), `role` (declared per node type) and `id` (engine-minted when omitted); a bare graph is still one chain `"main"` whose nodes are their own elements |
+| compile | **implemented** for validation, Kahn ordering, liveness/colouring, arena allocation and pointer binding; lowering, PDC and the cost model still to come. Per-chain compilation (one plan per chain, per-chain generations) is slice A2 |
 | apply | **partial** — the `smooth` class is built: a parameter-only change resolves to a vtable dispatch (`NodeType::set_param`) and ramps inside the node, no compile and no step, over both the daemon's `rig.patch` and the offline timeline. A structural change is built from a graph mutation (`graph::apply_patch`: `add_node`/`remove_node`/`connect`/`disconnect`/`rewire`/`swap_model`/`bypass`/non-rampable `set_param`), applied all-or-nothing to a copy, compiled, dual-rendered for `fade_ms` and equal-power crossfaded (`rt::Crossfade`) before the old plan is retired. `rig.patch` routes smooth vs structural and reports which it took. Bypass keeps the node running with its dry input substituted, so its state stays warm. Every node's output is guarded for non-finite samples and a failed node is taken out of the path and reported. Missing: admission control (the fade is fixed and an expensive dual-render is not rejected) and a tail-hold for a bypassed node with a tail |
 | control-side awareness | **partial** — `namchaind` is the daemon: a Unix `SOCK_SEQPACKET` socket with the versioned JSON protocol (`engine.hello/status/mute/panic`, `rig.load/get/patch`), `signalfd` for SIGHUP reload and TERM/INT stop, startup-from-config, and a `poll` loop whose timeout is the reclamation window. The offline edit timeline exists (`namchain-render --graph --timeline/--torture`); the in-process API and telemetry subscription are not built |
 | audio-side awareness | **partial** — the daemon drains the SPSC command ring at the top of each block and carries two kinds of record: plan identity (start a crossfade, or adopt the first plan) and parameter dispatches (ramp a node). The deferred-commit scheduler is M3 |

@@ -270,6 +270,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_guard.cpp
     tests/test_nodes.cpp
     tests/test_rig.cpp
+    tests/test_document.cpp
     tests/test_latency.cpp
     tests/test_glitch.cpp
     tests/test_ramp.cpp

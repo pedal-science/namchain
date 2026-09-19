@@ -2,8 +2,10 @@
 
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <system_error>
+#include <utility>
 
 #include <json.hpp>
 
@@ -19,75 +21,50 @@ std::string at(const std::string& where, const std::string& what)
   return where + ": " + what;
 }
 
-} // namespace
-
-Graph chain_graph(const std::string& model_path, unsigned instances)
+/// \brief Mint an engine node id for a node that did not bring one.
+///
+/// `<element>` for a node that is its own element, `<element>/<role>` for a node inside one, and a
+/// `~N` suffix if that name is already taken. Ids only have to be unique and legible in a dump; no
+/// client addresses them, so nothing depends on the spelling (docs/ui-integration-plan.md §1.2).
+std::string mint_node_id(const std::string& element, const std::string& role, const std::set<std::string>& used)
 {
-  const unsigned count = instances == 0 ? 1u : instances;
-
-  Graph graph;
-  graph.nodes.push_back(NodeSpec{"in", "nc.input", {}, {}});
-  for (unsigned i = 0; i < count; ++i)
+  const std::string base = role.empty() ? element : element + "/" + role;
+  if (used.count(base) == 0)
+    return base;
+  for (int n = 2;; ++n)
   {
-    NodeSpec nam;
-    nam.id = "nam" + std::to_string(i);
-    nam.type = "nc.nam";
-    nam.strings["model"] = model_path;
-    graph.nodes.push_back(std::move(nam));
+    std::string candidate = base + "~" + std::to_string(n);
+    if (used.count(candidate) == 0)
+      return candidate;
   }
-  graph.nodes.push_back(NodeSpec{"out", "nc.output", {}, {}});
-
-  // Serial: in -> nam0 -> nam1 -> ... -> out. The order of `graph.nodes` is irrelevant to the
-  // compiler, which is the point of declaring it in this shape.
-  std::string previous = "in";
-  for (unsigned i = 0; i < count; ++i)
-  {
-    const std::string id = "nam" + std::to_string(i);
-    graph.connections.push_back(Connection{previous, 0, id, 0});
-    previous = id;
-  }
-  graph.connections.push_back(Connection{previous, 0, "out", 0});
-  return graph;
 }
 
-bool parse_graph_json(const std::string& text, Graph& graph, std::string& error)
+/// Read an optional string key. \p ok is cleared and \p error set when the key is there but is not a
+/// string, which is the difference between "absent, use the default" and "the author meant something".
+std::string optional_string(const nlohmann::json& object, const char* key, const std::string& where, bool& ok,
+                            std::string& error)
 {
-  nlohmann::json doc;
-  try
+  if (!object.contains(key))
+    return {};
+  if (!object[key].is_string())
   {
-    doc = nlohmann::json::parse(text);
+    error = at(where, std::string("'") + key + "' must be a string");
+    ok = false;
+    return {};
   }
-  catch (const std::exception& e)
-  {
-    error = std::string("not valid JSON: ") + e.what();
-    return false;
-  }
+  return object[key].get<std::string>();
+}
 
-  if (!doc.is_object())
-  {
-    error = "the rig must be a JSON object";
-    return false;
-  }
-  if (!doc.contains("nodes") || !doc["nodes"].is_array())
-  {
-    error = "the rig needs a 'nodes' array";
-    return false;
-  }
-
-  Graph parsed;
-  const auto& nodes = doc["nodes"];
+bool parse_nodes(const nlohmann::json& nodes, const std::string& prefix, Graph& graph, std::string& error)
+{
+  std::set<std::string> used;
   for (std::size_t i = 0; i < nodes.size(); ++i)
   {
-    const std::string where = "node " + std::to_string(i);
+    const std::string where = prefix + std::to_string(i);
     const auto& object = nodes[i];
     if (!object.is_object())
     {
       error = at(where, "must be an object");
-      return false;
-    }
-    if (!object.contains("id") || !object["id"].is_string())
-    {
-      error = at(where, "needs a string 'id'");
       return false;
     }
     if (!object.contains("type") || !object["type"].is_string())
@@ -96,9 +73,33 @@ bool parse_graph_json(const std::string& text, Graph& graph, std::string& error)
       return false;
     }
 
+    bool ok = true;
+    std::string id = optional_string(object, "id", where, ok, error);
+    std::string element = optional_string(object, "element", where, ok, error);
+    const std::string role = optional_string(object, "role", where, ok, error);
+    if (!ok)
+      return false;
+
+    if (id.empty() && element.empty())
+    {
+      error = at(where, "needs an 'id', or an 'element' to derive one from");
+      return false;
+    }
+    if (id.empty())
+      id = mint_node_id(element, role, used);
+    if (element.empty())
+      element = id; // a node that does not name a document element is its own
+    if (!used.insert(id).second)
+    {
+      error = at(where, "duplicate node id '" + id + "'");
+      return false;
+    }
+
     NodeSpec spec;
-    spec.id = object["id"].get<std::string>();
+    spec.id = std::move(id);
     spec.type = object["type"].get<std::string>();
+    spec.element = std::move(element);
+    spec.role = role;
     if (object.contains("bypass"))
     {
       if (!object["bypass"].is_boolean())
@@ -144,7 +145,8 @@ bool parse_graph_json(const std::string& text, Graph& graph, std::string& error)
 
     for (const auto& [key, value] : object.items())
     {
-      if (key == "id" || key == "type" || key == "params" || key == "strings" || key == "bypass")
+      if (key == "id" || key == "type" || key == "element" || key == "role" || key == "params" ||
+          key == "strings" || key == "bypass")
         continue;
       if (value.is_number())
         spec.params[key] = value.get<double>();
@@ -159,56 +161,217 @@ bool parse_graph_json(const std::string& text, Graph& graph, std::string& error)
       }
     }
 
-    parsed.nodes.push_back(std::move(spec));
+    graph.nodes.push_back(std::move(spec));
   }
-
-  if (doc.contains("connections"))
-  {
-    if (!doc["connections"].is_array())
-    {
-      error = "'connections' must be an array";
-      return false;
-    }
-    const auto& connections = doc["connections"];
-    for (std::size_t i = 0; i < connections.size(); ++i)
-    {
-      const std::string where = "connection " + std::to_string(i);
-      const auto& object = connections[i];
-      if (!object.is_object() || !object.contains("from") || !object.contains("to") ||
-          !object["from"].is_string() || !object["to"].is_string())
-      {
-        error = at(where, "needs string 'from' and 'to'");
-        return false;
-      }
-      Connection connection;
-      connection.from = object["from"].get<std::string>();
-      connection.to = object["to"].get<std::string>();
-
-      // Ports are looked up through the same helper so that a bool, a float or a string is rejected
-      // here rather than silently truncating to a port number that happens to exist.
-      const auto port = [&](const char* key, int& out) {
-        if (!object.contains(key))
-          return true;
-        if (!object[key].is_number_integer())
-        {
-          error = at(where, std::string("'") + key + "' must be an integer");
-          return false;
-        }
-        out = object[key].get<int>();
-        return true;
-      };
-      if (!port("from_port", connection.from_port) || !port("to_port", connection.to_port))
-        return false;
-
-      parsed.connections.push_back(std::move(connection));
-    }
-  }
-
-  graph = std::move(parsed);
   return true;
 }
 
-bool load_graph_json(const std::string& path, Graph& graph, std::string& error)
+bool parse_connections(const nlohmann::json& connections, const std::string& prefix, Graph& graph, std::string& error)
+{
+  for (std::size_t i = 0; i < connections.size(); ++i)
+  {
+    const std::string where = prefix + std::to_string(i);
+    const auto& object = connections[i];
+    if (!object.is_object() || !object.contains("from") || !object.contains("to") ||
+        !object["from"].is_string() || !object["to"].is_string())
+    {
+      error = at(where, "needs string 'from' and 'to'");
+      return false;
+    }
+    Connection connection;
+    connection.from = object["from"].get<std::string>();
+    connection.to = object["to"].get<std::string>();
+
+    // Ports are looked up through the same helper so that a bool, a float or a string is rejected
+    // here rather than silently truncating to a port number that happens to exist.
+    const auto port = [&](const char* key, int& out) {
+      if (!object.contains(key))
+        return true;
+      if (!object[key].is_number_integer())
+      {
+        error = at(where, std::string("'") + key + "' must be an integer");
+        return false;
+      }
+      out = object[key].get<int>();
+      return true;
+    };
+    if (!port("from_port", connection.from_port) || !port("to_port", connection.to_port))
+      return false;
+
+    graph.connections.push_back(std::move(connection));
+  }
+  return true;
+}
+
+/// \brief The `nodes` and `connections` of one chain, from whatever object holds them.
+bool parse_graph_body(const nlohmann::json& object, const std::string& where, const std::string& prefix, Graph& graph,
+                      std::string& error)
+{
+  if (!object.contains("nodes") || !object["nodes"].is_array())
+  {
+    error = at(where, "needs a 'nodes' array");
+    return false;
+  }
+  if (!parse_nodes(object["nodes"], prefix + "node ", graph, error))
+    return false;
+  if (object.contains("connections"))
+  {
+    if (!object["connections"].is_array())
+    {
+      error = at(where, "'connections' must be an array");
+      return false;
+    }
+    if (!parse_connections(object["connections"], prefix + "connection ", graph, error))
+      return false;
+  }
+  return true;
+}
+
+bool parse_chain(const nlohmann::json& object, const std::string& where, Chain& chain, std::string& error)
+{
+  if (!object.is_object())
+  {
+    error = at(where, "must be an object");
+    return false;
+  }
+  if (!object.contains("id") || !object["id"].is_string() || object["id"].get<std::string>().empty())
+  {
+    error = at(where, "needs a non-empty string 'id'");
+    return false;
+  }
+  chain.id = object["id"].get<std::string>();
+  const std::string named = "chain '" + chain.id + "'";
+
+  bool ok = true;
+  chain.name = optional_string(object, "name", named, ok, error);
+  if (!ok)
+    return false;
+
+  const auto channel = [&](const char* key, int& target) {
+    if (!object.contains(key))
+      return true;
+    if (!object[key].is_number_integer() || object[key].get<int>() < 0)
+    {
+      error = at(named, std::string("'") + key + "' must be a non-negative integer");
+      return false;
+    }
+    target = object[key].get<int>();
+    return true;
+  };
+  if (!channel("input_channel", chain.input_channel) || !channel("output_channel", chain.output_channel))
+    return false;
+
+  return parse_graph_body(object, named, named + ": ", chain.graph, error);
+}
+
+} // namespace
+
+Graph chain_graph(const std::string& model_path, unsigned instances)
+{
+  const unsigned count = instances == 0 ? 1u : instances;
+
+  Graph graph;
+  graph.nodes.push_back(NodeSpec{"in", "nc.input", {}, {}});
+  for (unsigned i = 0; i < count; ++i)
+  {
+    NodeSpec nam;
+    nam.id = "nam" + std::to_string(i);
+    nam.type = "nc.nam";
+    nam.strings["model"] = model_path;
+    graph.nodes.push_back(std::move(nam));
+  }
+  graph.nodes.push_back(NodeSpec{"out", "nc.output", {}, {}});
+
+  // Serial: in -> nam0 -> nam1 -> ... -> out. The order of `graph.nodes` is irrelevant to the
+  // compiler, which is the point of declaring it in this shape.
+  std::string previous = "in";
+  for (unsigned i = 0; i < count; ++i)
+  {
+    const std::string id = "nam" + std::to_string(i);
+    graph.connections.push_back(Connection{previous, 0, id, 0});
+    previous = id;
+  }
+  graph.connections.push_back(Connection{previous, 0, "out", 0});
+  return graph;
+}
+
+bool parse_document_json(const std::string& text, Document& document, std::string& error)
+{
+  nlohmann::json doc;
+  try
+  {
+    doc = nlohmann::json::parse(text);
+  }
+  catch (const std::exception& e)
+  {
+    error = std::string("not valid JSON: ") + e.what();
+    return false;
+  }
+
+  if (!doc.is_object())
+  {
+    error = "the rig must be a JSON object";
+    return false;
+  }
+
+  Document parsed;
+  bool ok = true;
+  parsed.name = optional_string(doc, "name", "the rig", ok, error);
+  if (!ok)
+    return false;
+
+  if (doc.contains("chains"))
+  {
+    if (doc.contains("nodes") || doc.contains("connections"))
+    {
+      error = "the rig has both 'chains' and top-level 'nodes'/'connections'; it is one or the other";
+      return false;
+    }
+    if (!doc["chains"].is_array())
+    {
+      error = "'chains' must be an array";
+      return false;
+    }
+    if (doc["chains"].empty())
+    {
+      error = "a document needs at least one chain";
+      return false;
+    }
+    std::set<std::string> ids;
+    for (std::size_t i = 0; i < doc["chains"].size(); ++i)
+    {
+      Chain chain;
+      if (!parse_chain(doc["chains"][i], "chain " + std::to_string(i), chain, error))
+        return false;
+      if (!ids.insert(chain.id).second)
+      {
+        error = "chain " + std::to_string(i) + ": duplicate chain id '" + chain.id + "'";
+        return false;
+      }
+      parsed.chains.push_back(std::move(chain));
+    }
+  }
+  else
+  {
+    // The shape everything was in before documents existed: one graph, one chain, channels 0 and 0.
+    // It is a compatibility rule rather than a special case, and it keeps every committed rig valid.
+    if (!doc.contains("nodes") || !doc["nodes"].is_array())
+    {
+      error = "the rig needs a 'nodes' array, or a 'chains' array";
+      return false;
+    }
+    Chain chain;
+    chain.id = "main";
+    if (!parse_graph_body(doc, "the rig", "", chain.graph, error))
+      return false;
+    parsed.chains.push_back(std::move(chain));
+  }
+
+  document = std::move(parsed);
+  return true;
+}
+
+bool load_document_json(const std::string& path, Document& document, std::string& error)
 {
   std::ifstream file(path);
   if (!file)
@@ -218,7 +381,7 @@ bool load_graph_json(const std::string& path, Graph& graph, std::string& error)
   }
   std::ostringstream contents;
   contents << file.rdbuf();
-  if (!parse_graph_json(contents.str(), graph, error))
+  if (!parse_document_json(contents.str(), document, error))
   {
     error = "'" + path + "': " + error;
     return false;
@@ -230,17 +393,48 @@ bool load_graph_json(const std::string& path, Graph& graph, std::string& error)
   const std::filesystem::path directory = std::filesystem::path(path).parent_path();
   if (!directory.empty())
   {
-    for (NodeSpec& node : graph.nodes)
+    for (Chain& chain : document.chains)
     {
-      for (auto& [key, value] : node.strings)
+      for (NodeSpec& node : chain.graph.nodes)
       {
-        std::error_code ignored;
-        const std::filesystem::path candidate = directory / value;
-        if (!std::filesystem::path(value).is_absolute() && std::filesystem::exists(candidate, ignored))
-          value = candidate.string();
+        for (auto& [key, value] : node.strings)
+        {
+          std::error_code ignored;
+          const std::filesystem::path candidate = directory / value;
+          if (!std::filesystem::path(value).is_absolute() && std::filesystem::exists(candidate, ignored))
+            value = candidate.string();
+        }
       }
     }
   }
+  return true;
+}
+
+bool parse_graph_json(const std::string& text, Graph& graph, std::string& error)
+{
+  Document document;
+  if (!parse_document_json(text, document, error))
+    return false;
+  if (document.chains.size() != 1)
+  {
+    error = "this needs exactly one chain, found " + std::to_string(document.chains.size());
+    return false;
+  }
+  graph = std::move(document.chains.front().graph);
+  return true;
+}
+
+bool load_graph_json(const std::string& path, Graph& graph, std::string& error)
+{
+  Document document;
+  if (!load_document_json(path, document, error))
+    return false;
+  if (document.chains.size() != 1)
+  {
+    error = "'" + path + "': this needs exactly one chain, found " + std::to_string(document.chains.size());
+    return false;
+  }
+  graph = std::move(document.chains.front().graph);
   return true;
 }
 
