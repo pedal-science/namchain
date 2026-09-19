@@ -773,6 +773,11 @@ const std::vector<int>& RenderPlan::output_buffer_of(std::size_t node_index) con
   return node_index < output_buffers_.size() ? output_buffers_[node_index] : empty;
 }
 
+bool RenderPlan::node_failed(std::size_t node_index) const noexcept
+{
+  return node_index < failed_.size() && failed_[node_index].load(std::memory_order_relaxed);
+}
+
 std::size_t RenderPlan::failed_node_count() const noexcept
 {
   std::size_t count = 0;
@@ -841,12 +846,43 @@ void RenderPlan::prewarm() noexcept
 bool RenderPlan::resolve_param(const std::string& node_id, const std::string& param, std::size_t& node_index,
                                uint32_t& param_id) const
 {
+  return resolve_param(node_id, param, -1, node_index, param_id);
+}
+
+bool RenderPlan::resolve_param(const std::string& node_id, const std::string& param, int port,
+                               std::size_t& node_index, uint32_t& param_id) const
+{
   for (std::size_t i = 0; i < node_ids_.size(); ++i)
   {
     if (node_ids_[i] != node_id)
       continue;
     const render::NodeType* type = nodes_[i].type;
-    if (type->set_param == nullptr || type->params == nullptr)
+    if (type->set_param == nullptr)
+      return false;
+
+    if (port >= 0)
+    {
+      if (type->per_port_params == nullptr)
+        return false;
+      // The compiler terminates a node's input array with a nullptr, so its length minus one is how
+      // many ports it has -- the same number the arity parameter resolved to, read from the binding
+      // rather than from the spec, so the two cannot disagree.
+      const int ports = static_cast<int>(nodes_[i].inputs.size()) - 1;
+      if (port >= ports)
+        return false;
+      for (int p = 0; p < type->per_port_param_count; ++p)
+      {
+        const render::ParamDesc& desc = type->per_port_params[p];
+        if (param != desc.id || !desc.rampable || !desc.patchable)
+          continue;
+        node_index = i;
+        param_id = render::port_param_id(port, p);
+        return true;
+      }
+      return false;
+    }
+
+    if (type->params == nullptr)
       return false;
     for (int p = 0; p < type->param_count; ++p)
     {

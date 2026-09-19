@@ -434,3 +434,56 @@ TEST_CASE("a node type wider than the audio path is refused by name")
   CHECK(namchain::render::resolve_ports(stereo, spec, ports, error));
   CHECK(ports.channels == 1);
 }
+
+TEST_CASE("a mixer's per-port parameters are declared once and every one of them does something")
+{
+  namchain::rt::Arena arena(1u << 16);
+
+  const NodeType* mix = namchain::render::find_node_type("nc.mix");
+  REQUIRE(mix != nullptr);
+  REQUIRE(mix->per_port_param_count == 3);
+  CHECK(std::string(mix->per_port_params[0].id) == "level_db");
+  CHECK(mix->per_port_params[0].rampable);
+  CHECK(std::string(mix->per_port_params[1].id) == "mute");
+  CHECK(std::string(mix->per_port_params[2].id) == "phase");
+  // Every port parameter is rampable: a lane's settings are exactly the ones a client streams.
+  for (int i = 0; i < mix->per_port_param_count; ++i)
+    CHECK(mix->per_port_params[i].rampable);
+
+  // And each one changes the render, checked the same way a node parameter is: the same signal into
+  // both ports, so the sum is arithmetic.
+  auto build = [&arena](const char* param, double value) {
+    NodeSpec m;
+    m.id = "m";
+    m.type = "nc.mix";
+    m.params["inputs"] = 2;
+    m.params["ramp_ms"] = 0.0;
+    Graph g;
+    NodeSpec in = NodeSpec{"in", "nc.input", {}, {}};
+    NodeSpec out = NodeSpec{"out", "nc.output", {}, {}};
+    g.nodes = {in, m, out};
+    g.connections = {{"in", 0, "m", 0}, {"in", 0, "m", 1}, {"m", 0, "out", 0}};
+
+    CompileOptions options;
+    options.max_quantum = kQuantum;
+    options.sample_rate = kRate;
+    std::string error;
+    auto plan = RenderPlan::compile(g, options, arena, error);
+    REQUIRE_MESSAGE(plan != nullptr, error);
+    plan->prewarm();
+    std::size_t index = 0;
+    std::uint32_t id = 0;
+    REQUIRE(plan->resolve_param("m", param, 0, index, id));
+    REQUIRE(plan->set_param(index, id, static_cast<float>(value)));
+    std::vector<float> input(kQuantum, 0.5f);
+    std::vector<float> output(kQuantum, 0.0f);
+    plan->execute(input.data(), output.data(), kQuantum);
+    return output.back();
+  };
+
+  CHECK(build("level_db", 0.0) == doctest::Approx(1.0f).epsilon(0.01));   // two unity ports, 0.5 each
+  CHECK(build("level_db", -6.0206) == doctest::Approx(0.75f).epsilon(0.01));
+  CHECK(build("level_db", -120.0) == doctest::Approx(0.5f).epsilon(0.01));
+  CHECK(build("mute", 1.0) == doctest::Approx(0.5f).epsilon(0.01));
+  CHECK(build("phase", 1.0) == doctest::Approx(0.0f).epsilon(0.01));
+}

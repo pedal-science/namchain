@@ -124,6 +124,10 @@ constexpr uint32_t kBiquadParamQ = 3;
 constexpr uint32_t kBiquadParamGainDb = 4;
 constexpr uint32_t kDelayParamSamples = 1;
 constexpr uint32_t kDelayParamMs = 2;
+/// Per-port parameter ids are the index into \ref kMixPortParams, plus one, under a port.
+constexpr uint32_t kMixPortParamLevelDb = 1;
+constexpr uint32_t kMixPortParamMute = 2;
+constexpr uint32_t kMixPortParamPhase = 3;
 
 struct GainState
 {
@@ -233,16 +237,143 @@ void process_split(void*, const float* const* in, float* const* out, int frames)
     std::copy(in[0], in[0] + frames, out[port]);
 }
 
-void process_mix(void*, const float* const* in, float* const* out, int frames) noexcept
+/// One input's settings and the ramp that is moving them. Mirrors \ref GainState: the smoothing is
+/// the same smoothstep, because a lane level is a gain and there is no reason for it to move
+/// differently from any other gain in the engine.
+struct MixPort
+{
+  float gain = 1.0f;
+  float level = 1.0f; ///< the level the port is set to, before mute and polarity
+  float from = 1.0f;
+  float to = 1.0f;
+  int ramp_pos = 0;
+  int ramp_len = 0;
+  bool muted = false;
+  bool inverted = false;
+};
+
+struct MixState
+{
+  std::vector<MixPort> ports;
+  int smoothing_samples = 240;
+};
+
+/// The gain a port is heading for: mute is a ramp to silence rather than a flag the render path
+/// branches on, so muting and unmuting are click-free for the same reason a level change is.
+float mix_target(const MixPort& port) noexcept
+{
+  if (port.muted)
+    return 0.0f;
+  return port.inverted ? -port.level : port.level;
+}
+
+void* create_mix(const graph::NodeSpec& spec, const CompileOptions& options, std::string& error)
+{
+  // The arity has already been resolved and validated (`resolve_ports`), so reading the param here
+  // cannot disagree with the plan's port count: it is the same number, read the same way.
+  const int inputs = static_cast<int>(std::lround(number_param(spec, "inputs", 2.0)));
+  if (inputs < 1)
+  {
+    error = reject("nc.mix", "'inputs' must be at least 1");
+    return nullptr;
+  }
+
+  const double ramp_ms = number_param(spec, "ramp_ms", 5.0);
+  if (!std::isfinite(ramp_ms) || ramp_ms < 0.0)
+  {
+    error = reject("nc.mix", "'ramp_ms' must be a finite number >= 0");
+    return nullptr;
+  }
+
+  auto state = std::make_unique<MixState>();
+  state->ports.resize(static_cast<std::size_t>(inputs));
+  state->smoothing_samples =
+    ramp_ms == 0.0 ? 1 : std::max(1, static_cast<int>(std::llround(ramp_ms * options.sample_rate / 1000.0)));
+  // Every port starts at unity, unmuted and in phase.
+  //
+  // A *document* cannot set a lane here: per-port parameters are addressed with a port at runtime
+  // (`rig.patch`), and a rig that wants a lane at -6 dB says so with a node in the lane -- which is
+  // what a client's flattening already produces -- or, once there is a lowering layer, with a macro
+  // that sets the port itself. A naming convention like `level2` would have been a second way to say
+  // it, with its own schema, its own bounds and its own drift.
+  return state.release();
+}
+
+void destroy_mix(void* state)
+{
+  delete static_cast<MixState*>(state);
+}
+
+bool set_param_mix(void* raw, uint32_t param_id, float value) noexcept
+{
+  if (!std::isfinite(value))
+    return false;
+  MixState* state = static_cast<MixState*>(raw);
+
+  const int port = port_of_param_id(param_id);
+  if (port < 0 || static_cast<std::size_t>(port) >= state->ports.size())
+    return false; // a port the mixer does not have: refuse rather than ignore
+  const uint32_t index = param_id & ((1u << kPortParamShift) - 1u);
+  MixPort& p = state->ports[static_cast<std::size_t>(port)];
+
+  switch (index)
+  {
+  case kMixPortParamLevelDb:
+    p.level = static_cast<float>(std::pow(10.0, static_cast<double>(value) / 20.0));
+    break;
+  case kMixPortParamMute:
+    p.muted = value != 0.0f;
+    break;
+  case kMixPortParamPhase:
+    p.inverted = value != 0.0f;
+    break;
+  default:
+    return false;
+  }
+
+  // From the *current* value, so a second change mid-ramp does not jump back to the old endpoint.
+  p.from = p.gain;
+  p.to = mix_target(p);
+  p.ramp_pos = 0;
+  p.ramp_len = state->smoothing_samples;
+  return true;
+}
+
+void process_mix(void* raw, const float* const* in, float* const* out, int frames) noexcept
 {
   // N inputs, terminated by nullptr. Accumulating rather than writing in[0] + in[1] is what lets a
   // rig sum as many chains as its `inputs` param declares.
   std::fill(out[0], out[0] + frames, 0.0f);
+  MixState* state = static_cast<MixState*>(raw);
   for (int port = 0; in[port] != nullptr; ++port)
   {
     const float* source = in[port];
+    // An input with no port settings (the reference interpreter binds every declared port, and a
+    // hand-written graph may connect more than the state was built for) sums at unity rather than
+    // being dropped.
+    MixPort* settings = static_cast<std::size_t>(port) < state->ports.size()
+                          ? &state->ports[static_cast<std::size_t>(port)]
+                          : nullptr;
+    // The unity fast path is only for a port that is settled *at* unity: a pending ramp must run even
+    // when its starting value is 1.0, which is the common case for a lane nobody has touched yet.
+    if (settings == nullptr || (settings->gain == 1.0f && settings->ramp_pos >= settings->ramp_len))
+    {
+      for (int i = 0; i < frames; ++i)
+        out[0][i] += source[i];
+      continue;
+    }
     for (int i = 0; i < frames; ++i)
-      out[0][i] += source[i];
+    {
+      if (settings->ramp_pos < settings->ramp_len)
+      {
+        const float t = static_cast<float>(settings->ramp_pos + 1) / static_cast<float>(settings->ramp_len);
+        settings->gain = settings->from + (settings->to - settings->from) * t * t * (3.0f - 2.0f * t);
+        ++settings->ramp_pos;
+        if (settings->ramp_pos >= settings->ramp_len)
+          settings->gain = settings->to;
+      }
+      out[0][i] += source[i] * settings->gain;
+    }
   }
 }
 
@@ -1028,6 +1159,18 @@ const ParamDesc kSplitParams[] = {
 const ParamDesc kMixParams[] = {
   {.id = "inputs", .name = "Inputs", .kind = ParamKind::Flag, .default_value = 2.0, .has_min = true,
    .min = 1.0, .has_max = true, .max = 64.0, .step = 1.0, .snap = true},
+  {.id = "ramp_ms", .name = "Ramp", .unit = "ms", .default_value = 5.0, .has_min = true, .min = 0.0,
+   .has_max = true, .max = 1000.0},
+};
+
+/// What every input of a mixer has: a level, a mute and a polarity. Declared once and addressed with a
+/// port, so a client reads one set of shapes and applies them per lane rather than learning a naming
+/// convention like `level3`.
+const ParamDesc kMixPortParams[] = {
+  {.id = "level_db", .name = "Level", .unit = "dB", .default_value = 0.0, .has_min = true, .min = -60.0,
+   .has_max = true, .max = 12.0, .rampable = true},
+  {.id = "mute", .name = "Mute", .kind = ParamKind::Flag, .default_value = 0.0, .rampable = true},
+  {.id = "phase", .name = "Invert", .kind = ParamKind::Flag, .default_value = 0.0, .rampable = true},
 };
 
 const ParamDesc kNamParams[] = {
@@ -1111,8 +1254,10 @@ const NodeType kSplit{.id = "nc.split", .name = "Split", .category = "utility", 
                       .outputs = 2, .process = process_split, .arity_param = "outputs", .min_ports = 1,
                       .max_ports = 64, .params = kSplitParams, .param_count = 1};
 const NodeType kMix{.id = "nc.mix", .name = "Mix", .category = "utility", .inputs = 2, .outputs = 1,
-                    .process = process_mix, .arity_param = "inputs", .min_ports = 1, .max_ports = 64,
-                    .params = kMixParams, .param_count = 1};
+                    .create = create_mix, .destroy = destroy_mix, .process = process_mix,
+                    .arity_param = "inputs", .min_ports = 1, .max_ports = 64, .params = kMixParams,
+                    .param_count = 2, .per_port_params = kMixPortParams, .per_port_param_count = 3,
+                    .set_param = set_param_mix};
 const NodeType kBypass{"nc.bypass", "Bypass", "utility", 1, 1, nullptr, nullptr, process_bypass};
 const NodeType kNam{.id = "nc.nam", .name = "NAM model", .category = "amp", .inputs = 1, .outputs = 1,
                     .create = create_nam, .destroy = destroy_dsp, .process = process_dsp,

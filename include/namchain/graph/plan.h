@@ -182,6 +182,14 @@ struct NodeType
   /// the same fact written twice. Null, with a count of 0, is a node with no parameters.
   const ParamDesc* params = nullptr;
   int param_count = 0;
+  /// \brief Parameters that exist once per port rather than once per node.
+  ///
+  /// `nc.mix` has a level, a mute and a polarity per input: a lane's settings, not the mixer's. They
+  /// are declared exactly like node parameters -- same kinds, same bounds -- and addressed with a
+  /// port, because a mixer with N inputs and no per-input control is a summer rather than a mixer
+  /// (docs/ui-integration-plan.md §1.4).
+  const ParamDesc* per_port_params = nullptr;
+  int per_port_param_count = 0;
   /// \brief Channels per port. 1 is mono, which is all the engine has.
   ///
   /// Declared and *refused* rather than absent (docs/ui-integration-plan.md §1.4): the compiler
@@ -195,6 +203,25 @@ struct NodeType
   /// (§5.3, the `smooth` op class). Nothing here may allocate, lock or throw.
   bool (*set_param)(void* state, uint32_t param_id, float value) noexcept = nullptr;
 };
+
+/// \brief How a per-port parameter is encoded in the one integer a ramp dispatch carries.
+///
+/// A port's parameter takes an id no node-level parameter can: node ids are positions in the schema
+/// array plus one, so they are small, and a port id sets a bit well above them. Ports are 0-based in
+/// the document and 1-based here, so port 0's first parameter is not mistaken for "no port".
+inline constexpr uint32_t kPortParamShift = 16;
+
+inline uint32_t port_param_id(int port, int index) noexcept
+{
+  return ((static_cast<uint32_t>(port) + 1u) << kPortParamShift) | (static_cast<uint32_t>(index) + 1u);
+}
+
+/// The port a parameter id names, or -1 for a node-level parameter.
+inline int port_of_param_id(uint32_t param_id) noexcept
+{
+  const uint32_t port = param_id >> kPortParamShift;
+  return port == 0 ? -1 : static_cast<int>(port) - 1;
+}
 
 /// \brief A node spec's concrete port counts, after per-spec arity is resolved.
 struct PortCounts
@@ -289,6 +316,15 @@ public:
   bool resolve_param(const std::string& node_id, const std::string& param, std::size_t& node_index,
                      uint32_t& param_id) const;
 
+  /// \brief Resolve a parameter of one port of \p node_id, or of the node itself when \p port is -1.
+  ///
+  /// A mixer's per-input settings are addressed by port rather than by a naming convention: the schema
+  /// declares them once (\ref NodeType::per_port_params) and this turns "port 2, level" into the
+  /// integer the ramp dispatch carries. A port the node does not have is not resolved, so a client
+  /// cannot set a lane that does not exist.
+  bool resolve_param(const std::string& node_id, const std::string& param, int port, std::size_t& node_index,
+                     uint32_t& param_id) const;
+
   /// \brief Render path: ramp one node's parameter to \p value.
   ///
   /// \return false for an out-of-range index or an id the node does not know. Never allocates or
@@ -318,6 +354,9 @@ public:
   /// Control thread (or a report); the render thread flips the flags. A failed node's output is its
   /// dry input for the rest of the plan's life.
   std::size_t failed_node_count() const noexcept;
+  /// Whether the guard has taken the node at \p node_index out of the signal path. Read for a report
+  /// rather than to render a block, and what lets a client be told *which* node failed.
+  bool node_failed(std::size_t node_index) const noexcept;
   /// How many times the guard tripped. Counted separately from \ref failed_node_count because a
   /// second trip on an already-failed node is not a second failure.
   uint64_t guard_trips() const noexcept { return guard_trips_.load(std::memory_order_relaxed); }

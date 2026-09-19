@@ -107,7 +107,7 @@ length prefix to get wrong. A request is:
 |---|---|---|
 | `engine.hello` | `{"protocol": 1}` | `role`, `version`, `protocol` (what the server speaks), `features`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol` |
 | `engine.schema` | — | the catalogue: every node type with its ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. See docs/schema.md |
-| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, and a `chains` array (below) |
+| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), and `health`/`issues` (below) |
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `rig.load` | `{"rig": "name.json"}` | compiled and published; returns `rig`, `generation` |
@@ -199,6 +199,39 @@ output device channel, and its own graph (docs/rig-pipeline.md §2). What that m
   "generation": 3, "audible_generation": 3, "adopted_generation": 3, "target_generation": 3,
   "transition_active": false, "muted": false, "failed_nodes": 0, "guard_trips": 0 }
 ```
+
+### Health, and what a status light binds to
+
+`health` is one word — `ok`, `warn` or `error` — derived from `issues`, which is what a small control
+binds to without parsing anything:
+
+```json
+"health": "error",
+"issues": [ { "code": "device_lost", "severity": "error",
+              "message": "the audio device is not open; the render thread is retrying every 250 ms",
+              "count": 1 } ]
+```
+
+`code` is stable and machine-readable (the client maps it to its own words and icon); `severity` is
+per issue and `health` is the worst of them, so the two cannot disagree; `count` accumulates; and
+`chain`/`node` name the culprit where there is one. Issues are **current state, not a log** — one that
+stops being true disappears, which is the property that makes the light worth having:
+
+| code | severity | true while |
+|---|---|---|
+| `device_lost` | error | the device is not open and the render thread is retrying |
+| `node_failed` | error | a node returned a non-finite sample and has been taken out of the path |
+| `xruns` | warn | the device has missed deadlines *recently* — fed by the deltas and drained, not the driver's cumulative counter, which never clears |
+| `render_errors` | warn | the render thread has reported errors recently |
+| `not_realtime` | warn | a real-time policy was asked for and is not in force |
+| `memory_not_locked` | warn | `mlockall` was refused while `lock_memory` is on |
+| `transition` | info | a structural change is being crossfaded (normal, and it does not colour `health`) |
+
+Two things deliberately *not* issues: a daemon asked for no real-time priority that has none, and one
+asked not to lock memory, are doing exactly what they were told — the test for a healthy daemon
+asserts both are quiet. `params_stale` stays a counter, because a parameter that arrived after its
+target generation was superseded is an ordinary consequence of an asynchronous edit rather than a
+fault.
 
 The document-level `generation`, `adopted_generation`, `audible_generation`, `transition_active` and
 `failed_nodes`/`guard_trips` are derived from those: `audible_generation` is the *previous* document
@@ -294,7 +327,9 @@ expected.
 
 ## What is built, and what is not
 
-Built: the node schema — every built-in declares its parameters (kind, unit, default, bounds with
+Built: the lane mixer (`nc.mix` takes a level, a mute and a polarity per input, addressed by port,
+ramped, and refused by name when the port does not exist) and the health summary (`health` plus
+`issues` with stable codes, derived from the state rather than tracked beside it); the node schema — every built-in declares its parameters (kind, unit, default, bounds with
 inclusive/exclusive made explicit, step, scale, rampable), the compiler refuses a name it does not
 declare, and `engine.schema` publishes the catalogue (docs/schema.md); and the smooth class across
 every value a node has: gains by ramping, a filter by crossfading two coefficient sets, a delay time
@@ -316,8 +351,9 @@ Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 - no admission control or cost model, so a plan too expensive to dual-render is not rejected before it
   runs, and the fade length is fixed rather than shortened under load — the staggered apply is what
   stands in for it;
-- no *per-port* parameters on `nc.mix` (a lane's level is a `nc.gain` node in the lane), so a lane's
-  level, mute and phase are nodes rather than mixer settings (slice B4);
+- no *document-level* per-port setting: a lane's level, mute and polarity are runtime state addressed
+  by port (`rig.patch`), so a rig file expresses them with a gain node in the lane rather than as a
+  mixer setting (slice E's lowering is where that belongs);
 - no option (string) parameter can be patched yet, so `mode` and `model` are changed by a reload or a
   `swap_model` rather than by `set_param` (slice B2's remainder);
 - no lowered view in `rig.get`, because there is nothing to lower yet: a node is a node until the

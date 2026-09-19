@@ -1529,3 +1529,198 @@ TEST_CASE("an applied document with a parameter that does not exist is refused b
   CHECK(message.find("gainz") != std::string::npos);
   CHECK(message.find("gain_db") != std::string::npos);
 }
+
+TEST_CASE("a per-port parameter is a smooth edit, and a port that does not exist is refused")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  // in -> mix (both ports fed) -> out: the output is the sum of the two ports' gains.
+  write_file(root / "mix.json", R"({
+    "nodes": [
+      { "id": "in", "type": "nc.input" },
+      { "id": "m",  "type": "nc.mix", "inputs": 2, "ramp_ms": 5 },
+      { "id": "out", "type": "nc.output" }
+    ],
+    "connections": [
+      { "from": "in", "to": "m", "to_port": 0 },
+      { "from": "in", "to": "m", "to_port": 1 },
+      { "from": "m",  "to": "out" }
+    ]
+  })");
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "mix.json").string();
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() == 1;
+  }));
+
+  // A lane fader is the smooth class: a lane's level must not cost a compile and a crossfade, or
+  // every drag of a lane slider would be a rebuild.
+  const auto level = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"id":"p","method":"rig.patch","ops":[{"op":"set_param","node":"m","port":0,"param":"level_db","value":-6}]})"));
+  REQUIRE(level["ok"] == true);
+  CHECK(level["kind"] == "smooth");
+  CHECK(level["generation"] == 1); // no recompile, so no new generation
+  const bool applied = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["params_applied"].get<uint64_t>() == 1;
+  });
+  CHECK_MESSAGE(applied, "the render thread never applied the lane's level");
+
+  // Mute and polarity are lanes too, and they take the same path.
+  const auto muted = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"id":"q","method":"rig.patch","ops":[{"op":"set_param","node":"m","port":1,"param":"mute","value":1}]})"));
+  CHECK(muted["ok"] == true);
+  CHECK(muted["kind"] == "smooth");
+
+  // A port the mixer does not have is refused by name rather than silently ignored: with two inputs
+  // there is no lane 2, and a client that set one would believe it had done something.
+  const auto missing = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"id":"r","method":"rig.patch","ops":[{"op":"set_param","node":"m","port":2,"param":"level_db","value":-6}]})"));
+  CHECK(missing["ok"] == false);
+  CHECK(missing["error"]["code"] == "patch_rejected");
+  CHECK(missing["error"]["message"].get<std::string>().find("port 2") != std::string::npos);
+
+  // A node with no per-port parameters has no ports to address, and says so the same way.
+  const auto no_ports = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"id":"s","method":"rig.patch","ops":[{"op":"set_param","node":"out","port":0,"param":"level_db","value":-6}]})"));
+  CHECK(no_ports["ok"] == false);
+  CHECK(no_ports["error"]["code"] == "patch_rejected");
+}
+
+// ---------------------------------------------------------------------------
+// Health and issues (docs/ui-integration-plan.md §1.6, slice B5)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a daemon with nothing wrong reports health ok and no issues")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "gain.json", kGainRig);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "gain.json").string();
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["blocks"].get<uint64_t>() > 0;
+  }));
+
+  const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  const auto& status = reply["status"];
+  // The one field a light binds to, and the reasons behind it in a shape a client maps to its own
+  // words rather than parses.
+  CHECK(status["health"] == "ok");
+  CHECK(status["issues"].is_array());
+  CHECK(status["issues"].empty());
+  // Deliberately not issues: a daemon that was asked for no real-time priority and got none, and one
+  // that was asked not to lock memory, are doing exactly what they were told.
+  CHECK(status["rt_priority"] == 0);
+  CHECK(status["memory_locked"] == false);
+}
+
+TEST_CASE("a device that cannot be opened is an error issue, not just a counter")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "gain.json", kGainRig);
+
+  Config config;
+  config.backend = BackendKind::AlsaRaw;
+  config.device = "hw:99,0"; // not a device
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "gain.json").string();
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) { return status["state"] == "lost"; }));
+
+  const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  const auto& status = reply["status"];
+  CHECK(status["health"] == "error");
+  REQUIRE(status["issues"].size() >= 1u);
+
+  bool found = false;
+  for (const auto& issue : status["issues"])
+  {
+    if (issue["code"] != "device_lost")
+      continue;
+    found = true;
+    CHECK(issue["severity"] == "error");
+    CHECK(issue["count"].get<uint64_t>() >= 1u);
+    CHECK(issue["message"].get<std::string>().find("retrying") != std::string::npos);
+  }
+  CHECK_MESSAGE(found, "a device that will not open must say so as an issue, not only as a counter");
+  // The device state and the health code agree, because one is derived from the other rather than
+  // tracked beside it.
+  CHECK(status["device_lost"].get<uint64_t>() >= 1u);
+  CHECK(status["health"] == "error");
+}

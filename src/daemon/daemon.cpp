@@ -54,6 +54,11 @@ constexpr std::size_t kArenaBytes = 1u << 20;
 /// message that fills it is refused rather than truncated into something that parses.
 constexpr std::size_t kMaxMessageBytes = 256u * 1024;
 
+/// How often the recent-trouble buckets are drained, in blocks. A hundred blocks is a sixth of a
+/// second at 64 frames and 48 kHz, so a bucket halves in about a second: long enough that a dropout
+/// is still visible when the user looks, short enough that the light goes back to green.
+constexpr uint64_t kRecentDecayBlocks = 100;
+
 /// The protocol version this daemon speaks. Incremented when the request/response shape changes.
 ///
 /// 2 added `rig.apply` (a whole document in memory), the document in `rig.get`, the per-chain array in
@@ -71,6 +76,52 @@ nlohmann::json protocol_features()
   return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
                                 "structural_crossfade", "smooth_params", "bypass", "guard",
                                 "per_chain_mute", "schema"});
+}
+
+/// One parameter as `engine.schema` reports it. One shape for the node's own parameters and for the
+/// per-port ones, so a client builds a control the same way wherever it is addressed.
+nlohmann::json param_schema(const render::ParamDesc& param)
+{
+  nlohmann::json p;
+  p["id"] = param.id;
+  p["name"] = param.name == nullptr ? param.id : param.name;
+  switch (param.kind)
+  {
+  case render::ParamKind::Number: p["kind"] = "number"; break;
+  case render::ParamKind::Option: p["kind"] = "option"; break;
+  case render::ParamKind::Flag: p["kind"] = "flag"; break;
+  }
+  p["unit"] = param.unit == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.unit);
+  // A required parameter, and one of a `one_of` group, have no default: publishing the zero they
+  // happen to be stored with would be a value no node could be built from.
+  p["default"] = (param.required || param.one_of != nullptr) ? nlohmann::json(nullptr)
+                                                            : nlohmann::json(param.default_value);
+  p["min"] = param.has_min ? nlohmann::json(param.min) : nlohmann::json(nullptr);
+  p["min_inclusive"] = param.min_inclusive;
+  p["max"] = param.has_max ? nlohmann::json(param.max) : nlohmann::json(nullptr);
+  p["max_inclusive"] = param.max_inclusive;
+  p["step"] = param.step > 0.0 ? nlohmann::json(param.step) : nlohmann::json(nullptr);
+  p["snap"] = param.snap;
+  p["scale"] = param.scale == render::ParamScale::Log ? "log" : "linear";
+  p["rampable"] = param.rampable;
+  p["patchable"] = param.patchable;
+  p["hidden"] = param.hidden;
+  p["required"] = param.required;
+  p["one_of"] = param.one_of == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.one_of);
+  p["one_of_required"] = param.one_of_required;
+  p["options_from"] = param.options_from == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.options_from);
+  if (param.options != nullptr)
+  {
+    nlohmann::json options = nlohmann::json::array();
+    for (int o = 0; o < param.option_count; ++o)
+      options.push_back({{"value", param.options[o].value}, {"label", param.options[o].label}});
+    p["options"] = std::move(options);
+  }
+  else
+  {
+    p["options"] = nlohmann::json(nullptr);
+  }
+  return p;
 }
 
 /// One node type as `engine.schema` reports it: what a palette offers and what an inspector lays out.
@@ -121,55 +172,19 @@ nlohmann::json node_type_schema(const render::NodeType& type)
 
   nlohmann::json params = nlohmann::json::array();
   for (int i = 0; i < type.param_count; ++i)
-  {
-    const render::ParamDesc& param = type.params[i];
-    nlohmann::json p;
-    p["id"] = param.id;
-    p["name"] = param.name == nullptr ? param.id : param.name;
-    switch (param.kind)
-    {
-    case render::ParamKind::Number: p["kind"] = "number"; break;
-    case render::ParamKind::Option: p["kind"] = "option"; break;
-    case render::ParamKind::Flag: p["kind"] = "flag"; break;
-    }
-    p["unit"] = param.unit == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.unit);
-    // A required parameter, and one of a `one_of` group, have no default: publishing the zero they
-    // happen to be stored with would be a value no node could be built from.
-    p["default"] = (param.required || param.one_of != nullptr) ? nlohmann::json(nullptr)
-                                                              : nlohmann::json(param.default_value);
-    p["min"] = param.has_min ? nlohmann::json(param.min) : nlohmann::json(nullptr);
-    p["min_inclusive"] = param.min_inclusive;
-    p["max"] = param.has_max ? nlohmann::json(param.max) : nlohmann::json(nullptr);
-    p["max_inclusive"] = param.max_inclusive;
-    p["step"] = param.step > 0.0 ? nlohmann::json(param.step) : nlohmann::json(nullptr);
-    p["snap"] = param.snap;
-    p["scale"] = param.scale == render::ParamScale::Log ? "log" : "linear";
-    p["rampable"] = param.rampable;
-    p["patchable"] = param.patchable;
-    p["hidden"] = param.hidden;
-    p["required"] = param.required;
-    p["one_of"] = param.one_of == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.one_of);
-    p["one_of_required"] = param.one_of_required;
-    p["options_from"] = param.options_from == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.options_from);
-    if (param.options != nullptr)
-    {
-      nlohmann::json options = nlohmann::json::array();
-      for (int o = 0; o < param.option_count; ++o)
-        options.push_back({{"value", param.options[o].value}, {"label", param.options[o].label}});
-      p["options"] = std::move(options);
-    }
-    else
-    {
-      p["options"] = nlohmann::json(nullptr);
-    }
-    params.push_back(std::move(p));
-  }
+    params.push_back(param_schema(type.params[i]));
   entry["params"] = std::move(params);
+
+  // Per-port parameters, declared once and addressed with a port. Same shapes as the node's own, so a
+  // client builds one control per lane without a naming convention of its own.
+  nlohmann::json per_port = nlohmann::json::array();
+  for (int i = 0; i < type.per_port_param_count; ++i)
+    per_port.push_back(param_schema(type.per_port_params[i]));
+  entry["per_port_params"] = std::move(per_port);
   return entry;
 }
 
-/// A local control socket does not need many peers, and an unbounded accept loop is how a daemon
-/// runs out of descriptors. Past the cap the connection is closed immediately rather than queued.
+
 constexpr std::size_t kMaxClients = 16;
 
 void delete_plan_slot(void* object)
@@ -385,8 +400,8 @@ int Daemon::find_chain_with_node(const std::string& node) const
   return found;
 }
 
-bool Daemon::publish_param(const std::string& chain_id, const std::string& node, const std::string& param,
-                           double value, std::string& error)
+bool Daemon::publish_param(const std::string& chain_id, const std::string& node, int port,
+                           const std::string& param, double value, std::string& error)
 {
   int index = -1;
   if (!chain_id.empty())
@@ -430,9 +445,11 @@ bool Daemon::publish_param(const std::string& chain_id, const std::string& node,
   // thread; that is the whole point of the command.
   std::size_t node_index = 0;
   uint32_t param_id = 0;
-  if (!slot->plan->resolve_param(node, param, node_index, param_id))
+  if (!slot->plan->resolve_param(node, param, port, node_index, param_id))
   {
-    error = "node '" + node + "' has no settable param '" + param + "'";
+    error = port < 0 ? "node '" + node + "' has no settable param '" + param + "'"
+                     : "node '" + node + "' port " + std::to_string(port) + " has no settable param '" +
+                         param + "'";
     return false;
   }
 
@@ -831,6 +848,7 @@ void Daemon::fail_device(const std::string& reason)
   if (config_.verbose)
     std::fprintf(stderr, "[namchaind] device: %s\n", reason.c_str());
   render_errors_.fetch_add(1);
+  recent_render_errors_.fetch_add(1);
   close_device();
   set_device_state(DeviceState::Lost);
 }
@@ -1213,7 +1231,19 @@ void Daemon::render_loop()
 
     reclaimer_.advance_epoch();
     blocks_.fetch_add(1);
-    xruns_.store(device_->driver_xruns());
+    const uint64_t xruns = device_->driver_xruns();
+    xruns_.store(xruns);
+
+    // The recent-trouble buckets: what arrived since the last block, drained periodically so the
+    // number means "lately" rather than "ever".
+    if (xruns > last_xruns_)
+      recent_xruns_.fetch_add(xruns - last_xruns_);
+    last_xruns_ = xruns;
+    if (blocks_.load() % kRecentDecayBlocks == 0)
+    {
+      recent_xruns_.store(recent_xruns_.load() - recent_xruns_.load() / 8);
+      recent_render_errors_.store(recent_render_errors_.load() - recent_render_errors_.load() / 8);
+    }
   }
 
   // Give the backend its chance to write what it accumulated (a `file` backend's output WAV) before
@@ -1228,6 +1258,71 @@ void Daemon::render_loop()
 
 std::string Daemon::handle_request(const std::string& request)
 {
+  // The health summary: one field for a light to bind to, and the reasons behind it as stable codes a
+  // client maps to its own words rather than parsing (docs/ui-integration-plan.md §1.6). Issues are
+  // *current state*: one that stops being true disappears, which is why the cumulative counters are
+  // not what this reads.
+  auto issues_json = [this]() {
+    nlohmann::json issues = nlohmann::json::array();
+    const auto add = [&issues](const char* code, const char* severity, std::string message, uint64_t count,
+                               const std::string& chain = std::string(), const std::string& node = std::string()) {
+      nlohmann::json issue;
+      issue["code"] = code;
+      issue["severity"] = severity;
+      issue["message"] = std::move(message);
+      issue["count"] = count;
+      if (!chain.empty())
+        issue["chain"] = chain;
+      if (!node.empty())
+        issue["node"] = node;
+      issues.push_back(std::move(issue));
+    };
+
+    if (device_state() == DeviceState::Lost)
+    {
+      add("device_lost", "error",
+          "the audio device is not open; the render thread is retrying every " +
+            std::to_string(config_.device_retry_ms) + " ms",
+          device_lost_.load());
+    }
+    for (std::size_t i = 0; i < current_document_.chains.size() && i < static_cast<std::size_t>(kMaxChains); ++i)
+    {
+      if (chains_[i].failed_nodes.load() == 0)
+        continue;
+      std::string node;
+      if (published_slots_[i] != nullptr && published_slots_[i]->plan != nullptr)
+      {
+        const std::vector<std::string>& ids = published_slots_[i]->plan->node_ids();
+        for (std::size_t n = 0; n < ids.size() && n < chains_[i].failed_nodes.load(); ++n)
+        {
+          // The first failed node is the useful one to name; the counters carry the rest.
+          if (published_slots_[i]->plan->node_failed(n))
+          {
+            node = ids[n];
+            break;
+          }
+        }
+      }
+      add("node_failed", "error",
+          "a node returned a non-finite sample and has been taken out of the signal path",
+          chains_[i].guard_trips.load(), current_document_.chains[i].id, node);
+    }
+    if (recent_xruns_.load() > 0)
+      add("xruns", "warn", "the device has missed deadlines recently", recent_xruns_.load());
+    if (recent_render_errors_.load() > 0)
+      add("render_errors", "warn", "the render thread has reported errors recently", recent_render_errors_.load());
+    if (!rt_realtime_.load() && config_.rt_priority > 0)
+    {
+      add("not_realtime", "warn",
+          "the render thread is not running under the real-time policy that was asked for", 1);
+    }
+    if (config_.lock_memory && !memory_locked_.load() && device_state() != DeviceState::Closed)
+      add("memory_not_locked", "warn", "mlockall was refused, so the run is not pinned in memory", 1);
+    if (transition_active_.load())
+      add("transition", "info", "a structural change is being crossfaded", 1);
+    return issues;
+  };
+
   // One shape for the per-chain array wherever it appears, so a client can read the same entry from
   // `engine.status` and from `rig.get` and not learn two vocabularies for one thing.
   auto chains_json = [this]() {
@@ -1366,6 +1461,23 @@ std::string Daemon::handle_request(const std::string& request)
     // through its own transition. The document-level fields above are derived from these, so a client
     // can read either the whole picture or one chain's.
     status["chains"] = chains_json();
+
+    // `health` is derived from the issues rather than tracked beside them, so the two cannot disagree:
+    // error beats warn beats ok, and informational issues do not colour it.
+    nlohmann::json issues = issues_json();
+    const char* health = "ok";
+    for (const auto& issue : issues)
+    {
+      if (issue["severity"] == "error")
+      {
+        health = "error";
+        break;
+      }
+      if (issue["severity"] == "warn")
+        health = "warn";
+    }
+    status["health"] = health;
+    status["issues"] = std::move(issues);
     status["max_chains"] = kMaxChains;
     status["features"] = protocol_features();
     nlohmann::json body;
@@ -1523,11 +1635,34 @@ std::string Daemon::handle_request(const std::string& request)
         smooth = false;
         break;
       }
+      // An optional port: a mixer's per-input settings are addressed by port rather than by a name
+      // like `level3`, and one that the node does not have is not resolved.
+      int port = -1;
+      if (op.contains("port"))
+      {
+        if (!op["port"].is_number_integer() || op["port"].get<int>() < 0)
+        {
+          return error_response(id, "bad_request", "'port' must be a non-negative integer");
+        }
+        port = op["port"].get<int>();
+      }
       std::size_t node_index = 0;
       uint32_t param_id = 0;
-      if (!target->plan->resolve_param(op["node"].get<std::string>(), op["param"].get<std::string>(),
+      if (!target->plan->resolve_param(op["node"].get<std::string>(), op["param"].get<std::string>(), port,
                                        node_index, param_id))
+      {
+        // A port-addressed op has no structural fallback: a per-port parameter lives in the node's
+        // state, not in the graph, so rewriting the graph could not express it. Falling through would
+        // turn "lane 2 does not exist" into "the rig failed to compile", which is a worse answer to
+        // the same question.
+        if (port >= 0)
+        {
+          return error_response(id, "patch_rejected",
+                               "node '" + op["node"].get<std::string>() + "' port " + std::to_string(port) +
+                                 " has no settable param '" + op["param"].get<std::string>() + "'");
+        }
         smooth = false;
+      }
     }
 
     if (smooth)
@@ -1535,8 +1670,11 @@ std::string Daemon::handle_request(const std::string& request)
       unsigned applied = 0;
       for (const nlohmann::json& op : doc["ops"])
       {
+        int port = -1;
+        if (op.contains("port") && op["port"].is_number_integer())
+          port = op["port"].get<int>();
         std::string error;
-        if (!publish_param(chain_id, op["node"].get<std::string>(), op["param"].get<std::string>(),
+        if (!publish_param(chain_id, op["node"].get<std::string>(), port, op["param"].get<std::string>(),
                            op["value"].get<double>(), error))
         {
           return error_response(id, "patch_rejected", "ops[" + std::to_string(applied) + "]: " + error);

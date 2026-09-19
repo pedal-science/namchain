@@ -36,6 +36,7 @@ returns
 | `kind` | `primitive` today; `macro` arrives with the lowering layer (slice E), and a client should not care which it is looking at |
 | `ports.in[]`, `ports.out[]` | per-port `channels` and `optional`. **An unconnected input is legal and is bound to silence**, which is what makes a dry lane a matter of not wiring it rather than of wiring a special node |
 | `arity` | for a node whose port count comes from a parameter (`nc.split`, `nc.mix`): the parameter, its bounds and its default. `null` for a fixed shape |
+| `per_port_params[]` | parameters that exist once per port rather than once per node — a mixer's level, mute and polarity per input. The same shapes as `params`, addressed with a `port` in a patch |
 | `flags.stateful` | explains why bypass keeps the node running rather than removing it |
 | `flags.bypassable` | the compiler refuses bypass on anything but 1→1; publishing it lets a UI grey the control instead of finding out |
 | `flags.block_delay` | a scheduling primitive (`nc.unit_delay`), not a pedal: a palette should leave it out |
@@ -75,6 +76,25 @@ Those parameters publish no `max` at all, and the node's own check owns the boun
 error. The distinction shows up in the message: *"the schema's maximum is 24"* is a client bug,
 *"30000 Hz is at or above Nyquist for 48000 Hz"* is a client asking for something the rig cannot do.
 
+### Addressing a parameter
+
+Three pieces of an address, and a patch may use the one that fits:
+
+```json
+{ "op": "set_param", "node": "g", "param": "gain_db", "value": -6 }
+{ "op": "set_param", "node": "m", "port": 1, "param": "level_db", "value": -6 }
+```
+
+`port` selects a per-port parameter, and one that the node does not have is **refused rather than
+ignored** — with two inputs there is no lane 2, and a client that set one would believe it had done
+something. A port-addressed op has no structural fallback: a per-port parameter lives in the node's
+state rather than in the graph, so "lane 2 does not exist" is answered as exactly that rather than as
+a failed compile.
+
+Element and role addressing — `{"element": "b7f3…", "role": "line"}` — arrives with the lowering layer
+(slice E), which is the first time the engine mints node ids and a role is a thing a client cannot
+compute for itself.
+
 ## What enforcing it buys
 
 `validate()` lints every node against its type before anything else looks at the graph, so a rig — from
@@ -106,9 +126,12 @@ Three claims are asserted rather than promised, in `tests/test_schema.cpp`:
 
 ## What is not here yet
 
-- **Per-port parameters.** `nc.mix` can sum N inputs but has no per-input gain: a lane's level is a
-  `nc.gain` node in the lane, which is what a client's flattening already produces. Per-port gain,
-  mute and phase are slice B4.
+- **Per-port parameters are runtime, not document.** `nc.mix` declares a level, a mute and a polarity
+  per input (`per_port_params`), addressed by port in `rig.patch`, and they are the smooth class — a
+  lane fader streams rather than rebuilding. A *rig file* cannot set one: a document that wants a lane
+  at −6 dB says so with a node in the lane, which is what a client's flattening already produces, or —
+  once there is a lowering layer — with a macro that sets the port itself. A naming convention like
+  `level2` would have been a second way to say it, with its own bounds and its own drift.
 - **Ramping for a filter or a delay time, and how it is done.** These are rampable, and not by
   interpolating anything: a biquad runs the old and the new coefficient sets in two lanes and
   equal-power crossfades their outputs (`rt::Crossfade`, the same law a plan transition uses), because

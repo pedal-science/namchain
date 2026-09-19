@@ -180,8 +180,10 @@ private:
   ///
   /// \param chain_id the chain to resolve against, or empty to resolve by node id -- which is an error
   /// if more than one chain holds that node, because guessing would edit an arbitrary chain.
-  bool publish_param(const std::string& chain_id, const std::string& node, const std::string& param, double value,
-                     std::string& error);
+  /// \param port the port a per-port parameter belongs to (a mixer's per-input level, mute, phase), or
+  /// -1 for a parameter of the node itself.
+  bool publish_param(const std::string& chain_id, const std::string& node, int port, const std::string& param,
+                     double value, std::string& error);
   bool push_slot(uint32_t chain, uint32_t chain_count, PlanSlot* slot);
   /// The index of the chain with this id in the running document, or -1. Control thread.
   int find_chain(const std::string& chain_id) const;
@@ -295,6 +297,9 @@ private:
   /// still working through the chains.
   uint64_t rendered_generation_ = 0;
   uint64_t previous_generation_ = 0;
+  /// The driver's xrun counter as of the last block, so the recent-trouble bucket can be fed the
+  /// delta rather than the total.
+  uint64_t last_xruns_ = 0;
   std::vector<unsigned char> capture_buffer_;
   std::vector<unsigned char> playback_buffer_;
   /// The playback bus, planar: one run of \ref Config::period_size floats per device playback channel.
@@ -329,6 +334,15 @@ private:
   /// The non-finite guard across the audible chains: nodes failed, and how many times one tripped.
   std::atomic<unsigned> failed_nodes_{0};
   std::atomic<uint64_t> guard_trips_{0};
+  /// \brief Trouble that is happening *now*, rather than trouble that has ever happened.
+  ///
+  /// The driver's xrun and error counters only go up, so read raw they say "this box has glitched
+  /// since it booted", which is not a health indicator: it never clears, so a client's "is it well"
+  /// light would stay amber for the rest of the session after one dropout. These are the same events
+  /// through a leaky bucket -- fed by the deltas, drained every few hundred blocks -- so an issue can
+  /// go away, which is what makes it worth showing (docs/ui-integration-plan.md §1.6).
+  std::atomic<uint64_t> recent_xruns_{0};
+  std::atomic<uint64_t> recent_render_errors_{0};
   std::atomic<unsigned> active_rate_{0};
   std::atomic<unsigned> active_period_{0};
   std::atomic<unsigned> active_capture_channels_{0};

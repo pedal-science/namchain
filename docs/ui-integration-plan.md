@@ -12,8 +12,11 @@ an applied document. **B1 and B2 landed** — every node type declares its param
 refuses a name it does not declare (or a value outside the declared bounds, or an option outside the
 set, or a missing required parameter), and `engine.schema` publishes the catalogue. **B3 landed** — a
 filter's `freq`/`q`/`gain_db` and a delay's `ms`/`samples` ramp in-node, by crossfading two filter
-lanes and two delay taps rather than by interpolating coefficients or moving a read pointer. Remaining
-in B: per-port mix parameters (B4) and `health`/`issues` (B5). Follows
+lanes and two delay taps rather than by interpolating coefficients or moving a read pointer. **B4 and B5 landed** —
+`nc.mix` takes a level, a mute and a polarity per input, addressed by port and ramped, with a port that
+does not exist refused by name; and `engine.status` carries `health` plus `issues` with stable codes,
+derived from the current state so a light can go back to green. Slice B is complete. Slice C (the TCP
+listener and token) is next. Follows
 `docs/ljoss-comparison.md` (the analysis) and the seven decisions recorded below. Slices are ordered
 by dependency, not by appeal; each is independently committable and independently testable, and none
 of them requires the app to exist first.
@@ -392,8 +395,8 @@ vector; the staggering is a queue, not a scheduler.
 | **B1** ✅ | `ParamDesc` + node-type metadata on `NodeType`; every built-in declares its schema; `engine.schema` returns it; `docs/schema.md` |
 | **B2** ✅ (less the string patch path) | Validation against the schema at load and at patch: unknown param, unknown option, out of range (schema vs engine limit distinguished), missing `required`, unsatisfied `one_of`. Still to do: a patch path for string-valued (option) parameters |
 | **B3** ✅ | Smooth coverage. The gains ramp (`nc.gain`'s `gain_db` and its linear alias), and so do the two parameters that cannot simply be interpolated: a biquad runs the old and new coefficient sets in two lanes and equal-power crossfades them (interpolating coefficients is not guaranteed stable and is not the response anyone asked for mid-move), and a delay crossfades between two read taps (interpolating the position would be a varispeed slide). The incoming filter lane inherits the outgoing one's state, so a high-Q change does not start deaf. The delay line's length is now declared by the rig (`max_ms`/`max_samples`), because the render path may not allocate and a ring sized for the built time would wrap if the time were lengthened. Caveat, measured and written up in docs/transitions.md: the glitch detector's continuity limit is exactly the +6 dB comb peak a tap crossfade produces on correlated material, and its HF rule needs material with HF in it |
-| **B4** | `nc.split` gains `mode` (`y` implemented; `aB`/`crossover`/`dynamic` declared and refused); `nc.mix` gains per-port `gain_db`/`mute`/`phase`; ports declare `channels`, non-mono refused |
-| **B5** | `health` + `issues` in `engine.status`; the error-code list documented |
+| **B4** ✅ | `nc.mix` gains per-port `level_db`/`mute`/`phase`, addressed by port, ramped like any gain, and refused by name when the port does not exist — a port-addressed op has no structural fallback, because a per-port parameter lives in the node's state rather than in the graph. Ports declare `channels` and non-mono is refused (B1). Still open from this row: `nc.split`'s `mode` (the `y`/`aB`/`crossover`/`dynamic` split), which is a DSP decision rather than a schema one and is not needed until a client asks for a crossover |
+| **B5** ✅ | `health` + `issues` in `engine.status`: stable codes, per-issue severity, `health` derived from the worst of them, and matters that are *current state* rather than a log — the xrun and error signals go through a leaky bucket so they can clear, which is what makes the light worth showing. The code list is in docs/daemon.md |
 
 **Tests, beyond the above:**
 - **the defaults test**: for every node type, a node created with no params renders sample-identical

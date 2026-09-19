@@ -11,6 +11,8 @@
 #include <string>
 #include <vector>
 
+#include <json.hpp>
+
 #include "namchain/glitch.h"
 #include "namchain/graph/plan.h"
 #include "namchain/rt/arena.h"
@@ -383,4 +385,126 @@ TEST_CASE("a parameter change the node cannot honour is refused and changes noth
   // `ramp_ms` is declared and not rampable: the dispatch must refuse it rather than silently ignore
   // it, because a client that sent it would otherwise believe the smoothing time had changed.
   CHECK_FALSE(delay_plan->resolve_param("n", "ramp_ms", index, id));
+}
+
+// ---------------------------------------------------------------------------
+// Per-port parameters (docs/ui-integration-plan.md §1.4, slice B4)
+// ---------------------------------------------------------------------------
+//
+// A mixer with N inputs and no per-input control is a summer, so `nc.mix` declares a level, a mute
+// and a polarity *per port*, addressed with a port rather than named `level3`. They are the same
+// shapes as a node's own parameters and they ramp the same way, which is what makes a lane fader
+// stream rather than rebuild.
+
+namespace
+{
+
+/// in -> mix -> out, with the same signal wired into both inputs: the output is then the sum of the
+/// two ports' gains, which makes each setting's effect arithmetic rather than a judgement call.
+Graph mix_graph(double ramp_ms)
+{
+  NodeSpec mix = node("m", "nc.mix");
+  mix.params["inputs"] = 2;
+  mix.params["ramp_ms"] = ramp_ms;
+
+  Graph graph;
+  NodeSpec input = node("in", "nc.input");
+  NodeSpec output = node("out", "nc.output");
+  graph.nodes = {input, mix, output};
+  graph.connections = {{"in", 0, "m", 0}, {"in", 0, "m", 1}, {"m", 0, "out", 0}};
+  return graph;
+}
+
+/// Render with one per-port edit applied at \p kEditAt. \p port is ignored when \p edit is false.
+std::vector<float> render_port(const Graph& graph, const std::vector<float>& input, int port,
+                               const std::string& param, bool edit, float target)
+{
+  namchain::rt::Arena arena(1 << 16);
+  auto plan = compile(graph, arena);
+  plan->prewarm();
+
+  std::size_t node_index = 0;
+  std::uint32_t param_id = 0;
+  REQUIRE(plan->resolve_param("m", param, port, node_index, param_id));
+
+  std::vector<float> output(input.size(), 0.0f);
+  for (std::size_t at = 0; at < input.size(); at += kQuantum)
+  {
+    if (edit && at == kEditAt)
+      REQUIRE(plan->set_param(node_index, param_id, target));
+    const int frames = static_cast<int>(std::min<std::size_t>(kQuantum, input.size() - at));
+    plan->execute(input.data() + at, output.data() + at, frames);
+  }
+  return output;
+}
+
+} // namespace
+
+TEST_CASE("a mixer's per-port settings are addressed by port and sum as arithmetic")
+{
+  const std::vector<float> input = tone(kFrames);
+
+  // Two unity ports: the sum is twice the input.
+  const std::vector<float> both = render_port(mix_graph(0.0), input, 0, "level_db", false, 0.0f);
+  CHECK(both[kFrames - 1] == doctest::Approx(2.0f * input[kFrames - 1]).epsilon(0.01));
+
+  // One port at -6.02 dB is half: the sum is 1.5x.
+  const std::vector<float> halved = render_port(mix_graph(0.0), input, 0, "level_db", true, -6.0206f);
+  CHECK(halved[kFrames - 1] == doctest::Approx(1.5f * input[kFrames - 1]).epsilon(0.01));
+
+  // Muting the second port takes it out of the sum.
+  const std::vector<float> muted = render_port(mix_graph(0.0), input, 1, "mute", true, 1.0f);
+  CHECK(muted[kFrames - 1] == doctest::Approx(input[kFrames - 1]).epsilon(0.01));
+
+  // Inverting it subtracts instead.
+  const std::vector<float> inverted = render_port(mix_graph(0.0), input, 1, "phase", true, 1.0f);
+  CHECK(std::abs(inverted[kFrames - 1]) < 1e-4f);
+
+  // Every port starts at unity, unmuted and in phase: a lane's settings are runtime state addressed
+  // by port, not a document setting with a naming convention of its own.
+  const std::vector<float> defaults = render_port(mix_graph(0.0), input, 0, "level_db", false, 0.0f);
+  CHECK(defaults[kFrames - 1] == doctest::Approx(2.0f * input[kFrames - 1]).epsilon(0.01));
+}
+
+TEST_CASE("a per-port parameter change is refused when the port does not exist")
+{
+  namchain::rt::Arena arena(1 << 16);
+  auto plan = compile(mix_graph(5.0), arena);
+
+  std::size_t index = 0;
+  std::uint32_t id = 0;
+  CHECK(plan->resolve_param("m", "level_db", 0, index, id));
+  CHECK(plan->resolve_param("m", "mute", 1, index, id));
+  CHECK(plan->resolve_param("m", "phase", 1, index, id));
+  // Two ports, so there is no port 2 -- and refusing is the point: a client cannot set a lane that
+  // does not exist, and a mixer's own parameters are not reachable as if they were a port's.
+  CHECK_FALSE(plan->resolve_param("m", "level_db", 2, index, id));
+  CHECK_FALSE(plan->resolve_param("m", "inputs", 0, index, id));
+  CHECK_FALSE(plan->resolve_param("m", "ramp_ms", 0, index, id));
+  CHECK_FALSE(plan->resolve_param("m", "level_db", index, id)); // and not as a node parameter either
+  CHECK_FALSE(plan->resolve_param("nope", "level_db", 0, index, id));
+  // A node with no per-port parameters has no ports to address.
+  CHECK_FALSE(plan->resolve_param("in", "level_db", 0, index, id));
+}
+
+TEST_CASE("a ramped lane level passes the glitch detector, and an unramped one does not")
+{
+  const std::vector<float> input = tone(kFrames);
+
+  const std::vector<float> ramped = render_port(mix_graph(5.0), input, 0, "level_db", true, -12.0f);
+  const std::vector<float> before = render_port(mix_graph(0.0), input, 0, "level_db", false, 0.0f);
+  const std::vector<float> after = render_port(mix_graph(0.0), input, 0, "level_db", true, -12.0f);
+
+  const namchain::glitch::Report report = analyse(ramped, before, after, kEditAt + 240);
+  if (!report.ok)
+    for (const namchain::glitch::Finding& finding : report.findings)
+      MESSAGE(finding.rule << " at " << finding.frame << ": " << finding.detail);
+  CHECK(report.ok);
+  CHECK(report.max_edit_d2 > 0.0);
+
+  // The negative control: a lane level with no smoothing is a step, exactly like any other gain.
+  const std::vector<float> stepped = render_port(mix_graph(0.0), input, 0, "level_db", true, -12.0f);
+  const namchain::glitch::Report control = analyse(stepped, before, after, kEditAt + 1);
+  CHECK_FALSE(control.ok);
+  CHECK(control.max_edit_d2 > control.reference_d2);
 }

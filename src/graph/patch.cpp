@@ -282,6 +282,14 @@ bool op_set_param(Graph& graph, const nlohmann::json& op, const std::string& whe
     error = where + ": needs a numeric 'value'";
     return false;
   }
+  if (op.contains("port"))
+  {
+    // A per-port parameter is state in the node, not a property of the graph, so there is nothing
+    // here to rebuild: the smooth path is the only path for one (patch.h).
+    error = where + ": a per-port parameter is edited with set_param against the live plan, not by "
+                     "rebuilding the graph";
+    return false;
+  }
   NodeSpec* spec = find_node(graph, id);
   if (spec == nullptr)
   {
