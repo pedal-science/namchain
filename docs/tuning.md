@@ -187,7 +187,26 @@ The practical rules that follow:
   deviceless and 6 % on device xruns under an identical memory load — i.e. nothing**, because its
   housekeeping and audio CPUs share one memory bus and there is nowhere to move the work to. So
   confine on a Pi-class board, and on a 4-core ARMv7 board the rule is the one that actually
-  works: **run nothing else on it.** Two traps if you do it:
+  works: **run nothing else on it.**
+
+  Why the two differ, measured 2026-09-17 — and it is not the number of cores, which is four on
+  both:
+
+  | | Pi 500 (BCM2712, A76) | Tinker Board S (RK3288, A17) |
+  |---|---|---|
+  | L2 | **512 K private per core** | **one unified L2 shared by all four cores** |
+  | L3 | 2 M shared | none |
+  | single-thread `memcpy` | **10.97 GB/s** | **2.98 GB/s** (3.7× less) |
+  | CPU per A2-Full | RTF 0.0501 (~5 % of a core) | RTF 0.5199 (~52 %) |
+  | boot reservation | `isolcpus`/`nohz_full` on 2-3 | none, and `NO_HZ_FULL` not compiled in |
+
+  The engine's working set on the Pi lives in a private L2 that housekeeping can only reach
+  through the shared L3; on the Tinker Board there is no private L2 at all, so housekeeping
+  streams through the same cache the engine is using, over a bus with under a third of the
+  bandwidth, while the engine's own work costs ten times more CPU per model and has far less
+  slack to absorb the queueing. Confinement moves work off a *core*; it cannot give back a private
+  cache or bus capacity, and neither board offers cache partitioning (no MPAM/CAT). Hence ~4× on
+  the Pi and nothing on the Tinker Board. Two traps if you do it:
   confine the top-level slices to the housekeeping cores **and** run the engine in its own cpuset
   partition, or the confinement stops the engine reaching its own core; and pass the rlimits to
   the unit, because a systemd service does not get `pam_limits` and will silently run
