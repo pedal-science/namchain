@@ -11,6 +11,8 @@
 
 #include "namchain/daemon/daemon.h"
 
+#include <netdb.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -51,8 +53,11 @@ namespace
 constexpr std::size_t kArenaBytes = 1u << 20;
 
 /// One SEQPACKET message. A request names a rig, it does not carry one, so this is generous; a
-/// message that fills it is refused rather than truncated into something that parses.
-constexpr std::size_t kMaxMessageBytes = 256u * 1024;
+/// message that fills it is refused rather than truncated into something that parses. The TCP
+/// transport has its own cap (\ref Config::tcp_max_message_bytes), because a network peer is a
+/// different kind of caller than a local one -- but a size that *is* accepted means the same thing on
+/// both, which is why this is a byte count and not a message shape.
+constexpr std::size_t kMaxUnixMessageBytes = 256u * 1024;
 
 /// How often the recent-trouble buckets are drained, in blocks. A hundred blocks is a sixth of a
 /// second at 64 frames and 48 kHz, so a bucket halves in about a second: long enough that a dropout
@@ -75,7 +80,7 @@ nlohmann::json protocol_features()
 {
   return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
                                 "structural_crossfade", "smooth_params", "bypass", "guard",
-                                "per_chain_mute", "schema"});
+                                "per_chain_mute", "schema", "tcp_transport"});
 }
 
 /// One parameter as `engine.schema` reports it. One shape for the node's own parameters and for the
@@ -185,7 +190,72 @@ nlohmann::json node_type_schema(const render::NodeType& type)
 }
 
 
-constexpr std::size_t kMaxClients = 16;
+/// \brief Compare a presented secret with the configured one without an early exit.
+///
+/// `presented == expected` stops at the first wrong byte, and how long it took says how much of the
+/// token was right -- which over a LAN is enough to recover it a byte at a time. This folds every byte
+/// into one accumulator and checks the length in the same pass, so the work depends only on the
+/// token's length, which is not the secret. It is a real comparison, not a substitute for a long
+/// token: three guesses per connection is a meaningful bound only if guessing is hopeless.
+bool constant_time_equal(const std::string& presented, const std::string& expected)
+{
+  const std::size_t longest = std::max(presented.size(), expected.size());
+  unsigned char difference = presented.size() == expected.size() ? 0u : 1u;
+  for (std::size_t i = 0; i < longest; ++i)
+  {
+    const unsigned char a = i < presented.size() ? static_cast<unsigned char>(presented[i]) : 0u;
+    const unsigned char b = i < expected.size() ? static_cast<unsigned char>(expected[i]) : 0u;
+    difference = static_cast<unsigned char>(difference | static_cast<unsigned char>(a ^ b));
+  }
+  return difference == 0u;
+}
+
+/// \brief The first absolute path in \p document, or an empty string.
+///
+/// A Unix client is the operator -- filesystem permissions already decided who may talk to the daemon
+/// -- so an absolute path in a document it applies is the operator's own business. A network client is
+/// not, and an absolute path there is an arbitrary-file-read primitive: model, IR and other string
+/// parameters name files the daemon will open. Remote documents therefore name assets relative to the
+/// rigs root, which is the same boundary a `rig.load` *name* already lives behind.
+std::string first_absolute_path(const graph::Document& document)
+{
+  for (const graph::Chain& chain : document.chains)
+  {
+    for (const graph::NodeSpec& node : chain.graph.nodes)
+    {
+      for (const auto& [key, value] : node.strings)
+      {
+        if (value.size() > 1 && value.front() == '/')
+          return value;
+      }
+    }
+  }
+  return {};
+}
+
+/// \brief The first absolute path among a patch's ops, or an empty string.
+///
+/// Checked on the *ops* rather than on the patched document on purpose: a remote client may edit a
+/// document the operator loaded from a rig file that uses absolute paths, it may just not introduce
+/// any of its own. Refusing the whole document would break the legitimate case; refusing only what the
+/// client wrote is the rule it can actually satisfy.
+std::string first_absolute_path_in_ops(const nlohmann::json& ops)
+{
+  for (const auto& op : ops)
+  {
+    if (!op.is_object())
+      continue;
+    for (const auto& [key, value] : op.items())
+    {
+      if (!value.is_string())
+        continue;
+      const std::string text = value.get<std::string>();
+      if (text.size() > 1 && text.front() == '/')
+        return text;
+    }
+  }
+  return {};
+}
 
 void delete_plan_slot(void* object)
 {
@@ -295,7 +365,10 @@ bool Daemon::bind_socket(std::string& error)
   if (!parent.empty())
     std::filesystem::create_directories(parent, ignored);
 
-  const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+  // Non-blocking, because accepting is a loop until EAGAIN now that more than one connection can be
+  // waiting; on a blocking listener that loop would stop in accept() rather than in the poll that
+  // said there was something to accept.
+  const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
   if (fd < 0)
   {
     error = std::string("socket: ") + std::strerror(errno);
@@ -341,8 +414,8 @@ bool Daemon::bind_socket(std::string& error)
 
 void Daemon::close_socket()
 {
-  for (const int client : clients_)
-    ::close(client);
+  for (const Connection& client : clients_)
+    ::close(client.fd);
   clients_.clear();
   // The path is unlinked only when this process bound it: a failed bind must not remove a socket a
   // previous (or another) daemon is still serving.
@@ -353,6 +426,375 @@ void Daemon::close_socket()
     if (!config_.socket_path.empty())
       ::unlink(config_.socket_path.c_str());
   }
+  if (tcp_fd_ >= 0)
+  {
+    ::close(tcp_fd_);
+    tcp_fd_ = -1;
+    tcp_port_ = 0;
+  }
+}
+
+bool Daemon::bind_tcp(std::string& error)
+{
+  if (!config_.tcp_listen)
+    return true;
+
+  // AI_NUMERICHOST: no DNS at startup. An address that resolves to something else tomorrow is not an
+  // address an appliance should bind, and a name that fails to resolve at boot would take the daemon
+  // down with it.
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE | AI_NUMERICHOST;
+  addrinfo* candidates = nullptr;
+  const std::string service = std::to_string(config_.tcp_port);
+  const int resolved = ::getaddrinfo(config_.tcp_address.c_str(), service.c_str(), &hints, &candidates);
+  if (resolved != 0)
+  {
+    error = "tcp_address '" + config_.tcp_address + "' is not a numeric address: " + ::gai_strerror(resolved);
+    return false;
+  }
+
+  int fd = -1;
+  std::string last;
+  for (addrinfo* candidate = candidates; candidate != nullptr; candidate = candidate->ai_next)
+  {
+    fd = ::socket(candidate->ai_family, candidate->ai_socktype | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                  candidate->ai_protocol);
+    if (fd < 0)
+    {
+      last = std::strerror(errno);
+      continue;
+    }
+    int one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (::bind(fd, candidate->ai_addr, candidate->ai_addrlen) != 0)
+    {
+      last = std::strerror(errno);
+      ::close(fd);
+      fd = -1;
+      continue;
+    }
+    if (::listen(fd, static_cast<int>(config_.tcp_max_connections)) != 0)
+    {
+      last = std::strerror(errno);
+      ::close(fd);
+      fd = -1;
+      continue;
+    }
+    break;
+  }
+  ::freeaddrinfo(candidates);
+  if (fd < 0)
+  {
+    error = "cannot listen on tcp " + config_.tcp_address + ":" + service + ": " +
+            (last.empty() ? "no usable address" : last);
+    return false;
+  }
+
+  // A configured port of 0 means "pick one". Reading it back is what makes that reportable, and it is
+  // also how a test gets a listener with no fixed port and so no collision with a parallel run.
+  tcp_port_ = config_.tcp_port;
+  sockaddr_storage bound{};
+  socklen_t length = sizeof(bound);
+  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&bound), &length) == 0)
+  {
+    if (bound.ss_family == AF_INET)
+      tcp_port_ = ntohs(reinterpret_cast<const sockaddr_in*>(&bound)->sin_port);
+    else if (bound.ss_family == AF_INET6)
+      tcp_port_ = ntohs(reinterpret_cast<const sockaddr_in6*>(&bound)->sin6_port);
+  }
+  tcp_fd_ = fd;
+  return true;
+}
+
+void Daemon::close_transport()
+{
+  close_socket();
+  if (signal_fd_ >= 0)
+  {
+    ::close(signal_fd_);
+    signal_fd_ = -1;
+  }
+  if (mask_saved_)
+  {
+    ::pthread_sigmask(SIG_SETMASK, &previous_mask_, nullptr);
+    mask_saved_ = false;
+  }
+}
+
+std::size_t Daemon::connection_count(PeerKind peer) const
+{
+  std::size_t count = 0;
+  for (const Connection& connection : clients_)
+    count += connection.session.peer == peer ? 1u : 0u;
+  return count;
+}
+
+std::size_t Daemon::max_message_bytes(PeerKind peer) const
+{
+  return peer == PeerKind::Remote ? config_.tcp_max_message_bytes : kMaxUnixMessageBytes;
+}
+
+void Daemon::refuse_connection(int fd, PeerKind peer, const char* code, const std::string& message)
+{
+  // Best effort, and deliberately so. The useful part of `too_many_connections` is that the client is
+  // told why, but a refusal that cannot be delivered is still a refusal: the socket is non-blocking,
+  // a refusal is one small message, and anything the kernel will not take now is not worth a queue for
+  // a connection that is being dropped.
+  const std::string reply = error_response("", code, message);
+  std::vector<char> bytes;
+  if (peer == PeerKind::Remote)
+    append_frame(bytes, reply);
+  else
+    bytes.assign(reply.begin(), reply.end());
+  (void)::send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+  ::close(fd);
+}
+
+void Daemon::accept_connections(int listener, PeerKind peer)
+{
+  const std::size_t cap = peer == PeerKind::Remote ? config_.tcp_max_connections : kMaxLocalClients;
+  for (;;)
+  {
+    const int fd = ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+    if (fd < 0)
+    {
+      if (errno == EINTR)
+        continue;
+      if (errno != EAGAIN && errno != EWOULDBLOCK && config_.verbose)
+        std::fprintf(stderr, "[namchaind] accept: %s\n", std::strerror(errno));
+      return;
+    }
+
+    if (connection_count(peer) >= cap)
+    {
+      refuse_connection(fd, peer, "too_many_connections",
+                        "this daemon serves at most " + std::to_string(cap) +
+                          (peer == PeerKind::Remote ? " TCP control connections" : " local control connections"));
+      continue;
+    }
+
+    Connection connection;
+    connection.fd = fd;
+    connection.session.peer = peer;
+    connection.session.authorized = peer == PeerKind::Local;
+    connection.accepted_at = std::chrono::steady_clock::now();
+    connection.peer = peer == PeerKind::Remote ? config_.tcp_address : "unix";
+
+    if (peer == PeerKind::Remote)
+    {
+      // A modest send buffer, for the two reasons in the header: bounded kernel memory, and a partial
+      // write that shows up immediately rather than after megabytes of buffered reply.
+      int send_buffer = kTcpSendBufferBytes;
+      ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
+
+      // An unauthenticated connection is on a clock. Four idle connections would otherwise hold every
+      // slot this transport has, which turns "the port needs a token" into "the port needs a token,
+      // unless somebody else got there first".
+      if (config_.tcp_auth_timeout_ms > 0)
+      {
+        connection.deadline =
+          connection.accepted_at + std::chrono::milliseconds(config_.tcp_auth_timeout_ms);
+        connection.has_auth_deadline = true;
+      }
+    }
+    clients_.push_back(std::move(connection));
+  }
+}
+
+void Daemon::queue_reply(Connection& connection, std::string reply)
+{
+  if (connection.session.peer == PeerKind::Remote)
+    append_frame(connection.out, reply);
+  else
+    connection.out.insert(connection.out.end(), reply.begin(), reply.end());
+
+  // A client that never reads would otherwise grow this buffer for as long as it keeps asking. One
+  // message's worth of undelivered replies is the cap; past it the connection is finished, because a
+  // peer that cannot absorb a single answer is not a peer this daemon can serve.
+  const std::size_t pending = connection.out.size() - connection.out_sent;
+  if (pending > max_message_bytes(connection.session.peer) + kFrameHeaderBytes)
+    connection.close_after_flush = true;
+}
+
+bool Daemon::write_connection(Connection& connection)
+{
+  while (connection.out_sent < connection.out.size())
+  {
+    const ssize_t sent = ::send(connection.fd, connection.out.data() + connection.out_sent,
+                                connection.out.size() - connection.out_sent, MSG_NOSIGNAL);
+    if (sent > 0)
+    {
+      connection.out_sent += static_cast<std::size_t>(sent);
+      continue;
+    }
+    if (sent < 0 && errno == EINTR)
+      continue;
+    // EAGAIN is the whole point of the outbox: the kernel would not take the rest now, so the control
+    // loop goes and does something else and comes back when poll says this socket is writable again.
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+      return true;
+    return false; // the peer is gone
+  }
+
+  connection.out.clear();
+  connection.out_sent = 0;
+  return !connection.close_after_flush;
+}
+
+void Daemon::close_connection(std::size_t index)
+{
+  ::close(clients_[index].fd);
+  clients_.erase(clients_.begin() + static_cast<std::ptrdiff_t>(index));
+}
+
+void Daemon::drop_expired_connections()
+{
+  const auto now = std::chrono::steady_clock::now();
+  for (std::size_t index = clients_.size(); index-- > 0;)
+  {
+    const Connection& connection = clients_[index];
+    const bool auth_expired = connection.has_auth_deadline && !connection.session.authorized &&
+                              now >= connection.deadline;
+    const bool flush_expired = connection.has_flush_deadline && now >= connection.deadline;
+    if (!auth_expired && !flush_expired)
+      continue;
+    if (config_.verbose)
+      std::fprintf(stderr, "[namchaind] closing %s: %s\n", connection.peer.c_str(),
+                   auth_expired ? "no authentication within the window" : "the last reply never drained");
+    close_connection(index);
+  }
+}
+
+/// Read every whole SEQPACKET message waiting on \p connection and answer each. One datagram is one
+/// message, so there is no framing here at all -- which is the reason the local transport kept it.
+bool Daemon::read_datagrams(Connection& connection)
+{
+  // A local connection's `in` is a scratch buffer for the datagram being read, not an accumulation:
+  // one datagram is one message. It lives on the connection so it is allocated once per connection
+  // rather than once per request, which is what the previous single shared buffer did without the
+  // reentrancy problem of sharing it across connections.
+  if (connection.in.size() != kMaxUnixMessageBytes)
+    connection.in.assign(kMaxUnixMessageBytes, '\0');
+  std::vector<char>& buffer = connection.in;
+
+  for (;;)
+  {
+    const ssize_t got = ::recv(connection.fd, buffer.data(), buffer.size(), 0);
+    if (got == 0)
+      return false; // an orderly close
+    if (got < 0)
+    {
+      if (errno == EINTR)
+        continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        return true;
+      return false;
+    }
+
+    std::string reply;
+    if (static_cast<std::size_t>(got) == buffer.size())
+    {
+      reply = error_response("", "message_too_large", "the request filled the message buffer");
+    }
+    else
+    {
+      reply = handle_request(std::string(buffer.data(), static_cast<std::size_t>(got)), connection.session);
+      if (connection.session.auth_failures >= kMaxAuthFailures)
+        connection.close_after_flush = true;
+    }
+    queue_reply(connection, std::move(reply));
+    if (connection.close_after_flush)
+    {
+      connection.has_flush_deadline = true;
+      connection.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kFlushDeadlineMs);
+    }
+    if (!write_connection(connection))
+      return false;
+    // Stop reading while a reply is still undelivered: that is backpressure, and it is what keeps a
+    // client that asks faster than it reads from costing this daemon memory.
+    if (!connection.out.empty())
+      return true;
+  }
+}
+
+/// Reassemble length-prefixed messages from a stream and answer each.
+bool Daemon::read_framed(Connection& connection)
+{
+  const std::size_t cap = config_.tcp_max_message_bytes;
+  for (;;)
+  {
+    // How many bytes the message being assembled needs. The length prefix is checked against the cap
+    // *before* its body is read, so an oversized message costs a rejection instead of a buffer.
+    std::size_t needed = kFrameHeaderBytes;
+    if (connection.in.size() >= kFrameHeaderBytes)
+    {
+      const std::uint32_t declared = frame_length(connection.in.data());
+      if (declared > cap)
+      {
+        queue_reply(connection, error_response("", "message_too_large",
+                                               "the message declares " + std::to_string(declared) +
+                                                 " bytes; the limit is " + std::to_string(cap)));
+        connection.close_after_flush = true;
+        connection.has_flush_deadline = true;
+        connection.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kFlushDeadlineMs);
+        connection.in.clear();
+        // Deliberately not `true`: a stream cannot be resynchronised after a framing error, so the
+        // refusal is the last thing this connection hears. Returning the write's own result closes it
+        // as soon as that refusal has drained, and leaves it to the flush deadline if the peer will not
+        // read even that.
+        return write_connection(connection);
+      }
+      needed = kFrameHeaderBytes + declared;
+    }
+
+    if (connection.in.size() >= needed)
+    {
+      const std::uint32_t length = frame_length(connection.in.data());
+      const std::string body(connection.in.data() + kFrameHeaderBytes, length);
+      connection.in.erase(connection.in.begin(),
+                          connection.in.begin() + static_cast<std::ptrdiff_t>(kFrameHeaderBytes + length));
+      std::string reply = handle_request(body, connection.session);
+      if (connection.session.auth_failures >= kMaxAuthFailures)
+        connection.close_after_flush = true;
+      queue_reply(connection, std::move(reply));
+      if (connection.close_after_flush)
+      {
+        connection.has_flush_deadline = true;
+        connection.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kFlushDeadlineMs);
+      }
+      if (!write_connection(connection))
+        return false;
+      if (!connection.out.empty())
+        return true; // backpressure, as above
+      continue;
+    }
+
+    // Read exactly what the message in flight still needs, which is what bounds this buffer at one
+    // message plus its header rather than at whatever a peer feels like sending.
+    const std::size_t before = connection.in.size();
+    connection.in.resize(before + (needed - before));
+    const ssize_t got = ::recv(connection.fd, connection.in.data() + before, needed - before, 0);
+    if (got > 0)
+    {
+      connection.in.resize(before + static_cast<std::size_t>(got));
+      continue;
+    }
+    connection.in.resize(before);
+    if (got == 0)
+      return false; // the peer closed, possibly mid-message: a client that vanishes is not an error
+    if (errno == EINTR)
+      continue;
+    if (errno == EAGAIN || errno == EWOULDBLOCK)
+      return true;
+    return false;
+  }
+}
+
+bool Daemon::read_connection(Connection& connection)
+{
+  return connection.session.peer == PeerKind::Remote ? read_framed(connection) : read_datagrams(connection);
 }
 
 bool Daemon::push_slot(uint32_t chain, uint32_t chain_count, PlanSlot* slot)
@@ -661,21 +1103,58 @@ bool Daemon::start(std::string& error)
     error = "output_queue_periods must be less than periods";
     return false;
   }
+  if (config_.tcp_listen)
+  {
+    if (config_.tcp_max_connections == 0)
+    {
+      error = "tcp_max_connections must be at least 1";
+      return false;
+    }
+    // A cap small enough to be a mistake is refused here rather than accepted and then never met: a
+    // message has to hold a document, and one much over a few megabytes is a client bug that would
+    // otherwise cost every connection a buffer of that size.
+    if (config_.tcp_max_message_bytes < 1024 || config_.tcp_max_message_bytes > (64u << 20))
+    {
+      error = "tcp_max_message_bytes must be between 1024 and 67108864";
+      return false;
+    }
+    if (config_.tcp_port > 65535)
+    {
+      error = "tcp_port must be a valid port number (0 picks one)";
+      return false;
+    }
+  }
+  // The token is resolved before anything is bound, so a daemon asked for a listener it cannot
+  // authenticate never gets as far as opening one.
+  if (!resolve_tcp_token(config_, error))
+    return false;
 
   if (!setup_signals(error))
     return false;
-  if (!bind_socket(error))
+  if (!bind_tcp(error))
+  {
+    close_transport();
     return false;
+  }
+  if (!bind_socket(error))
+  {
+    close_transport();
+    return false;
+  }
 
   // The startup rig is compiled before the clock exists, so the first plan is there when the first
   // block runs (rig-pipeline.md §5.1 item 2). A failure here is fatal: the operator named a rig.
   if (!config_.rig.empty())
   {
     std::string path;
-    if (!resolve_startup_rig(config_, config_.rig, path, error))
+    if (!resolve_startup_rig(config_, config_.rig, path, error) || !load_rig(path, error))
+    {
+      // Both listeners are already up. Leaving them bound would mean the next start() -- the test
+      // suite does exactly this -- trips over its own socket, which turns one clear failure into two
+      // confusing ones.
+      close_transport();
       return false;
-    if (!load_rig(path, error))
-      return false;
+    }
   }
 
   running_.store(true);
@@ -717,17 +1196,7 @@ void Daemon::stop()
   failed_nodes_.store(0);
   guard_trips_.store(0);
   last_published_ = nullptr;
-  close_socket();
-  if (signal_fd_ >= 0)
-  {
-    ::close(signal_fd_);
-    signal_fd_ = -1;
-  }
-  if (mask_saved_)
-  {
-    ::pthread_sigmask(SIG_SETMASK, &previous_mask_, nullptr);
-    mask_saved_ = false;
-  }
+  close_transport();
   reclaimer_.collect();
   started_ = false;
 }
@@ -1258,6 +1727,12 @@ void Daemon::render_loop()
 
 std::string Daemon::handle_request(const std::string& request)
 {
+  Session session;
+  return handle_request(request, session);
+}
+
+std::string Daemon::handle_request(const std::string& request, Session& session)
+{
   // The health summary: one field for a light to bind to, and the reasons behind it as stable codes a
   // client maps to its own words rather than parsing (docs/ui-integration-plan.md §1.6). Issues are
   // *current state*: one that stops being true disappears, which is why the cumulative counters are
@@ -1372,9 +1847,44 @@ std::string Daemon::handle_request(const std::string& request)
     return error_response(id, "bad_request", "the request needs a string 'method'");
   const std::string method = doc["method"].get<std::string>();
 
-  // --- engine.hello: negotiate the protocol version -----------------------
+  // --- authorisation, before anything else ---------------------------------
+  //
+  // A remote connection that has not authenticated may say `engine.hello` and nothing else. Checking
+  // it here rather than in each method is the difference between a rule and a habit: a method added
+  // later is covered by construction, and the transport closes the connection after
+  // \ref kMaxAuthFailures of these regardless of which method was tried.
+  if (session.peer == PeerKind::Remote && !session.authorized && method != "engine.hello")
+  {
+    ++session.auth_failures;
+    return error_response(id, "unauthorized",
+                          "'" + method + "' needs an authenticated session: send `engine.hello` with the "
+                                          "transport token first");
+  }
+
+  // --- engine.hello: authenticate, then negotiate the protocol version -----
   if (method == "engine.hello")
   {
+    if (session.peer == PeerKind::Remote && !session.authorized)
+    {
+      // The token is checked first, and the answer says only that it was wrong: a peer that does not
+      // hold the token learns nothing about which protocol versions this daemon speaks, whether the
+      // token was missing or merely incorrect, or how close it was.
+      std::string presented;
+      if (doc.contains("token"))
+      {
+        if (!doc["token"].is_string())
+          return error_response(id, "bad_request", "'token' must be a string");
+        presented = doc["token"].get<std::string>();
+      }
+      if (!constant_time_equal(presented, config_.tcp_token))
+      {
+        ++session.auth_failures;
+        return error_response(id, "unauthorized", "the transport token is missing or wrong");
+      }
+      session.authorized = true;
+      session.auth_failures = 0;
+    }
+
     int protocol = kProtocolVersion;
     if (doc.contains("protocol"))
     {
@@ -1394,6 +1904,11 @@ std::string Daemon::handle_request(const std::string& request)
     body["role"] = "namchaind";
     body["version"] = NAMCHAIN_VERSION_STRING;
     body["features"] = protocol_features();
+    // Which transport answered, and whether this session is authenticated. On the local transport the
+    // second is always true (filesystem permissions decided it); on TCP it becomes true here and
+    // nowhere else, which is what makes a client able to tell "wrong token" from "wrong method".
+    body["transport"] = session.peer == PeerKind::Remote ? "tcp" : "unix";
+    body["authenticated"] = session.authorized;
     return ok_response(id, body);
   }
 
@@ -1461,6 +1976,22 @@ std::string Daemon::handle_request(const std::string& request)
     // through its own transition. The document-level fields above are derived from these, so a client
     // can read either the whole picture or one chain's.
     status["chains"] = chains_json();
+
+    // The control transports as they actually are, not as configured: whether the TCP listener came up
+    // and on which port (a configured 0 means the kernel chose), and how many connections each
+    // transport is holding. A client that cannot connect gets a better answer from this over the Unix
+    // socket than from a failed `connect`.
+    nlohmann::json control;
+    control["unix_socket"] = config_.socket_path;
+    control["unix_connections"] = connection_count(PeerKind::Local);
+    control["tcp_listening"] = tcp_fd_ >= 0;
+    control["tcp_address"] = config_.tcp_address;
+    control["tcp_port"] = tcp_port_;
+    control["tcp_token_required"] = config_.tcp_listen;
+    control["tcp_connections"] = connection_count(PeerKind::Remote);
+    control["tcp_max_connections"] = config_.tcp_max_connections;
+    control["tcp_max_message_bytes"] = config_.tcp_max_message_bytes;
+    status["control"] = std::move(control);
 
     // `health` is derived from the issues rather than tracked beside them, so the two cannot disagree:
     // error beats warn beats ok, and informational issues do not colour it.
@@ -1558,8 +2089,19 @@ std::string Daemon::handle_request(const std::string& request)
 
     // Relative model/IR paths resolve against the rigs root, which is the same trust boundary a
     // rig.load name lives behind: a socket client may name a rig but may not point the daemon at an
-    // arbitrary directory. Absolute paths in a document are the operator's business, and slice C
-    // revisits that rule for a network client (docs/ui-integration-plan.md §3.8).
+    // arbitrary directory. An absolute path is the operator's business on the local transport and
+    // nobody's business on the network one (docs/daemon.md, threat model).
+    if (session.peer == PeerKind::Remote)
+    {
+      const std::string offender = first_absolute_path(document);
+      if (!offender.empty())
+      {
+        return error_response(id, "path_refused",
+                              "a document from a network client may not name the absolute path '" + offender +
+                                "'; put the file under the rigs root and name it relatively");
+      }
+    }
+
     if (!publish_document(document, /*path=*/"", "applied", config_.rigs_root, error))
       return error_response(id, "compile_failed", error);
     nlohmann::json body;
@@ -1613,6 +2155,20 @@ std::string Daemon::handle_request(const std::string& request)
     const PlanSlot* target = published_slots_[chain_index];
     if (target == nullptr || target->plan == nullptr)
       return error_response(id, "patch_rejected", "no plan is loaded; rig.load first");
+
+    // The same rule as rig.apply, checked on the ops rather than on the patched document: a network
+    // client may edit a document the operator loaded from a rig file that uses absolute paths, it may
+    // just not introduce any of its own (docs/daemon.md, threat model).
+    if (session.peer == PeerKind::Remote)
+    {
+      const std::string offender = first_absolute_path_in_ops(doc["ops"]);
+      if (!offender.empty())
+      {
+        return error_response(id, "path_refused",
+                              "a patch from a network client may not name the absolute path '" + offender +
+                                "'; put the file under the rigs root and name it relatively");
+      }
+    }
 
     // Route by op class (§5.3). If every op is a `set_param` the live plan can dispatch, the whole
     // patch is the smooth class: a vtable dispatch on the render thread, no compile, no fade. Any
@@ -1721,14 +2277,23 @@ int Daemon::run()
     return 1;
   }
 
-  std::vector<char> message(kMaxMessageBytes);
   while (!stop_requested_.load())
   {
+    // The poll set: both listeners, the signal fd, then one entry per client. The client entries carry
+    // POLLOUT only while that connection still owes the peer bytes, so a drained connection costs one
+    // readable fd and nothing else.
     std::vector<pollfd> fds;
     fds.push_back(pollfd{listen_fd_, POLLIN, 0});
     fds.push_back(pollfd{signal_fd_, POLLIN, 0});
-    for (const int client : clients_)
-      fds.push_back(pollfd{client, POLLIN, 0});
+    if (tcp_fd_ >= 0)
+      fds.push_back(pollfd{tcp_fd_, POLLIN, 0});
+    const std::size_t tcp_listener = tcp_fd_ >= 0 ? 2 : 0;
+    const std::size_t first_client = fds.size();
+    for (const Connection& connection : clients_)
+    {
+      const short events = static_cast<short>(POLLIN | (connection.out_sent < connection.out.size() ? POLLOUT : 0));
+      fds.push_back(pollfd{connection.fd, events, 0});
+    }
 
     const int timeout = std::max(1, config_.reclamation_timeout_ms);
     const int ready = ::poll(fds.data(), fds.size(), timeout);
@@ -1741,22 +2306,8 @@ int Daemon::run()
       return 1;
     }
 
-    // A client can vanish at any point in the loop below; collect the dead fds and close them after
-    // the walk, so the index arithmetic stays honest.
-    std::vector<int> dead;
-
     if ((fds[0].revents & POLLIN) != 0 && listen_fd_ >= 0)
-    {
-      const int client = ::accept4(listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
-      if (client >= 0)
-      {
-        if (clients_.size() < kMaxClients)
-          clients_.push_back(client);
-        else
-          ::close(client);
-      }
-    }
-
+      accept_connections(listen_fd_, PeerKind::Local);
     if ((fds[1].revents & POLLIN) != 0)
     {
       signalfd_siginfo info{};
@@ -1783,37 +2334,32 @@ int Daemon::run()
     }
     if (stop_requested_.load())
       break;
+    if (tcp_listener != 0 && (fds[tcp_listener].revents & POLLIN) != 0)
+      accept_connections(tcp_fd_, PeerKind::Remote);
 
+    // A client can vanish at any point in the walk below; collect the dead indices and erase them
+    // after it, so the index arithmetic stays honest. `clients_` does not change during the walk --
+    // only this vector of indices does.
+    std::vector<std::size_t> dead;
     for (std::size_t i = 0; i < clients_.size(); ++i)
     {
-      const int client = clients_[i];
-      const short revents = fds[2 + i].revents;
+      Connection& connection = clients_[i];
+      const short revents = fds[first_client + i].revents;
       if ((revents & (POLLIN | POLLHUP | POLLERR)) == 0)
         continue;
 
-      const ssize_t got = ::recv(client, message.data(), message.size(), 0);
-      if (got <= 0)
-      {
-        dead.push_back(client);
-        continue;
-      }
-
-      std::string reply;
-      if (static_cast<std::size_t>(got) == message.size())
-        reply = error_response("", "message_too_large", "the request filled the message buffer");
-      else
-        reply = handle_request(std::string(message.data(), static_cast<std::size_t>(got)));
-
-      // A peer that went away between recv and send is dead, not an error worth reporting.
-      if (::send(client, reply.data(), reply.size(), MSG_NOSIGNAL) < 0)
-        dead.push_back(client);
+      bool alive = true;
+      if ((revents & (POLLIN | POLLHUP | POLLERR)) != 0)
+        alive = read_connection(connection);
+      if (alive && (revents & POLLOUT) != 0)
+        alive = write_connection(connection);
+      if (!alive)
+        dead.push_back(i);
     }
+    for (std::size_t i = dead.size(); i-- > 0;)
+      close_connection(dead[i]);
 
-    for (const int client : dead)
-    {
-      ::close(client);
-      clients_.erase(std::remove(clients_.begin(), clients_.end(), client), clients_.end());
-    }
+    drop_expired_connections();
 
     // The reclamation window of rig-pipeline.md §5.3: this is the "somebody" that frees a plan once
     // its grace has closed, and the reason the poll timeout is neither zero nor infinite.

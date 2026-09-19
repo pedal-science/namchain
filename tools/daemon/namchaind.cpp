@@ -33,6 +33,15 @@ void print_usage(std::FILE* stream)
                "      --rigs-root DIR          root for rig.load names (default /etc/namchain/rigs)\n"
                "      --socket PATH            control socket (default /run/namchain/namchaind.sock)\n"
                "      --socket-mode OCTAL      socket permissions, default 0660\n"
+               "      --tcp-listen             also listen for control connections on TCP (off by default)\n"
+               "      --tcp-address ADDR       TCP address to bind; numeric only (default 127.0.0.1)\n"
+               "      --tcp-port N             TCP port, or 0 to pick one (default 47810)\n"
+               "      --tcp-token TOKEN        pre-shared token a TCP client must present in engine.hello\n"
+               "      --tcp-token-file FILE    read the token from FILE (first line); preferred on a unit,\n"
+               "                               because a token on the command line is visible in `ps`\n"
+               "      --tcp-max-connections N  TCP connections served at once, default 4\n"
+               "      --tcp-max-message-bytes N  largest framed message accepted, default 1048576\n"
+               "      --tcp-auth-timeout-ms N  how long a connection may stay unauthenticated, default 10000\n"
                "      --rt-priority N          render-thread SCHED_FIFO priority, default 80; 0 leaves it\n"
                "      --cpu N                  pin the render thread to one CPU; -1 leaves it (default)\n"
                "      --lock-memory            mlockall(MCL_CURRENT) (default)\n"
@@ -48,7 +57,11 @@ void print_usage(std::FILE* stream)
                "\n"
                "The daemon survives the audio interface being unplugged: the render thread closes the\n"
                "device, reports state \"lost\", and reopens it as soon as it is back. Use\n"
-               "`systemctl reload namchaind` (SIGHUP) to re-read the configured rig.\n",
+               "`systemctl reload namchaind` (SIGHUP) to re-read the configured rig.\n"
+               "\n"
+               "TCP control is off unless --tcp-listen is given, and refuses to start without a token:\n"
+               "an unauthenticated port that can rewrite the rig and mute the output is worse than a\n"
+               "daemon that will not start. See docs/daemon.md for the transport and its threat model.\n",
                NAMCHAIN_VERSION_STRING);
 }
 
@@ -111,7 +124,8 @@ int main(int argc, char** argv)
 
     std::string name = argument == "-v" ? "verbose" : argument.substr(2);
     std::string value;
-    const bool takes_no_value = name == "verbose" || name == "lock-memory" || name == "no-lock-memory";
+    const bool takes_no_value = name == "verbose" || name == "lock-memory" || name == "no-lock-memory" ||
+                                name == "tcp-listen";
     if (!takes_no_value)
     {
       if (i + 1 >= argc)

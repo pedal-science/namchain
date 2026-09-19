@@ -835,7 +835,11 @@ and stop (fade out → stop → release).
 
 ### 8.3 Transports
 
-Primary: Unix domain **`SOCK_SEQPACKET`** (message boundaries + filesystem permissions). Continuous
+Primary: Unix domain **`SOCK_SEQPACKET`** (message boundaries + filesystem permissions). Remote
+control: an **opt-in TCP listener** carrying the same JSON bodies behind a u32 little-endian length
+prefix, with a mandatory pre-shared token in `engine.hello`, connection/message/output caps and no
+TLS (a tunnel is the documented answer off-LAN) — built as slice C of docs/ui-integration-plan.md and
+specified, with its threat model, in docs/daemon.md. Continuous
 parameters and meters: a **shared-memory seqlock/atomic block** (zero-copy, wait-free) (G21). Later:
 OSC/UDP bound to localhost for networked control, same wire structs.
 

@@ -215,6 +215,12 @@ if(NAMCHAIN_BUILD_TOOLS)
     add_executable(namchaind tools/daemon/namchaind.cpp)
     target_link_libraries(namchaind PRIVATE namchain)
     target_compile_options(namchaind PRIVATE ${NAMCHAIN_WARN_FLAGS})
+
+    # The reference control client (docs/ui-integration-plan.md slice C): the same protocol over
+    # either transport, written the way a client in another language would have to write it.
+    add_executable(namchainctl tools/namchainctl/namchainctl.cpp)
+    target_link_libraries(namchainctl PRIVATE namchain)
+    target_compile_options(namchainctl PRIVATE ${NAMCHAIN_WARN_FLAGS})
   endif()
 endif()
 
@@ -279,8 +285,9 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_timeline.cpp
     tests/test_splice_fader.cpp)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # The daemon's socket/signalfd control loop and its config/rig-resolution surface.
-    target_sources(namchain-tests PRIVATE tests/test_daemon.cpp)
+    # The daemon's socket/signalfd control loop and its config/rig-resolution surface, and the TCP
+    # transport that only exists there (framing, the token, the caps: tests/test_tcp.cpp).
+    target_sources(namchain-tests PRIVATE tests/test_daemon.cpp tests/test_tcp.cpp)
   endif()
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
@@ -320,6 +327,18 @@ if(NAMCHAIN_BUILD_TESTS)
         -DNAMCHAIN_INPUT=${NAMCHAIN_NAM_CORE_DIR}/example_audio/input.wav
         -DNAMCHAIN_WORK=${CMAKE_CURRENT_BINARY_DIR}/soak-cli
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/run_soak_backends.cmake")
+  endif()
+
+  # The reference client against the reference daemon, as two processes, over both transports. This
+  # is the only test that joins the two halves of the protocol instead of testing each against its own
+  # idea of the other -- see tests/cli/run_ctl.cmake for the bug that made that worth a test.
+  if(NAMCHAIN_BUILD_TOOLS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME ctl_cli
+      COMMAND ${CMAKE_COMMAND}
+        -DNAMCHAIND=$<TARGET_FILE:namchaind>
+        -DNAMCHAINCTL=$<TARGET_FILE:namchainctl>
+        -DNAMCHAIN_WORK=${CMAKE_CURRENT_BINARY_DIR}/ctl-cli
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/run_ctl.cmake")
   endif()
 
   # -------------------------------------------------------------------------

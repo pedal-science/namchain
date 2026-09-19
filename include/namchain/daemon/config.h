@@ -46,6 +46,39 @@ struct Config
   std::string socket_path = "/run/namchain/namchaind.sock";
   /// Permission bits for the socket node, as an octal string in the config file.
   unsigned socket_mode = 0660;
+
+  // --- the TCP control transport (slice C; docs/ui-integration-plan.md §1.8) ------------------
+  //
+  // Off unless an operator turns it on, and useless without a token: the Unix socket is authorised by
+  // filesystem permissions, and a TCP connection has none to offer. Everything here is about making
+  // a network control port a deliberate act with a bounded blast radius.
+  /// Listen for control connections on TCP as well.
+  bool tcp_listen = false;
+  /// The address to bind. Loopback by default: reaching the daemon from another machine is a decision
+  /// an operator should have to write down, not something that happens because a flag was set.
+  /// Resolved as a numeric address only -- no DNS at startup, so what binds is what was written.
+  std::string tcp_address = "127.0.0.1";
+  /// The port to bind, or 0 to let the kernel choose one (which `engine.status` then reports).
+  unsigned tcp_port = 47810;
+  /// How many TCP connections may be open at once, authenticated or not.
+  unsigned tcp_max_connections = 4;
+  /// The largest framed message accepted, in bytes. Checked against the length prefix *before* the
+  /// body is read, so an oversized message costs a rejection rather than a megabyte of buffer.
+  unsigned tcp_max_message_bytes = 1u << 20;
+  /// The pre-shared token a TCP client must present in `engine.hello`.
+  ///
+  /// Passed on the command line this is visible to every user on the machine (`/proc/<pid>/cmdline`),
+  /// so on a real appliance use \ref tcp_token_file.
+  std::string tcp_token;
+  /// Read the token from the first line of this file instead. The file should be mode 0600; the
+  /// daemon warns if it is readable more widely, because a token every local user can read is not a
+  /// secret. Setting both this and \ref tcp_token is an error rather than a silent precedence.
+  std::string tcp_token_file;
+  /// How long a connection may stay unauthenticated before it is closed, in milliseconds.
+  ///
+  /// Without this, four idle TCP connections would hold every slot the transport has. 0 disables the
+  /// deadline, which is only reasonable when the listener is not reachable from anywhere untrusted.
+  unsigned tcp_auth_timeout_ms = 10000;
   /// SCHED_FIFO priority for the render thread; 0 leaves the policy alone. Requires LimitRTPRIO in
   /// the unit (a systemd service does not get pam_limits).
   int rt_priority = 80;
@@ -97,6 +130,22 @@ bool resolve_startup_rig(const Config& config, const std::string& spec, std::str
 /// the root are refused, and the result must be a regular file. Separate functions because the trust
 /// levels are different -- an operator may point the daemon anywhere, a socket client may not.
 bool resolve_rig_name(const Config& config, const std::string& name, std::string& path, std::string& error);
+
+/// \brief The shortest TCP token the daemon will accept, in characters.
+///
+/// A credential a person can remember is a credential a script can guess: the transport allows three
+/// attempts per connection, and connections are free. Sixteen characters is the point below which a
+/// token is refused outright rather than quietly accepted as decoration.
+inline constexpr std::size_t kMinTokenLength = 16;
+
+/// \brief Read \ref Config::tcp_token_file if it is set, and check the token can be a credential.
+///
+/// Called once at startup, before anything is bound. Refuses a token that is too short, an unreadable
+/// or empty token file, both spellings of the token at once, and -- when \ref Config::tcp_listen is
+/// set -- a listener with no token at all, because an unauthenticated port that can rewrite the rig
+/// and mute the output is worse than a daemon that will not start. Warns (does not refuse) on a token
+/// file any other user can read; the message goes to stderr, ungated by \ref Config::verbose.
+bool resolve_tcp_token(Config& config, std::string& error);
 
 } // namespace daemon
 } // namespace namchain

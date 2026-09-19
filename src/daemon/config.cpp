@@ -1,6 +1,9 @@
 #include "namchain/daemon/config.h"
 
+#include <sys/stat.h>
+
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -229,7 +232,10 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "rigs_root",  "socket",      "socket_mode",     "rt_priority",
                                       "cpu",        "lock_memory",  "output_queue_periods",
                                       "output_queue_floor_periods", "fade_ms", "device_retry_ms",
-                                      "reclamation_timeout_ms", "verbose", "capture_path", "playback_path"};
+                                      "reclamation_timeout_ms", "verbose", "capture_path", "playback_path",
+                                      "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
+                                      "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
+                                      "tcp_auth_timeout_ms"};
   for (const auto& [key, value] : doc.items())
   {
     bool known = false;
@@ -257,7 +263,10 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_string(doc, "playback_path", config.playback_path, path, error) ||
       !read_string(doc, "rig", config.rig, path, error) ||
       !read_string(doc, "rigs_root", config.rigs_root, path, error) ||
-      !read_string(doc, "socket", config.socket_path, path, error))
+      !read_string(doc, "socket", config.socket_path, path, error) ||
+      !read_string(doc, "tcp_address", config.tcp_address, path, error) ||
+      !read_string(doc, "tcp_token", config.tcp_token, path, error) ||
+      !read_string(doc, "tcp_token_file", config.tcp_token_file, path, error))
     return false;
 
   if (doc.contains("socket_mode"))
@@ -281,11 +290,16 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_unsigned(doc, "output_queue_periods", config.output_queue_periods, path, error) ||
       !read_unsigned(doc, "output_queue_floor_periods", config.output_queue_floor_periods, path, error) ||
       !read_unsigned(doc, "device_retry_ms", config.device_retry_ms, path, error) ||
+      !read_unsigned(doc, "tcp_port", config.tcp_port, path, error) ||
+      !read_unsigned(doc, "tcp_max_connections", config.tcp_max_connections, path, error) ||
+      !read_unsigned(doc, "tcp_max_message_bytes", config.tcp_max_message_bytes, path, error) ||
+      !read_unsigned(doc, "tcp_auth_timeout_ms", config.tcp_auth_timeout_ms, path, error) ||
       !read_double(doc, "fade_ms", config.fade_ms, path, error) ||
       !read_int(doc, "rt_priority", config.rt_priority, path, error) ||
       !read_int(doc, "cpu", config.cpu, path, error) ||
       !read_int(doc, "reclamation_timeout_ms", config.reclamation_timeout_ms, path, error) ||
       !read_bool(doc, "lock_memory", config.lock_memory, path, error) ||
+      !read_bool(doc, "tcp_listen", config.tcp_listen, path, error) ||
       !read_bool(doc, "verbose", config.verbose, path, error))
     return false;
 
@@ -353,6 +367,41 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
     config.socket_path = value;
     return true;
   }
+  if (name == "tcp-listen")
+  {
+    config.tcp_listen = true;
+    return true;
+  }
+  if (name == "tcp-address")
+  {
+    if (value.empty())
+    {
+      error = "--tcp-address needs an address";
+      return false;
+    }
+    config.tcp_address = value;
+    return true;
+  }
+  if (name == "tcp-token")
+  {
+    if (value.empty())
+    {
+      error = "--tcp-token needs a token";
+      return false;
+    }
+    config.tcp_token = value;
+    return true;
+  }
+  if (name == "tcp-token-file")
+  {
+    if (value.empty())
+    {
+      error = "--tcp-token-file needs a path";
+      return false;
+    }
+    config.tcp_token_file = value;
+    return true;
+  }
   if (name == "socket-mode")
     return parse_octal_mode("socket-mode", value, config.socket_mode, error);
   if (name == "sample-rate")
@@ -371,6 +420,14 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
     return parse_unsigned("output-queue-floor-periods", value, config.output_queue_floor_periods, error);
   if (name == "device-retry-ms")
     return parse_unsigned("device-retry-ms", value, config.device_retry_ms, error);
+  if (name == "tcp-port")
+    return parse_unsigned("tcp-port", value, config.tcp_port, error);
+  if (name == "tcp-max-connections")
+    return parse_unsigned("tcp-max-connections", value, config.tcp_max_connections, error);
+  if (name == "tcp-max-message-bytes")
+    return parse_unsigned("tcp-max-message-bytes", value, config.tcp_max_message_bytes, error);
+  if (name == "tcp-auth-timeout-ms")
+    return parse_unsigned("tcp-auth-timeout-ms", value, config.tcp_auth_timeout_ms, error);
   if (name == "fade-ms")
     return parse_double("fade-ms", value, config.fade_ms, error);
   if (name == "reclamation-timeout-ms")
@@ -382,6 +439,65 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
 
   error = "unknown option '--" + name + "'";
   return false;
+}
+
+bool resolve_tcp_token(Config& config, std::string& error)
+{
+  if (!config.tcp_token.empty() && !config.tcp_token_file.empty())
+  {
+    error = "set either tcp_token or tcp_token_file, not both";
+    return false;
+  }
+
+  if (!config.tcp_token_file.empty())
+  {
+    struct stat info{};
+    if (::stat(config.tcp_token_file.c_str(), &info) != 0 || !S_ISREG(info.st_mode))
+    {
+      error = "cannot read tcp_token_file '" + config.tcp_token_file + "'";
+      return false;
+    }
+    std::ifstream file(config.tcp_token_file);
+    if (!file)
+    {
+      error = "cannot read tcp_token_file '" + config.tcp_token_file + "'";
+      return false;
+    }
+    std::string line;
+    std::getline(file, line);
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t'))
+      line.pop_back();
+    if (line.empty())
+    {
+      // Named separately from the length check below: "the token file is empty" and "the token is too
+      // short" have different fixes, and a daemon that has just read an empty file should say so.
+      error = "tcp_token_file '" + config.tcp_token_file + "' is empty";
+      return false;
+    }
+    config.tcp_token = line;
+
+    // A warning rather than a refusal: the file may be on a filesystem whose permissions mean
+    // something else, and an operator who has read this line has been told. Not gated by `verbose`,
+    // because a secret every local user can read is not a debug detail.
+    if ((info.st_mode & (S_IRGRP | S_IROTH)) != 0)
+      std::fprintf(stderr, "[namchaind] warning: %s is mode %03o; a token other users can read is not a secret\n",
+                   config.tcp_token_file.c_str(), static_cast<unsigned>(info.st_mode & 0777));
+  }
+
+  if (!config.tcp_token.empty() && config.tcp_token.size() < kMinTokenLength)
+  {
+    error = "the TCP token is " + std::to_string(config.tcp_token.size()) + " characters; at least " +
+            std::to_string(kMinTokenLength) +
+            " are required (the transport allows three attempts per connection, and connections are free)";
+    return false;
+  }
+  if (config.tcp_listen && config.tcp_token.empty())
+  {
+    error = "tcp_listen needs a token: set tcp_token (visible in `ps`; for a run) or tcp_token_file "
+            "(for an appliance)";
+    return false;
+  }
+  return true;
 }
 
 bool resolve_rig_name(const Config& config, const std::string& name, std::string& path, std::string& error)

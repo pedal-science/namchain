@@ -153,6 +153,13 @@ TEST_CASE("a config file sets the fields the daemon uses")
     "output_queue_floor_periods": 2,
     "fade_ms": 2.5,
     "device_retry_ms": 500,
+    "tcp_listen": true,
+    "tcp_address": "0.0.0.0",
+    "tcp_port": 47811,
+    "tcp_max_connections": 8,
+    "tcp_max_message_bytes": 65536,
+    "tcp_token": "0123456789abcdef0123456789abcdef",
+    "tcp_auth_timeout_ms": 2000,
     "verbose": true
   })");
 
@@ -177,6 +184,13 @@ TEST_CASE("a config file sets the fields the daemon uses")
   CHECK(config.output_queue_floor_periods == 2u);
   CHECK(config.fade_ms == doctest::Approx(2.5));
   CHECK(config.device_retry_ms == 500u);
+  CHECK(config.tcp_listen);
+  CHECK(config.tcp_address == "0.0.0.0");
+  CHECK(config.tcp_port == 47811u);
+  CHECK(config.tcp_max_connections == 8u);
+  CHECK(config.tcp_max_message_bytes == 65536u);
+  CHECK(config.tcp_token == "0123456789abcdef0123456789abcdef");
+  CHECK(config.tcp_auth_timeout_ms == 2000u);
   CHECK(config.verbose);
 }
 
@@ -240,6 +254,27 @@ TEST_CASE("command-line options parse and reject")
   CHECK(config.cpu == -1);
   CHECK(namchain::daemon::apply_option(config, "no-lock-memory", "", error));
   CHECK_FALSE(config.lock_memory);
+
+  // The TCP transport's flags spell the same fields as the config keys, for the same reason every
+  // other flag does: what a unit passes and what an operator types should be one vocabulary.
+  CHECK(namchain::daemon::apply_option(config, "tcp-listen", "", error));
+  CHECK(config.tcp_listen);
+  CHECK(namchain::daemon::apply_option(config, "tcp-address", "0.0.0.0", error));
+  CHECK(config.tcp_address == "0.0.0.0");
+  CHECK(namchain::daemon::apply_option(config, "tcp-port", "0", error));
+  CHECK(config.tcp_port == 0u);
+  CHECK(namchain::daemon::apply_option(config, "tcp-max-connections", "2", error));
+  CHECK(config.tcp_max_connections == 2u);
+  CHECK(namchain::daemon::apply_option(config, "tcp-max-message-bytes", "4096", error));
+  CHECK(config.tcp_max_message_bytes == 4096u);
+  CHECK(namchain::daemon::apply_option(config, "tcp-token", "0123456789abcdef", error));
+  CHECK(config.tcp_token == "0123456789abcdef");
+  CHECK(namchain::daemon::apply_option(config, "tcp-token-file", "/etc/namchain/token", error));
+  CHECK(config.tcp_token_file == "/etc/namchain/token");
+  CHECK(namchain::daemon::apply_option(config, "tcp-auth-timeout-ms", "500", error));
+  CHECK(config.tcp_auth_timeout_ms == 500u);
+  CHECK_FALSE(namchain::daemon::apply_option(config, "tcp-address", "", error));
+  CHECK_FALSE(namchain::daemon::apply_option(config, "tcp-token", "", error));
 
   CHECK_FALSE(namchain::daemon::apply_option(config, "nonsense", "1", error));
   CHECK(error.find("nonsense") != std::string::npos);

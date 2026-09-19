@@ -11,6 +11,7 @@
 #include <signal.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include "namchain/daemon/config.h"
+#include "namchain/daemon/framing.h"
 #include "namchain/graph/plan.h"
 #include "namchain/graph/rig.h"
 #include "namchain/io/backend.h"
@@ -42,6 +44,55 @@ enum class DeviceState
 };
 
 const char* device_state_name(DeviceState state);
+
+/// Which transport a request arrived on (docs/ui-integration-plan.md §1.8).
+///
+/// The two have different trust levels and that is the whole reason the type exists: a Unix socket is
+/// authorised by filesystem permissions, a TCP connection is authorised by nothing until it presents
+/// the transport token.
+enum class PeerKind
+{
+  Local,  ///< Unix `SOCK_SEQPACKET`: the local operator.
+  Remote, ///< TCP: untrusted until authenticated.
+};
+
+/// \brief One connection's protocol state, owned by the transport and handed to the request handler.
+///
+/// Authorisation is a property of the *connection*, not of the request: a TCP client that has not sent
+/// `engine.hello` with the right token may not call anything else, however well-formed the call is.
+/// Keeping it here rather than in the handler is what makes that a rule the transport can enforce
+/// (it closes the connection) instead of a check the handler has to remember.
+struct Session
+{
+  PeerKind peer = PeerKind::Local;
+  /// True on a local connection from the moment it is accepted; false on a remote one until
+  /// `engine.hello` carries the token.
+  bool authorized = true;
+  /// Failed authentications on this connection. The transport closes it at \ref kMaxAuthFailures.
+  unsigned auth_failures = 0;
+};
+
+/// Failed authentications one connection is allowed before the daemon closes it.
+///
+/// Three is enough for a client with a stale token to be told clearly, and small enough that guessing
+/// gets three tries per connection rather than a stream of them.
+inline constexpr unsigned kMaxAuthFailures = 3;
+
+/// Open Unix control connections allowed at once. Separate from \ref Config::tcp_max_connections
+/// because the local transport's cost is a file descriptor and the remote one's is a network peer.
+inline constexpr std::size_t kMaxLocalClients = 16;
+
+/// The `SO_SNDBUF` given to an accepted TCP connection.
+///
+/// A control response is small, so a modest send buffer costs nothing and buys two things: the
+/// kernel's per-connection memory is bounded, and a client that stops reading produces a partial write
+/// the control loop walks away from promptly instead of after megabytes of buffered reply. It is also
+/// what makes "a slow reader does not stall the control loop" a test that finishes in milliseconds.
+inline constexpr int kTcpSendBufferBytes = 64 * 1024;
+
+/// How long a connection that is being closed may take to drain its last reply before it is dropped
+/// anyway. A client that will not read its own refusal does not get to keep the slot.
+inline constexpr unsigned kFlushDeadlineMs = 5000;
 
 /// \brief One published chain plan and the arena its buffers live in.
 ///
@@ -119,6 +170,10 @@ inline constexpr int kMaxTransitionFrames = 1 << 14;
 /// length is fixed rather than shortened under load -- which is why a document apply transitions its
 /// chains **one at a time**. No tail-hold for a bypassed node with a tail. No stereo: the schema
 /// declares one channel per port and a client asking for more is refused by name.
+///
+/// Since slice C there is a second transport. Both carry the same JSON bodies; they differ in framing
+/// (a length prefix, because TCP is a stream) and in trust (a token, because TCP has no filesystem
+/// permissions to offer). See docs/daemon.md §"Two transports" and its threat model.
 class Daemon
 {
 public:
@@ -131,9 +186,9 @@ public:
   /// \brief Build the startup rig, bind the socket, open the signal set and start the render thread.
   ///
   /// Fatal only for things an operator must fix before the daemon can mean anything: an unusable
-  /// startup rig, a socket path that will not bind, a signal set that cannot be created. A missing
-  /// audio device is **not** fatal -- that is the unplugged case, and the daemon serves status and
-  /// retries while it waits.
+  /// startup rig, a socket path that will not bind, a TCP listener asked for without a token, a signal
+  /// set that cannot be created. A missing audio device is **not** fatal -- that is the unplugged
+  /// case, and the daemon serves status and retries while it waits.
   bool start(std::string& error);
 
   /// \brief The control loop. Blocks until SIGTERM/SIGINT or \ref request_stop, then tears down.
@@ -146,8 +201,13 @@ public:
   /// \brief Handle one protocol request, returning one response.
   ///
   /// Public because it is the unit-testable half of the transport: the socket code only has to move
-  /// whole SEQPACKET messages. Never throws; errors come back as a structured JSON response.
+  /// whole messages and keep the connection's authorisation state. Never throws; errors come back as
+  /// a structured JSON response.
+  ///
+  /// This overload is a local, already-authorised session, which is what a caller who is not a
+  /// transport means. \ref Session carries the peer kind and the authorisation for a real connection.
   std::string handle_request(const std::string& request);
+  std::string handle_request(const std::string& request, Session& session);
 
   /// The device state, for tests and for a caller that wants the same number the status reports.
   DeviceState device_state() const { return static_cast<DeviceState>(device_state_.load()); }
@@ -155,10 +215,24 @@ public:
   /// The chains the running document holds, in the order their channels were bound. Control thread.
   const std::vector<graph::Chain>& chains() const { return current_document_.chains; }
 
+  /// The port the TCP listener is bound to, or 0 when it is not listening. Read back from the socket,
+  /// so a configured `tcp_port: 0` ("pick one") is reportable rather than a mystery. Control thread.
+  unsigned tcp_port() const { return tcp_port_; }
+
+  /// How many control connections are open on one transport. Control thread; the status reports it,
+  /// and a test uses it to see a vanished client released.
+  std::size_t connection_count(PeerKind peer) const;
+
 private:
   // --- control thread only -------------------------------------------------
   bool bind_socket(std::string& error);
+  /// Bind and listen on the configured TCP address, unless \ref Config::tcp_listen is off.
+  bool bind_tcp(std::string& error);
   void close_socket();
+  /// Undo whatever \ref start managed before it failed: both listeners, the signal fd and the signal
+  /// mask. Without this a failed start leaves a bound socket behind, which the next start then trips
+  /// over.
+  void close_transport();
   bool setup_signals(std::string& error);
   /// Compile \p rig_path and publish it. Called for the startup rig, SIGHUP and `rig.load`.
   bool load_rig(const std::string& rig_path, std::string& error);
@@ -191,6 +265,38 @@ private:
   int find_chain_with_node(const std::string& node) const;
   void set_device_state(DeviceState state);
   void stop();
+
+  // --- control thread: the transports --------------------------------------
+  struct Connection;
+  /// Accept whatever is pending on \p listener, up to that transport's connection cap. Non-blocking,
+  /// so a burst of connections costs a loop rather than a stall.
+  void accept_connections(int listener, PeerKind peer);
+  /// Answer \p fd with one refusal and close it. Used when a transport is already at its cap, where
+  /// the useful answer is `too_many_connections` rather than a connection that hangs up silently.
+  void refuse_connection(int fd, PeerKind peer, const char* code, const std::string& message);
+  /// \brief Read what \p connection has to offer and answer every whole message in it.
+  ///
+  /// \return false when the connection is finished and should be closed: the peer went away, broke the
+  /// framing, or was told its last reply before being disconnected.
+  bool read_connection(Connection& connection);
+  /// Read every whole SEQPACKET datagram waiting on a local connection. One datagram is one message,
+  /// so this transport has no framing to reassemble.
+  bool read_datagrams(Connection& connection);
+  /// Reassemble length-prefixed messages (\ref framing.h) from a remote stream and answer each.
+  bool read_framed(Connection& connection);
+  /// Write as much of \p connection's pending reply as the kernel will take. \return false when the
+  /// connection is finished -- the peer is gone, or the reply it was owed has now been delivered and
+  /// the connection was marked to close.
+  bool write_connection(Connection& connection);
+  /// Queue one reply, framed or not depending on the transport, and mark the connection to close if a
+  /// client that never reads has let it grow past the cap.
+  void queue_reply(Connection& connection, std::string reply);
+  void close_connection(std::size_t index);
+  /// Close connections whose authentication window or flush deadline has passed.
+  void drop_expired_connections();
+  /// The largest message accepted on \p peer's transport. Local keeps the fixed SEQPACKET size;
+  /// remote uses \ref Config::tcp_max_message_bytes.
+  std::size_t max_message_bytes(PeerKind peer) const;
 
   // --- render thread only --------------------------------------------------
   void render_loop();
@@ -240,6 +346,38 @@ private:
     std::atomic<uint64_t> guard_trips{0};
   };
 
+  /// \brief One open control connection, on either transport.
+  ///
+  /// The buffers are per connection because a stream socket has no message boundaries: \ref in holds
+  /// the bytes of a message that has not finished arriving and \ref out holds a reply the kernel would
+  /// not take. Both exist so that a client which reads slowly, or stops reading, costs its own
+  /// connection rather than the control loop -- which is the failure mode of a blocking `send` on a
+  /// single-threaded server, and the reason for the send-buffer limit in \ref kTcpSendBufferBytes.
+  struct Connection
+  {
+    int fd = -1;
+    Session session;
+    /// The receive buffer. On TCP it holds bytes that have arrived but do not yet form a whole
+    /// message, which is what reassembly means; on the datagram transport it is a scratch buffer for
+    /// the one message being read. Either way it is per connection, so one client's half-message is
+    /// never another's problem.
+    std::vector<char> in;
+    std::vector<char> out; ///< replies queued but not yet accepted by the kernel
+    std::size_t out_sent = 0;
+    /// When the connection was accepted, and when its current deadline expires: the authentication
+    /// window for an unauthenticated remote peer, the flush window for one being disconnected. A
+    /// connection with no deadline is a local one, or an authenticated remote one that is behaving.
+    std::chrono::steady_clock::time_point accepted_at{};
+    std::chrono::steady_clock::time_point deadline{};
+    bool has_auth_deadline = false;
+    bool has_flush_deadline = false;
+    /// Set when the reply just queued is the last one this connection gets: the third failed
+    /// authentication, a message that broke the framing, or an outbox past its cap. It is closed once
+    /// that reply has drained, so the peer is told *why* rather than seeing a bare hangup.
+    bool close_after_flush = false;
+    std::string peer; ///< for logging: `unix`, or `127.0.0.1:41234`
+  };
+
   Config config_;
   // Sized once; the render path only pushes/pops. Big enough for a whole document plus a burst of
   // parameter edits, because a document publish is all-or-nothing: if every chain's command does not
@@ -250,6 +388,10 @@ private:
   rt::Reclaimer reclaimer_{2, 16};
 
   int listen_fd_ = -1;
+  /// The TCP listener, and the port it actually bound (read back from the socket, so `tcp_port: 0`
+  /// is reportable). Both are control-thread-only.
+  int tcp_fd_ = -1;
+  unsigned tcp_port_ = 0;
   int signal_fd_ = -1;
   /// The newest published document. Control-thread-only, and never dangling: a slot is retired only
   /// when a *newer* document is adopted, and this pointer has already moved to that newer one by then.
@@ -262,7 +404,9 @@ private:
   /// this daemon does not inherit a blocked SIGTERM for the rest of the process's life.
   sigset_t previous_mask_{};
   bool mask_saved_ = false;
-  std::vector<int> clients_;
+  /// Every open control connection, on both transports. A vector rather than a fixed array because a
+  /// connection is created and destroyed at runtime and nothing on the render path ever sees it.
+  std::vector<Connection> clients_;
   std::string current_rig_;
   /// How the running document arrived: `"file"`, `"applied"`, or empty before anything is loaded.
   std::string current_source_;

@@ -81,6 +81,14 @@ silently ignored.
 | `fade_ms` | `5.0` | equal-power crossfade for a structural plan transition |
 | `device_retry_ms` | `250` | backoff between attempts to open a lost device |
 | `reclamation_timeout_ms` | `20` | the control `poll` timeout, i.e. the reclamation window |
+| `tcp_listen` | `false` | serve control connections on TCP as well |
+| `tcp_address` | `127.0.0.1` | TCP address to bind; numeric only (no DNS at startup) |
+| `tcp_port` | `47810` | TCP port; `0` lets the kernel choose, and `engine.status` reports it |
+| `tcp_max_connections` | `4` | TCP connections open at once, authenticated or not |
+| `tcp_max_message_bytes` | `1048576` | largest framed message accepted, checked before the body is read |
+| `tcp_token` | *(empty)* | pre-shared token a TCP client presents in `engine.hello` |
+| `tcp_token_file` | *(empty)* | read the token from the first line of this file instead |
+| `tcp_auth_timeout_ms` | `10000` | how long a connection may stay unauthenticated; `0` disables |
 | `verbose` | `false` | log lifecycle events to stderr |
 
 The daemon refuses a device that does not give the configured quantum and rate exactly
@@ -88,10 +96,113 @@ The daemon refuses a device that does not give the configured quantum and rate e
 past every node's buffers. That refusal is a configuration error, not a device failure, and it is
 reported with both numbers.
 
+## Two transports
+
+One protocol, two ways to reach it. The JSON bodies are identical — the same `engine.status`, the same
+`rig.apply`, the same error codes, the same tests on both sides — so a client is written once and the
+transport is a detail it picks at startup.
+
+| | Unix socket (default) | TCP (opt-in) |
+|---|---|---|
+| Framing | none: `SOCK_SEQPACKET` preserves message boundaries | **u32 little-endian length prefix** + one JSON body |
+| Auth | filesystem permissions (`socket_mode`) | **pre-shared token** in `engine.hello`, constant-time compare |
+| Trust | the local operator | untrusted network; off unless `tcp_listen` |
+| Caps | 16 connections, 256 KiB message | `tcp_max_connections` (4), `tcp_max_message_bytes` (1 MiB), 3 auth failures then close |
+| Bind | `socket` | `tcp_address`/`tcp_port`, **loopback by default** |
+
+TCP is off unless an operator turns it on, and the daemon **refuses to start** with `tcp_listen` set
+and no token: an unauthenticated control port that can rewrite the rig and mute the output is worse
+than a daemon that will not start. A token shorter than 16 characters is refused outright, so a
+four-digit PIN cannot be configured by accident.
+
+The client side is `namchainctl` (slice C), which is both the operator's tool and the reference for
+whoever writes the next client:
+
+```console
+$ namchainctl --socket /run/namchain/namchaind.sock status --compact
+$ namchainctl --host 127.0.0.1 --port 47810 --token-file /etc/namchain/token get
+$ namchainctl --host studio.local --token-file /etc/namchain/token set --node g --param gain_db --value -6
+{"applied":1,"chain":"main","generation":4,"kind":"smooth","ok":true}
+```
+
+`set` is the shape a UI uses while a knob is being dragged: it is one `set_param` op, and the answer's
+`kind` says whether the engine ramped it (`smooth`) or had to rebuild the plan (`structural`).
+`namchainctl` exits 0 when the daemon said yes, 1 when the command line or the connection failed, and
+2 when the daemon answered with an error — printing the error's code and message on stderr.
+
+### The wire, byte for byte
+
+A request body is one JSON object; on TCP it is preceded by its length:
+
+```
++--------+--------+--------+--------+--------------------------------+
+| len & 0xff | len >> 8 | len >> 16 | len >> 24 | len bytes of JSON  |
++--------+--------+--------+--------+--------------------------------+
+```
+
+Three consequences a client has to get right, and the daemon's own tests assert:
+
+- **A message may arrive in pieces, or several may arrive together.** Bytes are reassembled by the
+  length prefix; one `recv` is not one message, and code that assumes it works in a test on a loopback
+  and fails on a network.
+- **The length is checked before the body is read.** A message declaring more than
+  `tcp_max_message_bytes` is answered with `message_too_large` from the header alone, and the
+  connection is then closed — a stream cannot be resynchronised after a framing error, so
+  "keep reading and hope" is not an option.
+- **Writes are non-blocking, and a reply may be queued rather than sent.** A client that stops reading
+  fills its own socket buffer and then the daemon's per-connection outbox; past one message's worth of
+  pending replies the connection is closed. The control loop never waits for a client, which is what
+  keeps a slow reader from being everyone's problem.
+
+`engine.status` reports the transports as they are, not as configured — `control` carries
+`unix_socket`, `unix_connections`, `tcp_listening`, `tcp_address`, `tcp_port`, `tcp_connections`,
+`tcp_max_connections`, `tcp_max_message_bytes` and `tcp_token_required`. A client that cannot connect
+gets a better answer from `namchainctl --socket … status` than from a failed `connect`.
+
+### Threat model
+
+What the transport defends, and what it does not. Written down because a control port that can mute
+the output and rewrite the rig deserves an explicit account of itself rather than a promise.
+
+**Defended:**
+
+- **No unauthenticated port.** The listener will not start without a token, the token is compared in
+  constant time, three failures close the connection, and a connection that does not authenticate
+  within `tcp_auth_timeout_ms` is dropped — so four idle connections cannot hold every slot.
+- **Bounded work per peer.** A message size, a connection count, a bounded outbox, and a bounded
+  receive buffer (the length prefix is checked before the body is read). None of these is a rate
+  limit; together they mean no single peer can make the daemon allocate without bound.
+- **No arbitrary file access from the network.** A document or patch arriving over TCP may not name an
+  absolute path: model and IR parameters resolve relative to `rigs_root`, which is the same boundary a
+  `rig.load` name lives behind. Refused as `path_refused`, naming the path, before anything is
+  compiled. On the Unix socket an absolute path is still the operator's business — the filesystem
+  already decided who may talk to the daemon.
+- **No remote file writes at all.** Nothing in the protocol writes a file; the daemon's only outputs
+  are the audio device and, with the `file` backend, a WAV the operator configured.
+
+**Not defended, deliberately:**
+
+- **The wire is plaintext, and the token travels in it.** Anyone who can read the traffic can read the
+  token and the whole rig. TLS is out of scope; for anything past a trusted LAN the answer is a
+  tunnel (`ssh -L`, WireGuard, a TLS terminator), and `tcp_address` defaults to loopback so that
+  exposure is a decision rather than an accident.
+- **Three guesses per connection is not a rate limit.** A client can reconnect and guess again. The
+  bound that matters is the token's own entropy: 16 characters minimum, and a generated 32-byte secret
+  is what an appliance should use. There is no lockout, no fail2ban hook and no per-address memory.
+- **`--tcp-token` on a command line is visible** to every local user through `/proc/<pid>/cmdline`.
+  `tcp_token_file` exists for that reason, and the daemon warns at startup when the file is readable
+  by anyone but its owner.
+- **A token holder can do anything the protocol allows**: rewrite the rig, mute the output, and load
+  any model under `rigs_root`. There are no roles, no per-method scopes and no audit log. This is one
+  credential for one appliance, not an account system.
+- **Denial of service is only partly addressed.** The audio thread is separate and unaffected by the
+  control loop, and a full connection table is answered with `too_many_connections` rather than a
+  silent hangup — but an attacker on the path can still flood the listener, and there is no admission
+  control on expensive operations (a large document apply costs what it costs).
+
 ## The control protocol
 
-`SOCK_SEQPACKET`, one JSON object per message in each direction. No framing to reimplement and no
-length prefix to get wrong. A request is:
+One JSON object per message in each direction, over either transport above. A request is:
 
 ```json
 { "id": "7", "method": "rig.load", "rig": "two-chains.json" }
@@ -105,9 +216,9 @@ length prefix to get wrong. A request is:
 
 | method | request | response |
 |---|---|---|
-| `engine.hello` | `{"protocol": 1}` | `role`, `version`, `protocol` (what the server speaks), `features`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol` |
+| `engine.hello` | `{"protocol": 2, "token": "…"?}` | `role`, `version`, `protocol` (what the server speaks), `features`, `transport` (`unix`/`tcp`) and `authenticated`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol`. On TCP the token is required and is checked **before** the version, so a peer without it learns nothing else |
 | `engine.schema` | — | the catalogue: every node type with its ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. See docs/schema.md |
-| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), and `health`/`issues` (below) |
+| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), and `health`/`issues` (below) |
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `rig.load` | `{"rig": "name.json"}` | compiled and published; returns `rig`, `generation` |
@@ -131,8 +242,9 @@ Two ways in, and they differ only in where the bytes live:
 - **`rig.apply`** carries the document itself, which is the path a UI takes: it owns the document, so
   a structural edit is one publish rather than a sequence of graph ops it would have to get right
   (docs/ui-integration-plan.md §1.1). Relative paths resolve against `rigs_root`, the same trust
-  boundary a `rig.load` name lives behind. An absolute path in a document is still the operator's
-  business — slice C revisits that rule for a network client.
+  boundary a `rig.load` name lives behind. An absolute path is the operator's business on the Unix
+  socket and is refused (`path_refused`) for a document that arrived over TCP — see "Rig names and
+  trust" below.
 
 `engine.status` reports which one it was as `rig_source`, with `rig` (the path, empty for an applied
 document) and `rig_name` (the document's own name) beside it.
@@ -150,8 +262,14 @@ be careful with.
 
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
-`bypass`, `guard`, `per_chain_mute`, `schema`. It grows as the slices land, and absence is how a
-client degrades rather than guesses.
+`bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`. It grows as the slices land, and
+absence is how a client degrades rather than guesses.
+
+The error codes a client may have to act on are `bad_json`, `bad_request`, `unknown_method`,
+`unknown_chain`, `rig_not_found`, `patch_rejected`, `compile_failed`, `path_refused`, `unauthorized`,
+`message_too_large`, `too_many_connections` and `unsupported_protocol`. A refusal is a normal answer:
+the connection stays open (except after a framing error, a third failed authentication, or a full
+connection table) and the running plan is untouched.
 
 A parameter name the engine does not know is refused with the list of what it takes, at load and at
 patch time alike: `node 'g' (nc.gain) has no parameter 'gainz'; it takes 'gain_db', 'gain', 'ramp_ms'
@@ -276,6 +394,11 @@ Two different trust levels, two different rules:
   traversal and symlinks that resolve outside the root are refused before any file is opened, and
   the target must be a regular file. A client must not be able to make the daemon read an arbitrary
   path and hand back the parse error (docs/rig-pipeline.md §5.1 item 1).
+- A **network client** (`rig.apply`/`rig.patch` over TCP) may not name an absolute path *at all*:
+  model and IR parameters in a document it applies, or in the ops it sends, must be relative to
+  `rigs_root`. The local operator's absolute paths stay the operator's business, and a remote client
+  may still *edit* a document that contains one — the rule is about what the client writes, not about
+  what it can reach. Refused as `path_refused`, quoting the path, before anything is compiled.
 
 ## Reload and device loss
 
@@ -291,6 +414,10 @@ Two different trust levels, two different rules:
 
 ## A client
 
+`namchainctl` is the reference implementation, over either transport (`tools/namchainctl/namchainctl.cpp`).
+The smallest thing that works over the Unix socket is still four lines, because the datagram transport
+has no framing to implement:
+
 ```python
 import socket, json
 s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -298,10 +425,33 @@ s.connect("/run/namchain/namchaind.sock")
 def call(message):
     s.send(json.dumps(message).encode())
     return json.loads(s.recv(65536))
-print(call({"id": "1", "method": "engine.hello", "protocol": 1}))
+print(call({"id": "1", "method": "engine.hello", "protocol": 2}))
 print(call({"id": "2", "method": "rig.load", "rig": "two-chains.json"}))
 print(call({"id": "3", "method": "engine.status"})["status"])
 ```
+
+Over TCP the handshake comes first — nothing else is answered until it succeeds — and every body
+carries a length prefix:
+
+```python
+import socket, json, struct
+s = socket.create_connection(("127.0.0.1", 47810))
+def call(message):
+    body = json.dumps(message).encode()
+    s.sendall(struct.pack("<I", len(body)) + body)
+    length = struct.unpack("<I", s.recv(4))[0]
+    body = b""
+    while len(body) < length:                 # one recv is not one message
+        body += s.recv(length - len(body))
+    return json.loads(body)
+print(call({"method": "engine.hello", "protocol": 2, "token": open("/etc/namchain/token").read().strip()}))
+print(call({"method": "engine.status"})["status"]["health"])
+```
+
+That is the whole client contract: a length prefix, a token, and the JSON above. A client that gets
+those three right talks to the same daemon `namchainctl` does — which is asserted, not assumed:
+`tests/cli/run_ctl.cmake` runs the daemon as a process and drives it with the real client over both
+transports, and `tests/test_tcp.cpp` covers the framing and the token from the socket side.
 
 ## Install the unit
 
@@ -310,10 +460,26 @@ sudo install -Dm644 packaging/namchaind.json  /etc/namchain/namchaind.json
 sudo install -Dm644 packaging/systemd/namchaind.service \
      /etc/systemd/system/namchaind.service
 sudo install -Dm755 build/namchaind /usr/bin/namchaind
+sudo install -Dm755 build/namchainctl /usr/bin/namchainctl
 sudo install -d /etc/namchain/rigs          # put rig specs and models here
 sudo systemctl daemon-reload
 sudo systemctl enable --now namchaind
 ```
+
+To drive it from another machine, turn the TCP transport on and give it a token **from a file** — a
+token on the command line is visible to every local user in `ps`:
+
+```
+sudo install -Dm600 /dev/stdin /etc/namchain/token <<< "$(head -c 32 /dev/urandom | base64)"
+# then in /etc/namchain/namchaind.json:
+#   "tcp_listen": true, "tcp_address": "0.0.0.0", "tcp_token_file": "/etc/namchain/token"
+sudo systemctl restart namchaind
+namchainctl --host <this-host> --token-file /etc/namchain/token status
+```
+
+`tcp_address` defaults to `127.0.0.1`, so reaching the daemon across a network is a line an operator
+writes deliberately. Off a trusted LAN, put it behind a tunnel rather than exposing the port: the
+token travels in clear text, and the threat model above says what that does and does not cost.
 
 The unit exists because a systemd service does not get `pam_limits`: without `LimitRTPRIO` and
 `LimitMEMLOCK`, the render thread's `sched_setscheduler(SCHED_FIFO)` is refused and the daemon
@@ -327,7 +493,11 @@ expected.
 
 ## What is built, and what is not
 
-Built: the lane mixer (`nc.mix` takes a level, a mute and a polarity per input, addressed by port,
+Built: **the TCP transport** — length-prefixed framing over a non-blocking acceptor and per-connection
+in/out buffers, a mandatory token with a constant-time compare, three authentication attempts per
+connection, an authentication deadline, and the caps above, with `namchainctl` as the reference client
+and `control` in `engine.status` reporting what actually came up; the lane mixer (`nc.mix` takes a
+level, a mute and a polarity per input, addressed by port,
 ramped, and refused by name when the port does not exist) and the health summary (`health` plus
 `issues` with stable codes, derived from the state rather than tracked beside it); the node schema — every built-in declares its parameters (kind, unit, default, bounds with
 inclusive/exclusive made explicit, step, scale, rampable), the compiler refuses a name it does not
@@ -358,7 +528,8 @@ Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
   `swap_model` rather than by `set_param` (slice B2's remainder);
 - no lowered view in `rig.get`, because there is nothing to lower yet: a node is a node until the
   macro layer exists (slice E);
-- no TCP listener, so the socket is local to the machine (slice C);
+- no TLS and no per-client identity on the TCP transport: one pre-shared token for one appliance, with
+  a tunnel as the documented answer off-LAN (see the threat model above);
 - no model/IR registry, so a model is a path rather than a device-library id (slice D);
 - no macros, so a block that is really a subgraph has to be written out as one (slice E);
 - no telemetry subscription and no `scene.*`, `model.*`, `bench.run` methods;

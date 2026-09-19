@@ -15,8 +15,13 @@ filter's `freq`/`q`/`gain_db` and a delay's `ms`/`samples` ramp in-node, by cros
 lanes and two delay taps rather than by interpolating coefficients or moving a read pointer. **B4 and B5 landed** —
 `nc.mix` takes a level, a mute and a polarity per input, addressed by port and ramped, with a port that
 does not exist refused by name; and `engine.status` carries `health` plus `issues` with stable codes,
-derived from the current state so a light can go back to green. Slice B is complete. Slice C (the TCP
-listener and token) is next. Follows
+derived from the current state so a light can go back to green. Slice B is complete. **C1–C3 landed** —
+the TCP transport: u32 little-endian framing over a non-blocking acceptor with per-connection in/out
+buffers, a mandatory pre-shared token compared in constant time with three attempts per connection and
+an authentication deadline, the caps (connections, message bytes, pending output), `path_refused` for
+an absolute path from a network client, `namchainctl` as the reference client over either transport,
+and a threat model in `docs/daemon.md`. Slice C is complete. Slice D (the model/IR registry) is next.
+Follows
 `docs/ljoss-comparison.md` (the analysis) and the seven decisions recorded below. Slices are ordered
 by dependency, not by appeal; each is independently committable and independently testable, and none
 of them requires the app to exist first.
@@ -307,8 +312,11 @@ Stable codes, because the UI must react to them rather than show them: `unknown_
 `param_out_of_range`, `unknown_option`, `unknown_element`, `unknown_role`, `unknown_chain`,
 `unknown_node`, `not_patchable`, `not_rampable`, `stereo_not_supported`, `mode_not_supported`,
 `macro_unavailable`, `asset_missing`, `compile_failed`, `patch_rejected`, `unauthorized`,
-`message_too_large`, `too_many_connections`, `unsupported_protocol`. Each keeps the existing human
-`message`, which names the node/element/chain and lists the valid alternatives.
+`message_too_large`, `too_many_connections`, `unsupported_protocol`, `bad_json`, `bad_request`,
+`unknown_method`, `rig_not_found`, `path_refused`. Each keeps the existing human `message`, which
+names the node/element/chain and lists the valid alternatives. `path_refused` is the transport's
+addition (slice C): an absolute asset path in a document or patch that arrived over TCP, refused
+because a network client is not the operator — see §1.8.
 
 ### 1.8 Transports (Slice C)
 
@@ -320,8 +328,18 @@ Stable codes, because the UI must react to them rather than show them: `unknown_
 | Caps | existing | max message bytes (1 MiB), max connections (4), 3 auth failures then close |
 
 The JSON body is identical on both. The daemon refuses to start a TCP listener without a token rather
-than exposing an unauthenticated port that can rewrite the rig and mute the output. TLS is out of
-scope; the documented recommendation for anything beyond a trusted LAN is a tunnel.
+than exposing an unauthenticated port that can rewrite the rig and mute the output, and refuses a
+token shorter than 16 characters, because three attempts per connection is only a bound if guessing is
+hopeless. TLS is out of scope; the documented recommendation for anything beyond a trusted LAN is a
+tunnel. Two further caps belong with the token: an unauthenticated connection is closed after
+`tcp_auth_timeout_ms` (so idle connections cannot hold the table), and pending output is bounded at one
+message per connection (so a client that stops reading costs its own connection rather than the control
+loop).
+
+A network client is not the local operator, so it may not name an absolute path at all: model and IR
+parameters in a document it applies — or in the ops it patches with — resolve relative to `rigs_root`.
+This is the one place the two transports differ in what they *allow* rather than in how they carry it,
+and it is refused as `path_refused` before anything is compiled.
 
 ### 1.9 Who does what
 
@@ -422,17 +440,24 @@ lie, and it unblocks the app's inspector.
 
 | Commit | Contents |
 |---|---|
-| **C1** | Framing (u32 LE) + non-blocking acceptor and per-connection in/out buffers in the existing `poll` loop; `tcp_listen`, `tcp_port`, `tcp_max_connections`, `tcp_max_message_bytes` |
-| **C2** | Token in `engine.hello` (constant-time), the unauthorised state machine, caps, refusal to start without a token; `docs/daemon.md` transport + threat model |
-| **C3** | `tools/namchainctl` (hello/status/apply/get/patch/mute over either transport) and `tests/test_tcp.cpp` |
+| **C1** ✅ | Framing (`include/namchain/daemon/framing.h`, shared by daemon, client and tests) + non-blocking acceptor and per-connection in/out buffers in the existing `poll` loop; `tcp_listen`, `tcp_address`, `tcp_port`, `tcp_max_connections`, `tcp_max_message_bytes`, `tcp_auth_timeout_ms`; `control` in `engine.status` |
+| **C2** ✅ | Token in `engine.hello` (constant-time, checked before the version), the unauthorised state machine (three failures then close, an authentication deadline, `too_many_connections`), refusal to start without a token or with one under 16 characters, `tcp_token_file` with a permissions warning, `path_refused` for an absolute path from a network client; `docs/daemon.md` transport + threat model |
+| **C3** ✅ | `tools/namchainctl` (hello/status/schema/get/apply/patch/set/mute/panic over either transport), `tests/test_tcp.cpp`, and `tests/cli/run_ctl.cmake` (the daemon as a process, driven by the real client) |
 
-**Tests:** a framed round trip over loopback; a message delivered one byte at a time reassembles; a
-partial write to a slow reader does not stall the control loop; an oversized message is refused with
-`message_too_large` before it is buffered; wrong token → `unauthorized` and nothing else, three times
-then close; two concurrent clients; a client that vanishes mid-message; the UDS tests unchanged.
+**Tests, as built:** a framed round trip over loopback; a message delivered one byte at a time
+reassembles, and two messages in one write answer twice in order; a partial write to a slow reader does
+not stall the control loop (a second client is served while the first has stopped reading); an
+oversized message is refused with `message_too_large` from its header, before a byte of it is buffered;
+wrong token → `unauthorized` and nothing else, three times, then the connection closes; the
+authentication deadline releases the slot; two concurrent clients interleave without mixing up; a
+client that vanishes mid-message is forgotten; non-JSON is `bad_json` rather than fatal; the two
+transports answer the same request identically; an absolute path is refused remotely and accepted
+locally; and the UDS tests are unchanged.
 
 **Done when:** a machine on the LAN can drive the daemon with a token, and `namchainctl` is the
-reference for whoever writes the Swift client.
+reference for whoever writes the Swift client. **Done:** `namchainctl --host 127.0.0.1 --port … --token-file
+… set --node g --param gain_db --value -6` answers `{"kind":"smooth"}` against a real daemon, and one
+correction to the client (it sent `{"method":"hello"}`) is exactly what `ctl_cli` exists to catch.
 
 ### Slice D — The asset registry
 
@@ -473,7 +498,7 @@ Listed so the contract can be checked against it, and because it is the other ha
 
 | App change | Enabled by |
 |---|---|
-| `EngineClient`: TCP + framing + token; hello/status/schema/assets/apply/patch/get | C |
+| `EngineClient`: TCP + framing + token; hello/status/schema/assets/apply/patch/get — `tools/namchainctl/namchainctl.cpp` is the worked example | C |
 | `DocumentEncoder`: rig tree → engine document (chains, element ids, split/mix flattening, macros) | A, E |
 | Palette and inspector driven by `engine.schema` (+ a local presentation side table keyed by type id, with a generic fallback for an unknown type) | B |
 | `isEnabled` → **bypass**: tile dimmed but alive; bypass toggles are one structural commit | A, B |
