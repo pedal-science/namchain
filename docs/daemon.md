@@ -105,13 +105,14 @@ length prefix to get wrong. A request is:
 
 | method | request | response |
 |---|---|---|
-| `engine.hello` | `{"protocol": 1}` | `role`, `version`, negotiated `protocol`; a mismatch is `unsupported_protocol` |
+| `engine.hello` | `{"protocol": 1}` | `role`, `version`, `protocol` (what the server speaks), `features`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol` |
 | `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, and a `chains` array (below) |
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `rig.load` | `{"rig": "name.json"}` | compiled and published; returns `rig`, `generation` |
+| `rig.apply` | `{"document": { … }}` — a whole document, parsed by the same parser a rig file goes through | `name`, `chains`, `generation`; relative model paths resolve against the rigs root |
 | `rig.patch` | `{"ops": [...], "chain": "id"?}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass` | `kind` (`smooth` or `structural`), `applied`, `chain`, `generation` |
-| `rig.get` | — | the current rig path, generation, `loaded` |
+| `rig.get` | — | the rig path (empty for an applied document), `source` (`file`/`applied`), `generation`, `loaded`, the current `document` as the engine parsed it, and a per-chain summary |
 
 Unknown fields are ignored; an unknown method is `unknown_method`. A malformed message never kills
 the connection or the daemon.
@@ -119,6 +120,37 @@ the connection or the daemon.
 `chain` is optional for a document with one chain and **required** when there are several: a patch or
 a mute that did not say which chain would otherwise edit an arbitrary one, and guessing is not a
 service. An unknown chain is `unknown_chain` and names the one that was asked for.
+
+### Where a document comes from, and what a client can read back
+
+Two ways in, and they differ only in where the bytes live:
+
+- **`rig.load`** names a file under `rigs_root`. Relative model/IR paths in it resolve against *that
+  file's own directory* first, which is what lets a rig be checked in next to its models.
+- **`rig.apply`** carries the document itself, which is the path a UI takes: it owns the document, so
+  a structural edit is one publish rather than a sequence of graph ops it would have to get right
+  (docs/ui-integration-plan.md §1.1). Relative paths resolve against `rigs_root`, the same trust
+  boundary a `rig.load` name lives behind. An absolute path in a document is still the operator's
+  business — slice C revisits that rule for a network client.
+
+`engine.status` reports which one it was as `rig_source`, with `rig` (the path, empty for an applied
+document) and `rig_name` (the document's own name) beside it.
+
+**`rig.get` hands back the engine's parse of the document it is running**: every chain with its id,
+name and channels, and every node with its `id`, `element`, `role`, `type`, `bypass` and parameters —
+including the node ids the engine *minted*, which is the only place a client can learn them. It is a
+**diagnostic, not a document store** (docs/ui-integration-plan.md §1.1): the app owns the document,
+and nothing should be rehydrated from this. But it makes two things answerable that otherwise are
+not — "did my edit land, and where did it go", and "is the engine still running what I think it is".
+
+It is also a **fixed point**: applying what `rig.get` returned changes nothing, so it does not advance
+the generation. That is what makes the read-back usable for reconciliation rather than something to
+be careful with.
+
+`features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
+`multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
+`bypass`, `guard`, `per_chain_mute`. It grows as the slices land, and absence is how a client degrades
+rather than guesses.
 
 ### One document, several chains
 
@@ -255,7 +287,9 @@ expected.
 
 ## What is built, and what is not
 
-Built: the `smooth` op class (a `rig.patch` set_param ramps inside the node, no recompile, no step),
+Built: the document protocol — `rig.apply` for a whole document in memory, `rig.get` returning the
+engine's parse of what it is running, protocol 2 with `features`, and the per-chain array in
+`engine.status`; the `smooth` op class (a `rig.patch` set_param ramps inside the node, no recompile, no step),
 the offline scripted timeline that measures it (`namchain-render --graph rig.json --timeline
 edits.json`, or `--torture N --seed S`, judged by the glitch detector), the structural dual-render
 crossfade that a `rig.load`, a SIGHUP reload or a structural patch takes, the structural patch
@@ -271,11 +305,10 @@ Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 - no admission control or cost model, so a plan too expensive to dual-render is not rejected before it
   runs, and the fade length is fixed rather than shortened under load — the staggered apply is what
   stands in for it;
-- no per-chain *patching* protocol beyond the request-level `chain` (a patch is one chain's graph, and
-  a document apply is the whole thing), no `rig.apply` for a document on the wire, and no `rig.get`
-  that returns the graph;
 - no parameter schema or catalogue on the wire, so an unknown parameter name is still accepted
-  silently (slice B);
+  silently, and an option (string) parameter cannot be patched at all (slice B);
+- no lowered view in `rig.get`, because there is nothing to lower yet: a node is a node until the
+  macro layer exists (slice E);
 - no TCP listener, so the socket is local to the machine (slice C);
 - no model/IR registry, so a model is a path rather than a device-library id (slice D);
 - no macros, so a block that is really a subgraph has to be written out as one (slice E);

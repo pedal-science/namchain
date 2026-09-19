@@ -100,6 +100,25 @@ bool parse_graph_json(const std::string& text, Graph& graph, std::string& error)
 /// \brief Load a single-chain rig from a file. \see parse_graph_json
 bool load_graph_json(const std::string& path, Graph& graph, std::string& error);
 
+/// \brief Rewrite every string parameter that names a file relative to \p base_dir, when that file is
+/// there.
+///
+/// A rig that says "A2-Lite.nam" almost always means the file sitting next to it. For a document read
+/// from a file the base is that file's directory; for one applied over the socket it is the rigs root,
+/// which is the same trust boundary a `rig.load` name lives behind. A parameter whose file is not
+/// there is left exactly as written, so "cannot load 'x.nam'" names what the author typed rather than
+/// a path they never wrote.
+void resolve_relative_paths(Document& document, const std::string& base_dir);
+
+/// \brief Serialise a document back to JSON, in the canonical form the parser accepts.
+///
+/// What `rig.get` hands a client: the engine's own parse of the document it is running, including the
+/// node ids it minted and the `element`/`role` of every node. It is a diagnostic rather than a store
+/// (docs/ui-integration-plan.md §1.1) -- the app owns the document, and a client must not rehydrate a
+/// library from this -- but it is the only way to see what a document *became* under the engine's
+/// rules, which is what makes "did my edit land, and where" answerable.
+std::string document_to_json(const Document& document);
+
 /// \brief Structural checks over a whole document, with the chain named in any failure.
 ///
 /// One chain, one plan: the per-chain checks are \ref validate(const Graph&) unchanged, and this adds

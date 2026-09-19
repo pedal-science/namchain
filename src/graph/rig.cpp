@@ -390,24 +390,28 @@ bool load_document_json(const std::string& path, Document& document, std::string
   // File-naming string params are resolved against the rig's own directory first. A rig that says
   // "A2-Lite.nam" almost always means the file sitting next to it, and making that work means a
   // rig can be moved, or checked into a directory with its models, without editing paths.
-  const std::filesystem::path directory = std::filesystem::path(path).parent_path();
-  if (!directory.empty())
+  resolve_relative_paths(document, std::filesystem::path(path).parent_path().string());
+  return true;
+}
+
+void resolve_relative_paths(Document& document, const std::string& base_dir)
+{
+  if (base_dir.empty())
+    return;
+  const std::filesystem::path directory(base_dir);
+  for (Chain& chain : document.chains)
   {
-    for (Chain& chain : document.chains)
+    for (NodeSpec& node : chain.graph.nodes)
     {
-      for (NodeSpec& node : chain.graph.nodes)
+      for (auto& [key, value] : node.strings)
       {
-        for (auto& [key, value] : node.strings)
-        {
-          std::error_code ignored;
-          const std::filesystem::path candidate = directory / value;
-          if (!std::filesystem::path(value).is_absolute() && std::filesystem::exists(candidate, ignored))
-            value = candidate.string();
-        }
+        std::error_code ignored;
+        const std::filesystem::path candidate = directory / value;
+        if (!std::filesystem::path(value).is_absolute() && std::filesystem::exists(candidate, ignored))
+          value = candidate.string();
       }
     }
   }
-  return true;
 }
 
 bool parse_graph_json(const std::string& text, Graph& graph, std::string& error)
@@ -436,6 +440,60 @@ bool load_graph_json(const std::string& path, Graph& graph, std::string& error)
   }
   graph = std::move(document.chains.front().graph);
   return true;
+}
+
+std::string document_to_json(const Document& document)
+{
+  nlohmann::json chains = nlohmann::json::array();
+  for (const Chain& chain : document.chains)
+  {
+    nlohmann::json nodes = nlohmann::json::array();
+    for (const NodeSpec& node : chain.graph.nodes)
+    {
+      nlohmann::json object;
+      object["id"] = node.id;
+      object["element"] = node.element;
+      if (!node.role.empty())
+        object["role"] = node.role;
+      object["type"] = node.type;
+      if (node.bypass)
+        object["bypass"] = true;
+      // Parameters keep their own spelling rather than being nested under "params", because that is
+      // the form the parser accepts back: a number is a numeric param and a string is a string param.
+      for (const auto& [key, value] : node.params)
+        object[key] = value;
+      for (const auto& [key, value] : node.strings)
+        object[key] = value;
+      nodes.push_back(std::move(object));
+    }
+
+    nlohmann::json connections = nlohmann::json::array();
+    for (const Connection& connection : chain.graph.connections)
+    {
+      nlohmann::json object;
+      object["from"] = connection.from;
+      object["from_port"] = connection.from_port;
+      object["to"] = connection.to;
+      object["to_port"] = connection.to_port;
+      connections.push_back(std::move(object));
+    }
+
+    nlohmann::json entry;
+    entry["id"] = chain.id;
+    if (!chain.name.empty())
+      entry["name"] = chain.name;
+    entry["input_channel"] = chain.input_channel;
+    entry["output_channel"] = chain.output_channel;
+    entry["nodes"] = std::move(nodes);
+    entry["connections"] = std::move(connections);
+    chains.push_back(std::move(entry));
+  }
+
+  nlohmann::json object;
+  if (!document.name.empty())
+    object["name"] = document.name;
+  object["chains"] = std::move(chains);
+  return object.dump();
 }
 
 bool same_graph(const Graph& a, const Graph& b)

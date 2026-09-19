@@ -169,11 +169,13 @@ private:
   /// document keeps rendering. On success \ref current_document_ becomes \p document, the generation
   /// advances, and the render thread crossfades each chain into its new plan -- one chain at a time,
   /// so the peak cost is two of the largest chain rather than two of the document.
-  bool publish_document(const graph::Document& document, const std::string& label, std::string& error);
-  /// \brief Publish \p graph as the whole document's single chain.
-  ///
-  /// The shape every caller that predates chains wants, and what `rig.patch` still uses.
-  bool publish_graph(const graph::Graph& graph, const std::string& label, std::string& error);
+  /// \param path the file the document came from, or empty when it was applied over the socket.
+  /// \param source `"file"` or `"applied"`, reported so a client can tell a rig it can re-read from
+  /// disk from one that exists only in this process.
+  /// \param base_dir the directory a relative model/IR path resolves against: the rig file's own
+  /// directory for a load, the rigs root for an applied document.
+  bool publish_document(const graph::Document& document, const std::string& path, const std::string& source,
+                        const std::string& base_dir, std::string& error);
   /// \brief Resolve a `set_param` against a chain's newest published plan and push it on the ring.
   ///
   /// \param chain_id the chain to resolve against, or empty to resolve by node id -- which is an error
@@ -260,6 +262,12 @@ private:
   bool mask_saved_ = false;
   std::vector<int> clients_;
   std::string current_rig_;
+  /// How the running document arrived: `"file"`, `"applied"`, or empty before anything is loaded.
+  std::string current_source_;
+  /// The document's own name, which is all an applied document has.
+  std::string current_name_;
+  /// What a relative path in the document (or in a patch against it) resolves against.
+  std::string current_base_dir_;
   uint64_t generation_ = 0;
   bool started_ = false;
 

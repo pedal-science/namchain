@@ -357,3 +357,42 @@ TEST_CASE("a document loads from a file and resolves every chain's paths against
   CHECK_FALSE(namchain::graph::load_graph_json(path, graph, error));
   CHECK(error.find("exactly one chain") != std::string::npos);
 }
+
+TEST_CASE("a document serialises back to something the parser accepts, ids and all")
+{
+  Document document;
+  std::string error;
+  REQUIRE_MESSAGE(namchain::graph::parse_document_json(R"({
+    "name": "Round trip",
+    "chains": [ { "id": "c", "name": "Guitar", "input_channel": 0, "output_channel": 1, "nodes": [
+      { "id": "in", "type": "nc.input" },
+      { "element": "blk7", "role": "line", "type": "nc.delay", "samples": 8 },
+      { "id": "g", "type": "nc.gain", "gain": 0.5, "bypass": true, "note": "hand written" },
+      { "id": "out", "type": "nc.output" }
+    ], "connections": [
+      { "from": "in", "to": "blk7/line" },
+      { "from": "blk7/line", "to": "g" },
+      { "from": "g", "to": "out" }
+    ] } ]
+  })", document, error), error);
+
+  const std::string text = namchain::graph::document_to_json(document);
+
+  Document again;
+  REQUIRE_MESSAGE(namchain::graph::parse_document_json(text, again, error), error);
+
+  // The minted id and the client's element both survive the trip, so `rig.get` can show a client what
+  // its document became without the client having to guess an engine node name.
+  CHECK(again.name == "Round trip");
+  REQUIRE(again.chains.size() == 1u);
+  CHECK(again.chains[0].id == "c");
+  CHECK(again.chains[0].name == "Guitar");
+  CHECK(again.chains[0].input_channel == 0);
+  CHECK(again.chains[0].output_channel == 1);
+  CHECK(again.chains[0].graph.nodes[1].id == "blk7/line");
+  CHECK(again.chains[0].graph.nodes[1].element == "blk7");
+  CHECK(again.chains[0].graph.nodes[1].role == "line");
+  CHECK(again.chains[0].graph.nodes[2].bypass);
+  CHECK(again.chains[0].graph.nodes[2].strings.at("note") == "hand written");
+  CHECK(namchain::graph::same_graph(document.chains[0].graph, again.chains[0].graph));
+}

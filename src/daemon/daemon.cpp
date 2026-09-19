@@ -55,7 +55,23 @@ constexpr std::size_t kArenaBytes = 1u << 20;
 constexpr std::size_t kMaxMessageBytes = 256u * 1024;
 
 /// The protocol version this daemon speaks. Incremented when the request/response shape changes.
-constexpr int kProtocolVersion = 1;
+///
+/// 2 added `rig.apply` (a whole document in memory), the document in `rig.get`, the per-chain array in
+/// `engine.status`, a `chain` on `rig.patch` and `engine.mute`, and `features`. A version-1 client is
+/// still served: every change is additive, and unknown fields are ignored by both sides, so the
+/// negotiation accepts anything from 1 up to this (docs/ui-integration-plan.md §1.4).
+constexpr int kProtocolVersion = 2;
+constexpr int kOldestProtocolVersion = 1;
+
+/// What this daemon can be relied on to do, so a client degrades rather than guesses. Grows as the
+/// slices land (docs/ui-integration-plan.md §1.4): a client that does not see "stereo" does not offer
+/// a pan control, and one that sees "schema" knows to build its inspector from `engine.schema`.
+nlohmann::json protocol_features()
+{
+  return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
+                                "structural_crossfade", "smooth_params", "bypass", "guard",
+                                "per_chain_mute"});
+}
 
 /// A local control socket does not need many peers, and an unbounded accept loop is how a daemon
 /// runs out of descriptors. Past the cap the connection is closed immediately rather than queued.
@@ -345,10 +361,11 @@ bool Daemon::load_rig(const std::string& rig_path, std::string& error)
   graph::Document document;
   if (!graph::load_document_json(rig_path, document, error))
     return false;
-  return publish_document(document, rig_path, error);
+  return publish_document(document, rig_path, "file", std::filesystem::path(rig_path).parent_path().string(), error);
 }
 
-bool Daemon::publish_document(const graph::Document& document, const std::string& label, std::string& error)
+bool Daemon::publish_document(const graph::Document& document, const std::string& path, const std::string& source,
+                              const std::string& base_dir, std::string& error)
 {
   const graph::Validation validation = graph::validate(document);
   if (!validation.ok)
@@ -362,6 +379,12 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
             std::to_string(document.chains.size());
     return false;
   }
+
+  // Relative model/IR paths resolve against the base the document arrived with, on a *copy*: the
+  // document the engine remembers and hands back is the one the client wrote, so applying what
+  // `rig.get` returned is a fixed point rather than a rewrite of every relative path.
+  graph::Document resolved = document;
+  graph::resolve_relative_paths(resolved, base_dir);
 
   render::CompileOptions options;
   options.max_quantum = static_cast<int>(config_.period_size);
@@ -389,10 +412,13 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
 
   if (changed_count == 0 && published_slots_.size() == document.chains.size())
   {
-    // Nothing about the running document would change. The label is still worth recording -- it is
-    // what a later patch republishes under -- but the generation does not advance, because no new
-    // plan exists and a client that polls for adoption should not see one.
-    current_rig_ = label;
+    // Nothing about the running document would change. Where it came from is still worth recording --
+    // it is what a later patch republishes under -- but the generation does not advance, because no
+    // new plan exists and a client that polls for adoption should not see one.
+    current_rig_ = path;
+    current_source_ = source;
+    current_base_dir_ = base_dir;
+    current_name_ = document.name;
     return true;
   }
 
@@ -425,7 +451,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   {
     if (!changed[i])
       continue;
-    const graph::Chain& chain = document.chains[i];
+    const graph::Chain& chain = resolved.chains[i];
     auto slot = std::make_unique<PlanSlot>(kArenaBytes);
     slot->plan = graph::RenderPlan::compile(chain.graph, options, slot->arena, error);
     if (slot->plan == nullptr)
@@ -466,27 +492,22 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   // Only now does anything about the running engine change. A failed compile, a chain whose channels
   // are not available, or a full ring leaves the previous document, plans and generation as they were.
   generation_ = generation;
-  current_rig_ = label;
+  current_rig_ = path;
+  current_source_ = source;
+  current_base_dir_ = base_dir;
+  current_name_ = document.name;
   current_document_ = document;
   published_slots_ = std::move(raw);
   last_published_ = &current_document_;
 
   if (config_.verbose)
   {
-    std::fprintf(stderr, "[namchaind] published %s (generation %llu, %zu chain%s, %zu replanned)\n", label.c_str(),
+    const std::string what = path.empty() ? (document.name.empty() ? "(applied document)" : document.name) : path;
+    std::fprintf(stderr, "[namchaind] published %s (generation %llu, %zu chain%s, %zu replanned)\n", what.c_str(),
                  static_cast<unsigned long long>(generation_), document.chains.size(),
                  document.chains.size() == 1 ? "" : "s", built.size());
   }
   return true;
-}
-
-bool Daemon::publish_graph(const graph::Graph& graph, const std::string& label, std::string& error)
-{
-  graph::Document document;
-  document.chains.push_back(graph::Chain{});
-  document.chains.back().id = "main";
-  document.chains.back().graph = graph;
-  return publish_document(document, label, error);
 }
 
 bool Daemon::start(std::string& error)
@@ -1112,6 +1133,32 @@ void Daemon::render_loop()
 
 std::string Daemon::handle_request(const std::string& request)
 {
+  // One shape for the per-chain array wherever it appears, so a client can read the same entry from
+  // `engine.status` and from `rig.get` and not learn two vocabularies for one thing.
+  auto chains_json = [this]() {
+    nlohmann::json list = nlohmann::json::array();
+    for (std::size_t i = 0; i < current_document_.chains.size() && i < static_cast<std::size_t>(kMaxChains); ++i)
+    {
+      const graph::Chain& chain = current_document_.chains[i];
+      const ChainRuntime& runtime = chains_[i];
+      nlohmann::json entry;
+      entry["id"] = chain.id;
+      entry["name"] = chain.name;
+      entry["input_channel"] = chain.input_channel;
+      entry["output_channel"] = chain.output_channel;
+      entry["generation"] = published_slots_[i] == nullptr ? 0 : published_slots_[i]->generation;
+      entry["audible_generation"] = runtime.audible_generation.load();
+      entry["adopted_generation"] = runtime.adopted_generation.load();
+      entry["target_generation"] = runtime.target_generation.load();
+      entry["transition_active"] = runtime.transition_active.load();
+      entry["muted"] = runtime.mute.load();
+      entry["failed_nodes"] = runtime.failed_nodes.load();
+      entry["guard_trips"] = runtime.guard_trips.load();
+      list.push_back(std::move(entry));
+    }
+    return list;
+  };
+
   nlohmann::json doc;
   try
   {
@@ -1145,16 +1192,18 @@ std::string Daemon::handle_request(const std::string& request)
         return error_response(id, "bad_request", "'protocol' must be an integer");
       protocol = doc["protocol"].get<int>();
     }
-    if (protocol != kProtocolVersion)
+    if (protocol < kOldestProtocolVersion || protocol > kProtocolVersion)
     {
       return error_response(id, "unsupported_protocol",
-                            "namchaind speaks protocol " + std::to_string(kProtocolVersion) + ", the client asked for " +
+                            "namchaind speaks protocol " + std::to_string(kOldestProtocolVersion) + " to " +
+                              std::to_string(kProtocolVersion) + ", the client asked for " +
                               std::to_string(protocol));
     }
     nlohmann::json body;
     body["protocol"] = kProtocolVersion;
     body["role"] = "namchaind";
     body["version"] = NAMCHAIN_VERSION_STRING;
+    body["features"] = protocol_features();
     return ok_response(id, body);
   }
 
@@ -1173,6 +1222,8 @@ std::string Daemon::handle_request(const std::string& request)
     status["capture_channels"] = active_capture_channels_.load();
     status["playback_channels"] = active_playback_channels_.load();
     status["rig"] = current_rig_;
+    status["rig_source"] = current_source_;
+    status["rig_name"] = current_name_;
     status["generation"] = generation_;
     status["adopted_generation"] = adopted_generation_.load();
     status["blocks"] = blocks_.load();
@@ -1205,28 +1256,9 @@ std::string Daemon::handle_request(const std::string& request)
     // became: the chain ids it owns, the channels it was bound to, and how far each chain has got
     // through its own transition. The document-level fields above are derived from these, so a client
     // can read either the whole picture or one chain's.
-    nlohmann::json chain_list = nlohmann::json::array();
-    for (std::size_t i = 0; i < current_document_.chains.size() && i < static_cast<std::size_t>(kMaxChains); ++i)
-    {
-      const graph::Chain& chain = current_document_.chains[i];
-      const ChainRuntime& runtime = chains_[i];
-      nlohmann::json entry;
-      entry["id"] = chain.id;
-      entry["name"] = chain.name;
-      entry["input_channel"] = chain.input_channel;
-      entry["output_channel"] = chain.output_channel;
-      entry["generation"] = published_slots_[i] == nullptr ? 0 : published_slots_[i]->generation;
-      entry["audible_generation"] = runtime.audible_generation.load();
-      entry["adopted_generation"] = runtime.adopted_generation.load();
-      entry["target_generation"] = runtime.target_generation.load();
-      entry["transition_active"] = runtime.transition_active.load();
-      entry["muted"] = runtime.mute.load();
-      entry["failed_nodes"] = runtime.failed_nodes.load();
-      entry["guard_trips"] = runtime.guard_trips.load();
-      chain_list.push_back(std::move(entry));
-    }
-    status["chains"] = std::move(chain_list);
+    status["chains"] = chains_json();
     status["max_chains"] = kMaxChains;
+    status["features"] = protocol_features();
     nlohmann::json body;
     body["status"] = status;
     return ok_response(id, body);
@@ -1290,12 +1322,45 @@ std::string Daemon::handle_request(const std::string& request)
     body["generation"] = generation_;
     return ok_response(id, body);
   }
+  if (method == "rig.apply")
+  {
+    // A whole document, in memory. This is the path a UI takes: it owns the document, and a
+    // structural edit is one publish rather than a sequence of graph ops it would have to get right
+    // (docs/ui-integration-plan.md §1.1). The document is parsed by the same parser a rig file goes
+    // through, so a document means the same thing however it arrived.
+    if (!doc.contains("document") || !doc["document"].is_object())
+      return error_response(id, "bad_request", "rig.apply needs an object 'document'");
+    graph::Document document;
+    std::string error;
+    if (!graph::parse_document_json(doc["document"].dump(), document, error))
+      return error_response(id, "bad_request", error);
+
+    // Relative model/IR paths resolve against the rigs root, which is the same trust boundary a
+    // rig.load name lives behind: a socket client may name a rig but may not point the daemon at an
+    // arbitrary directory. Absolute paths in a document are the operator's business, and slice C
+    // revisits that rule for a network client (docs/ui-integration-plan.md §3.8).
+    if (!publish_document(document, /*path=*/"", "applied", config_.rigs_root, error))
+      return error_response(id, "compile_failed", error);
+    nlohmann::json body;
+    body["name"] = document.name;
+    body["generation"] = generation_;
+    body["chains"] = document.chains.size();
+    return ok_response(id, body);
+  }
   if (method == "rig.get")
   {
     nlohmann::json body;
     body["rig"] = current_rig_;
+    body["source"] = current_source_;
     body["generation"] = generation_;
-    body["loaded"] = current_rig_.empty() ? false : true;
+    body["loaded"] = current_document_.chains.empty() ? false : true;
+    if (!current_document_.chains.empty())
+    {
+      // The engine's own parse of what it is running, so a client can see the ids it minted and the
+      // element/role of every node. A diagnostic, not a document store (§1.1).
+      body["document"] = nlohmann::json::parse(graph::document_to_json(current_document_));
+      body["chains"] = chains_json();
+    }
     return ok_response(id, body);
   }
   if (method == "rig.patch")
@@ -1383,11 +1448,11 @@ std::string Daemon::handle_request(const std::string& request)
     graph::PatchContext context;
     // A model path in a patch is relative to the rig being patched, the same rule a rig's own model
     // paths follow, so the two agree about where models live.
-    context.base_dir = std::filesystem::path(current_rig_).parent_path().string();
+    context.base_dir = current_base_dir_;
     std::string error;
     if (!graph::apply_patch(patched.chains[chain_index].graph, doc["ops"].dump(), context, error))
       return error_response(id, "patch_rejected", error);
-    if (!publish_document(patched, current_rig_, error))
+    if (!publish_document(patched, current_rig_, current_source_, current_base_dir_, error))
       return error_response(id, "compile_failed", error);
 
     nlohmann::json body;

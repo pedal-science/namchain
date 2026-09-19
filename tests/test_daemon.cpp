@@ -282,16 +282,28 @@ TEST_CASE("the protocol version negotiates, rejects and names unknown methods")
   Daemon daemon(config);
 
   {
+    // A version-1 client is still served, and is told what the server actually speaks: every change
+    // since is additive, so a client that ignores what it does not know keeps working.
     const auto reply = nlohmann::json::parse(
       daemon.handle_request(R"({"id":"1","method":"engine.hello","protocol":1})"));
     CHECK(reply["ok"] == true);
     CHECK(reply["id"] == "1");
-    CHECK(reply["protocol"] == 1);
+    CHECK(reply["protocol"] == 2);
     CHECK(reply["role"] == "namchaind");
+    CHECK(reply["features"].is_array());
+    CHECK(reply["features"].size() > 0);
   }
   {
     const auto reply = nlohmann::json::parse(
-      daemon.handle_request(R"({"id":"2","method":"engine.hello","protocol":99})"));
+      daemon.handle_request(R"({"id":"2","method":"engine.hello","protocol":2})"));
+    CHECK(reply["ok"] == true);
+    CHECK(reply["protocol"] == 2);
+  }
+  for (const char* too_new : {"0", "99"})
+  {
+    const std::string request =
+      std::string(R"({"id":"3","method":"engine.hello","protocol":)") + too_new + "}";
+    const auto reply = nlohmann::json::parse(daemon.handle_request(request));
     CHECK(reply["ok"] == false);
     CHECK(reply["error"]["code"] == "unsupported_protocol");
   }
@@ -1242,4 +1254,176 @@ TEST_CASE("a document with fewer chains drops the ones that are gone and keeps r
            status["transition_active"] == false;
   });
   CHECK_MESSAGE(running, "the engine did not settle after losing a chain");
+}
+
+// ---------------------------------------------------------------------------
+// The document on the wire (docs/ui-integration-plan.md §1.1, slice A3)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("rig.apply takes a whole document and rig.get hands it back")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  std::filesystem::create_directories(root);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.capture_channels = 2;
+  config.playback_channels = 2;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  // No startup rig: the document arrives over the socket, which is how a UI would do it.
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  // A document that names one node by element and role and mints a name the client never wrote.
+  nlohmann::json document;
+  document["name"] = "Applied";
+  {
+    nlohmann::json chain;
+    chain["id"] = "gtr";
+    chain["name"] = "Guitar";
+    chain["input_channel"] = 0;
+    chain["output_channel"] = 1;
+    chain["nodes"] = nlohmann::json::array({
+      {{"id", "in"}, {"type", "nc.input"}},
+      {{"element", "blk7"}, {"role", "trim"}, {"type", "nc.gain"}, {"gain", 0.5}},
+      {{"id", "out"}, {"type", "nc.output"}},
+    });
+    chain["connections"] = nlohmann::json::array({
+      {{"from", "in"}, {"to", "blk7/trim"}},
+      {{"from", "blk7/trim"}, {"to", "out"}},
+    });
+    document["chains"] = nlohmann::json::array({chain});
+  }
+
+  {
+    nlohmann::json request;
+    request["id"] = "a";
+    request["method"] = "rig.apply";
+    request["document"] = document;
+    const auto reply = nlohmann::json::parse(call(config.socket_path, request.dump()));
+    REQUIRE_MESSAGE(reply["ok"] == true, reply.dump());
+    CHECK(reply["name"] == "Applied");
+    CHECK(reply["chains"] == 1);
+    REQUIRE(reply["generation"] == 1);
+  }
+
+  const bool running = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() == 1;
+  });
+  CHECK_MESSAGE(running, "an applied document never reached the device");
+
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  CHECK(status["status"]["rig_source"] == "applied");
+  CHECK(status["status"]["rig_name"] == "Applied");
+  CHECK(status["status"]["rig"] == ""); // there is no file, and saying so is better than inventing one
+  CHECK(status["status"]["chains"][0]["output_channel"] == 1);
+
+  // rig.get hands back the engine's parse: the minted node id, the element the client owns, and the
+  // channel binding it asked for.
+  const auto got = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  REQUIRE(got["ok"] == true);
+  CHECK(got["source"] == "applied");
+  CHECK(got["loaded"] == true);
+  const auto& chain = got["document"]["chains"][0];
+  CHECK(chain["id"] == "gtr");
+  CHECK(chain["output_channel"] == 1);
+  CHECK(chain["nodes"][1]["id"] == "blk7/trim");
+  CHECK(chain["nodes"][1]["element"] == "blk7");
+  CHECK(chain["nodes"][1]["role"] == "trim");
+  CHECK(chain["nodes"][1]["gain"] == doctest::Approx(0.5));
+  CHECK(got["chains"][0]["id"] == "gtr");
+  CHECK(got["chains"][0]["audible_generation"] == 1);
+
+  // Applying what rig.get returned is a document that changes nothing, so it does not advance the
+  // generation: the round trip is a fixed point, which is what makes it usable for reconciliation.
+  {
+    nlohmann::json request;
+    request["method"] = "rig.apply";
+    request["document"] = got["document"];
+    const auto reply = nlohmann::json::parse(call(config.socket_path, request.dump()));
+    REQUIRE_MESSAGE(reply["ok"] == true, reply.dump());
+    CHECK(reply["generation"] == 1);
+  }
+
+  // And a patch on an applied document works without a chain, because it has one.
+  const auto patch = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"method":"rig.patch","ops":[{"op":"set_param","node":"blk7/trim","param":"gain","value":0.75}]})"));
+  CHECK(patch["ok"] == true);
+  CHECK(patch["kind"] == "smooth");
+}
+
+TEST_CASE("an applied document resolves its relative paths against the rigs root")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  std::filesystem::create_directories(root / "models");
+  // A stand-in rather than a model: what is being tested is which path the daemon tried to load, and
+  // the failure names it.
+  write_file(root / "models" / "missing.nam", "not a model");
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+
+  const auto reply = nlohmann::json::parse(daemon.handle_request(R"({"method":"rig.apply","document":
+    {"chains":[{"id":"c","nodes":[{"id":"in","type":"nc.input"},
+      {"id":"amp","type":"nc.nam","model":"models/missing.nam"},
+      {"id":"out","type":"nc.output"}],
+      "connections":[{"from":"in","to":"amp"},{"from":"amp","to":"out"}]}]}})"));
+  CHECK(reply["ok"] == false);
+  const std::string message = reply["error"]["message"];
+  // The path in the message is absolute and under the rigs root, which is the rule the socket's trust
+  // boundary needs: a client cannot point the daemon at an arbitrary directory by applying a document.
+  CHECK(message.find((root / "models" / "missing.nam").string()) != std::string::npos);
+}
+
+TEST_CASE("rig.apply refuses a document with no chains and one that does not parse")
+{
+  Config config;
+  Daemon daemon(config);
+
+  const auto empty = nlohmann::json::parse(
+    daemon.handle_request(R"({"method":"rig.apply","document":{"chains":[]}})"));
+  CHECK(empty["ok"] == false);
+  CHECK(empty["error"]["code"] == "bad_request");
+  CHECK(empty["error"]["message"].get<std::string>().find("at least one chain") != std::string::npos);
+
+  const auto malformed =
+    nlohmann::json::parse(daemon.handle_request(R"({"method":"rig.apply","document":{"chains":{}}})"));
+  CHECK(malformed["ok"] == false);
+  CHECK(malformed["error"]["code"] == "bad_request");
+
+  const auto missing = nlohmann::json::parse(daemon.handle_request(R"({"method":"rig.apply"})"));
+  CHECK(missing["ok"] == false);
+  CHECK(missing["error"]["code"] == "bad_request");
 }

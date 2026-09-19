@@ -5,8 +5,10 @@ device channels), three-space node identity (`element`/`role`/`id`), chain-named
 `tests/test_document.cpp`. **A2 landed** — one plan per chain in the daemon, per-chain generations,
 mute and transitions, channel binding with summing, staggered applies, unchanged chains left alone,
 `engine.status.chains`, `rig.patch`'s request-level `chain`, and the `file` backend wired into the
-daemon so a document can be rendered offline end to end. A3 (the protocol: `rig.apply`, `rig.get`,
-protocol 2, `features`) is next. Follows
+daemon so a document can be rendered offline end to end. **A3 landed** — `rig.apply` for a whole
+document in memory, `rig.get` returning the engine's parse of what it is running (minted ids,
+`element`, `role`), protocol 2 with `features`, and relative paths resolving against the rigs root for
+an applied document. Slice B (the schema and the catalogue) is next. Follows
 `docs/ljoss-comparison.md` (the analysis) and the seven decisions recorded below. Slices are ordered
 by dependency, not by appeal; each is independently committable and independently testable, and none
 of them requires the app to exist first.
@@ -350,7 +352,7 @@ what it is running.
 |---|---|
 | **A1** ✅ | IR: `NodeSpec.element` / `NodeSpec.role`, optional `id`, reserved-key list; `Graph` unchanged. Parser: chain envelope with single-graph back-compat. `graph::validate` gains chain context in messages |
 | **A2** ✅ | Compiler/daemon: per-chain plan slots, per-chain generation, adoption and transition, staggered multi-chain transitions, channel binding and summing, per-chain mute + global mute/panic. A chain the new document does not have stops immediately, which is stated rather than faded. The `file` backend is wired into the daemon so a document renders end to end offline |
-| **A3** | Protocol 2: `engine.hello` (version + `features`), `rig.apply` (whole document, in memory), `rig.get` (document + per-chain status, optional lowered view), `engine.status.chains`; `chain` on patch ops; docs (`docs/daemon.md`, `docs/rig-pipeline.md`, `plan.md`) |
+| **A3** ✅ | Protocol 2: `engine.hello` (version range + `features`), `rig.apply` (whole document, in memory, paths resolved against the rigs root), `rig.get` (the document as the engine parsed it + per-chain status), `engine.status.chains`; `chain` on `rig.patch` and `engine.mute`; docs (`docs/daemon.md`, `docs/rig-pipeline.md`, `plan.md`). The *lowered* view in `rig.get` waits for the macro layer, because until then there is nothing to lower |
 
 **Files:** `include/namchain/graph/{graph,rig,patch}.h`, `src/graph/{rig,plan,patch}.cpp`,
 `include/namchain/daemon/daemon.h`, `src/daemon/daemon.cpp`, `src/nodes/builtin.cpp` (`nc.output`),
