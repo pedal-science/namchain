@@ -1,9 +1,38 @@
 # Testing namchain M1 on tib — the ARMv7 target
 
-**Status:** proposed; Gate 0 not started. Everything marked *[verified]* was read off tib or this
-checkout while writing.
+**Status:** the round below has been run. This document is kept as the record of what was planned;
+the revision block immediately after it supersedes its premises. Everything marked *[verified]* was
+read off tib or this checkout while writing.
 **Written:** 2026-09-16. **Host:** tib (Tinker Board S, RK3288, Cortex-A17, armv7l, 4 cores).
-**Companion:** `plan-rt-piv.md` (the piv round, finished), `rtpi@ff08927` (the kernel work on tib).
+**Companion:** `plan-rt-piv.md` (the piv round, finished), `rtpi` (the kernel work on tib).
+
+---
+
+## Revision, 2026-09-19
+
+tib now boots a kernel rtpi built for it, and three premises of the plan below no longer hold.
+Read §0 and §1 with this block on top of them:
+
+| then (2026-09-16) | now (2026-09-19) |
+|---|---|
+| mainline `7.2.6`, `NO_HZ_IDLE` only | `7.2.6-tib1`: `CONFIG_NO_HZ_FULL=y`, and `CONFIG_SOUND`/`SND`/`SND_USB_AUDIO` genuinely built in |
+| no `isolcpus`, no `nohz_full` — "no isolation at all" | `isolcpus=managed_irq,domain,3 nohz_full=3 rcu_nocbs=3`; `.tick_stopped=1` on cpu 3 |
+| governor `ondemand`, needing setting per arm | `performance` |
+| SSL 2+ not attached | attached throughout; the card number moves between boots (2 on 09-17, 1 on 09-19) |
+| 1 483 modules installed, 74 MB | 61 modules, 7.8 MB, no debug info, trimmed to what the board actually loads |
+
+The consequence for the plan: **premise 1 of §0 ("there is no reservation to hide behind") is
+gone** — the engine's core is now reserved at boot rather than merely pinned — and the
+deviceless-first ordering in §0 turned out to be unnecessary, because the device was attached for
+the whole round. What did *not* change is §2's conclusion, which the round confirmed: criterion 3
+on this board is **one A2-Full per core, not four**.
+
+Evidence: `bench-results/tib-summary.txt` (the round's results),
+`bench-results/tib-nohzfull-summary.txt` (the tick, and what it did and did not buy),
+`bench-results/tib-dx-*` and `bench-results/tib-nz-*` (the device A/B before and after the kernel
+change), `bench-results/tib-k1-a2full*` and `bench-results/tib-k2-a2full-hour*` (criterion 3).
+Deliverable 6 in §6 was written against the wrong premise; the corrected section is in
+`docs/tuning.md`.
 
 ---
 

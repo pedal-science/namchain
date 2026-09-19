@@ -1,0 +1,35 @@
+# Why init.scope needs a boot unit instead of a drop-in
+#
+# Reproduced on tib 2026-09-17T14:42:01Z, kernel 7.2.6. Commands are shown
+# with their output. Nothing is left behind: the probe drop-ins are removed and the
+# runtime property is restored from namchain-host-slim-initconfine.service at the end.
+
+$ systemctl show init.scope -p Transient -p FragmentPath
+FragmentPath=
+Transient=yes
+
+# A transient unit has no fragment and no /etc drop-in directory. Its only drop-in dir is
+# the one systemctl creates under /run:
+$ systemctl show init.scope -p DropInPaths
+DropInPaths=/run/systemd/transient/init.scope.d/50-AllowedCPUs.conf
+
+## probe 1: a drop-in under /etc is ignored
+[Scope]
+AllowedCPUs=0-1
+$ systemctl set-property --runtime init.scope AllowedCPUs=   # clear the runtime value only
+allowed (from the /etc drop-in): AllowedCPUs=
+cpuset.cpus.effective:           0-3
+^^ the drop-in was NOT read: with the runtime value cleared, confinement is gone (0-3).
+
+## probe 2: a drop-in under /run IS read
+[Scope]
+AllowedCPUs=0-1
+$ systemctl show init.scope -p DropInPaths
+DropInPaths=/run/systemd/transient/init.scope.d/50-AllowedCPUs.conf /run/systemd/system/init.scope.d/99-probe.conf
+allowed:               AllowedCPUs=0-1
+cpuset.cpus.effective: 0-1
+^^ honored -- but /run is tmpfs, so this is exactly as durable as the runtime value.
+
+## cleanup: remove the probe and restore the real confinement from the boot unit
+unit result:           success
+cpuset.cpus.effective: 0-1

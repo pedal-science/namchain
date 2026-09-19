@@ -8,6 +8,8 @@
 #   host-slim.sh --check               report current state against the intended state
 #   host-slim.sh --revert              undo exactly what --apply did (from the manifest)
 #   host-slim.sh --diff                show intended vs actual, per item
+#   host-slim.sh --list-services       print this board's mask set, one unit per line
+#                                      (read-only; used to reconcile a stale manifest)
 #
 # What it does, and why (full reasoning in docs/distro-slimming.md; measured evidence in
 # bench-results/host-confine-screen.json and bench-results/tib-e5c-*):
@@ -47,6 +49,13 @@ STATE_DIR="${NAMSLIM_STATE:-/var/lib/namchain/host-slim}"
 MANIFEST="$STATE_DIR/manifest"
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/10-namchain-audio.conf"
 VMSTAT_UNIT="/etc/systemd/system/namchain-host-slim-vmstat.service"
+# init.scope is a *transient* unit (FragmentPath is empty), so a normal drop-in under
+# /etc/systemd/system/init.scope.d/ is silently IGNORED for it -- verified 2026-09-17:
+# after `set-property --runtime init.scope AllowedCPUs=` cleared the runtime value, the
+# drop-in was not consulted and cpuset.cpus.effective fell back to 0-3. Only
+# /run/systemd/transient/init.scope.d/ is read, and /run is tmpfs. So the confinement is
+# re-established at every boot by this oneshot instead of by a drop-in.
+INITCONFINE_UNIT="/etc/systemd/system/namchain-host-slim-initconfine.service"
 CDL_RULE="/etc/udev/rules.d/90-namchain-cpu-dma-latency.rules"
 LIMITS_FILE="/etc/security/limits.d/90-namchain-rttime.conf"
 
@@ -115,8 +124,9 @@ do_confine() {
     if [[ $DRY -eq 0 && $eff == "$hk" ]]; then ok "$s -> $eff"
     elif [[ $DRY -eq 0 ]]; then warn "$s read back '$eff', wanted '$hk'"; fi
   done
-  # init.scope holds pid 1 and kernel threads; constraining it is what removes unbound work
-  # from the audio cores entirely. Measured to be effective where the kernel permits it.
+  # init.scope holds pid 1 and the units systemd could not place in a slice. Confining it
+  # keeps that work off the audio cores. See the INITCONFINE_UNIT note: a drop-in cannot
+  # persist this, so there are two halves -- the runtime write here, and a boot unit below.
   if [[ -d /sys/fs/cgroup/init.scope ]]; then
     run systemctl set-property --runtime init.scope AllowedCPUs="$hk"
     local e; e=$(cat /sys/fs/cgroup/init.scope/cpuset.cpus.effective 2>/dev/null)
@@ -127,7 +137,11 @@ do_confine() {
   # command to undo); writing the drop-ins makes it survive reboot. The audio IRQ thread is
   # in the root cgroup, which none of these touch, so its pin survives either way.
   local dir
-  for s in system.slice user.slice; do
+  for s in system.slice user.slice machine.slice; do
+    # All three are non-transient (they have a fragment in /usr/lib), so a drop-in is read.
+    # machine.slice only materialises once something uses it -- libvirt on piv -- but its
+    # drop-in is harmless when the cgroup is absent and correct when it is not.
+    if [[ ! -d /sys/fs/cgroup/$s ]]; then skip "$s (no cgroup yet; drop-in written anyway)"; fi
     dir="/etc/systemd/system/$s.d"
     run install -d -m 0755 "$dir"
     if [[ $DRY -eq 1 ]]; then printf '  DRY   write %s/10-namchain-cpuset.conf\n' "$dir"
@@ -135,6 +149,35 @@ do_confine() {
     manifest_add "file $dir/10-namchain-cpuset.conf"
     manifest_add "dir $dir"
   done
+  # init.scope cannot take a drop-in at all (see INITCONFINE_UNIT), so it gets a oneshot
+  # that re-applies the runtime property at every boot. ExecStartPost is a real assertion,
+  # not decoration: if the confinement did not take, the unit fails and `systemctl --failed`
+  # says so, rather than the state quietly decaying back to all four cores.
+  local systemctl_bin; systemctl_bin=$(command -v systemctl)
+  if [[ $DRY -eq 1 ]]; then
+    printf '  DRY   write %s (boot-time init.scope confine)\n' "$INITCONFINE_UNIT"
+  else
+    cat > "$INITCONFINE_UNIT" <<EOF
+[Unit]
+Description=namchain host-slim: confine init.scope to the housekeeping CPUs
+DefaultDependencies=no
+After=systemd-sysctl.service
+Before=sysinit.target
+ConditionPathIsDirectory=/sys/fs/cgroup/init.scope
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$systemctl_bin set-property --runtime init.scope AllowedCPUs=$hk
+ExecStartPost=/bin/sh -c '[ "\$(cat /sys/fs/cgroup/init.scope/cpuset.cpus.effective)" = "$hk" ]'
+
+[Install]
+WantedBy=sysinit.target
+EOF
+    run systemctl daemon-reload
+    run systemctl enable --now namchain-host-slim-initconfine.service
+    manifest_add "file $INITCONFINE_UNIT"
+  fi
 }
 
 # 2. mask background services
@@ -255,7 +298,10 @@ EOF
   fi
   manifest_add "file $JOURNALD_DROPIN"
   run systemctl restart systemd-journald
-  local where; where=$(findmnt -no FSTYPE /run/log/journal 2>/dev/null || echo unknown)
+  # --target, not the path itself: /run/log/journal is normally not its own mountpoint, so
+  # asking findmnt about it directly answers "not mounted" and reads as a failure when the
+  # storage is exactly where we want it (tmpfs under /run).
+  local where; where=$(findmnt -no FSTYPE --target /run/log/journal 2>/dev/null || echo unknown)
   [[ $DRY -eq 0 ]] && ok "journal now on ${where:-?} (expect tmpfs)"
 }
 
@@ -368,11 +414,33 @@ do_check() {
   done
   [[ $n -gt 0 ]] && ok "$n services masked/not-enabled"
   [[ $bad -eq 0 ]] && ok "no enabled background service left unmasked"
+  # `masked` and merely `disabled` are very different states: only the first is what this
+  # tool does, and only units with a manifest line are ones --revert can undo. A masked unit
+  # with no line is either pre-existing (not ours, correct to leave alone) or the residue of
+  # an apply made before the manifest was merged -- in which case --revert silently leaves
+  # every mask in place. That is how piv ended up half-reverted, so it is now reported.
+  local unrecorded=0
+  for u in $(service_list); do
+    [[ $(systemctl is-enabled "$u" 2>/dev/null) == masked ]] || continue
+    manifest_has "mask $u" || unrecorded=$((unrecorded+1))
+  done
+  if [[ $unrecorded -gt 0 ]]; then
+    printf '  WARN  %s service(s) masked but not recorded in the manifest; --revert will NOT undo them\n' "$unrecorded"
+  else
+    ok "every masked service is recorded in the manifest"
+  fi
 
   head2 "files"
-  for f in "$JOURNALD_DROPIN" "$VMSTAT_UNIT" "$CDL_RULE" "$LIMITS_FILE"; do
+  for f in "$JOURNALD_DROPIN" "$VMSTAT_UNIT" "$INITCONFINE_UNIT" "$CDL_RULE" "$LIMITS_FILE"; do
     [[ -r $f ]] && ok "$f" || printf '  FAIL  %-46s absent\n' "$f"
   done
+  # init.scope confinement decays at reboot unless the boot unit carried it, so its
+  # enablement is part of the check rather than an implementation detail.
+  if [[ -r $INITCONFINE_UNIT ]]; then
+    local st; st=$(systemctl is-enabled namchain-host-slim-initconfine.service 2>/dev/null)
+    check_one "initconfine unit enabled" "$st" "enabled"
+    check_one "initconfine unit active" "$(systemctl is-active namchain-host-slim-initconfine.service 2>/dev/null)" "active"
+  fi
   check_one "vm.stat_interval" "$(cat /proc/sys/vm/stat_interval 2>/dev/null)" "10"
   say "  /dev/cpu_dma_latency: $(ls -l /dev/cpu_dma_latency 2>/dev/null || echo absent)"
   say "  journal Storage: $(grep -h '^Storage=' /etc/systemd/journald.conf "$JOURNALD_DROPIN" 2>/dev/null | tail -1)"
@@ -387,10 +455,13 @@ do_revert() {
   if [[ ! -r $MANIFEST ]]; then
     warn "no manifest at $MANIFEST; reverting only the fixed file set"
   fi
-  # Stop and disable the oneshot unit BEFORE deleting its file, or systemd keeps a
-  # dangling enablement symlink and the vmstat write is reverted but still wanted.
+  # Stop and disable the oneshot units BEFORE deleting their files, or systemd keeps a
+  # dangling enablement symlink and the write is reverted but still wanted.
   if [[ -f $VMSTAT_UNIT ]]; then
     run systemctl disable --now namchain-host-slim-vmstat.service
+  fi
+  if [[ -f $INITCONFINE_UNIT ]]; then
+    run systemctl disable --now namchain-host-slim-initconfine.service
   fi
   local kind what
   while read -r kind what _; do
@@ -423,20 +494,30 @@ while [[ $# -gt 0 ]]; do
     --check)  MODE=check;  PASSTHRU+=(--check) ;;
     --diff)   MODE=diff;   PASSTHRU+=(--diff) ;;
     --revert) MODE=revert; PASSTHRU+=(--revert) ;;
+    --list-services) MODE=listservices; PASSTHRU+=(--list-services) ;;
     --dry-run) DRY=1;      PASSTHRU+=(--dry-run) ;;
     -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
   shift
 done
-[[ -n $MODE ]] || die "one of --apply --check --diff --revert is required"
+[[ -n $MODE ]] || die "one of --apply --check --diff --revert --list-services is required"
 
 case $MODE in
+  listservices) service_list | tr ' ' '\n' | sed '/^$/d' ;;
   apply)
     need_root "${PASSTHRU[@]}"
     say "host-slim --apply on board $(board)$([[ $DRY -eq 1 ]] && echo ' (DRY RUN -- nothing will change)')"
     say "changes are recorded in $MANIFEST for --revert"
-    [[ $DRY -eq 0 ]] && mkdir -p "$STATE_DIR" && : > "$MANIFEST"
+    # The manifest is MERGED, not reset. Resetting it loses the record of units this tool
+    # masked on an earlier apply: the second apply finds them already masked and records
+    # nothing, so a later --revert has no line to unmask them with. That is not theoretical
+    # -- piv was found on 2026-09-17 with 33 units still masked and a manifest that claimed
+    # only confinement, which made `--revert` silently leave every mask in place.
+    [[ $DRY -eq 0 ]] && mkdir -p "$STATE_DIR" && touch "$MANIFEST"
+    if [[ $DRY -eq 0 && -s $MANIFEST ]]; then
+      say "  (keeping $(grep -c . "$MANIFEST") existing manifest entries; --revert undoes these too)"
+    fi
     do_confine; do_mask; do_journald; do_vmstat; do_cdl; do_limits
     head2 "verify"
     do_check

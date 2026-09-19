@@ -155,8 +155,62 @@ weight reuse between blocks, better cache blocking), not their shape.
 
 The practical rules that follow:
 
-- Do not run memory-heavy work (builds, VMs, containers, large copies, a desktop under load)
-  on the same machine while playing. "Isolated cores" does not mean isolated machine.
+- **It is new-page traffic that hurts, not the size of the working set.** "Do not run memory-heavy
+  work beside the engine" is the right rule but the wrong diagnosis, and the difference decides
+  what you are allowed to run. Measured on piv, same engine, back to back, load pinned to cpus 0-1:
+
+  | load | xruns | late blocks | block p99 |
+  |---|---|---|---|
+  | `stress-ng --vm 1 --vm-bytes 128M` | 2400 | 26 719 | 2050 µs |
+  | the same **with `--vm-keep`** | 562 | 10 083 | 1597 µs |
+
+  Without `--vm-keep`, stress-ng frees and re-maps its 128 MB every cycle, so the kernel keeps
+  zeroing and re-faulting those pages; with it, the same pages are rewritten in place. A large
+  working set touched steadily is far cheaper than a small one allocated and freed repeatedly.
+  So watch for allocation churn — page faults, `mmap`/`munmap`, page zeroing, a build or a
+  container runtime starting and stopping — rather than for the RSS figure.
+- **A memory-pressure measurement on this class of host is not reproducible on its own.** The same
+  load flags gave **0 driver xruns at one time and 562 at another** (piv, 3.5 h apart), while a
+  different configuration reproduced to within 7 xruns a day apart. This comparison sits near a
+  cliff, so arms involving memory pressure must be run **balanced and in one session**, and the
+  record should carry the load's own traffic rather than merely its presence.
+- **Do not measure an arm straight after boot.** Each arm of the first boot-argument A/B began
+  about a minute after a reboot, and every one had its first deadline overrun inside the first 240
+  blocks of 1 350 000, with CPU spike runs through the first 0.4 s — the post-boot storm. It
+  inflated the late-block counts and made those arms incomparable with anything run on a settled
+  machine. Wait a couple of minutes, or measure a settled machine.
+- **Cgroup v2 cpuset confinement is worth having on a board with a core to spare, and worth
+  nothing on one without.** On piv, same session, no reboots, balanced, quiet, engine pinned to
+  cpu 3: unconfined 7 and 5 late blocks against confined 1 and 2, with 0 xruns and 0 drops in all
+  four arms — about 4× on late blocks, and p99 and worst block moved by less than the spread
+  *within* the unconfined condition. On tib, which has no core to spare: **3 % on late blocks
+  deviceless and 6 % on device xruns under an identical memory load — i.e. nothing**, because its
+  housekeeping and audio CPUs share one memory bus and there is nowhere to move the work to. So
+  confine on a Pi-class board, and on a 4-core ARMv7 board the rule is the one that actually
+  works: **run nothing else on it.**
+
+  Why the two differ, measured 2026-09-17 — and it is not the number of cores, which is four on
+  both:
+
+  | | Pi 500 (BCM2712, A76) | Tinker Board S (RK3288, A17) |
+  |---|---|---|
+  | L2 | **512 K private per core** | **one unified L2 shared by all four cores** |
+  | L3 | 2 M shared | none |
+  | single-thread `memcpy` | **10.97 GB/s** | **2.98 GB/s** (3.7× less) |
+  | CPU per A2-Full | RTF 0.0501 (~5 % of a core) | RTF 0.5199 (~52 %) |
+  | boot reservation | `isolcpus`/`nohz_full` on 2-3 | none, and `NO_HZ_FULL` not compiled in |
+
+  The engine's working set on the Pi lives in a private L2 that housekeeping can only reach
+  through the shared L3; on the Tinker Board there is no private L2 at all, so housekeeping
+  streams through the same cache the engine is using, over a bus with under a third of the
+  bandwidth, while the engine's own work costs ten times more CPU per model and has far less
+  slack to absorb the queueing. Confinement moves work off a *core*; it cannot give back a private
+  cache or bus capacity, and neither board offers cache partitioning (no MPAM/CAT). Hence ~4× on
+  the Pi and nothing on the Tinker Board. Two traps if you do it:
+  confine the top-level slices to the housekeeping cores **and** run the engine in its own cpuset
+  partition, or the confinement stops the engine reaching its own core; and pass the rlimits to
+  the unit, because a systemd service does not get `pam_limits` and will silently run
+  `SCHED_OTHER`. Details and the corrected screens: `docs/distro-slimming.md`.
 - The engine has a **throughput ceiling that is memory-shaped, not CPU-shaped**: 4 concurrent
   A2-Full holds, 6 costs 1.9× the p99 of 4 rather than the 1.5× the arithmetic predicts, and
   8 produces xruns. More resident models is more traffic per block.
@@ -215,19 +269,63 @@ gates its ARMv7 arm on `__arm__ && __ARM_NEON && __ARM_FEATURE_FMA`. Two consequ
   `aarch64|arm64|armv8`, so an armv7 NEON build prints "A2 planar NEON: OFF" while actually
   running the planar kernels. The bit-identity gate keys off the header macro and does run.
 
-### `NO_HZ_FULL` is not available here, and that is fine
+### `NO_HZ_FULL` on tib: enabled 2026-09-19, and what it bought
 
-tib's kernel deliberately declines `isolcpus`/`nohz_full`/`rcu_nocbs`: a 4-core board with a full
-userspace has no cores to spare. The RT kernel's scheduler is then the *only* protection, and the
-engine still holds its period — the 1 h soak above ran with `SCHED_FIFO 80` pinned to one core and
-no isolation at all. Pin the audio thread anyway (`--cpu`): a pin is not a reservation, but it
-stops migration for free.
+Two earlier versions of this section were wrong in opposite directions: the first said the option
+was unavailable on this board, and the second — correctly, at the time — said it was off by
+configuration. It is now **on**, in rtpi's `7.2.6-tib1` build:
 
-**Under load it does degrade.** With `stress-ng --cpu 4 --io 2 --vm 1` + `hackbench` on all four
-cores the same configuration produced 36 xruns and 1138 late blocks in 5 minutes, and the engine's
-own CPU time more than doubled (chain p99 410 → 851 µs) at a pinned 1416 MHz — the same
-memory-stall signature as the x86/ARM64 case above, since the engine's core is now shared. The
-rule is the same on both: **do not run memory-heavy work beside the engine.**
+```
+$ grep -E '^CONFIG_(NO_HZ_FULL|NO_HZ_IDLE)=' /boot/config-$(uname -r)
+CONFIG_NO_HZ_FULL=y
+# CONFIG_NO_HZ_IDLE is not set
+$ tr ' ' '\n' < /proc/cmdline | grep -E 'isolcpus|nohz_full|rcu_nocbs'
+isolcpus=managed_irq,domain,3
+nohz_full=3
+rcu_nocbs=3
+```
+
+`NO_HZ_IDLE` being unset is not a regression. The two are members of `kernel/time/Kconfig`'s
+"Timer tick handling" **choice**, so exactly one is set and FULL is the superset — it stops the
+tick on an idle core *and* on a busy core running exactly one task. The fragment had asked for
+both since the first commit, and Kconfig had been silently keeping one of them.
+
+**Enable it, then measure it the right way: the interrupt count is not the test.** `arch_timer`
+counts every arch-timer interrupt including hrtimers, so a workload with its own timers shows a
+rate no matter what the tick is doing — and the first version of this section read that rate as
+"the tick", which is how it concluded the opposite of the truth. `/proc/timer_list` answers the
+actual question, and a timer-free busy task separates the two sources:
+
+| workload on cpu 3, 2026-09-19 | `.tick_stopped` | `arch_timer` on cpu 3 |
+|---|---|---|
+| pure busy spinner, one task, no timers | 1 | **0/s** |
+| engine, device backend, quiet (602 s) | 1 | 1.0/s (601 total) |
+| engine, device backend, under vm load (618 s) | 1 | 5.0/s (3 084 total) |
+| the same engine on 7.2.6 without it | 0 | **921/s** (554 761 in 602 s) |
+
+The housekeeping cores keep their tick — in the loaded arm cpu1 and cpu2 take ~618 000 each. The
+tick on the audio core went from ~920/s to 1-5/s, and the remainder is the *workload's* own
+timers, which no tick setting removes: the null backend, which paces itself with a per-block
+sleep, leaves 470-550/s behind even with the tick provably stopped. That is also why the old
+921/s is an upper bound on what the tick cost there.
+
+**What it bought: a little, and the loaded case is unchanged.** Device arms, same engine, same
+pins, only the kernel differing: p99 492.6 → 357.0 µs and max 768.3 → 596.5 µs with 0 xruns either
+way; under a memory load both directions still fail the gate (p99 1785.6 → 1709.8 µs, xruns
+2876 → 2082). That is one arm per condition two days apart with four changes bundled together, and
+the same quiet arm on 7.2.6 has itself given 36.95 % and 46.5 %, so the improvement is a lead
+rather than a result — `bench-results/tib-nohzfull-summary.txt` §3 has the caveats and the
+attribution experiment that would settle it. The loaded case behaving the same is the
+expected outcome: there the binding constraint is the shared L2 and ~2.98 GB/s of bandwidth, not
+the tick. **This is hygiene for a headless node, not a cure.**
+
+**Under load it still degrades, and the load now has to be aimed.** With
+`stress-ng --cpu 4 --io 2 --vm 1` + `hackbench` the same engine configuration produced 36 xruns
+and 1138 late blocks in five minutes, and the engine's own CPU time more than doubled (chain p99
+410 → 851 µs) at a pinned 1416 MHz — the same memory-stall signature as the x86/ARM64 case above.
+`isolcpus=3` stops the scheduler *balancing* work onto the engine's core, but a load whose workers
+are explicitly affine to all four CPUs still lands there, so pin the load to the housekeeping
+cores. The rule is unchanged on both boards: **do not run memory-heavy work beside the engine.**
 
 **Cap the frequency and watch the thermals.** 1416 MHz is the point this board holds; the stock
 top bin drove the rtpi suite into its 90 °C critical trip once. Sample `thermal_zone0` and

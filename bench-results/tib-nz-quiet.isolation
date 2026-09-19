@@ -1,0 +1,32 @@
+=== host state ===
+period           2026-09-19T09:55:53+01:00 -> 2026-09-19T10:05:55+01:00 (602s)
+kernel_release   7.2.6-tib1
+uname_says_rt    true
+cmdline          earlyprintk root=UUID=e04f90b4-4c61-41cf-80bd-03df2cb494d6 rootwait rootfstype=ext4 splash=verbose console=ttyS2,115200n8 console=tty1 consoleblank=0 loglevel=1 ubootpart=4c19c430-01 usb-storage.quirks=0x2537:0x1066:u,0x2537:0x1068:u rtpi.slot=candidate isolcpus=managed_irq,domain,3 nohz_full=3 rcu_nocbs=3 coherent_pool=2M  cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory
+isolated_cpus    3
+nohz_full_cpus   3
+governor         performance
+scaling_max_khz  1800000
+scaling_cur_khz  1800000
+temp_mC          59545
+throttled        no-vcgencmd
+audio_card        card 1: II [SSL 2+ Mk II], device 0: USB Audio [USB Audio]
+audio_irq_name   ehci_hcd:usb3
+audio_irq_number 54
+audio_irq_affinity 0-3
+audio_irq_thread_prio 50
+
+=== interrupt deltas per CPU (602s) ===
+source                   cpu0       cpu1       cpu2       cpu3
+arch_timer            608298     24066     20041       601
+IPI0_resched               0         0         0         0
+IPI5_irqwork           74783        27        53       606
+audio_IRQ                  0         0         0         0
+IPI1_fncall                0         0         0         0
+
+=== verdict ===
+ok:   cpu 3 .tick_stopped=1 -- the scheduler tick is stopped on this core.
+info: cpu 3 arch_timer delta 601 in 602s (1.0/s).
+      On a tickless core this is normally 0; a nonzero value is an hrtimer (or a
+      tick that came back), not proof of either.
+ok:   isolated=3 nohz_full=3

@@ -1,0 +1,15 @@
+start       2026-09-17T20:28:40+01:00
+command     /home/rik/namchain/tools/soak/rt-manipulation-check.sh arm /home/rik/namchain/bench-results/tib-dx-2-vm-unc /home/rik/namchain/bin-neon/namchain-soak --device hw:2,0 --capture-channels 8 --playback-channels 6 --quantum 64 --periods 6 --output-queue-periods 4 --output-queue-floor-periods 2 --instances 3 --model /home/rik/namchain/models/A2-Lite.nam --input-channel 0 --output-channel 0 --self-oracle --oracle-window 5 --rt-priority 80 --cpu 3 --seconds 600
+2026-09-17T20:28:40+01:00
+2026-09-17T20:29:40+01:00
+2026-09-17T20:30:40+01:00
+2026-09-17T20:31:40+01:00
+2026-09-17T20:32:40+01:00
+2026-09-17T20:33:40+01:00
+2026-09-17T20:34:40+01:00
+2026-09-17T20:35:40+01:00
+2026-09-17T20:36:40+01:00
+2026-09-17T20:37:40+01:00
+2026-09-17T20:38:41+01:00
+end         2026-09-17T20:39:03+01:00
+exit        1
