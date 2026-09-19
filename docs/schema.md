@@ -62,7 +62,8 @@ stereo block is not available rather than discovering it in an error (docs/ui-in
 | `patchable` | whether `rig.patch` may name it at all |
 | `hidden` | an alias or an internal knob: a generic inspector leaves it out. `nc.gain` publishes `gain_db` (dB, visible) and `gain` (linear, hidden) for one underlying value |
 | `required` | the node cannot be built without it |
-| `one_of` | a group name for alternatives: `nc.delay` takes `samples` **or** `ms`, and at least one must be present |
+| `one_of` | a group name for alternatives: `nc.delay` takes `samples` **or** `ms`. Giving two members of a group is refused rather than resolved by precedence |
+| `one_of_required` | whether at least one member of that group must be present. True for the delay's time, false for its line length, which may be declared in either unit or not at all |
 | `options` | for `kind: "option"`, an array of `{value, label}` — the wire value and the display label are not assumed to be the same string |
 | `options_from` | for an option whose values live on the device: `"models"` or `"irs"`, resolved through the asset registry (slice D). Exactly one of `options`/`options_from` is present |
 
@@ -108,10 +109,13 @@ Three claims are asserted rather than promised, in `tests/test_schema.cpp`:
 - **Per-port parameters.** `nc.mix` can sum N inputs but has no per-input gain: a lane's level is a
   `nc.gain` node in the lane, which is what a client's flattening already produces. Per-port gain,
   mute and phase are slice B4.
-- **Ramping for a filter or a delay time.** `nc.eq.biquad`'s `freq`/`q`/`gain_db` and `nc.delay`'s
-  `ms`/`samples` are patchable and **not** rampable: interpolating a biquad's coefficients is not the
-  same as interpolating a value, and moving a delay's read pointer needs a crossfade between two taps.
-  Until those exist, changing one is the structural class — dual-rendered and crossfaded at the plan
-  level, which is glitch-free by construction but is a rebuild. Making them rampable is slice B3.
+- **Ramping for a filter or a delay time, and how it is done.** These are rampable, and not by
+  interpolating anything: a biquad runs the old and the new coefficient sets in two lanes and
+  equal-power crossfades their outputs (`rt::Crossfade`, the same law a plan transition uses), because
+  linearly interpolating `b0..a2` between two stable filters is not guaranteed stable and is not the
+  response anyone asked for at the midpoint; a delay crossfades between the old and new read taps,
+  because interpolating the read position would be a varispeed slide rather than a new delay time.
+  Two consequences a client can see: a change is a *transition* of one smoothing time (`ramp_ms`), and
+  a delay can only be lengthened into a line the rig declared — hence `max_ms`/`max_samples`.
 - **Macros** — a `kind: "macro"` entry with the same parameter shape, once there is a lowering layer to
   put behind it (slice E).

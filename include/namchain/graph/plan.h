@@ -99,11 +99,16 @@ struct ParamDesc
   bool hidden = false;
   /// The node cannot be built without it.
   bool required = false;
-  /// \brief A group name for mutually exclusive alternatives, one of which is required.
+  /// \brief A group name for mutually exclusive alternatives.
   ///
-  /// `nc.delay` takes `samples` **or** `ms`, which a flat parameter list cannot express; parameters
-  /// sharing a `one_of` group are alternatives and at least one of them must be present.
+  /// `nc.delay` takes `samples` **or** `ms`, which a flat parameter list cannot express. Parameters
+  /// sharing a group name are alternatives: giving two of them is a contradiction rather than a
+  /// precedence rule, and is refused. Whether one of them is *required* is \ref one_of_required,
+  /// because the same mechanism covers a pair that is merely optional -- `nc.delay`'s line length can
+  /// be declared in samples or in milliseconds or not at all.
   const char* one_of = nullptr;
+  /// Whether at least one member of the \ref one_of group must be present.
+  bool one_of_required = false;
   /// For \ref ParamKind::Option: the accepted values. The wire value is what a client sends; `label`
   /// is what it shows, and they are not assumed to be the same string.
   const OptionDesc* options = nullptr;

@@ -5,6 +5,29 @@ structural patch protocol, bypass and the non-finite guard are built. Warm-start
 (M3), and neither is admission control. This document is the operational half of
 docs/rig-pipeline.md §4–§5, which is the design half. Read that for *why*; read this for *what runs*.
 
+### What the glitch detector cannot judge (found in B3)
+
+The detector is the judge for the smooth class, and two of its rules have limits that only showed up
+once a *delay time* became rampable:
+
+- **A crossfade between two taps of the same material is a comb.** During the transition the output is
+  `w_a·x[n-Δa] + w_b·x[n-Δb]`, and where the two copies line up the sum reaches +6 dB. The continuity
+  rule's limit is `κ = 2 ×` the louder oracle, which is *exactly* that boundary, so a long enough
+  series of delay edits on correlated material will sit on it. That is the effect doing what a
+  tape-style delay does when the time moves; it is not a click.
+- **The high-frequency ratio needs material with high frequencies in it.** The rule compares HF energy
+  against the louder oracle, and when the test signal is a pure tone both oracles' HF floor is
+  numerical (about −126 dBFS), so the residue of any transition is tens of dB "above" it while being
+  inaudible. On broadband material the same edit measures within a couple of dB.
+
+Measured, on a 2-second test tone through `nc.delay` sweeping 35 ↔ 45 ms every 80 ms with a 15 ms
+ramp: the render tracks the named tap sample-exactly, its second difference in the judged windows
+matches both oracles to within 1 %, and the reported findings are "+6 dB comb peaks" and "HF above a
+numerical floor". The detector is right about what it measures; the numbers are at the edge of what it
+can measure. Judging a *time-shifting* parameter properly needs either broadband material or a rule
+that knows a crossfade of correlated copies sums rather than splices.
+
+
 ## The four op classes (plan.md §5.3)
 
 | edit | mechanism | state |

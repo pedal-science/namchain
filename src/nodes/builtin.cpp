@@ -1,5 +1,7 @@
 #include "namchain/graph/plan.h"
 
+#include "namchain/rt/crossfade.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -113,9 +115,15 @@ void process_marker(void*, const float* const*, float* const*, int) noexcept {}
 // to samples is control-thread work (§6.1). `ramp_ms = 0` is a legal instant change, which the
 // timeline's negative control uses to show the detector can fail.
 
-/// Parameter ids are positions in \ref kGainParams plus one (plan.h, \ref ParamDesc).
+/// Parameter ids are positions in the type's schema array plus one (plan.h, \ref ParamDesc).
 constexpr uint32_t kGainParamGainDb = 1;
 constexpr uint32_t kGainParamGain = 2;
+constexpr uint32_t kBiquadParamMode = 1;
+constexpr uint32_t kBiquadParamFreq = 2;
+constexpr uint32_t kBiquadParamQ = 3;
+constexpr uint32_t kBiquadParamGainDb = 4;
+constexpr uint32_t kDelayParamSamples = 1;
+constexpr uint32_t kDelayParamMs = 2;
 
 struct GainState
 {
@@ -482,52 +490,73 @@ bool parse_biquad_mode(const std::string& name, BiquadMode& mode)
   return false;
 }
 
-struct BiquadState
+/// Normalised coefficients of one biquad section: the difference equation is
+///   y = b0*x + s1;  s1 = b1*x - a1*y + s2;  s2 = b2*x - a2*y
+struct BiquadCoeffs
 {
-  // Normalised by a0, so the difference equation is
-  //   y = b0*x + s1;  s1 = b1*x - a1*y + s2;  s2 = b2*x - a2*y
   float b0 = 1.0f;
   float b1 = 0.0f;
   float b2 = 0.0f;
   float a1 = 0.0f;
   float a2 = 0.0f;
+};
+
+/// One running section: coefficients plus the two states they carry.
+///
+/// Two of these live in a node, because a parameter change crossfades between them rather than
+/// interpolating coefficients (see \ref BiquadState).
+struct BiquadLane
+{
+  BiquadCoeffs coeffs;
   float s1 = 0.0f;
   float s2 = 0.0f;
 };
 
-void* create_biquad(const graph::NodeSpec& spec, const CompileOptions& options, std::string& error)
+void run_biquad(BiquadLane& lane, const float* in, float* out, int frames) noexcept
 {
-  const std::string type = "nc.eq.biquad";
-
-  BiquadMode mode = BiquadMode::Peaking;
-  const std::string mode_name = string_param(spec, "mode");
-  if (!mode_name.empty() && !parse_biquad_mode(mode_name, mode))
+  const float b0 = lane.coeffs.b0;
+  const float b1 = lane.coeffs.b1;
+  const float b2 = lane.coeffs.b2;
+  const float a1 = lane.coeffs.a1;
+  const float a2 = lane.coeffs.a2;
+  float s1 = lane.s1;
+  float s2 = lane.s2;
+  for (int i = 0; i < frames; ++i)
   {
-    error = reject(type, "unknown mode '" + mode_name + "'");
-    return nullptr;
+    const float x = in[i];
+    const float y = b0 * x + s1;
+    s1 = b1 * x - a1 * y + s2;
+    s2 = b2 * x - a2 * y;
+    out[i] = y;
   }
+  lane.s1 = s1;
+  lane.s2 = s2;
+}
 
-  const double rate = options.sample_rate;
-  const double freq = number_param(spec, "freq", 1000.0);
-  const double q = number_param(spec, "q", 0.707);
-  const double gain_db = number_param(spec, "gain_db", 0.0);
-
+/// The RBJ cookbook coefficients for \p mode at these settings, normalised by a0.
+///
+/// Returns false with a reason for settings the filter cannot honour, so `create` can report them and
+/// a render-path parameter change can refuse them: a `set_param` must not be able to build a
+/// degenerate filter either.
+bool biquad_coefficients(BiquadMode mode, double freq, double q, double gain_db, double rate,
+                         BiquadCoeffs& out, std::string& error)
+{
   if (!std::isfinite(freq) || !std::isfinite(q) || !std::isfinite(gain_db))
   {
-    error = reject(type, "freq, q and gain_db must be finite");
-    return nullptr;
+    error = "freq, q and gain_db must be finite";
+    return false;
   }
   // Reject rather than clamp: an EQ that silently ignores a 30 kHz setting is a bug report about
   // "the EQ does nothing", and one that silently wraps is a bug report about noise.
   if (freq <= 0.0 || freq >= 0.5 * rate)
   {
-    error = reject(type, "freq " + quoted(freq) + " Hz is outside (0, " + quoted(0.5 * rate) + ") Hz");
-    return nullptr;
+    error = "freq " + quoted(freq) + " Hz is outside (0, " + quoted(0.5 * rate) + ") Hz";
+    return false;
   }
   if (q <= 0.0)
   {
-    error = reject(type, "q must be > 0, got " + quoted(q));
-    return nullptr;
+    error = "q must be > 0, got " + quoted(q);
+    return false;
   }
   // Shelves have no bandwidth, so RBJ parameterises them by slope instead. Using `q` as that slope
   // (clamped to the range that stays monotonic) beats accepting a parameter and ignoring it.
@@ -616,16 +645,92 @@ void* create_biquad(const graph::NodeSpec& spec, const CompileOptions& options, 
 
   if (!(a0 != 0.0) || !std::isfinite(a0))
   {
-    error = reject(type, "the coefficients are degenerate at these settings");
+    error = "the coefficients are degenerate at these settings";
+    return false;
+  }
+
+  out.b0 = static_cast<float>(b0 / a0);
+  out.b1 = static_cast<float>(b1 / a0);
+  out.b2 = static_cast<float>(b2 / a0);
+  out.a1 = static_cast<float>(a1 / a0);
+  out.a2 = static_cast<float>(a2 / a0);
+  return true;
+}
+
+/// \brief A biquad whose parameters can change while it runs.
+///
+/// The interesting decision: a parameter change does **not** interpolate coefficients. Linearly
+/// interpolating b0..a2 between two stable filters is not itself guaranteed stable, and even when it
+/// is, it is not the response anyone asked for at the midpoint. Instead the node keeps the old
+/// coefficients in a second lane, runs both sections over the ramp and equal-power crossfades their
+/// outputs (`rt::Crossfade`, the same law and the same code as a plan-level transition). Two filters
+/// for the duration of a ramp costs one extra biquad per sample and cannot click, because both
+/// signals it is mixing are individually valid.
+struct BiquadState
+{
+  explicit BiquadState(int max_fade) : fader(max_fade) {}
+
+  BiquadLane lane;      ///< the coefficients the output is following
+  BiquadLane outgoing;  ///< the previous ones, still running while a ramp closes
+  rt::Crossfade fader;  ///< equal power between the two lanes; inactive when settled
+  /// The parameters behind \ref lane, so a change ramps from where the filter actually is rather than
+  /// from whatever a client last sent.
+  double freq = 1000.0;
+  double q = 0.707;
+  double gain_db = 0.0;
+  BiquadMode mode = BiquadMode::Peaking;
+  double rate = 48000.0;
+  int smoothing_samples = 240;
+  /// Sized at build: the render path may not allocate, and both lanes run during a ramp.
+  std::vector<float> old_buf;
+  std::vector<float> new_buf;
+};
+
+void* create_biquad(const graph::NodeSpec& spec, const CompileOptions& options, std::string& error)
+{
+  const std::string type = "nc.eq.biquad";
+
+  BiquadMode mode = BiquadMode::Peaking;
+  const std::string mode_name = string_param(spec, "mode");
+  if (!mode_name.empty() && !parse_biquad_mode(mode_name, mode))
+  {
+    error = reject(type, "unknown mode '" + mode_name + "'");
     return nullptr;
   }
 
-  auto state = std::make_unique<BiquadState>();
-  state->b0 = static_cast<float>(b0 / a0);
-  state->b1 = static_cast<float>(b1 / a0);
-  state->b2 = static_cast<float>(b2 / a0);
-  state->a1 = static_cast<float>(a1 / a0);
-  state->a2 = static_cast<float>(a2 / a0);
+  const double freq = number_param(spec, "freq", 1000.0);
+  const double q = number_param(spec, "q", 0.707);
+  const double gain_db = number_param(spec, "gain_db", 0.0);
+
+  BiquadCoeffs coeffs;
+  std::string reason;
+  if (!biquad_coefficients(mode, freq, q, gain_db, options.sample_rate, coeffs, reason))
+  {
+    error = reject(type, reason);
+    return nullptr;
+  }
+
+  const double ramp_ms = number_param(spec, "ramp_ms", 5.0);
+  if (!std::isfinite(ramp_ms) || ramp_ms < 0.0)
+  {
+    error = reject(type, "'ramp_ms' must be a finite number >= 0");
+    return nullptr;
+  }
+  // A ramp shorter than a sample is a step, which is what ramp_ms = 0 asks for, and it is also the
+  // negative control the glitch tests use.
+  const int smoothing =
+    ramp_ms == 0.0 ? 1 : std::max(1, static_cast<int>(std::llround(ramp_ms * options.sample_rate / 1000.0)));
+
+  auto state = std::make_unique<BiquadState>(smoothing);
+  state->lane.coeffs = coeffs;
+  state->freq = freq;
+  state->q = q;
+  state->gain_db = gain_db;
+  state->mode = mode;
+  state->rate = options.sample_rate;
+  state->smoothing_samples = smoothing;
+  state->old_buf.assign(static_cast<std::size_t>(std::max(1, options.max_quantum)), 0.0f);
+  state->new_buf.assign(static_cast<std::size_t>(std::max(1, options.max_quantum)), 0.0f);
   return state.release();
 }
 
@@ -634,26 +739,63 @@ void destroy_biquad(void* state)
   delete static_cast<BiquadState*>(state);
 }
 
+bool set_param_biquad(void* raw, uint32_t param_id, float value) noexcept
+{
+  if (!std::isfinite(value))
+    return false;
+  BiquadState* state = static_cast<BiquadState*>(raw);
+
+  double freq = state->freq;
+  double q = state->q;
+  double gain_db = state->gain_db;
+  switch (param_id)
+  {
+  case kBiquadParamFreq: freq = value; break;
+  case kBiquadParamQ: q = value; break;
+  case kBiquadParamGainDb: gain_db = value; break;
+  default: return false;
+  }
+
+  BiquadCoeffs coeffs;
+  std::string reason;
+  if (!biquad_coefficients(state->mode, freq, q, gain_db, state->rate, coeffs, reason))
+    return false; // out of range: leave the filter exactly as it was rather than jump somewhere else
+
+  if (!state->fader.active())
+  {
+    // Start from where the filter actually is, not from the last value a client sent.
+    state->outgoing = state->lane;
+    // And give the incoming section the outgoing one's memory. The states are the filter's record of
+    // the signal, not of the coefficients, so a section that starts from zero is a section that has
+    // forgotten the last few milliseconds -- audible as a thump on a high-Q setting, and measurably
+    // not the response the parameter asked for until the filter has rung itself back in.
+    state->lane.s1 = state->outgoing.s1;
+    state->lane.s2 = state->outgoing.s2;
+    state->fader.start(state->smoothing_samples);
+  }
+  // A second change while a ramp is still closing retargets the incoming lane and lets the fade
+  // continue: restarting it would jump the mix weights, which is the click this exists to avoid.
+  state->lane.coeffs = coeffs;
+  state->freq = freq;
+  state->q = q;
+  state->gain_db = gain_db;
+  return true;
+}
+
 void process_biquad(void* raw, const float* const* in, float* const* out, int frames) noexcept
 {
   BiquadState* state = static_cast<BiquadState*>(raw);
-  const float b0 = state->b0;
-  const float b1 = state->b1;
-  const float b2 = state->b2;
-  const float a1 = state->a1;
-  const float a2 = state->a2;
-  float s1 = state->s1;
-  float s2 = state->s2;
-  for (int i = 0; i < frames; ++i)
+  if (!state->fader.active())
   {
-    const float x = in[0][i];
-    const float y = b0 * x + s1;
-    s1 = b1 * x - a1 * y + s2;
-    s2 = b2 * x - a2 * y;
-    out[0][i] = y;
+    run_biquad(state->lane, in[0], out[0], frames);
+    return;
   }
-  state->s1 = s1;
-  state->s2 = s2;
+
+  run_biquad(state->outgoing, in[0], state->old_buf.data(), frames);
+  run_biquad(state->lane, in[0], state->new_buf.data(), frames);
+  state->fader.mix(state->old_buf.data(), state->new_buf.data(), out[0], frames);
+  if (!state->fader.active())
+    state->outgoing = BiquadLane{}; // the old section is stale once the fade has closed
 }
 
 // --- nc.delay --------------------------------------------------------------
@@ -661,20 +803,57 @@ void process_biquad(void* raw, const float* const* in, float* const* out, int fr
 // A plain fixed delay, which is also the only way to write feedback: §5.1 makes a cycle a compile
 // error, so a feedback loop is "split, delay, gain, mix" with the delay breaking the cycle.
 
+/// \brief A fixed delay whose time can change while it runs, by crossfading between two taps.
+///
+/// The ring itself is shared; only the read offset moves. Moving it in one step would splice two
+/// unrelated points of the signal together, which is a click, and interpolating the read position
+/// would be a varispeed pitch slide rather than a new delay time. So the node reads the old tap and
+/// the new tap for the length of a ramp and equal-power crossfades them -- the tape-machine answer,
+/// and the same `rt::Crossfade` law a plan-level transition uses.
 struct DelayState
 {
+  explicit DelayState(int max_fade) : fader(max_fade) {}
+
   std::vector<float> line;
   std::size_t write = 0;
-  std::size_t read = 0;
+  std::size_t read = 0;          ///< the tap the output is following
+  std::size_t outgoing_read = 0; ///< the previous tap, read while a ramp closes
+  rt::Crossfade fader;           ///< equal power between the two taps; inactive when settled
+  /// The longest delay this line can hold, in samples. A `set_param` beyond it is refused: the ring
+  /// cannot be grown on the render path, and reading past its capacity would wrap into recent samples
+  /// and sound like a short delay rather than like a mistake.
+  double capacity = 1.0;
+  double rate = 48000.0;
+  int smoothing_samples = 240;
+  std::vector<float> old_buf;
+  std::vector<float> new_buf;
 
-  void advance() noexcept
+  void advance(std::size_t& index) noexcept
   {
-    if (++write == line.size())
-      write = 0;
-    if (++read == line.size())
-      read = 0;
+    if (++index == line.size())
+      index = 0;
   }
 };
+
+/// Where the read pointer has to be for a delay of \p samples behind the write pointer.
+std::size_t delay_tap(std::size_t write, std::size_t size, double samples) noexcept
+{
+  const std::size_t back = static_cast<std::size_t>(samples) % size;
+  return (write + size - back) % size;
+}
+
+bool delay_in_range(double samples, double rate, std::string& error)
+{
+  // A delay shorter than a sample is not a delay, and a longer one is a user error worth naming --
+  // silently allocating 10 minutes of ring for a typo'd 'ms' is worse than refusing.
+  const double max_samples = 60.0 * rate;
+  if (!std::isfinite(samples) || samples < 1.0 || samples > max_samples)
+  {
+    error = "delay must be between 1 sample and " + quoted(max_samples) + " samples, got " + quoted(samples);
+    return false;
+  }
+  return true;
+}
 
 void* create_delay(const graph::NodeSpec& spec, const CompileOptions& options, std::string& error)
 {
@@ -695,22 +874,61 @@ void* create_delay(const graph::NodeSpec& spec, const CompileOptions& options, s
     return nullptr;
   }
 
-  // A delay shorter than a sample is not a delay, and a longer one is a user error worth naming --
-  // silently allocating 10 minutes of ring for a typo'd 'ms' is worse than refusing.
-  const double max_samples = 60.0 * options.sample_rate;
-  if (!std::isfinite(samples) || samples < 1.0 || samples > max_samples)
+  std::string reason;
+  if (!delay_in_range(samples, options.sample_rate, reason))
   {
-    error = reject(type, "delay must be between 1 sample and " + quoted(max_samples) + " samples, got " +
-                           quoted(samples));
+    error = reject(type, reason);
     return nullptr;
   }
 
-  auto state = std::make_unique<DelayState>();
-  // One more than the delay so that read and write can never be the same slot: read-before-write at
-  // a shared index would also work, but this way the read pointer is visibly `delay` behind.
-  state->line.assign(static_cast<std::size_t>(samples) + 1, 0.0f);
+  // How much line to allocate. A delay that can be *lengthened* while it runs needs a ring long enough
+  // for the longest time it will be asked for, and the render path may not allocate, so the rig
+  // declares the maximum -- exactly as a real delay's memory is sized by its longest setting rather
+  // than by where the knob happens to be. Without one, the ring is the built time and a later
+  // `set_param` beyond it is refused rather than reading stale samples from a too-short line.
+  double capacity = samples;
+  if (has_param(spec, "max_samples"))
+  {
+    capacity = std::round(number_param(spec, "max_samples", samples));
+  }
+  else if (has_param(spec, "max_ms"))
+  {
+    capacity = std::round(number_param(spec, "max_ms", samples * 1000.0 / options.sample_rate) *
+                          options.sample_rate / 1000.0);
+  }
+  if (!delay_in_range(capacity, options.sample_rate, reason))
+  {
+    error = reject(type, reason);
+    return nullptr;
+  }
+  if (capacity < samples)
+  {
+    error = reject(type, "the delay is " + quoted(samples) + " samples and the line is only " +
+                           quoted(capacity) + "; raise 'max_ms' or 'max_samples'");
+    return nullptr;
+  }
+
+  const double ramp_ms = number_param(spec, "ramp_ms", 5.0);
+  if (!std::isfinite(ramp_ms) || ramp_ms < 0.0)
+  {
+    error = reject(type, "'ramp_ms' must be a finite number >= 0");
+    return nullptr;
+  }
+  const int smoothing =
+    ramp_ms == 0.0 ? 1 : std::max(1, static_cast<int>(std::llround(ramp_ms * options.sample_rate / 1000.0)));
+
+  auto state = std::make_unique<DelayState>(smoothing);
+  // One more than the longest delay so that read and write can never be the same slot: read-before-
+  // write at a shared index would also work, but this way the read pointer is visibly `delay` behind.
+  state->line.assign(static_cast<std::size_t>(capacity) + 1, 0.0f);
+  state->capacity = capacity;
   state->write = 0;
-  state->read = state->line.size() - static_cast<std::size_t>(samples); // == 1
+  state->read = delay_tap(0, state->line.size(), samples);
+  state->outgoing_read = state->read;
+  state->rate = options.sample_rate;
+  state->smoothing_samples = smoothing;
+  state->old_buf.assign(static_cast<std::size_t>(std::max(1, options.max_quantum)), 0.0f);
+  state->new_buf.assign(static_cast<std::size_t>(std::max(1, options.max_quantum)), 0.0f);
   return state.release();
 }
 
@@ -719,15 +937,64 @@ void destroy_delay(void* state)
   delete static_cast<DelayState*>(state);
 }
 
+bool set_param_delay(void* raw, uint32_t param_id, float value) noexcept
+{
+  if (!std::isfinite(value))
+    return false;
+  DelayState* state = static_cast<DelayState*>(raw);
+
+  double samples = 0.0;
+  switch (param_id)
+  {
+  case kDelayParamSamples: samples = std::round(value); break;
+  case kDelayParamMs: samples = std::round(static_cast<double>(value) * state->rate / 1000.0); break;
+  default: return false;
+  }
+
+  std::string reason;
+  if (!delay_in_range(samples, state->rate, reason) || samples > state->capacity)
+    return false; // out of range or longer than the line: leave the delay exactly as it was
+
+  if (!state->fader.active())
+  {
+    // Both taps start at the current one; the ramp is what separates them.
+    state->outgoing_read = state->read;
+    state->fader.start(state->smoothing_samples);
+  }
+  // A second change mid-ramp retargets the incoming tap and lets the fade continue, for the same
+  // reason the biquad does: restarting would jump the mix weights.
+  state->read = delay_tap(state->write, state->line.size(), samples);
+  return true;
+}
+
 void process_delay(void* raw, const float* const* in, float* const* out, int frames) noexcept
 {
   DelayState* state = static_cast<DelayState*>(raw);
+  if (!state->fader.active())
+  {
+    for (int i = 0; i < frames; ++i)
+    {
+      out[0][i] = state->line[state->read];
+      state->line[state->write] = in[0][i];
+      state->advance(state->write);
+      state->advance(state->read);
+    }
+    return;
+  }
+
+  // Both taps are read before the input is written, so neither sees the sample being recorded now.
   for (int i = 0; i < frames; ++i)
   {
-    out[0][i] = state->line[state->read];
+    state->old_buf[static_cast<std::size_t>(i)] = state->line[state->outgoing_read];
+    state->new_buf[static_cast<std::size_t>(i)] = state->line[state->read];
     state->line[state->write] = in[0][i];
-    state->advance();
+    state->advance(state->write);
+    state->advance(state->read);
+    state->advance(state->outgoing_read);
   }
+  state->fader.mix(state->old_buf.data(), state->new_buf.data(), out[0], frames);
+  if (!state->fader.active())
+    state->outgoing_read = state->read; // the old tap is stale once the fade has closed
 }
 
 // --- nc.unit_delay ---------------------------------------------------------
@@ -780,31 +1047,45 @@ const char* const kBiquadModeAliases[] = {"peak",  "eq",        "low_shelf",  "h
 const ParamDesc kBiquadParams[] = {
   {.id = "mode", .name = "Mode", .kind = ParamKind::Option, .default_value = 0.0,
    .options = kBiquadModes, .option_count = 7, .aliases = kBiquadModeAliases, .alias_count = 8},
-  // Not rampable yet, and deliberately: interpolating a biquad's *coefficients* is not the same thing
-  // as interpolating a value, so a smooth freq/q/gain needs an in-node crossfade between the old and
-  // new coefficient sets. Until that exists, a change here is the structural class -- dual-rendered
-  // and crossfaded at the plan level, which is glitch-free by construction
-  // (docs/ui-integration-plan.md §2, slice B3).
+  // Rampable, and the ramp is an in-node crossfade between two coefficient sets rather than an
+  // interpolated one: linearly interpolating b0..a2 between two stable filters is not itself
+  // guaranteed stable, and it is not the response anyone asked for at the midpoint either.
+  //
   // No maximum: the real limit is Nyquist at whatever rate the rig runs at, which the schema does not
   // know and a fixed 20 kHz would get wrong at 96 kHz. The node's own check owns that bound and says
   // so, which is the difference between a schema limit and an engine limit.
   {.id = "freq", .name = "Frequency", .unit = "Hz", .default_value = 1000.0, .has_min = true,
-   .min = 10.0, .min_inclusive = false, .scale = ParamScale::Log},
+   .min = 10.0, .min_inclusive = false, .scale = ParamScale::Log, .rampable = true},
   {.id = "q", .name = "Q", .default_value = 0.707, .has_min = true, .min = 0.0,
-   .min_inclusive = false, .has_max = true, .max = 20.0, .scale = ParamScale::Log},
+   .min_inclusive = false, .has_max = true, .max = 20.0, .scale = ParamScale::Log, .rampable = true},
   {.id = "gain_db", .name = "Gain", .unit = "dB", .default_value = 0.0, .has_min = true, .min = -30.0,
-   .has_max = true, .max = 30.0},
+   .has_max = true, .max = 30.0, .rampable = true},
+  {.id = "ramp_ms", .name = "Ramp", .unit = "ms", .default_value = 5.0, .has_min = true, .min = 0.0,
+   .has_max = true, .max = 1000.0},
 };
 
 const ParamDesc kDelayParams[] = {
-  // Same reasoning as the biquad: moving a read pointer needs a crossfade between two taps rather
-  // than an interpolated value, so changing either spelling is the structural class for now.
   // Bounded by the engine, not by the schema: 60 seconds at the rig's rate, in samples. A client
   // showing a slider picks its own display range when a parameter is unbounded here.
+  //
+  // Rampable, by crossfading between the old tap and the new one rather than by interpolating the read
+  // position -- interpolating would be a varispeed slide, which is a different effect from a new delay
+  // time.
   {.id = "samples", .name = "Delay", .unit = "samples", .has_min = true, .min = 1.0, .step = 1.0,
-   .snap = true, .one_of = "delay time"},
+   .snap = true, .rampable = true, .one_of = "delay time", .one_of_required = true},
   {.id = "ms", .name = "Delay", .unit = "ms", .has_min = true, .min = 0.021, .scale = ParamScale::Log,
-   .one_of = "delay time"},
+   .rampable = true, .one_of = "delay time", .one_of_required = true},
+  // How long *this* node takes to move between two delay times. Not rampable: it is the smoothing
+  // time, so changing it is a rebuild, and a rebuild is the only honest way to change it.
+  {.id = "ramp_ms", .name = "Ramp", .unit = "ms", .default_value = 5.0, .has_min = true, .min = 0.0,
+   .has_max = true, .max = 1000.0},
+  // How much line to allocate, and therefore how far the delay can be *lengthened* while it runs.
+  // Build-only: the render path may not allocate, so this is the rig's declaration of its own memory.
+  // Absent, the ring is the built time and a longer `set_param` is refused.
+  {.id = "max_samples", .name = "Max delay", .unit = "samples", .has_min = true, .min = 1.0,
+   .step = 1.0, .snap = true, .one_of = "max delay"},
+  {.id = "max_ms", .name = "Max delay", .unit = "ms", .has_min = true, .min = 0.021,
+   .scale = ParamScale::Log, .one_of = "max delay"},
 };
 
 const ParamDesc kCabIrParams[] = {
@@ -843,10 +1124,11 @@ const NodeType kCabIr{.id = "nc.cab.ir", .name = "Cabinet IR", .category = "cab"
                       .min_ports = 1, .max_ports = 64, .params = kCabIrParams, .param_count = 1};
 const NodeType kBiquad{.id = "nc.eq.biquad", .name = "Biquad EQ", .category = "eq", .inputs = 1,
                        .outputs = 1, .create = create_biquad, .destroy = destroy_biquad,
-                       .process = process_biquad, .params = kBiquadParams, .param_count = 4};
+                       .process = process_biquad, .params = kBiquadParams, .param_count = 5,
+                       .set_param = set_param_biquad};
 const NodeType kDelay{.id = "nc.delay", .name = "Delay", .category = "delay", .inputs = 1, .outputs = 1,
                       .create = create_delay, .destroy = destroy_delay, .process = process_delay,
-                      .params = kDelayParams, .param_count = 2};
+                      .params = kDelayParams, .param_count = 5, .set_param = set_param_delay};
 // A scheduling primitive rather than a pedal: `block_delay` is what breaks a feedback cycle, and a
 // palette should leave it out, which is what the flag is for.
 const NodeType kUnitDelay{"nc.unit_delay", "Unit delay", "utility", 1, 1, nullptr, nullptr,

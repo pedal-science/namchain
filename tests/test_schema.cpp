@@ -272,8 +272,9 @@ TEST_CASE("every declared parameter does something")
     for (int i = 0; i < type->param_count; ++i)
     {
       const ParamDesc& param = type->params[i];
-      // Required parameters are already in the baseline, and a `one_of` alternative is a different way
-      // of saying the same thing rather than a knob: both are covered by the compile tests.
+      // Required parameters are already in the baseline. A `one_of` alternative is a different *unit*
+      // for the same quantity rather than a separate knob, so it is checked by the subcase below
+      // rather than here -- setting both would be a contradiction, which is the point of the group.
       if (param.hidden || param.required || param.one_of != nullptr)
         continue;
 
@@ -291,6 +292,42 @@ TEST_CASE("every declared parameter does something")
                     type->id << "." << param.id << " is declared and changes nothing");
     }
   }
+}
+
+TEST_CASE("both spellings of an alternative reach the engine, and giving both is refused")
+{
+  // `nc.delay` takes its time in samples or in milliseconds. Each spelling has to be read -- a schema
+  // that declared one and ignored it would be the silent-knob bug wearing a different hat -- and
+  // giving both is a contradiction rather than a precedence rule.
+  const std::vector<float> short_delay = render(one_node("nc.delay", nlohmann::json{{"samples", 30.0}}));
+  const std::vector<float> long_delay = render(one_node("nc.delay", nlohmann::json{{"samples", 300.0}}));
+  CHECK(differs(short_delay, long_delay));
+
+  // 300 samples at 48 kHz is 6.25 ms: the same delay written the other way renders the same.
+  const std::vector<float> in_ms = render(one_node("nc.delay", nlohmann::json{{"ms", 6.25}}));
+  CHECK_FALSE(differs(long_delay, in_ms));
+
+  const auto both = namchain::graph::validate(
+    one_node("nc.delay", nlohmann::json{{"samples", 300.0}, {"ms", 6.25}}));
+  CHECK_FALSE(both.ok);
+  CHECK(both.message.find("alternatives") != std::string::npos);
+
+  // And the *optional* group is satisfied by nothing: the line length can be declared in either unit
+  // or not at all, which is what `one_of_required` distinguishes.
+  CHECK(namchain::graph::validate(one_node("nc.delay", nlohmann::json{{"ms", 5.0}})).ok);
+  CHECK(namchain::graph::validate(one_node("nc.delay", nlohmann::json{{"ms", 5.0}, {"max_ms", 20.0}})).ok);
+  const auto both_max = namchain::graph::validate(
+    one_node("nc.delay", nlohmann::json{{"ms", 5.0}, {"max_ms", 20.0}, {"max_samples", 960.0}}));
+  CHECK_FALSE(both_max.ok);
+  CHECK(both_max.message.find("alternatives") != std::string::npos);
+}
+
+TEST_CASE("a stepped parameter refuses a value off its grid")
+{
+  // Half a sample is not a shorter delay, it is a number the node would silently round.
+  const auto result = namchain::graph::validate(one_node("nc.delay", nlohmann::json{{"samples", 1.5}}));
+  CHECK_FALSE(result.ok);
+  CHECK(result.message.find("multiple of") != std::string::npos);
 }
 
 TEST_CASE("a parameter the schema does not declare is refused by name")

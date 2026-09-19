@@ -149,6 +149,7 @@ nlohmann::json node_type_schema(const render::NodeType& type)
     p["hidden"] = param.hidden;
     p["required"] = param.required;
     p["one_of"] = param.one_of == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.one_of);
+    p["one_of_required"] = param.one_of_required;
     p["options_from"] = param.options_from == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.options_from);
     if (param.options != nullptr)
     {

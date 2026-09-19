@@ -312,10 +312,13 @@ Validation lint_params(const NodeSpec& spec, const render::NodeType& type)
                                    std::to_string(param.max));
       }
     }
+    // A stepped parameter is a count, not a quantity: half a sample is not a shorter delay, it is a
+    // number the node would silently round. The grid is measured from the minimum when there is one,
+    // which is where a count starts.
     if (param.step > 0.0 && param.snap)
     {
       const double steps = (value - (param.has_min ? param.min : 0.0)) / param.step;
-      if (!param.has_min && std::abs(steps - std::llround(steps)) > 1e-6)
+      if (std::abs(steps - std::llround(steps)) > 1e-6)
         return Validation::failure(where + ": '" + key + "' must be a multiple of " + std::to_string(param.step));
     }
   }
@@ -358,27 +361,42 @@ Validation lint_params(const NodeSpec& spec, const render::NodeType& type)
       return Validation::failure(where + " needs '" + param.id + "'");
   }
 
-  // A `one_of` group is a set of alternatives with at least one present: `nc.delay` takes samples or
-  // ms, and neither is individually required.
+  // A `one_of` group is a set of alternatives: giving two of them is a contradiction -- there is no
+  // precedence rule in the schema, and inventing one would make a rig's meaning depend on an
+  // implementation detail -- and whether one of them is required is a property of the group.
   for (int i = 0; i < type.param_count; ++i)
   {
     const render::ParamDesc& param = type.params[static_cast<std::size_t>(i)];
-    if (param.one_of == nullptr || seen[static_cast<std::size_t>(i)])
+    if (param.one_of == nullptr)
       continue;
-    bool satisfied = false;
+
     std::string group;
+    std::string given;
+    int given_count = 0;
+    int member_count = 0;
     for (int j = 0; j < type.param_count; ++j)
     {
       const render::ParamDesc& other = type.params[static_cast<std::size_t>(j)];
       if (other.one_of == nullptr || std::string(other.one_of) != param.one_of)
         continue;
+      ++member_count;
       if (!group.empty())
         group += " or ";
       group += std::string("'") + other.id + "'";
-      satisfied = satisfied || seen[static_cast<std::size_t>(j)];
+      if (seen[static_cast<std::size_t>(j)])
+      {
+        ++given_count;
+        if (!given.empty())
+          given += " and ";
+        given += std::string("'") + other.id + "'";
+      }
     }
-    if (!satisfied)
+    if (given_count > 1)
+      return Validation::failure(where + ": " + given + " are alternatives; give one");
+    if (given_count == 0 && param.one_of_required)
       return Validation::failure(where + " needs one of " + group);
+    // One pass per group, not per member.
+    i += member_count - 1;
   }
 
   return Validation{};

@@ -241,12 +241,34 @@ EditTimeline random_timeline(const graph::Graph& graph, unsigned edits, uint64_t
       Candidate candidate;
       candidate.node = spec.id;
       candidate.param = param.id;
-      // Inside the declared bounds where there are any, so a generated timeline is legal against the
-      // same schema the compiler validates against rather than legal only by luck.
+
+      // The range to sweep, anchored on what the rig actually set: a parameter with no declared
+      // maximum (`freq`, a delay time) has no useful range of its own, and a generator that fell back
+      // to the bounds would spend a whole torture run moving a 1 kHz filter between 11 Hz and 12 Hz
+      // -- legal, and nothing to do with what the parameter is for. A factor of four either way is
+      // wide enough to be a real move and narrow enough to stay musical.
+      double anchor = param.default_value;
+      const auto current = spec.params.find(param.id);
+      if (current != spec.params.end())
+        anchor = current->second;
+      if (!(anchor > 0.0))
+        anchor = 1.0;
+      candidate.low = anchor / 4.0;
+      candidate.high = anchor * 4.0;
+
+      // Clipped to the declared bounds, so a generated timeline is legal against the same schema the
+      // compiler validates against rather than legal only by luck.
       if (param.has_min)
-        candidate.low = param.min_inclusive ? param.min : param.min + (param.has_max ? (param.max - param.min) * 0.1 : 1.0);
+        candidate.low = std::max(candidate.low, param.min_inclusive ? param.min : param.min + std::abs(param.min) * 1e-3 + 1e-9);
       if (param.has_max)
-        candidate.high = param.max_inclusive ? param.max : param.max - (param.has_max ? (param.max - (param.has_min ? param.min : 0.0)) * 0.1 : 1.0);
+        candidate.high = std::min(candidate.high, param.max);
+      if (candidate.high <= candidate.low)
+      {
+        // A parameter pinned by its bounds (`outputs` between 1 and 64 has no room to move by ratio):
+        // sweep across the bounds instead, which is a real move for a count.
+        candidate.low = param.has_min ? param.min : candidate.low;
+        candidate.high = param.has_max ? param.max : candidate.low + 1.0;
+      }
       if (candidate.high <= candidate.low)
         candidate.high = candidate.low + 1.0;
       candidates.push_back(std::move(candidate));

@@ -296,7 +296,9 @@ expected.
 
 Built: the node schema — every built-in declares its parameters (kind, unit, default, bounds with
 inclusive/exclusive made explicit, step, scale, rampable), the compiler refuses a name it does not
-declare, and `engine.schema` publishes the catalogue (docs/schema.md); the document protocol — `rig.apply` for a whole document in memory, `rig.get` returning the
+declare, and `engine.schema` publishes the catalogue (docs/schema.md); and the smooth class across
+every value a node has: gains by ramping, a filter by crossfading two coefficient sets, a delay time
+by crossfading two read taps; the document protocol — `rig.apply` for a whole document in memory, `rig.get` returning the
 engine's parse of what it is running, protocol 2 with `features`, and the per-chain array in
 `engine.status`; the `smooth` op class (a `rig.patch` set_param ramps inside the node, no recompile, no step),
 the offline scripted timeline that measures it (`namchain-render --graph rig.json --timeline
@@ -314,9 +316,8 @@ Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 - no admission control or cost model, so a plan too expensive to dual-render is not rejected before it
   runs, and the fade length is fixed rather than shortened under load — the staggered apply is what
   stands in for it;
-- no *per-port* parameters on `nc.mix` (a lane's level is a `nc.gain` node in the lane), and no
-  ramping for a filter's coefficients or a delay's read pointer, so changing `freq`/`q`/`gain_db`/`ms`
-  is a structural edit (slice B3/B4);
+- no *per-port* parameters on `nc.mix` (a lane's level is a `nc.gain` node in the lane), so a lane's
+  level, mute and phase are nodes rather than mixer settings (slice B4);
 - no option (string) parameter can be patched yet, so `mode` and `model` are changed by a reload or a
   `swap_model` rather than by `set_param` (slice B2's remainder);
 - no lowered view in `rig.get`, because there is nothing to lower yet: a node is a node until the
