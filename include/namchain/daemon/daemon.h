@@ -58,9 +58,25 @@ struct PlanSlot
 };
 
 /// Control thread -> render thread: the identity of prepared work that is already finished.
+///
+/// One tagged record rather than one ring per op: the render thread drains it in order at the top of
+/// the block, and `kind` is what selects the work. `PublishPlan` carries a finished plan; `SetParam`
+/// carries the vtable dispatch of §5.3's `smooth` class, which is why it needs no plan compile and
+/// no fade.
 struct PlanCommand
 {
-  PlanSlot* slot = nullptr;
+  enum class Kind : uint32_t
+  {
+    PublishPlan,
+    SetParam,
+  };
+
+  Kind kind = Kind::PublishPlan;
+  PlanSlot* slot = nullptr; ///< PublishPlan
+  uint64_t generation = 0;  ///< SetParam: the plan generation it targets
+  uint32_t node = 0;        ///< SetParam: index into the plan's execution order
+  uint32_t param = 0;       ///< SetParam: the node's param id
+  float value = 0.0f;       ///< SetParam
 };
 
 /// \brief The reference daemon engine.
@@ -113,6 +129,8 @@ private:
   bool setup_signals(std::string& error);
   /// Compile \p rig_path and publish it. Called for the startup rig, SIGHUP and `rig.load`.
   bool load_rig(const std::string& rig_path, std::string& error);
+  /// Resolve a `set_param` against the newest published plan and push it on the ring.
+  bool publish_param(const std::string& node, const std::string& param, double value, std::string& error);
   bool push_slot(PlanSlot* slot);
   void set_device_state(DeviceState state);
   void stop();
@@ -133,6 +151,9 @@ private:
 
   int listen_fd_ = -1;
   int signal_fd_ = -1;
+  /// The newest published plan. Control-thread-only, and never dangling: a slot is retired only when
+  /// a *newer* plan is adopted, and this pointer has already moved to that newer plan by then.
+  PlanSlot* last_published_ = nullptr;
   /// The signal mask in force before \ref setup_signals, restored on stop so a library that started
   /// this daemon does not inherit a blocked SIGTERM for the rest of the process's life.
   sigset_t previous_mask_{};
@@ -163,6 +184,10 @@ private:
   std::atomic<uint64_t> device_restored_{0};
   std::atomic<uint64_t> render_errors_{0};
   std::atomic<uint64_t> adopted_generation_{0};
+  /// Parameter edits that reached the render thread and were applied; and those dropped because the
+  /// plan they named had already been superseded.
+  std::atomic<uint64_t> params_applied_{0};
+  std::atomic<uint64_t> params_stale_{0};
   std::atomic<unsigned> active_rate_{0};
   std::atomic<unsigned> active_period_{0};
   std::atomic<unsigned> active_capture_channels_{0};

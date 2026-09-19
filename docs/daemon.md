@@ -93,10 +93,11 @@ length prefix to get wrong. A request is:
 | method | request | response |
 |---|---|---|
 | `engine.hello` | `{"protocol": 1}` | `role`, `version`, negotiated `protocol`; a mismatch is `unsupported_protocol` |
-| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending |
+| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale` |
 | `engine.mute` | `{"mute": true\|false}` | the new state |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `rig.load` | `{"rig": "name.json"}` | compiled and published; returns `rig`, `generation` |
+| `rig.patch` | `{"ops": [{"op":"set_param","node":"g","param":"gain","value":0.5}]}` | ramped with no recompile; returns `applied`, `generation` |
 | `rig.get` | — | the current rig path, generation, `loaded` |
 
 Unknown fields are ignored; an unknown method is `unknown_method`. A malformed message never kills
@@ -104,6 +105,17 @@ the connection or the daemon.
 
 `mute` zeroes the *emitted* copy **after** the chain has run: a muted chain whose inference is
 skipped freezes the model's state and clicks on unmute (plan.md G14).
+
+`rig.patch` is the `smooth` op class of plan.md §5.3: the control thread resolves the node and param
+to the vtable dispatch, pushes one POD record on the ring, and the render thread ramps it over the
+node's own smoothing time. It never recompiles and never steps, so it costs nothing and cannot click;
+`engine.status` reports `params_applied` once the render thread has taken it. The response is an
+acknowledgement, not a completion — adoption is asynchronous by design. `"op"` may be omitted and
+defaults to `set_param`; any other op kind is a structured `unsupported_op`, so a client cannot
+believe a rewire happened when it did not.
+
+Structural reloads are **not** this path yet: `rig.load` publishes a complete new plan but the
+exchange is a cold swap, and `engine.status` says so (`"structural_transitions": "cold-swap"`).
 
 ### Rig names and trust
 
@@ -164,13 +176,17 @@ Run `systemd-analyze verify packaging/systemd/namchaind.service` after editing i
 on an uninstalled tree (the binary is not at `/usr/bin/namchaind` yet, and there is no man page) are
 expected.
 
-## What is not built
+## What is built, and what is not
 
-The M2 transition machinery, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
+Built: the `smooth` op class (a `rig.patch` set_param ramps inside the node, no recompile, no step)
+and the offline scripted timeline that measures it — `namchain-render --graph rig.json --timeline
+edits.json`, or `--torture N --seed S`, judged by the glitch detector. See docs/transitions.md.
+
+Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 
 - no dual-render or equal-power crossfade, so `rig.load` swaps plans at a block boundary and may
-  click; `engine.status` reports `"transitions": "none"`;
-- no parameter-only ramp path (`set_param`), so every edit is a recompile;
+  click; `engine.status` reports `"structural_transitions": "cold-swap"`;
+- no bypass/enable or model-swap op class;
 - no admission control or cost model, so a plan that is too expensive is not rejected before it
   runs;
 - no telemetry subscription and no `scene.*`, `model.*`, `bench.run` methods;

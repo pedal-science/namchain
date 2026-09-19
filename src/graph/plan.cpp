@@ -443,6 +443,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
     plan_node.inputs.push_back(nullptr);
 
     plan->nodes_.push_back(std::move(plan_node));
+    plan->node_ids_.push_back(spec.id);
   }
 
   // Bind inputs now that every output buffer is known.
@@ -525,6 +526,39 @@ void RenderPlan::prewarm() noexcept
 {
   if (max_quantum_ > 0)
     execute(nullptr, nullptr, max_quantum_);
+}
+
+bool RenderPlan::resolve_param(const std::string& node_id, const std::string& param, std::size_t& node_index,
+                               uint32_t& param_id) const
+{
+  for (std::size_t i = 0; i < node_ids_.size(); ++i)
+  {
+    if (node_ids_[i] != node_id)
+      continue;
+    const render::NodeType* type = nodes_[i].type;
+    if (type->set_param == nullptr || type->settable_params == nullptr)
+      return false;
+    for (int p = 0; p < type->settable_param_count; ++p)
+    {
+      if (param != type->settable_params[p])
+        continue;
+      node_index = i;
+      param_id = static_cast<uint32_t>(p) + 1;
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+bool RenderPlan::set_param(std::size_t node_index, uint32_t param_id, float value) noexcept
+{
+  if (node_index >= nodes_.size())
+    return false;
+  const render::NodeType* type = nodes_[node_index].type;
+  if (type->set_param == nullptr || type->settable_params == nullptr)
+    return false;
+  return type->set_param(nodes_[node_index].state, param_id, value);
 }
 
 std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, int max_quantum, rt::Arena& arena,

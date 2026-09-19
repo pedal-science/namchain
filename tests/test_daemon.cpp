@@ -291,8 +291,9 @@ TEST_CASE("the protocol version negotiates, rejects and names unknown methods")
     const auto reply = nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.status"})"));
     CHECK(reply["ok"] == true);
     CHECK(reply["status"]["role"] == "namchaind");
-    // The honest label: there is no transition machinery yet.
-    CHECK(reply["status"]["transitions"] == "none");
+    // The honest labels: parameter edits are ramped, structural reloads are still a cold swap.
+    CHECK(reply["status"]["param_edits"] == "ramped");
+    CHECK(reply["status"]["structural_transitions"] == "cold-swap");
   }
 }
 
@@ -360,10 +361,56 @@ TEST_CASE("rig.load compiles a named rig and rig.get reports it")
   }
 }
 
+TEST_CASE("rig.patch pushes a ramped set_param and refuses what it cannot apply")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "gain.json", kGainRig);
+
+  Config config;
+  config.rigs_root = root.string();
+  Daemon daemon(config);
+
+  SUBCASE("without a plan it is rejected, not ignored")
+  {
+    const auto reply = nlohmann::json::parse(daemon.handle_request(
+      R"({"method":"rig.patch","ops":[{"op":"set_param","node":"g","param":"gain","value":0.7}]})"));
+    CHECK(reply["ok"] == false);
+    CHECK(reply["error"]["code"] == "patch_rejected");
+  }
+
+  REQUIRE(nlohmann::json::parse(daemon.handle_request(R"({"method":"rig.load","rig":"gain.json"})"))["ok"] ==
+          true);
+
+  SUBCASE("a settable param is accepted")
+  {
+    const auto reply = nlohmann::json::parse(daemon.handle_request(
+      R"({"method":"rig.patch","ops":[{"op":"set_param","node":"g","param":"gain","value":0.7}]})"));
+    REQUIRE(reply["ok"] == true);
+    CHECK(reply["applied"] == 1);
+  }
+
+  SUBCASE("an unknown param is rejected with the node's name in the reason")
+  {
+    const auto reply = nlohmann::json::parse(daemon.handle_request(
+      R"({"method":"rig.patch","ops":[{"op":"set_param","node":"g","param":"gain_db","value":0.7}]})"));
+    CHECK(reply["ok"] == false);
+    CHECK(reply["error"]["code"] == "patch_rejected");
+    CHECK(reply["error"]["message"].get<std::string>().find("gain_db") != std::string::npos);
+  }
+
+  SUBCASE("a structural op names its own unsupported class")
+  {
+    const auto reply = nlohmann::json::parse(daemon.handle_request(
+      R"({"method":"rig.patch","ops":[{"op":"rewire","node":"g","param":"gain","value":0.7}]})"));
+    CHECK(reply["ok"] == false);
+    CHECK(reply["error"]["code"] == "unsupported_op");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // End to end: render thread, publication and socket together
 // ---------------------------------------------------------------------------
-
 TEST_CASE("the daemon runs the null backend and serves the control socket")
 {
   TempDir dir;
@@ -417,6 +464,18 @@ TEST_CASE("the daemon runs the null backend and serves the control socket")
   // A published plan is not adopted by magic: the generation the render thread runs tracks the one
   // the control thread assigned.
   CHECK(status["status"]["generation"] == status["status"]["adopted_generation"]);
+
+  // The `smooth` op class, end to end: the control thread resolves the vtable dispatch, the render
+  // thread drains it and applies it, and the status counter proves it happened rather than assuming.
+  const auto patch = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"id":"p","method":"rig.patch","ops":[{"op":"set_param","node":"g","param":"gain","value":0.25}]})"));
+  REQUIRE(patch["ok"] == true);
+  CHECK(patch["applied"] == 1);
+  const bool applied = wait_for(config.socket_path, [](const nlohmann::json& s) {
+    return s["params_applied"].get<uint64_t>() == 1;
+  });
+  CHECK_MESSAGE(applied, "the render thread never applied the parameter edit");
 }
 
 TEST_CASE("the daemon stays up and reports lost when the device cannot be opened")

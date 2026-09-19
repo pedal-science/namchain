@@ -101,25 +101,58 @@ void process_input(void* raw, const float* const*, float* const* out, int frames
 void process_marker(void*, const float* const*, float* const*, int) noexcept {}
 
 // --- nc.gain ---------------------------------------------------------------
+//
+// The first `smooth`-class parameter of §5.3: a change never recompiles and never steps. A step
+// clicks; a *linear* ramp would be cheap but has a slope discontinuity at each end, and the glitch
+// detector measures a second difference, so it scores the corner. The smoothing is therefore a
+// smoothstep, whose value and slope both match at each end:
+//
+//   g(t) = from + (to - from) * t*t*(3 - 2t),   t = ramp_pos / ramp_len
+//
+// The length is the rig's `ramp_ms` (default 5 ms) converted to samples at build time, because time
+// to samples is control-thread work (§6.1). `ramp_ms = 0` is a legal instant change, which the
+// timeline's negative control uses to show the detector can fail.
+
+constexpr uint32_t kGainParamGain = 1;
 
 struct GainState
 {
-  float gain = 1.0f;
+  float gain = 1.0f;             ///< the value the render uses right now
+  float from = 1.0f;             ///< where the current ramp started
+  float to = 1.0f;               ///< where it is heading
+  int ramp_pos = 0;              ///< samples into the current ramp
+  int ramp_len = 0;              ///< current ramp length; 0 means "settled"
+  int smoothing_samples = 240;   ///< the ramp length a set_param starts
 };
 
-void* create_gain(const graph::NodeSpec& spec, const CompileOptions&, std::string& error)
+float gain_value(const graph::NodeSpec& spec)
+{
+  if (has_param(spec, "gain_db"))
+    return static_cast<float>(std::pow(10.0, number_param(spec, "gain_db", 0.0) / 20.0));
+  return static_cast<float>(number_param(spec, "gain", 1.0));
+}
+
+void* create_gain(const graph::NodeSpec& spec, const CompileOptions& options, std::string& error)
 {
   auto state = std::make_unique<GainState>();
-  if (has_param(spec, "gain_db"))
-    state->gain = static_cast<float>(std::pow(10.0, number_param(spec, "gain_db", 0.0) / 20.0));
-  else
-    state->gain = static_cast<float>(number_param(spec, "gain", 1.0));
+  state->gain = state->from = state->to = gain_value(spec);
 
   if (!std::isfinite(state->gain))
   {
     error = reject("nc.gain", "gain is not finite");
     return nullptr;
   }
+
+  const double ramp_ms = number_param(spec, "ramp_ms", 5.0);
+  if (!std::isfinite(ramp_ms) || ramp_ms < 0.0)
+  {
+    error = reject("nc.gain", "'ramp_ms' must be a finite number >= 0");
+    return nullptr;
+  }
+  // A ramp shorter than a sample is a step, which is what ramp_ms = 0 asks for; the max(1) keeps a
+  // sub-sample request from becoming a division by zero rather than a shorter-than-possible ramp.
+  state->smoothing_samples =
+    ramp_ms == 0.0 ? 1 : std::max(1, static_cast<int>(std::llround(ramp_ms * options.sample_rate / 1000.0)));
   return state.release();
 }
 
@@ -128,12 +161,38 @@ void destroy_gain(void* state)
   delete static_cast<GainState*>(state);
 }
 
+// The settable set, in id order: `gain` is id 1 (kGainParamGain). `gain_db` is a build-time
+// convenience that resolves to the same value, not a second thing to patch.
+const char* const kGainSettable[] = {"gain"};
+
+bool set_param_gain(void* raw, uint32_t param_id, float value) noexcept
+{
+  if (param_id != kGainParamGain || !std::isfinite(value))
+    return false;
+  GainState* state = static_cast<GainState*>(raw);
+  // From the *current* value, so a second change mid-ramp does not jump back to the old endpoint.
+  state->from = state->gain;
+  state->to = value;
+  state->ramp_pos = 0;
+  state->ramp_len = state->smoothing_samples;
+  return true;
+}
+
 void process_gain(void* raw, const float* const* in, float* const* out, int frames) noexcept
 {
-  const GainState* state = static_cast<const GainState*>(raw);
-  const float gain = state->gain;
+  GainState* state = static_cast<GainState*>(raw);
   for (int i = 0; i < frames; ++i)
-    out[0][i] = in[0][i] * gain;
+  {
+    if (state->ramp_pos < state->ramp_len)
+    {
+      const float t = static_cast<float>(state->ramp_pos + 1) / static_cast<float>(state->ramp_len);
+      state->gain = state->from + (state->to - state->from) * t * t * (3.0f - 2.0f * t);
+      ++state->ramp_pos;
+      if (state->ramp_pos >= state->ramp_len)
+        state->gain = state->to;
+    }
+    out[0][i] = in[0][i] * state->gain;
+  }
 }
 
 // --- nc.split / nc.mix -----------------------------------------------------
@@ -654,10 +713,15 @@ void process_unit_delay(void*, const float* const* in, float* const* out, int fr
 }
 
 // Field order matches NodeType: id, inputs, outputs, create, destroy, process, describe,
-// set_block_input, block_delay, arity_param, min_ports, max_ports.
+// set_block_input, block_delay, arity_param, min_ports, max_ports, param_id, set_param.
 const NodeType kInput{"nc.input", 0, 1, create_input, destroy_input, process_input, nullptr, set_block_input};
 const NodeType kOutput{"nc.output", 1, 0, nullptr, nullptr, process_marker};
-const NodeType kGain{"nc.gain", 1, 1, create_gain, destroy_gain, process_gain};
+// `nc.gain` is the first settable-parameter node: `param_id`/`set_param` are the `smooth` op class
+// of §5.3, and every later settable node reuses the same two vtable slots.
+const NodeType kGain{.id = "nc.gain", .inputs = 1, .outputs = 1, .create = create_gain,
+                     .destroy = destroy_gain, .process = process_gain,
+                     .settable_params = kGainSettable, .settable_param_count = 1,
+                     .set_param = set_param_gain};
 // `nc.split`/`nc.mix` are the per-spec arity nodes (plan.md §6.1): the fan-out is the rig's
 // `"outputs"`/`"inputs"` param rather than a fixed 2, which is what makes N parallel chains a
 // first-class shape. The default stays 2, so a rig written before this means exactly what it did.

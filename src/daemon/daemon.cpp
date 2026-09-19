@@ -230,7 +230,10 @@ void Daemon::close_socket()
 
 bool Daemon::push_slot(PlanSlot* slot)
 {
-  if (commands_.push(PlanCommand{slot}))
+  PlanCommand command;
+  command.kind = PlanCommand::Kind::PublishPlan;
+  command.slot = slot;
+  if (commands_.push(command))
     return true;
   // A full command ring means the render thread is not draining, which is an engine bug rather than
   // a load condition. Free the plan here rather than leaking it.
@@ -238,6 +241,44 @@ bool Daemon::push_slot(PlanSlot* slot)
   if (config_.verbose)
     std::fprintf(stderr, "[namchaind] publication ring is full; plan dropped\n");
   return false;
+}
+
+bool Daemon::publish_param(const std::string& node, const std::string& param, double value, std::string& error)
+{
+  if (last_published_ == nullptr || last_published_->plan == nullptr)
+  {
+    error = "no plan is loaded; rig.load first";
+    return false;
+  }
+  if (!std::isfinite(value))
+  {
+    error = "'" + node + "." + param + "' is not finite";
+    return false;
+  }
+
+  // resolve_param reads immutable plan structure only, so doing it on the control thread while the
+  // render thread runs the same plan is safe. The *write* goes on the ring and happens on the render
+  // thread; that is the whole point of the command.
+  std::size_t node_index = 0;
+  uint32_t param_id = 0;
+  if (!last_published_->plan->resolve_param(node, param, node_index, param_id))
+  {
+    error = "node '" + node + "' has no settable param '" + param + "'";
+    return false;
+  }
+
+  PlanCommand command;
+  command.kind = PlanCommand::Kind::SetParam;
+  command.generation = last_published_->generation;
+  command.node = static_cast<uint32_t>(node_index);
+  command.param = param_id;
+  command.value = static_cast<float>(value);
+  if (!commands_.push(command))
+  {
+    error = "the command ring is full; the render thread is not consuming edits";
+    return false;
+  }
+  return true;
 }
 
 bool Daemon::load_rig(const std::string& rig_path, std::string& error)
@@ -262,6 +303,7 @@ bool Daemon::load_rig(const std::string& rig_path, std::string& error)
   const uint64_t generation = generation_ + 1;
   slot->generation = generation;
 
+  PlanSlot* raw = slot.get();
   const int buffers = slot->plan->buffer_count();
   if (!push_slot(slot.release()))
   {
@@ -270,6 +312,7 @@ bool Daemon::load_rig(const std::string& rig_path, std::string& error)
   }
   generation_ = generation;
   current_rig_ = rig_path;
+  last_published_ = raw;
 
   if (config_.verbose)
   {
@@ -347,13 +390,15 @@ void Daemon::stop()
   // still owned by the command ring. Free it here; the loop has stopped, so nothing else can.
   PlanCommand command;
   while (commands_.pop(command))
-    delete command.slot;
+    if (command.kind == PlanCommand::Kind::PublishPlan)
+      delete command.slot;
 
   if (current_slot_ != nullptr)
   {
     delete current_slot_;
     current_slot_ = nullptr;
   }
+  last_published_ = nullptr;
   close_socket();
   if (signal_fd_ >= 0)
   {
@@ -458,6 +503,23 @@ void Daemon::drain_commands()
   PlanCommand command;
   while (commands_.pop(command))
   {
+    if (command.kind == PlanCommand::Kind::SetParam)
+    {
+      // The command names the generation it was resolved against. A plan swap queued ahead of it is
+      // processed first (the ring is FIFO), so the only way to be stale is a patch that lost a race
+      // with a structural reload -- in which case dropping it is the intended coalescing, not a bug.
+      if (current_slot_ == nullptr || current_slot_->generation != command.generation)
+      {
+        params_stale_.fetch_add(1);
+        continue;
+      }
+      if (current_slot_->plan->set_param(command.node, command.param, command.value))
+        params_applied_.fetch_add(1);
+      else
+        params_stale_.fetch_add(1); // an unknown param is a control-side bug; counted, not fatal
+      continue;
+    }
+
     PlanSlot* next = command.slot;
     if (next == nullptr)
       continue;
@@ -662,8 +724,12 @@ std::string Daemon::handle_request(const std::string& request)
     status["rt_policy"] = rt_policy_.load();
     status["rt_priority"] = rt_priority_.load();
     status["retired_pending"] = static_cast<std::uint64_t>(reclaimer_.pending());
-    // The honest label for the M1 skeleton: a reload is a cold swap, not a crossfade.
-    status["transitions"] = "none";
+    status["params_applied"] = params_applied_.load();
+    status["params_stale"] = params_stale_.load();
+    // Two honest labels: parameter edits are ramped inside the node (no recompile, no step); a
+    // structural reload is still a cold swap, because the crossfade is not built.
+    status["param_edits"] = "ramped";
+    status["structural_transitions"] = "cold-swap";
     nlohmann::json body;
     body["status"] = status;
     return ok_response(id, body);
@@ -718,6 +784,41 @@ std::string Daemon::handle_request(const std::string& request)
     body["rig"] = current_rig_;
     body["generation"] = generation_;
     body["loaded"] = current_rig_.empty() ? false : true;
+    return ok_response(id, body);
+  }
+  if (method == "rig.patch")
+  {
+    // The `smooth` op class of §5.3: each op is a vtable dispatch on the render thread, no compile
+    // and no fade. The response says how many were accepted; adoption is asynchronous, so a caller
+    // that wants to observe the rendered result polls engine.status (params_applied).
+    if (!doc.contains("ops") || !doc["ops"].is_array())
+      return error_response(id, "bad_request", "rig.patch needs an 'ops' array");
+    unsigned applied = 0;
+    for (std::size_t i = 0; i < doc["ops"].size(); ++i)
+    {
+      const std::string where = "ops[" + std::to_string(i) + "]";
+      const nlohmann::json& op = doc["ops"][i];
+      if (!op.is_object())
+        return error_response(id, "bad_request", where + " must be an object");
+      if (op.contains("op") && (!op["op"].is_string() || op["op"].get<std::string>() != "set_param"))
+        return error_response(id, "unsupported_op",
+                              where + ": only 'set_param' is implemented");
+      if (!op.contains("node") || !op["node"].is_string() || !op.contains("param") ||
+          !op["param"].is_string() || !op.contains("value") || !op["value"].is_number())
+      {
+        return error_response(id, "bad_request", where + " needs string 'node' and 'param' and a numeric 'value'");
+      }
+      std::string error;
+      if (!publish_param(op["node"].get<std::string>(), op["param"].get<std::string>(),
+                         op["value"].get<double>(), error))
+      {
+        return error_response(id, "patch_rejected", where + ": " + error);
+      }
+      ++applied;
+    }
+    nlohmann::json body;
+    body["applied"] = applied;
+    body["generation"] = generation_;
     return ok_response(id, body);
   }
 

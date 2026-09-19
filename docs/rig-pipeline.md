@@ -1,12 +1,15 @@
 # The rig spec pipeline: load, parse, compile, apply
 
 **Status:** design, partly built. Load, parse and compile are implemented and tested. Apply is
-partial: `namchaind` compiles a new plan on its control thread, publishes it through the SPSC ring
-and retires the old one after a grace window, but there is no dual-render, no parameter ramp and no
-admission control. Control-side awareness is partial: the daemon's socket, protocol, `signalfd`
-reload and device-loss survival exist; the offline edit timeline and telemetry subscription do not.
-The audio-side command ring is drained at the top of each block, but only plan identity travels on
-it. The last section says exactly which is which, so nothing here is mistaken for running code.
+partial in two separate ways: the `smooth` class (parameter-only) never recompiles and is ramped
+inside the node, over both the daemon's `rig.patch` and the offline `namchain-render` timeline; a
+*structural* change still compiles a new plan, publishes it through the SPSC ring and retires the old
+one after a grace window, but with no dual-render, no crossfade and no admission control. Control-side
+awareness is partial: the daemon's socket, protocol, `signalfd` reload and device-loss survival
+exist, and the offline edit timeline now exists; telemetry subscription does not. The audio-side
+command ring is drained at the top of each block and carries both plan identity and parameter
+dispatches. The last section says exactly which is which, so nothing here is mistaken for running
+code.
 
 **Names.** Three stages, three words, because using one word for all of them is how a conversation
 about latency ends up talking about the wrong thing:
@@ -198,10 +201,10 @@ The mechanisms, in the order they matter:
 | load | **implemented** — `load_graph_json` |
 | parse | **implemented** — `parse_graph_json` plus full structural validation |
 | compile | **implemented** for validation, Kahn ordering, liveness/colouring, arena allocation and pointer binding; lowering, PDC and the cost model still to come |
-| apply | **partial** — `namchaind` builds the complete new plan on the control thread and publishes its identity on the SPSC ring; the render thread swaps it in at a block boundary and the old plan is freed by the control thread after `grace + 2` epochs. No dual-render, no equal-power crossfade, no admission control: a structural reload can click |
-| control-side awareness | **partial** — `namchaind` is the daemon: a Unix `SOCK_SEQPACKET` socket with the versioned JSON protocol (`engine.hello/status/mute/panic`, `rig.load/get`), `signalfd` for SIGHUP reload and TERM/INT stop, startup-from-config, and a `poll` loop whose timeout is the reclamation window. The in-process API, the offline edit timeline and telemetry subscription are not built |
-| audio-side awareness | **partial** — the daemon drains the SPSC command ring and swaps the plan pointer at the top of each block, so the mechanism of §6.3/§6.4 is live; the ring carries plan identity only, and the transition ops that make a structural change glitch-free are M2 |
-| stall avoidance | mixed. `rt/arena.h` is in use today — the compiler allocates every intermediate buffer from one — and `rt/splice_fader.h` is in use in the live device loop, though for the output-queue splice rather than for plan transitions. `rt/spsc_ring.h` and `rt/reclaimer.h` are now wired into `namchaind`: the render thread drains the ring each block and retires the old plan, and the control loop's timeout is the reclamation window. What is still missing is the *content* of that ring — the transition ops of §4 |
+| apply | **partial** — the `smooth` class is built: a parameter-only change resolves to a vtable dispatch (`NodeType::set_param`) and ramps inside the node, with no compile and no step, over both the daemon's `rig.patch` and the offline timeline. Structurally, `namchaind` builds the complete new plan on the control thread and publishes its identity on the SPSC ring; the render thread swaps it in at a block boundary and the old plan is freed by the control thread after `grace + 2` epochs. Structural changes still have no dual-render, no equal-power crossfade and no admission control: they can click |
+| control-side awareness | **partial** — `namchaind` is the daemon: a Unix `SOCK_SEQPACKET` socket with the versioned JSON protocol (`engine.hello/status/mute/panic`, `rig.load/get/patch`), `signalfd` for SIGHUP reload and TERM/INT stop, startup-from-config, and a `poll` loop whose timeout is the reclamation window. The offline edit timeline exists (`namchain-render --graph --timeline/--torture`); the in-process API and telemetry subscription are not built |
+| audio-side awareness | **partial** — the daemon drains the SPSC command ring at the top of each block and carries two kinds of record: plan identity (swap the slot) and parameter dispatches (ramp a node). The structural transition ops that make a rewire glitch-free are M2 |
+| stall avoidance | mixed. `rt/arena.h` is in use today — the compiler allocates every intermediate buffer from one — and `rt/splice_fader.h` is in use in the live device loop, though for the output-queue splice rather than for plan transitions. `rt/spsc_ring.h` and `rt/reclaimer.h` are wired into `namchaind`: the render thread drains the ring each block and retires the old plan, and the control loop's timeout is the reclamation window. The ring now carries a `set_param` dispatch as well as plan identity; the structural ops of §4 are still missing |
 
 `RenderPlan::execute(input, output, frames)` still has no plan-swap indirection of its own; the
 indirection lives in `namchaind`, which swaps the whole slot pointer at a block boundary while the

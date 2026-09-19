@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -70,6 +71,21 @@ struct NodeType
   /// for a thousand ports.
   int min_ports = 1;
   int max_ports = 64;
+  /// \brief The settable parameter names, in id order: name `i` takes id `i + 1`.
+  ///
+  /// Control thread, at compile time: the compiler resolves a rig's param name to the integer id
+  /// that travels on the render path, so nothing there compares a string (§6.1). Null, with a count
+  /// of 0, is a node with nothing to set. A table rather than a name→id function because a tool also
+  /// needs to *enumerate* what can be patched without knowing each node type -- which is how the
+  /// timeline generator and a future `rig.get` learn the settable set.
+  const char* const* settable_params = nullptr;
+  int settable_param_count = 0;
+  /// \brief Render path: ramp \p value into the node over the node's own smoothing time.
+  ///
+  /// The value is range-checked by the caller. Returns false for an unknown id, and the node leaves
+  /// its state untouched rather than jumping: an unramped step is the click this exists to avoid
+  /// (§5.3, the `smooth` op class). Nothing here may allocate, lock or throw.
+  bool (*set_param)(void* state, uint32_t param_id, float value) noexcept = nullptr;
 };
 
 /// \brief A node spec's concrete port counts, after per-spec arity is resolved.
@@ -134,6 +150,25 @@ public:
   /// Render one block. \p input and \p output are mono and \p frames long. RT-safe.
   void execute(const float* input, float* output, int frames) noexcept;
 
+  /// \brief Resolve a node id and a param name to what \ref set_param takes.
+  ///
+  /// Control thread. The plan's node order is its execution order, not the rig's declaration order,
+  /// so a caller that only knows ids has to resolve through here rather than count nodes.
+  /// \return false when the node does not exist, its type has no settable params, or the name is
+  /// not one of them.
+  bool resolve_param(const std::string& node_id, const std::string& param, std::size_t& node_index,
+                     uint32_t& param_id) const;
+
+  /// \brief Render path: ramp one node's parameter to \p value.
+  ///
+  /// \return false for an out-of-range index or an id the node does not know. Never allocates or
+  /// locks; the node smooths the change over its own ramp, so this is the no-recompile, no-click
+  /// path of §5.3's `smooth` class.
+  bool set_param(std::size_t node_index, uint32_t param_id, float value) noexcept;
+
+  /// Node ids in execution order, parallel to \ref nodes.
+  const std::vector<std::string>& node_ids() const noexcept { return node_ids_; }
+
   /// \brief Run one quantum of silence through every node, discarding the output.
   ///
   /// The first `process()` call on a freshly built model costs milliseconds -- reset and warm-up
@@ -155,6 +190,7 @@ private:
   RenderPlan() = default;
 
   std::vector<PlanNode> nodes_;    // topological order
+  std::vector<std::string> node_ids_; // parallel to nodes_, for id -> index resolution
   std::vector<float*> buffers_;    // all from the arena
   int input_node_ = -1;            // index in nodes_ whose block input is sampled from the graph
   int output_buffer_ = -1;         // buffer the graph output is read from

@@ -133,6 +133,7 @@ add_library(namchain OBJECT
   src/graph/rig.cpp
   src/daemon/config.cpp
   src/daemon/daemon.cpp
+  src/render/timeline.cpp
   src/latency/latency.cpp
   src/glitch/glitch.cpp
   src/nodes/builtin.cpp
@@ -267,6 +268,8 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_rig.cpp
     tests/test_latency.cpp
     tests/test_glitch.cpp
+    tests/test_ramp.cpp
+    tests/test_timeline.cpp
     tests/test_splice_fader.cpp)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # The daemon's socket/signalfd control loop and its config/rig-resolution surface.
