@@ -90,11 +90,15 @@ for a headless node, not a cure, exactly as predicted.**
 
 3. WHAT THESE ARMS DO NOT ESTABLISH
 -----------------------------------
-* **This is one arm per condition, two days apart — not a balanced same-session A/B.** The
-  old-kernel quiet p99 has been measured near 36.9 % several times (tib-dx-1, e5b/e5c quiet), so
-  26.77 % sits outside that cluster rather than inside its spread; but a repeated baseline is
-  not a control, and the thermal state differed (the 09-17 arms started at ~62-68 C, this one at
-  ~56 C). Treat the quiet improvement as a lead, not a result.
+* **This is one arm per condition two days apart — not a balanced same-session A/B, and the old
+  kernel's own spread is the same order as the difference.** The same quiet device arm shape on
+  7.2.6 has given p99 **36.95 %** (tib-dx-1-quiet-unc) and **46.5 %** (tib-e5c-quiet, same 64/384
+  buffer and the same queue shape) — a 9.5-point spread between two runs of the same thing on the
+  same kernel. This arm's 26.77 % is below both, but not by more than that spread, so treat the
+  quiet improvement as a lead rather than a result. The thermal state also differed: this quiet arm
+  started 9.5 C cooler than its baseline (58.2 C against 67.7 C), because the baseline ran straight
+  after the arm before it. (tib-e5b-quiet, p99 32.3 %, is excluded from the comparison: it ran
+  `--output-queue-periods 0` with a 64/256 buffer, a deliberately headroom-free configuration.)
 * **Four things changed at once**, so nothing here can be attributed to NO_HZ_FULL on its own:
   (a) isolcpus + nohz_full; (b) the module trim, 1472 -> 64 built; (c) CONFIG_SOUND/SND/
   SND_USB_AUDIO now genuinely built in rather than merely requested (see §4); (d) no debug info

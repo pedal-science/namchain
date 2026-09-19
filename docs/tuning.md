@@ -312,9 +312,10 @@ sleep, leaves 470-550/s behind even with the tick provably stopped. That is also
 **What it bought: a little, and the loaded case is unchanged.** Device arms, same engine, same
 pins, only the kernel differing: p99 492.6 → 357.0 µs and max 768.3 → 596.5 µs with 0 xruns either
 way; under a memory load both directions still fail the gate (p99 1785.6 → 1709.8 µs, xruns
-2876 → 2082). That is one arm per condition two days apart with four changes bundled together, so
-it is a lead rather than a result — `bench-results/tib-nohzfull-summary.txt` §3 has the caveats
-and the attribution experiment that would settle it. The loaded case behaving the same is the
+2876 → 2082). That is one arm per condition two days apart with four changes bundled together, and
+the same quiet arm on 7.2.6 has itself given 36.95 % and 46.5 %, so the improvement is a lead
+rather than a result — `bench-results/tib-nohzfull-summary.txt` §3 has the caveats and the
+attribution experiment that would settle it. The loaded case behaving the same is the
 expected outcome: there the binding constraint is the shared L2 and ~2.98 GB/s of bandwidth, not
 the tick. **This is hygiene for a headless node, not a cure.**
 
