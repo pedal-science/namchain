@@ -65,6 +65,24 @@ bool parse_int(const std::string& name, const std::string& text, int& out, std::
   return true;
 }
 
+bool parse_double(const std::string& name, const std::string& text, double& out, std::string& error)
+{
+  if (text.empty())
+  {
+    error = "--" + name + " needs a value";
+    return false;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const double value = std::strtod(text.c_str(), &end);
+  if (errno != 0 || end == text.c_str() || *end != '\0')
+  {
+    error = "--" + name + ": '" + text + "' is not a number";
+    return false;
+  }
+  out = value;
+  return true;
+}
 /// Socket permission bits are written in the config as an octal string ("0660") because JSON has no
 /// octal literal, and as a flag in the same spelling. Parsed explicitly rather than with strtoul's
 /// base 8, so "8" is an error instead of a silent zero.
@@ -148,6 +166,20 @@ bool read_bool(const nlohmann::json& doc, const char* key, bool& out, const std:
   return true;
 }
 
+bool read_double(const nlohmann::json& doc, const char* key, double& out, const std::string& path,
+                 std::string& error)
+{
+  if (!doc.contains(key))
+    return true;
+  if (!doc[key].is_number())
+  {
+    error = path + ": '" + key + "' must be a number";
+    return false;
+  }
+  out = doc[key].get<double>();
+  return true;
+}
+
 bool read_string(const nlohmann::json& doc, const char* key, std::string& out, const std::string& path,
                  std::string& error)
 {
@@ -196,7 +228,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "periods",    "capture_channels", "playback_channels", "rig",
                                       "rigs_root",  "socket",      "socket_mode",     "rt_priority",
                                       "cpu",        "lock_memory",  "output_queue_periods",
-                                      "output_queue_floor_periods", "device_retry_ms",
+                                      "output_queue_floor_periods", "fade_ms", "device_retry_ms",
                                       "reclamation_timeout_ms", "verbose"};
   for (const auto& [key, value] : doc.items())
   {
@@ -247,6 +279,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_unsigned(doc, "output_queue_periods", config.output_queue_periods, path, error) ||
       !read_unsigned(doc, "output_queue_floor_periods", config.output_queue_floor_periods, path, error) ||
       !read_unsigned(doc, "device_retry_ms", config.device_retry_ms, path, error) ||
+      !read_double(doc, "fade_ms", config.fade_ms, path, error) ||
       !read_int(doc, "rt_priority", config.rt_priority, path, error) ||
       !read_int(doc, "cpu", config.cpu, path, error) ||
       !read_int(doc, "reclamation_timeout_ms", config.reclamation_timeout_ms, path, error) ||
@@ -326,6 +359,8 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
     return parse_unsigned("output-queue-floor-periods", value, config.output_queue_floor_periods, error);
   if (name == "device-retry-ms")
     return parse_unsigned("device-retry-ms", value, config.device_retry_ms, error);
+  if (name == "fade-ms")
+    return parse_double("fade-ms", value, config.fade_ms, error);
   if (name == "reclamation-timeout-ms")
     return parse_int("reclamation-timeout-ms", value, config.reclamation_timeout_ms, error);
   if (name == "rt-priority")

@@ -15,6 +15,7 @@
   "lock_memory": true,
   "output_queue_periods": 4,
   "output_queue_floor_periods": 2,
+  "fade_ms": 5,
   "device_retry_ms": 250,
   "verbose": false
 }

@@ -49,6 +49,12 @@ struct Config
   /// Output-queue cap and floor, in periods; see BackendConfig. 0 disables each.
   unsigned output_queue_periods = 0;
   unsigned output_queue_floor_periods = 0;
+  /// \brief Equal-power crossfade length for a structural plan transition, in milliseconds (§5.3).
+  ///
+  /// The old and new plans are both rendered for this long and their chain outputs are crossfaded
+  /// before the old is retired. 5 ms is §5.3's default; 0 would be a hard switch, which the glitch
+  /// detector catches, so it is accepted but not recommended.
+  double fade_ms = 5.0;
   /// How long the render thread waits before retrying a device that failed or is not present.
   unsigned device_retry_ms = 250;
   /// How long the control loop's poll sleeps when nothing is pending. This is the reclamation

@@ -76,6 +76,21 @@ const char* kGainRig = R"({
   ]
 })";
 
+/// A structurally different chain (one more node), for the transition test.
+const char* kSecondRig = R"({
+  "nodes": [
+    { "id": "in", "type": "nc.input" },
+    { "id": "g", "type": "nc.gain", "gain": 0.5 },
+    { "id": "g2", "type": "nc.gain", "gain": 0.5 },
+    { "id": "out", "type": "nc.output" }
+  ],
+  "connections": [
+    { "from": "in", "to": "g" },
+    { "from": "g", "to": "g2" },
+    { "from": "g2", "to": "out" }
+  ]
+})";
+
 /// One SEQPACKET request, one response. The framing the daemon does not have to implement.
 std::string call(const std::string& socket_path, const std::string& request)
 {
@@ -135,6 +150,7 @@ TEST_CASE("a config file sets the fields the daemon uses")
     "lock_memory": false,
     "output_queue_periods": 4,
     "output_queue_floor_periods": 2,
+    "fade_ms": 2.5,
     "device_retry_ms": 500,
     "verbose": true
   })");
@@ -158,6 +174,7 @@ TEST_CASE("a config file sets the fields the daemon uses")
   CHECK_FALSE(config.lock_memory);
   CHECK(config.output_queue_periods == 4u);
   CHECK(config.output_queue_floor_periods == 2u);
+  CHECK(config.fade_ms == doctest::Approx(2.5));
   CHECK(config.device_retry_ms == 500u);
   CHECK(config.verbose);
 }
@@ -291,9 +308,9 @@ TEST_CASE("the protocol version negotiates, rejects and names unknown methods")
     const auto reply = nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.status"})"));
     CHECK(reply["ok"] == true);
     CHECK(reply["status"]["role"] == "namchaind");
-    // The honest labels: parameter edits are ramped, structural reloads are still a cold swap.
+    // The honest labels: parameter edits are ramped, structural reloads are crossfaded.
     CHECK(reply["status"]["param_edits"] == "ramped");
-    CHECK(reply["status"]["structural_transitions"] == "cold-swap");
+    CHECK(reply["status"]["structural_transitions"] == "crossfade");
   }
 }
 
@@ -476,6 +493,63 @@ TEST_CASE("the daemon runs the null backend and serves the control socket")
     return s["params_applied"].get<uint64_t>() == 1;
   });
   CHECK_MESSAGE(applied, "the render thread never applied the parameter edit");
+}
+
+TEST_CASE("a structural rig.load is dual-rendered and crossfaded")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "a.json", kGainRig);
+  write_file(root / "b.json", kSecondRig);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "a.json").string();
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  config.fade_ms = 5.0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() == 1;
+  }));
+
+  const auto loaded = nlohmann::json::parse(
+    call(config.socket_path, R"({"id":"l","method":"rig.load","rig":"b.json"})"));
+  REQUIRE(loaded["ok"] == true);
+  CHECK(loaded["generation"] == 2);
+
+  // The fade is ~5 ms, so the end state is the robust thing to poll for; `transitions_started`
+  // distinguishes a crossfade from an immediate swap, which is the whole point.
+  const bool settled = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["transition_active"] == false && status["audible_generation"].get<uint64_t>() == 2;
+  });
+  CHECK_MESSAGE(settled, "the render thread never finished the structural transition");
+
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  CHECK(status["status"]["structural_transitions"] == "crossfade");
+  CHECK(status["status"]["transitions_started"].get<uint64_t>() >= 1);
+  CHECK(status["status"]["target_generation"] == 2);
+  CHECK(status["status"]["generation"] == 2);
 }
 
 TEST_CASE("the daemon stays up and reports lost when the device cannot be opened")

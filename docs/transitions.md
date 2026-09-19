@@ -1,8 +1,9 @@
 # Transitions: the op classes, the timeline, and the detector
 
-**Status:** the `smooth` op class and its offline harness are built; the structural op classes are
-not. This document is the operational half of docs/rig-pipeline.md §4–§5, which is the design half.
-Read that for *why*; read this for *what runs*.
+**Status:** the `smooth` op class, its offline harness, and the structural dual-render crossfade are
+built. Bypass/enable and model swap are not, and neither is admission control. This document is the
+operational half of docs/rig-pipeline.md §4–§5, which is the design half. Read that for *why*; read
+this for *what runs*.
 
 ## The four op classes (plan.md §5.3)
 
@@ -11,12 +12,52 @@ Read that for *why*; read this for *what runs*.
 | Parameter change, `smooth` class | per-sample ramp inside the node's param slot | **built** — `NodeType::set_param`, no recompile, no step |
 | Bypass / enable | equal-power crossfade to/from dry | not built |
 | Model swap in `nc.nam` | warm start, then a short crossfade | not built (M3) |
-| Rewire / add / remove / scene recall | dual-render old and new plan, equal-power crossfade, retire | not built |
+| Rewire / add / remove / scene recall | dual-render old and new plan, equal-power crossfade, retire | **built** — `rt::Crossfade`, destination plans only (no op yet builds the modified graph) |
 
-A structural reload today is still the M1 cold swap: the new plan is compiled and prewarmed on the
-control thread and published, but the render thread exchanges it at a block boundary with no
-crossfade. `engine.status` says exactly that: `"param_edits": "ramped"`, `"structural_transitions":
-"cold-swap"`.
+`engine.status` says which is which: `"param_edits": "ramped"`, `"structural_transitions":
+"crossfade"`, plus `transition_active`, `audible_generation` and `target_generation` while a fade is
+in flight.
+
+## The structural transition
+
+A structural publish (`rig.load`, a SIGHUP reload, and later the structural `rig.patch` ops) compiles
+and prewarms a complete new plan on the control thread, exactly as before. What changed is what the
+render thread does with it:
+
+```
+on PublishPlan:
+  if no plan is loaded yet      -> adopt it (nothing to fade from)
+  else if a fade is in flight   -> keep it as the single pending slot, newest wins
+  else                          -> start a transition
+
+per block during a transition:
+  current->execute(in, old)          # both plans run on the same input
+  next->execute(in, new)
+  crossfade.mix(old, new, out)       # equal-power, fade_ms long
+  when the fade closes: retire current, current = next
+  if a pending plan exists: start the next transition from the new current
+```
+
+Two properties matter:
+
+- **Equal-power, not linear.** `rt::Crossfade` weights the two chain outputs by `cos`/`sin` of a
+  quarter turn, so `from² + to² == 1` across the whole fade. A linear crossfade of two uncorrelated
+  signals dips 3 dB in the middle — audible on sustained material. The identity is checked directly in
+  `tests/test_crossfade.cpp` rather than assumed.
+- **The fade lands exactly.** With `length` samples there are `length - 1` steps between them, so the
+  table index is `position * max / (length - 1)`; reading `position * max / length` leaves a residual
+  `cos(π/2·(length-1)/length)` of the old signal at the handoff — 0.008 for a 240-frame fade, which
+  is a step the detector measures. This was found by the endpoint test, not by ear.
+
+Both plans keep running for the whole fade: a chain that stops mid-transition freezes its state and
+would step on the way out (plan.md G14). The old plan is *retired* into the epoch reclaimer when the
+fade closes and freed by the control thread after the grace window; no plan is deleted on the render
+thread.
+
+A burst of structural requests coalesces to the newest: one transition in flight, one pending slot,
+the superseded pending plan retired. Parameter edits are routed to whichever live plan names their
+generation, and a patch for a superseded plan is counted stale rather than applied to the wrong chain.
+
 
 ## The `smooth` class
 
@@ -105,10 +146,17 @@ full 60 s / 500-edit torture becomes a routine run.
 
 ## What is next
 
-1. The structural op classes: dual-render old and new plans for `fade_ms`, equal-power crossfade at
-   the chain outputs, then retire (§5.3). `rt::SpliceFader` is a splice repair and is **not** this
-   crossfade; a chain crossfade is its own primitive.
-2. Admission control and the deferred-commit scheduler (§5.3, §5.4): `worst_case_block`, the 70 %
-   budget, shorten-fade -> drop-warming -> slim -> reject-with-reason, one structural transition in
-   flight with coalescing.
-3. Bypass/enable and the per-node non-finite guard, which need a dry path.
+1. The structural **patch protocol**: `rig.patch` accepts only `set_param`, so nothing yet builds the
+   modified graph that the crossfade would carry. `add_node`, `remove_node`, `connect`, `disconnect`,
+   `swap_model`, `rewire` (§8.4) compile a new graph through the same path `rig.load` uses and publish
+   it; the transition mechanism above is already what receives it.
+2. **Bypass/enable** and an `nc.bypass` dry path, plus the per-node non-finite guard.
+3. **Admission control and the deferred-commit scheduler** (§5.3, §5.4): `worst_case_block`, the 70 %
+   budget, shorten-fade -> drop-warming -> slim -> reject-with-reason. The cost model it needs does
+   not exist yet.
+4. A **structural op in the timeline**, so the offline harness can drive a plan change and the
+   detector can judge it per edit. Today the transition is measured by `tests/test_crossfade.cpp`
+   with two compiled plans and the same primitive; the timeline knows only `set_param`.
+5. The **acceptance sweep**: 60 s / 500 edits at 32/64/128/256 and 44.1/48/96 kHz, with the per-edit
+   oracle cost reduced from O(edits x file) first.
+

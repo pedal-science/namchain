@@ -66,6 +66,7 @@ silently ignored.
 | `lock_memory` | `true` | `mlockall(MCL_CURRENT)`, never `MCL_FUTURE` (plan.md §14.10) |
 | `output_queue_periods` | `0` | output-ring cap in periods; `0` is off |
 | `output_queue_floor_periods` | `0` | queue floor in periods; `0` is off |
+| `fade_ms` | `5.0` | equal-power crossfade for a structural plan transition |
 | `device_retry_ms` | `250` | backoff between attempts to open a lost device |
 | `reclamation_timeout_ms` | `20` | the control `poll` timeout, i.e. the reclamation window |
 | `verbose` | `false` | log lifecycle events to stderr |
@@ -114,8 +115,14 @@ acknowledgement, not a completion — adoption is asynchronous by design. `"op"`
 defaults to `set_param`; any other op kind is a structured `unsupported_op`, so a client cannot
 believe a rewire happened when it did not.
 
-Structural reloads are **not** this path yet: `rig.load` publishes a complete new plan but the
-exchange is a cold swap, and `engine.status` says so (`"structural_transitions": "cold-swap"`).
+Structural reloads take the other path: `rig.load` (and a SIGHUP reload) publishes a complete new
+plan, and the render thread dual-renders the old and new plans for `fade_ms`, crossfading their chain
+outputs with `rt::Crossfade` before retiring the old one. `engine.status` reports
+`"structural_transitions": "crossfade"`, and during the fade `transition_active` is true with
+`audible_generation`/`target_generation` naming the two plans. A burst of requests coalesces to the
+newest: one transition in flight, one pending. Nothing yet *builds* a modified graph from an op —
+that is the structural patch protocol, still to come — so the only structural changes available today
+are whole-rig loads.
 
 ### Rig names and trust
 
@@ -178,16 +185,17 @@ expected.
 
 ## What is built, and what is not
 
-Built: the `smooth` op class (a `rig.patch` set_param ramps inside the node, no recompile, no step)
-and the offline scripted timeline that measures it — `namchain-render --graph rig.json --timeline
-edits.json`, or `--torture N --seed S`, judged by the glitch detector. See docs/transitions.md.
+Built: the `smooth` op class (a `rig.patch` set_param ramps inside the node, no recompile, no step),
+the offline scripted timeline that measures it (`namchain-render --graph rig.json --timeline
+edits.json`, or `--torture N --seed S`, judged by the glitch detector), and the structural dual-render
+crossfade that a `rig.load` or SIGHUP reload now takes. See docs/transitions.md.
 
 Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 
-- no dual-render or equal-power crossfade, so `rig.load` swaps plans at a block boundary and may
-  click; `engine.status` reports `"structural_transitions": "cold-swap"`;
+- no structural patch ops, so nothing yet *builds* a modified graph; a structural change is always a
+  whole-rig load (`add_node`/`remove_node`/`connect`/`disconnect`/`swap_model`/`rewire`);
 - no bypass/enable or model-swap op class;
-- no admission control or cost model, so a plan that is too expensive is not rejected before it
-  runs;
+- no admission control or cost model, so a plan too expensive to dual-render is not rejected before it
+  runs, and the fade length is fixed rather than shortened under load;
 - no telemetry subscription and no `scene.*`, `model.*`, `bench.run` methods;
 - no state-accurate NAM warm start (M3).

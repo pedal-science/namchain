@@ -39,6 +39,7 @@ void print_usage(std::FILE* stream)
                "      --no-lock-memory         do not lock memory\n"
                "      --output-queue-periods N output ring cap in periods; 0 = none (default)\n"
                "      --output-queue-floor-periods N  queue floor in periods; 0 = none (default)\n"
+               "      --fade-ms X              structural crossfade length, default 5\n"
                "      --device-retry-ms N      retry backoff after a lost device, default 250\n"
                "      --reclamation-timeout-ms N  control poll timeout, default 20\n"
                "  -v, --verbose                log lifecycle events to stderr\n"

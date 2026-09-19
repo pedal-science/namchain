@@ -21,6 +21,7 @@
 #include "namchain/graph/plan.h"
 #include "namchain/io/backend.h"
 #include "namchain/rt/arena.h"
+#include "namchain/rt/crossfade.h"
 #include "namchain/rt/reclaimer.h"
 #include "namchain/rt/spsc_ring.h"
 
@@ -78,6 +79,10 @@ struct PlanCommand
   uint32_t param = 0;       ///< SetParam: the node's param id
   float value = 0.0f;       ///< SetParam
 };
+
+/// The longest structural crossfade the weight table covers; a larger `fade_ms` is clamped to it.
+/// 16384 frames is 341 ms at 48 kHz and 43 ms at 384 kHz, well past §5.3's 5 ms default.
+inline constexpr int kMaxTransitionFrames = 1 << 14;
 
 /// \brief The reference daemon engine.
 ///
@@ -141,6 +146,10 @@ private:
   void close_device();
   void fail_device(const std::string& reason);
   void drain_commands();
+  /// Begin an equal-power transition from \ref current_slot_ to \p next. Render thread.
+  void start_transition(PlanSlot* next);
+  /// Retire the faded-out plan and promote the incoming one. Render thread.
+  void finish_transition();
 
   Config config_;
   // Sized once; the render path only pushes/pops.
@@ -171,11 +180,20 @@ private:
   // Render-thread-owned state. Only the render thread touches these.
   std::unique_ptr<AudioBackend> device_;
   bool device_started_ = false;
-  PlanSlot* current_slot_ = nullptr;
+  PlanSlot* current_slot_ = nullptr; ///< the audible plan (fading out during a transition)
+  PlanSlot* next_slot_ = nullptr;    ///< the plan fading in, or null
+  /// A structural publish that arrived while a transition was in flight. One slot, newest wins: a
+  /// burst of rig.load coalesces to the last request, and the superseded plan is retired.
+  PlanSlot* pending_slot_ = nullptr;
+  /// Equal-power crossfade for the transition. Sized once, on the control thread.
+  rt::Crossfade crossfade_{kMaxTransitionFrames};
   std::vector<unsigned char> capture_buffer_;
   std::vector<unsigned char> playback_buffer_;
   std::vector<float> mono_in_;
   std::vector<float> mono_out_;
+  /// The two chain outputs during a transition, crossfaded into \ref mono_out_.
+  std::vector<float> mono_old_;
+  std::vector<float> mono_new_;
 
   std::atomic<int> device_state_{static_cast<int>(DeviceState::Closed)};
   std::atomic<uint64_t> blocks_{0};
@@ -184,6 +202,12 @@ private:
   std::atomic<uint64_t> device_restored_{0};
   std::atomic<uint64_t> render_errors_{0};
   std::atomic<uint64_t> adopted_generation_{0};
+  /// Structural transition state, for engine.status. `audible_generation` is what the device is
+  /// hearing now; `target_generation` is what it is fading to while `transition_active`.
+  std::atomic<bool> transition_active_{false};
+  std::atomic<uint64_t> audible_generation_{0};
+  std::atomic<uint64_t> target_generation_{0};
+  std::atomic<uint64_t> transitions_started_{0};
   /// Parameter edits that reached the render thread and were applied; and those dropped because the
   /// plan they named had already been superseded.
   std::atomic<uint64_t> params_applied_{0};

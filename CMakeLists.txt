@@ -125,6 +125,7 @@ add_library(namchain OBJECT
   src/rt/telemetry.cpp
   src/rt/rt_check.cpp
   src/rt/arena.cpp
+  src/rt/crossfade.cpp
   src/rt/reclaimer.cpp
   src/rt/splice_fader.cpp
   src/rt/scheduling.cpp
@@ -269,6 +270,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_latency.cpp
     tests/test_glitch.cpp
     tests/test_ramp.cpp
+    tests/test_crossfade.cpp
     tests/test_timeline.cpp
     tests/test_splice_fader.cpp)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

@@ -344,6 +344,11 @@ bool Daemon::start(std::string& error)
     error = "rt_priority must be in [0, 99]";
     return false;
   }
+  if (!(config_.fade_ms >= 0.0))
+  {
+    error = "fade_ms must be >= 0";
+    return false;
+  }
   if (config_.output_queue_floor_periods > config_.output_queue_periods)
   {
     error = "output_queue_floor_periods cannot exceed output_queue_periods";
@@ -398,6 +403,17 @@ void Daemon::stop()
     delete current_slot_;
     current_slot_ = nullptr;
   }
+  if (next_slot_ != nullptr)
+  {
+    delete next_slot_;
+    next_slot_ = nullptr;
+  }
+  if (pending_slot_ != nullptr)
+  {
+    delete pending_slot_;
+    pending_slot_ = nullptr;
+  }
+  transition_active_.store(false);
   last_published_ = nullptr;
   close_socket();
   if (signal_fd_ >= 0)
@@ -469,6 +485,8 @@ bool Daemon::open_device(std::string& error)
   playback_buffer_.assign(static_cast<std::size_t>(config_.period_size) * info.playback_bytes_per_frame, 0);
   mono_in_.assign(config_.period_size, 0.0f);
   mono_out_.assign(config_.period_size, 0.0f);
+  mono_old_.assign(config_.period_size, 0.0f);
+  mono_new_.assign(config_.period_size, 0.0f);
 
   active_rate_.store(info.sample_rate);
   active_period_.store(info.period_size);
@@ -498,6 +516,42 @@ void Daemon::fail_device(const std::string& reason)
   set_device_state(DeviceState::Lost);
 }
 
+void Daemon::start_transition(PlanSlot* next)
+{
+  next_slot_ = next;
+  unsigned rate = active_rate_.load();
+  if (rate == 0)
+    rate = config_.sample_rate;
+  const int fade = static_cast<int>(std::llround(config_.fade_ms * static_cast<double>(rate) / 1000.0));
+  crossfade_.start(fade);
+  target_generation_.store(next->generation);
+  // "Adopted" means the render thread has taken the plan up, which for a structural change is the
+  // moment it starts fading in, not the moment the fade closes.
+  adopted_generation_.store(next->generation);
+  transition_active_.store(true);
+  transitions_started_.fetch_add(1);
+}
+
+void Daemon::finish_transition()
+{
+  if (current_slot_ != nullptr)
+    reclaimer_.retire(current_slot_, &delete_plan_slot);
+  current_slot_ = next_slot_;
+  next_slot_ = nullptr;
+  if (current_slot_ != nullptr)
+    audible_generation_.store(current_slot_->generation);
+  transition_active_.store(false);
+
+  // A publish that arrived while this fade was in flight starts now, from the plan that has just
+  // become audible. Nothing is lost and nothing nests: one structural transition at a time.
+  if (pending_slot_ != nullptr)
+  {
+    PlanSlot* pending = pending_slot_;
+    pending_slot_ = nullptr;
+    start_transition(pending);
+  }
+}
+
 void Daemon::drain_commands()
 {
   PlanCommand command;
@@ -505,15 +559,18 @@ void Daemon::drain_commands()
   {
     if (command.kind == PlanCommand::Kind::SetParam)
     {
-      // The command names the generation it was resolved against. A plan swap queued ahead of it is
-      // processed first (the ring is FIFO), so the only way to be stale is a patch that lost a race
-      // with a structural reload -- in which case dropping it is the intended coalescing, not a bug.
-      if (current_slot_ == nullptr || current_slot_->generation != command.generation)
-      {
-        params_stale_.fetch_add(1);
-        continue;
-      }
-      if (current_slot_->plan->set_param(command.node, command.param, command.value))
+      // The command names the generation it was resolved against. During a transition two plans are
+      // live, so the edit goes to whichever of them it names; a plan a structural reload has already
+      // superseded is counted as stale rather than applied to the wrong chain.
+      graph::RenderPlan* plan = nullptr;
+      if (current_slot_ != nullptr && current_slot_->generation == command.generation)
+        plan = current_slot_->plan.get();
+      else if (next_slot_ != nullptr && next_slot_->generation == command.generation)
+        plan = next_slot_->plan.get();
+      else if (pending_slot_ != nullptr && pending_slot_->generation == command.generation)
+        plan = pending_slot_->plan.get();
+
+      if (plan != nullptr && plan->set_param(command.node, command.param, command.value))
         params_applied_.fetch_add(1);
       else
         params_stale_.fetch_add(1); // an unknown param is a control-side bug; counted, not fatal
@@ -523,14 +580,29 @@ void Daemon::drain_commands()
     PlanSlot* next = command.slot;
     if (next == nullptr)
       continue;
-    PlanSlot* previous = current_slot_;
-    current_slot_ = next;
-    adopted_generation_.store(next->generation);
-    // The old plan may still be referenced by a block this thread has not finished. It is *retired*
-    // here and freed by the control thread after the grace window (rig-pipeline.md §6.4); never
-    // deleted on this thread.
-    if (previous != nullptr)
-      reclaimer_.retire(previous, &delete_plan_slot);
+
+    if (current_slot_ == nullptr)
+    {
+      // The first plan has nothing to fade from: adopt it. This is the startup rig, and the device
+      // has not produced a block yet.
+      current_slot_ = next;
+      audible_generation_.store(next->generation);
+      adopted_generation_.store(next->generation);
+      target_generation_.store(next->generation);
+      continue;
+    }
+
+    if (transition_active_.load())
+    {
+      // One structural transition in flight. A burst coalesces to the newest request (the stale one
+      // is retired here) rather than nesting fades, which is what rig-pipeline.md §5.3 asks for.
+      if (pending_slot_ != nullptr)
+        reclaimer_.retire(pending_slot_, &delete_plan_slot);
+      pending_slot_ = next;
+      continue;
+    }
+
+    start_transition(next);
   }
 }
 
@@ -606,16 +678,32 @@ void Daemon::render_loop()
       RtScope scope;
       drain_commands();
 
-      graph::RenderPlan* plan = current_slot_ == nullptr ? nullptr : current_slot_->plan.get();
       const std::size_t width = info.bytes_per_sample;
       for (unsigned i = 0; i < info.period_size; ++i)
         mono_in_[i] = pcm_decode(capture_buffer_.data() + static_cast<std::size_t>(i) * info.capture_channels * width,
                                  info.format);
 
-      if (plan != nullptr)
-        plan->execute(mono_in_.data(), mono_out_.data(), static_cast<int>(info.period_size));
+      if (transition_active_.load() && current_slot_ != nullptr && next_slot_ != nullptr)
+      {
+        // Dual-render: both plans run on the same input, and their chain outputs are equal-power
+        // crossfaded. Both keep running for the whole fade (a chain that stops mid-transition
+        // freezes its state and would step on the way out).
+        current_slot_->plan->execute(mono_in_.data(), mono_old_.data(), static_cast<int>(info.period_size));
+        next_slot_->plan->execute(mono_in_.data(), mono_new_.data(), static_cast<int>(info.period_size));
+        crossfade_.mix(mono_old_.data(), mono_new_.data(), mono_out_.data(), static_cast<int>(info.period_size));
+        // mix() has finished reading mono_old_, so the old plan can be retired here; the control
+        // thread frees it after the reclaimer's grace window.
+        if (!crossfade_.active())
+          finish_transition();
+      }
+      else if (current_slot_ != nullptr)
+      {
+        current_slot_->plan->execute(mono_in_.data(), mono_out_.data(), static_cast<int>(info.period_size));
+      }
       else
+      {
         std::fill(mono_out_.begin(), mono_out_.end(), 0.0f);
+      }
 
       // Mute is a zeroing of the *emitted* copy, applied after execute so the chain keeps running:
       // a muted slot whose inference is skipped freezes state and clicks on unmute (G14).
@@ -727,9 +815,14 @@ std::string Daemon::handle_request(const std::string& request)
     status["params_applied"] = params_applied_.load();
     status["params_stale"] = params_stale_.load();
     // Two honest labels: parameter edits are ramped inside the node (no recompile, no step); a
-    // structural reload is still a cold swap, because the crossfade is not built.
+    // structural reload is dual-rendered and equal-power crossfaded for fade_ms.
     status["param_edits"] = "ramped";
-    status["structural_transitions"] = "cold-swap";
+    status["structural_transitions"] = "crossfade";
+    status["transition_active"] = transition_active_.load();
+    status["audible_generation"] = audible_generation_.load();
+    status["target_generation"] = target_generation_.load();
+    status["transitions_started"] = transitions_started_.load();
+    status["fade_ms"] = config_.fade_ms;
     nlohmann::json body;
     body["status"] = status;
     return ok_response(id, body);
