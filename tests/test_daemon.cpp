@@ -2276,3 +2276,29 @@ TEST_CASE("engine.schema publishes macros beside the primitives, and a macro's I
     carried = carried || (spec.role == "ir" && spec.strings.count("ir") == 1 && spec.strings.at("ir") == "CabIR");
   CHECK(carried);
 }
+
+TEST_CASE("a recent-trouble bucket reaches zero in bounded time")
+{
+  using namchain::daemon::decay_recent_trouble;
+
+  CHECK(decay_recent_trouble(0) == 0);
+  CHECK(decay_recent_trouble(1) == 0); // the case the first version got wrong: it stuck at 7
+  CHECK(decay_recent_trouble(7) == 6);
+  CHECK(decay_recent_trouble(18) == 16);
+
+  // The property the bucket exists for: a light that has been amber goes back to green. Eighteen
+  // xruns -- one dropout -- must be gone within a few seconds of blocks, not never.
+  uint64_t value = 18;
+  int steps = 0;
+  while (value != 0 && steps < 1000)
+  {
+    value = decay_recent_trouble(value);
+    ++steps;
+  }
+  CHECK(value == 0);
+  CHECK(steps < 40); // ~40 * 100 blocks = 5 s at 64 frames and 48 kHz
+
+  // And it is still a decay: a big count takes longer than a small one, and never grows.
+  CHECK(decay_recent_trouble(1000) < 1000);
+  CHECK(decay_recent_trouble(1000) > decay_recent_trouble(18));
+}

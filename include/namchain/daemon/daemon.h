@@ -95,6 +95,23 @@ inline constexpr int kTcpSendBufferBytes = 64 * 1024;
 /// anyway. A client that will not read its own refusal does not get to keep the slot.
 inline constexpr unsigned kFlushDeadlineMs = 5000;
 
+/// How often the recent-trouble buckets are drained, in blocks. A hundred blocks is a sixth of a
+/// second at 64 frames and 48 kHz, so a bucket halves in about a second: long enough that a dropout
+/// is still visible when the user looks, short enough that the light goes back to green.
+inline constexpr uint64_t kRecentDecayBlocks = 100;
+
+/// \brief One step of the recent-trouble decay: a bucket that reaches zero in bounded time.
+///
+/// The first version decayed by `n - n/8`, which with integer division sticks at 7 for ever -- so
+/// after a single dropout the health light stayed amber for the rest of the session, which is exactly
+/// what the bucket was introduced to avoid (docs/ui-integration-plan.md §1.6). Subtracting at least
+/// one per step makes the guarantee the bucket is for actually true: every count reaches zero, and a
+/// count that started at n takes about `log(n) * 8` steps to get there.
+inline uint64_t decay_recent_trouble(uint64_t value)
+{
+  return value == 0 ? 0 : value - (value / 8 > 1 ? value / 8 : 1);
+}
+
 /// \brief One published chain plan and the arena its buffers live in.
 ///
 /// Owns both, so retiring a slot frees the plan and every intermediate buffer together. The control

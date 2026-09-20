@@ -60,11 +60,6 @@ constexpr std::size_t kArenaBytes = 1u << 20;
 /// both, which is why this is a byte count and not a message shape.
 constexpr std::size_t kMaxUnixMessageBytes = 256u * 1024;
 
-/// How often the recent-trouble buckets are drained, in blocks. A hundred blocks is a sixth of a
-/// second at 64 frames and 48 kHz, so a bucket halves in about a second: long enough that a dropout
-/// is still visible when the user looks, short enough that the light goes back to green.
-constexpr uint64_t kRecentDecayBlocks = 100;
-
 /// The protocol version this daemon speaks. Incremented when the request/response shape changes.
 ///
 /// 2 added `rig.apply` (a whole document in memory), the document in `rig.get`, the per-chain array in
@@ -2113,8 +2108,8 @@ void Daemon::render_loop()
     last_xruns_ = xruns;
     if (blocks_.load() % kRecentDecayBlocks == 0)
     {
-      recent_xruns_.store(recent_xruns_.load() - recent_xruns_.load() / 8);
-      recent_render_errors_.store(recent_render_errors_.load() - recent_render_errors_.load() / 8);
+      recent_xruns_.store(decay_recent_trouble(recent_xruns_.load()));
+      recent_render_errors_.store(decay_recent_trouble(recent_render_errors_.load()));
     }
   }
 
