@@ -262,6 +262,11 @@ namespace graph
 struct PlanNode
 {
   const render::NodeType* type = nullptr;
+  /// The document identity of this node: the client's `element`, and the macro role it was lowered
+  /// from. Carried so a patch can resolve `element` + `role` against what is *running* rather than
+  /// against a document that may have moved on.
+  std::string element;
+  std::string role;
   void* state = nullptr;
   std::vector<const float*> inputs;
   std::vector<float*> outputs;
@@ -315,6 +320,25 @@ public:
   /// not one of them.
   bool resolve_param(const std::string& node_id, const std::string& param, std::size_t& node_index,
                      uint32_t& param_id) const;
+
+  /// \brief The index of the node with this `element` and `role`, or -1 for none and -2 for several.
+  ///
+  /// An empty \p role matches any role of that element, which is how a client addresses a macro it
+  /// does not know the lowering of, and how a hand-written rig's node (whose element defaults to its
+  /// id) is addressed. Several matches is -2 rather than the first hit: an ambiguous address is a
+  /// question the caller has to answer, not one this can answer for it.
+  int node_index_of_role(const std::string& element, const std::string& role) const;
+
+  /// The element and role of a node, for error messages that name what the client named.
+  const std::string& element_of(std::size_t node_index) const;
+  const std::string& role_of(std::size_t node_index) const;
+
+  /// Whether a node is bypassed in the running plan. Read for reports; the render path reads the flag
+  /// directly.
+  bool node_bypassed(std::size_t node_index) const
+  {
+    return node_index < nodes_.size() && nodes_[node_index].bypass;
+  }
 
   /// \brief Resolve a parameter of one port of \p node_id, or of the node itself when \p port is -1.
   ///

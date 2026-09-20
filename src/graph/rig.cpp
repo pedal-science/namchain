@@ -442,41 +442,56 @@ bool load_graph_json(const std::string& path, Graph& graph, std::string& error)
   return true;
 }
 
+nlohmann::json graph_json(const Graph& graph)
+{
+  nlohmann::json nodes = nlohmann::json::array();
+  for (const NodeSpec& node : graph.nodes)
+  {
+    nlohmann::json object;
+    object["id"] = node.id;
+    object["element"] = node.element;
+    if (!node.role.empty())
+      object["role"] = node.role;
+    object["type"] = node.type;
+    if (node.bypass)
+      object["bypass"] = true;
+    // Parameters keep their own spelling rather than being nested under "params", because that is
+    // the form the parser accepts back: a number is a numeric param and a string is a string param.
+    for (const auto& [key, value] : node.params)
+      object[key] = value;
+    for (const auto& [key, value] : node.strings)
+      object[key] = value;
+    nodes.push_back(std::move(object));
+  }
+
+  nlohmann::json connections = nlohmann::json::array();
+  for (const Connection& connection : graph.connections)
+  {
+    nlohmann::json object;
+    object["from"] = connection.from;
+    object["from_port"] = connection.from_port;
+    object["to"] = connection.to;
+    object["to_port"] = connection.to_port;
+    connections.push_back(std::move(object));
+  }
+
+  nlohmann::json result;
+  result["nodes"] = std::move(nodes);
+  result["connections"] = std::move(connections);
+  return result;
+}
+
+std::string graph_to_json(const Graph& graph)
+{
+  return graph_json(graph).dump();
+}
+
 std::string document_to_json(const Document& document)
 {
   nlohmann::json chains = nlohmann::json::array();
   for (const Chain& chain : document.chains)
   {
-    nlohmann::json nodes = nlohmann::json::array();
-    for (const NodeSpec& node : chain.graph.nodes)
-    {
-      nlohmann::json object;
-      object["id"] = node.id;
-      object["element"] = node.element;
-      if (!node.role.empty())
-        object["role"] = node.role;
-      object["type"] = node.type;
-      if (node.bypass)
-        object["bypass"] = true;
-      // Parameters keep their own spelling rather than being nested under "params", because that is
-      // the form the parser accepts back: a number is a numeric param and a string is a string param.
-      for (const auto& [key, value] : node.params)
-        object[key] = value;
-      for (const auto& [key, value] : node.strings)
-        object[key] = value;
-      nodes.push_back(std::move(object));
-    }
-
-    nlohmann::json connections = nlohmann::json::array();
-    for (const Connection& connection : chain.graph.connections)
-    {
-      nlohmann::json object;
-      object["from"] = connection.from;
-      object["from_port"] = connection.from_port;
-      object["to"] = connection.to;
-      object["to_port"] = connection.to_port;
-      connections.push_back(std::move(object));
-    }
+    const nlohmann::json graph = graph_json(chain.graph);
 
     nlohmann::json entry;
     entry["id"] = chain.id;
@@ -484,8 +499,8 @@ std::string document_to_json(const Document& document)
       entry["name"] = chain.name;
     entry["input_channel"] = chain.input_channel;
     entry["output_channel"] = chain.output_channel;
-    entry["nodes"] = std::move(nodes);
-    entry["connections"] = std::move(connections);
+    entry["nodes"] = graph["nodes"];
+    entry["connections"] = graph["connections"];
     chains.push_back(std::move(entry));
   }
 

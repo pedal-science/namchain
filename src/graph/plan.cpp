@@ -1,6 +1,7 @@
 #include "namchain/graph/plan.h"
 
 #include <algorithm>
+#include <deque>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -8,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "namchain/graph/macro.h"
 #include "namchain/graph/rig.h"
 
 namespace namchain
@@ -131,8 +133,17 @@ bool outputs_finite(const PlanNode& node, int frames) noexcept
 struct Indexed
 {
   std::map<std::string, int> position;
+  /// The type of each node, as every later pass wants to read it. A macro node gets a *synthesised*
+  /// `NodeType` view (id, ports, category) so the port logic, the dependency walk and the cycle check
+  /// do not each need a second branch: a macro is a black box with a declared arity until it is
+  /// lowered, and that is exactly what this describes.
   std::vector<const render::NodeType*> types;
+  /// The macro behind a synthesised view, or null for a primitive. The parameter lint needs the real
+  /// declaration, because its param table carries a param map as well as a description.
+  std::vector<const graph::MacroType*> macros;
   std::vector<render::PortCounts> ports;
+  /// Storage for the synthesised views; a deque because `types` holds pointers into it.
+  std::deque<render::NodeType> macro_views;
 };
 
 Indexed index_graph(const Graph& graph, Validation& validation)
@@ -153,11 +164,25 @@ Indexed index_graph(const Graph& graph, Validation& validation)
       validation = Validation::failure("duplicate node id '" + node.id + "'");
       return indexed;
     }
+    const graph::MacroType* macro = graph::find_macro_type(node.type);
     const render::NodeType* type = render::find_node_type(node.type);
-    if (type == nullptr)
+    if (type == nullptr && macro == nullptr)
     {
       validation = Validation::failure("unknown node type '" + node.type + "' on node '" + node.id + "'");
       return indexed;
+    }
+    if (macro != nullptr)
+    {
+      render::NodeType view;
+      view.id = macro->id;
+      view.name = macro->name;
+      view.category = macro->category;
+      view.inputs = macro->inputs;
+      view.outputs = macro->outputs;
+      view.min_ports = macro->inputs;
+      view.max_ports = macro->inputs;
+      indexed.macro_views.push_back(view);
+      type = &indexed.macro_views.back();
     }
     // A bypass replaces the node's output with its input, which is only a signal for a 1->1 node: a
     // fan-out has several outputs and a mixer several inputs, and picking one would be a guess. The
@@ -176,6 +201,7 @@ Indexed index_graph(const Graph& graph, Validation& validation)
     }
     indexed.position[node.id] = static_cast<int>(indexed.types.size());
     indexed.types.push_back(type);
+    indexed.macros.push_back(macro);
     indexed.ports.push_back(ports);
   }
   return indexed;
@@ -232,22 +258,7 @@ int next_ready(const Indexed& indexed, const std::vector<int>& indegree, const s
 namespace
 {
 
-/// The declared parameters of \p type, for an error message that says what to write instead.
-std::string declared_params(const render::NodeType& type)
-{
-  std::string list;
-  for (int i = 0; i < type.param_count; ++i)
-  {
-    if (i != 0)
-      list += ", ";
-    list += "'";
-    list += type.params[i].id;
-    list += "'";
-    if (type.params[i].hidden)
-      list += " (alias)";
-  }
-  return list.empty() ? "none" : list;
-}
+
 
 bool option_matches(const render::ParamDesc& param, const std::string& value)
 {
@@ -271,23 +282,54 @@ bool option_matches(const render::ParamDesc& param, const std::string& value)
 /// rejected here, with the accepted set in the message. Before this, a rig could say `"gainz": 3` and
 /// be published happily -- which from a UI is a knob that does nothing
 /// (docs/ljoss-comparison.md §3.5).
-Validation lint_params(const NodeSpec& spec, const render::NodeType& type)
+/// One entry of a parameter table: a primitive's is the `ParamDesc` itself, a macro's carries the
+/// param map beside it. The lint reads only the description, so it is the same lint for both -- which
+/// is what "a client cannot tell a macro from a primitive except by kind" has to mean in practice.
+const render::ParamDesc& param_desc(const render::ParamDesc& entry)
 {
-  const std::string where = "node '" + spec.id + "' (" + type.id + ")";
-  std::vector<bool> seen(static_cast<std::size_t>(type.param_count), false);
+  return entry;
+}
+
+const render::ParamDesc& param_desc(const graph::MacroParamDecl& entry)
+{
+  return entry.desc;
+}
+
+template <typename Entry>
+std::string declared_params(const Entry* params, int count)
+{
+  std::string list;
+  for (int i = 0; i < count; ++i)
+  {
+    if (i != 0)
+      list += ", ";
+    const std::string name = param_desc(params[i]).id;
+    list += "'" + name + "'";
+    if (param_desc(params[i]).hidden)
+      list += " (alias)";
+  }
+  return list.empty() ? std::string("no parameters") : list;
+}
+
+template <typename Entry>
+Validation lint_params(const NodeSpec& spec, const Entry* params, int param_count, const std::string& type_id)
+{
+  const std::string where = "node '" + spec.id + "' (" + type_id + ")";
+  std::vector<bool> seen(static_cast<std::size_t>(param_count), false);
 
   for (const auto& [key, value] : spec.params)
   {
     int index = -1;
-    for (int i = 0; i < type.param_count; ++i)
+    for (int i = 0; i < param_count; ++i)
     {
-      if (key == type.params[i].id)
+      if (key == param_desc(params[i]).id)
         index = i;
     }
     if (index < 0)
-      return Validation::failure(where + " has no parameter '" + key + "'; it takes " + declared_params(type));
+      return Validation::failure(where + " has no parameter '" + key + "'; it takes " +
+                                 declared_params(params, param_count));
 
-    const render::ParamDesc& param = type.params[static_cast<std::size_t>(index)];
+    const render::ParamDesc& param = param_desc(params[index]);
     seen[static_cast<std::size_t>(index)] = true;
     if (param.kind == render::ParamKind::Option)
       return Validation::failure(where + ": '" + key + "' is an option, and takes a string");
@@ -326,15 +368,16 @@ Validation lint_params(const NodeSpec& spec, const render::NodeType& type)
   for (const auto& [key, value] : spec.strings)
   {
     int index = -1;
-    for (int i = 0; i < type.param_count; ++i)
+    for (int i = 0; i < param_count; ++i)
     {
-      if (key == type.params[i].id)
+      if (key == param_desc(params[i]).id)
         index = i;
     }
     if (index < 0)
-      return Validation::failure(where + " has no parameter '" + key + "'; it takes " + declared_params(type));
+      return Validation::failure(where + " has no parameter '" + key + "'; it takes " +
+                                 declared_params(params, param_count));
 
-    const render::ParamDesc& param = type.params[static_cast<std::size_t>(index)];
+    const render::ParamDesc& param = param_desc(params[index]);
     seen[static_cast<std::size_t>(index)] = true;
     if (param.kind != render::ParamKind::Option)
       return Validation::failure(where + ": '" + key + "' is not an option, and takes a number");
@@ -354,9 +397,9 @@ Validation lint_params(const NodeSpec& spec, const render::NodeType& type)
     }
   }
 
-  for (int i = 0; i < type.param_count; ++i)
+  for (int i = 0; i < param_count; ++i)
   {
-    const render::ParamDesc& param = type.params[static_cast<std::size_t>(i)];
+    const render::ParamDesc& param = param_desc(params[i]);
     if (param.required && !seen[static_cast<std::size_t>(i)])
       return Validation::failure(where + " needs '" + param.id + "'");
   }
@@ -364,9 +407,9 @@ Validation lint_params(const NodeSpec& spec, const render::NodeType& type)
   // A `one_of` group is a set of alternatives: giving two of them is a contradiction -- there is no
   // precedence rule in the schema, and inventing one would make a rig's meaning depend on an
   // implementation detail -- and whether one of them is required is a property of the group.
-  for (int i = 0; i < type.param_count; ++i)
+  for (int i = 0; i < param_count; ++i)
   {
-    const render::ParamDesc& param = type.params[static_cast<std::size_t>(i)];
+    const render::ParamDesc& param = param_desc(params[i]);
     if (param.one_of == nullptr)
       continue;
 
@@ -374,9 +417,9 @@ Validation lint_params(const NodeSpec& spec, const render::NodeType& type)
     std::string given;
     int given_count = 0;
     int member_count = 0;
-    for (int j = 0; j < type.param_count; ++j)
+    for (int j = 0; j < param_count; ++j)
     {
-      const render::ParamDesc& other = type.params[static_cast<std::size_t>(j)];
+      const render::ParamDesc& other = param_desc(params[j]);
       if (other.one_of == nullptr || std::string(other.one_of) != param.one_of)
         continue;
       ++member_count;
@@ -419,8 +462,14 @@ Validation validate(const Graph& graph)
   // keeps it out of the render path's silent-ignore behaviour.
   for (const NodeSpec& node : graph.nodes)
   {
-    const render::NodeType* type = indexed.types[static_cast<std::size_t>(indexed.position.at(node.id))];
-    const Validation lint = lint_params(node, *type);
+    const std::size_t index = static_cast<std::size_t>(indexed.position.at(node.id));
+    const render::NodeType* type = indexed.types[index];
+    // A macro's parameters are checked against the macro's own schema -- the same lint, the same
+    // messages, and a param map beside each description that the lint does not need to know about.
+    const Validation lint = indexed.macros[index] != nullptr
+                              ? lint_params(node, indexed.macros[index]->params,
+                                            indexed.macros[index]->param_count, indexed.macros[index]->id)
+                              : lint_params(node, type->params, type->param_count, type->id);
     if (!lint.ok)
       return lint;
   }
@@ -574,7 +623,19 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
     return nullptr;
   }
 
-  const Validation validation = validate(graph);
+  // Lower first. A macro is a document-level node -- a feedback delay is one node there and seven
+  // here -- and everything below this point is the primitive compiler: it never sees a macro, which is
+  // why macros cost nothing on the render path and no node type knows that macros exist.
+  //
+  // The lowered graph is validated again before it is compiled. A lowering is engine code, so a
+  // lowering that produces something the compiler refuses is an engine bug rather than a document
+  // error, and the message says so: the alternative is a confusing complaint about a graph the author
+  // never wrote.
+  Graph lowered_graph;
+  if (!lower_graph(graph, lowered_graph, error))
+    return nullptr;
+
+  const Validation validation = validate(lowered_graph);
   if (!validation.ok)
   {
     error = validation.message;
@@ -582,9 +643,9 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   }
 
   Validation ignored;
-  const Indexed indexed = index_graph(graph, ignored);
+  const Indexed indexed = index_graph(lowered_graph, ignored);
 
-  const std::vector<int> order = topological_order(graph, indexed);
+  const std::vector<int> order = topological_order(lowered_graph, indexed);
   if (order.empty())
   {
     error = "graph contains a cycle";
@@ -592,7 +653,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   }
 
   // Position of each node in the execution order, for liveness.
-  std::vector<int> position_of(graph.nodes.size(), 0);
+  std::vector<int> position_of(lowered_graph.nodes.size(), 0);
   for (std::size_t i = 0; i < order.size(); ++i)
     position_of[static_cast<std::size_t>(order[i])] = static_cast<int>(i);
 
@@ -619,7 +680,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
     if (owner[static_cast<std::size_t>(value)] >= 0)
       last_use[static_cast<std::size_t>(value)] = position_of[static_cast<std::size_t>(owner[static_cast<std::size_t>(value)])];
 
-  for (const Connection& connection : graph.connections)
+  for (const Connection& connection : lowered_graph.connections)
   {
     const int from = indexed.position.at(connection.from);
     const int to = indexed.position.at(connection.to);
@@ -672,7 +733,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
 
   auto plan = std::unique_ptr<RenderPlan>(new RenderPlan());
   plan->max_quantum_ = max_quantum;
-  plan->failed_ = std::vector<std::atomic<bool>>(graph.nodes.size());
+  plan->failed_ = std::vector<std::atomic<bool>>(lowered_graph.nodes.size());
   for (std::atomic<bool>& flag : plan->failed_)
     flag.store(false, std::memory_order_relaxed);
   plan->buffers_.reserve(static_cast<std::size_t>(total_buffers));
@@ -690,11 +751,17 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
 
   for (const int node : order)
   {
-    const NodeSpec& spec = graph.nodes[static_cast<std::size_t>(node)];
+    const NodeSpec& spec = lowered_graph.nodes[static_cast<std::size_t>(node)];
     const render::NodeType* type = indexed.types[static_cast<std::size_t>(node)];
 
     PlanNode plan_node;
     plan_node.type = type;
+    // The document identity travels with the node, because a client addresses `element` + `role` and
+    // the plan is what a patch resolves against (docs/ui-integration-plan.md §1.3). Copied rather
+    // than looked up in the document: the plan is what is running, and a patch must resolve against
+    // the thing the render thread is actually executing.
+    plan_node.element = spec.element;
+    plan_node.role = spec.role;
     // Bypass runs the node and replaces its output (see execute), so `create` still runs: the node's
     // state must stay warm for the un-bypass.
     plan_node.bypass = spec.bypass;
@@ -722,7 +789,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   // Bind inputs now that every output buffer is known.
   for (std::size_t i = 0; i < plan->nodes_.size(); ++i)
   {
-    for (const Connection& connection : graph.connections)
+    for (const Connection& connection : lowered_graph.connections)
     {
       if (indexed.position.at(connection.to) != order[i])
         continue;
@@ -847,6 +914,37 @@ bool RenderPlan::resolve_param(const std::string& node_id, const std::string& pa
                                uint32_t& param_id) const
 {
   return resolve_param(node_id, param, -1, node_index, param_id);
+}
+
+int RenderPlan::node_index_of_role(const std::string& element, const std::string& role) const
+{
+  int found = -1;
+  for (std::size_t i = 0; i < nodes_.size(); ++i)
+  {
+    if (nodes_[i].element != element)
+      continue;
+    // An empty role matches any role of the element: that is the "the element is one node" spelling a
+    // hand-written rig uses, and the reason several matches is an answer of its own rather than the
+    // first one found.
+    if (!role.empty() && nodes_[i].role != role)
+      continue;
+    if (found >= 0)
+      return -2;
+    found = static_cast<int>(i);
+  }
+  return found;
+}
+
+const std::string& RenderPlan::element_of(std::size_t node_index) const
+{
+  static const std::string empty;
+  return node_index < nodes_.size() ? nodes_[node_index].element : empty;
+}
+
+const std::string& RenderPlan::role_of(std::size_t node_index) const
+{
+  static const std::string empty;
+  return node_index < nodes_.size() ? nodes_[node_index].role : empty;
 }
 
 bool RenderPlan::resolve_param(const std::string& node_id, const std::string& param, int port,

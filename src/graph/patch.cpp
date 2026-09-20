@@ -62,6 +62,88 @@ bool node_reference(const nlohmann::json& op, const std::string& where, std::str
   return require_string(op, "id", where, out, error);
 }
 
+/// \brief The node an op names, by `node` id or by `element` (+ optional `role`).
+///
+/// The three spellings of docs/ui-integration-plan.md §1.3, and the order they are tried in is the
+/// order they are written in: an op that gives both is asking for two different things, so it is
+/// refused rather than resolved by precedence.
+///
+/// `element` alone means the element's *one* node. For a macro that is the macro node itself -- which
+/// is how a whole feedback delay is bypassed or given a new band count -- and for a hand-written
+/// node it is the node whose element defaults to its id. An element with several nodes and no role is
+/// an error that lists the roles, because guessing which of them was meant would be a coin flip the
+/// client cannot see.
+NodeSpec* resolve_target(Graph& graph, const nlohmann::json& op, const std::string& where, std::string& error)
+{
+  const bool has_node = op.contains("node") || op.contains("id");
+  const bool has_element = op.contains("element");
+  if (has_node && has_element)
+  {
+    error = where + ": give either 'node' or 'element', not both";
+    return nullptr;
+  }
+  if (has_node)
+  {
+    std::string id;
+    if (!node_reference(op, where, id, error))
+      return nullptr;
+    NodeSpec* spec = find_node(graph, id);
+    if (spec == nullptr)
+      error = where + ": unknown node '" + id + "'";
+    return spec;
+  }
+  if (!has_element)
+  {
+    error = where + ": needs a 'node', or an 'element' with an optional 'role'";
+    return nullptr;
+  }
+
+  std::string element;
+  if (!require_string(op, "element", where, element, error))
+    return nullptr;
+  std::string role;
+  if (op.contains("role") && !require_string(op, "role", where, role, error))
+    return nullptr;
+
+  NodeSpec* found = nullptr;
+  std::string roles;
+  for (NodeSpec& spec : graph.nodes)
+  {
+    if (spec.element != element)
+      continue;
+    if (!role.empty() && spec.role != role)
+      continue;
+    if (found != nullptr)
+    {
+      if (!found->role.empty())
+        roles += (roles.empty() ? "" : ", ") + std::string("'") + found->role + "'";
+      if (!spec.role.empty())
+        roles += (roles.empty() ? "" : ", ") + std::string("'") + spec.role + "'";
+      error = where + ": element '" + element + "' has more than one node; name a role (" + roles + ")";
+      return nullptr;
+    }
+    found = &spec;
+  }
+  if (found == nullptr)
+  {
+    // The contract's rule for an unresolved target: say what exists. A client that has drifted out of
+    // sync with the engine should be able to fix it from the message alone
+    // (docs/ui-integration-plan.md §1.3).
+    std::string elements;
+    for (const NodeSpec& spec : graph.nodes)
+    {
+      if (spec.element.empty() || spec.element == element)
+        continue;
+      if (elements.find("'" + spec.element + "'") != std::string::npos)
+        continue;
+      elements += (elements.empty() ? "" : ", ") + std::string("'") + spec.element + "'";
+    }
+    error = role.empty() ? where + ": unknown element '" + element + "'" + (elements.empty() ? "" : "; this chain has " + elements)
+                         : where + ": element '" + element + "' has no node with role '" + role + "'";
+  }
+  return found;
+}
+
 /// The same rule `load_graph_json` applies to a rig: a relative string param that names something
 /// next to the rig resolves there, so a patch and its rig agree about where models live.
 void resolve_strings(NodeSpec& spec, const std::string& base_dir)
@@ -245,15 +327,9 @@ bool op_swap_model(Graph& graph, const nlohmann::json& op, const std::string& wh
 
 bool op_bypass(Graph& graph, const nlohmann::json& op, const std::string& where, std::string& error)
 {
-  std::string id;
-  if (!node_reference(op, where, id, error))
-    return false;
-  NodeSpec* spec = find_node(graph, id);
+  NodeSpec* spec = resolve_target(graph, op, where, error);
   if (spec == nullptr)
-  {
-    error = where + ": unknown node '" + id + "'";
     return false;
-  }
   // `{"op":"bypass","node":"g"}` means enable; an explicit `"bypass": false` un-bypasses. Whether the
   // node *can* be bypassed is the compiler's check (only a 1->1 node has a dry path), so the flag is
   // set here and validation refuses an impossible one with the node's name -- one authority, not two.
@@ -273,15 +349,9 @@ bool op_bypass(Graph& graph, const nlohmann::json& op, const std::string& where,
 
 bool op_set_param(Graph& graph, const nlohmann::json& op, const std::string& where, std::string& error)
 {
-  std::string id;
   std::string param;
-  if (!node_reference(op, where, id, error) || !require_string(op, "param", where, param, error))
+  if (!require_string(op, "param", where, param, error))
     return false;
-  if (!op.contains("value") || !op["value"].is_number())
-  {
-    error = where + ": needs a numeric 'value'";
-    return false;
-  }
   if (op.contains("port"))
   {
     // A per-port parameter is state in the node, not a property of the graph, so there is nothing
@@ -290,10 +360,26 @@ bool op_set_param(Graph& graph, const nlohmann::json& op, const std::string& whe
                      "rebuilding the graph";
     return false;
   }
-  NodeSpec* spec = find_node(graph, id);
+  NodeSpec* spec = resolve_target(graph, op, where, error);
   if (spec == nullptr)
+    return false;
+
+  // A string value lands in `strings` and a number in `params`: the two maps are the IR's own split
+  // (graph.h), and which one a parameter belongs to is its declaration's business, not the caller's.
+  // Both are accepted here; whether the name means anything is the schema lint's check, which runs on
+  // the patched graph and names what the node does take.
+  if (op.contains("value") && op["value"].is_string())
   {
-    error = where + ": unknown node '" + id + "'";
+    spec->strings[param] = op["value"].get<std::string>();
+    // The numeric spelling of the same parameter, if a previous edit left one, would win at build
+    // time: `nc.gain` prefers `gain_db` over `gain`, and a stale number would be a silently ignored
+    // edit. Dropping it is the same rule the alias case below follows.
+    spec->params.erase(param);
+    return true;
+  }
+  if (!op.contains("value") || !op["value"].is_number())
+  {
+    error = where + ": needs a 'value', which is a number or a string (an option)";
     return false;
   }
   spec->params[param] = op["value"].get<double>();
@@ -301,6 +387,8 @@ bool op_set_param(Graph& graph, const nlohmann::json& op, const std::string& whe
   // `gain` has to drop the alias or it would be silently ignored.
   if (spec->type == "nc.gain" && param == "gain")
     spec->params.erase("gain_db");
+  // The other direction: setting the number of a parameter whose string form is what the node reads.
+  spec->strings.erase(param);
   return true;
 }
 

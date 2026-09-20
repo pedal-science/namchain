@@ -34,6 +34,7 @@
 
 #include <json.hpp>
 
+#include "namchain/graph/macro.h"
 #include "namchain/graph/rig.h"
 #include "namchain/graph/patch.h"
 #include "namchain/pcm.h"
@@ -179,6 +180,66 @@ nlohmann::json root_json(const assets::Root& root)
   return entry;
 }
 
+/// The transform names `engine.schema` publishes, so the param map is legible to a client that wants
+/// to know what a macro parameter actually drives.
+const char* transform_name(graph::Transform transform)
+{
+  switch (transform)
+  {
+  case graph::Transform::Direct: return "direct";
+  case graph::Transform::DbToLinear: return "db_to_linear";
+  case graph::Transform::LinearToDb: return "linear_to_db";
+  case graph::Transform::OneMinus: return "one_minus";
+  case graph::Transform::ScaleBy: return "scale_by";
+  }
+  return "direct";
+}
+
+/// \brief One macro as `engine.schema` reports it.
+///
+/// The same fields as a node type -- so a palette lists both from one array and tells them apart by
+/// `kind` -- plus two a primitive has no need for: the `roles` a client can address with
+/// `element` + `role`, and, on each parameter, the `targets` it drives. Publishing the targets is not
+/// required to use the API, but it is what makes "why did my knob move two nodes" answerable from the
+/// daemon rather than from the source.
+nlohmann::json macro_type_schema(const graph::MacroType& macro, const assets::Registry& registry)
+{
+  nlohmann::json entry;
+  entry["id"] = macro.id;
+  entry["kind"] = "macro";
+  entry["name"] = macro.name;
+  entry["category"] = macro.category;
+  entry["inputs"] = macro.inputs;
+  entry["outputs"] = macro.outputs;
+  entry["channels"] = 1;
+  entry["stereo"] = false;
+  entry["bypass"] = macro.bypass == graph::MacroBypass::AllRolesCarry ? "roles" : "crossfade";
+
+  nlohmann::json roles = nlohmann::json::array();
+  for (int i = 0; i < macro.node_count; ++i)
+    roles.push_back({{"role", macro.nodes[i].role}, {"type", macro.nodes[i].type}});
+  entry["roles"] = std::move(roles);
+
+  nlohmann::json params = nlohmann::json::array();
+  for (int i = 0; i < macro.param_count; ++i)
+  {
+    nlohmann::json param = param_schema(macro.params[i].desc, registry);
+    nlohmann::json targets = nlohmann::json::array();
+    for (int t = 0; t < macro.params[i].target_count; ++t)
+    {
+      const graph::MacroTarget& target = macro.params[i].targets[t];
+      targets.push_back({{"role", target.role},
+                         {"param", target.param},
+                         {"transform", transform_name(target.transform)},
+                         {"scale", target.scale}});
+    }
+    param["targets"] = std::move(targets);
+    params.push_back(std::move(param));
+  }
+  entry["params"] = std::move(params);
+  return entry;
+}
+
 /// One node type as `engine.schema` reports it: what a palette offers and what an inspector lays out.
 ///
 /// Every parameter carries its kind, unit, default, bounds (with inclusive/exclusive made explicit),
@@ -258,6 +319,277 @@ bool constant_time_equal(const std::string& presented, const std::string& expect
     difference = static_cast<unsigned char>(difference | static_cast<unsigned char>(a ^ b));
   }
   return difference == 0u;
+}
+
+/// The plan and the document chain a patch resolves against. Passed explicitly rather than reached
+/// through the daemon, because resolving an edit is a pure question about what is running.
+struct EditContext
+{
+  const PlanSlot* slot = nullptr;
+  const graph::Chain* chain = nullptr;
+  std::size_t chain_index = 0;
+};
+
+/// \brief One `set_param` op resolved against the live plan: the commands it becomes, and where the
+/// value lands in the document.
+///
+/// Resolved before anything is pushed, so a patch that fails half way through leaves the rig exactly
+/// as it was -- which is the rule the structural class already lives by, and there is no reason for
+/// the smooth one to be different.
+struct ResolvedEdit
+{
+  std::vector<PlanCommand> commands;
+  /// The document node and parameter to record the value against, so `rig.get` and a later
+  /// structural edit see what is playing. Empty `document_node` means "not a document parameter":
+  /// a per-port setting, or a primitive inside a macro, both of which are runtime state.
+  std::string document_node;
+  std::string document_param;
+  double value = 0.0;
+  bool is_text = false;
+  std::string text;
+};
+
+/// \brief Resolve one smooth-class op, or report that the patch has to go the structural way.
+///
+/// \param structural true when the op is well formed but cannot be a ramp -- a parameter that is not
+/// rampable, an op that is not a `set_param` at all, a target the plan does not have. The structural
+/// path then rebuilds the graph from the document, and it is the authority on *why* something is not
+/// applicable; producing a second, differently worded complaint here would be worse than none.
+/// \param error set only when the op is malformed, or when it addresses a per-port parameter that
+/// does not exist -- which has no structural fallback, because a lane is state rather than a graph.
+bool resolve_smooth_edit(const EditContext& context, const nlohmann::json& op, ResolvedEdit& edit,
+                         bool& structural, std::string& error)
+{
+  structural = false;
+  const PlanSlot* slot = context.slot;
+  if (slot == nullptr || slot->plan == nullptr)
+  {
+    structural = true;
+    return false;
+  }
+
+  if (!op.is_object() || !op.contains("op") || !op["op"].is_string() ||
+      op["op"].get<std::string>() != "set_param")
+  {
+    structural = true;
+    return false;
+  }
+  if (!op.contains("param") || !op["param"].is_string() || op["param"].get<std::string>().empty())
+  {
+    structural = true; // let apply_patch say what a set_param needs
+    return false;
+  }
+  const std::string param = op["param"].get<std::string>();
+
+  const bool is_text = op.contains("value") && op["value"].is_string();
+  if (!op.contains("value") || !(op["value"].is_number() || op["value"].is_string()))
+  {
+    structural = true;
+    return false;
+  }
+  const double value = op["value"].is_number() ? op["value"].get<double>() : 0.0;
+  if (op["value"].is_number() && !std::isfinite(value))
+  {
+    error = "'" + param + "' is not finite";
+    return false;
+  }
+
+  int port = -1;
+  if (op.contains("port"))
+  {
+    if (!op["port"].is_number_integer() || op["port"].get<int>() < 0)
+    {
+      error = "'port' must be a non-negative integer";
+      return false;
+    }
+    port = op["port"].get<int>();
+  }
+
+  const bool has_node = op.contains("node") || op.contains("id");
+  std::string element;
+  if (op.contains("element"))
+  {
+    if (!op["element"].is_string() || op["element"].get<std::string>().empty())
+    {
+      error = "'element' must be a non-empty string";
+      return false;
+    }
+    element = op["element"].get<std::string>();
+  }
+  std::string role;
+  if (op.contains("role"))
+  {
+    if (!op["role"].is_string() || op["role"].get<std::string>().empty())
+    {
+      error = "'role' must be a non-empty string";
+      return false;
+    }
+    role = op["role"].get<std::string>();
+  }
+
+  const graph::Chain& chain = *context.chain;
+  const std::vector<std::string>& node_ids = slot->plan->node_ids();
+
+  // (a) `element` alone naming a macro: the macro-level parameter, mapped onto every node it drives.
+  //     Tried before the plan lookup, because a macro node is not *in* the plan -- it was lowered.
+  if (!element.empty() && role.empty() && !has_node)
+  {
+    const graph::MacroType* macro = nullptr;
+    const graph::NodeSpec* macro_spec = nullptr;
+    for (const graph::NodeSpec& spec : chain.graph.nodes)
+    {
+      if (spec.element != element)
+        continue;
+      if (const graph::MacroType* candidate = graph::find_macro_type(spec.type))
+      {
+        macro = candidate;
+        macro_spec = &spec;
+        break;
+      }
+    }
+    if (macro != nullptr && macro_spec != nullptr)
+    {
+      const graph::MacroParamDecl* declared = graph::find_macro_param(*macro, param);
+      if (declared == nullptr || declared->target_count == 0 || is_text)
+      {
+        // Not a parameter of this macro, or one the lowering itself consumes (a band count, a slope):
+        // both are structural, and apply_patch gives the better message for the first.
+        structural = true;
+        return false;
+      }
+      for (int t = 0; t < declared->target_count; ++t)
+      {
+        const graph::MacroTarget& target = declared->targets[t];
+        const int index = slot->plan->node_index_of_role(element, target.role);
+        if (index < 0)
+        {
+          structural = true;
+          return false;
+        }
+        std::size_t node_index = 0;
+        uint32_t param_id = 0;
+        if (!slot->plan->resolve_param(node_ids[static_cast<std::size_t>(index)], target.param, -1, node_index,
+                                       param_id))
+        {
+          // A target that cannot ramp: the whole edit goes the structural way, because half a macro
+          // parameter applied smoothly and half by a rebuild is not a state anybody asked for.
+          structural = true;
+          return false;
+        }
+        PlanCommand command;
+        command.kind = PlanCommand::Kind::SetParam;
+        command.chain = static_cast<uint32_t>(context.chain_index);
+        command.generation = slot->generation;
+        command.node = static_cast<uint32_t>(node_index);
+        command.param = param_id;
+        command.value = static_cast<float>(graph::apply_transform(target.transform, value, target.scale));
+        edit.commands.push_back(command);
+      }
+      edit.document_node = macro_spec->id;
+      edit.document_param = param;
+      edit.value = value;
+      return true;
+    }
+  }
+
+  // (b) A node of the plan, by id or by element (+ role).
+  int index = -1;
+  if (has_node)
+  {
+    std::string id;
+    if (!op["node"].is_string() && op.contains("node"))
+    {
+      error = "'node' must be a string";
+      return false;
+    }
+    id = op.contains("node") ? op["node"].get<std::string>() : op["id"].get<std::string>();
+    if (id.empty())
+    {
+      error = "'node' must be a non-empty string";
+      return false;
+    }
+    for (std::size_t i = 0; i < node_ids.size(); ++i)
+    {
+      if (node_ids[i] == id)
+      {
+        index = static_cast<int>(i);
+        break;
+      }
+    }
+  }
+  else if (!element.empty())
+  {
+    index = slot->plan->node_index_of_role(element, role);
+  }
+  else
+  {
+    structural = true; // no address at all: apply_patch says what is missing
+    return false;
+  }
+
+  if (index < 0)
+  {
+    // Either an id that is not in the plan (a macro's own id, or a node the plan does not have) or an
+    // element that names several nodes. Both are the structural path's to explain: it works on the
+    // document, where a macro still exists and where an ambiguous element has a different answer.
+    if (port >= 0)
+    {
+      error = has_node ? "node '" + op["node"].get<std::string>() + "' port " + std::to_string(port) +
+                           " has no settable param '" + param + "'"
+                       : "element '" + element + "' has no single node to address a port on";
+      return false;
+    }
+    structural = true;
+    return false;
+  }
+
+  std::size_t node_index = 0;
+  uint32_t param_id = 0;
+  if (is_text || !slot->plan->resolve_param(node_ids[static_cast<std::size_t>(index)], param, port, node_index,
+                                            param_id))
+  {
+    if (port >= 0 && !is_text)
+    {
+      // A port-addressed op has no structural fallback: a per-port parameter lives in the node's
+      // state, not in the graph, so rewriting the graph could not express it. Falling through would
+      // turn "lane 2 does not exist" into "the rig failed to compile", which is a worse answer.
+      error = "node '" + node_ids[static_cast<std::size_t>(index)] + "' port " + std::to_string(port) +
+              " has no settable param '" + param + "'";
+      return false;
+    }
+    structural = true;
+    return false;
+  }
+
+  PlanCommand command;
+  command.kind = PlanCommand::Kind::SetParam;
+  command.chain = static_cast<uint32_t>(context.chain_index);
+  command.generation = slot->generation;
+  command.node = static_cast<uint32_t>(node_index);
+  command.param = param_id;
+  command.value = static_cast<float>(value);
+  edit.commands.push_back(command);
+
+  // The document is updated for a *document* parameter, and only then: a node the document holds, and
+  // a parameter of that node rather than one of its ports. A lowered primitive inside a macro is not
+  // in the document at all -- the macro's own parameter is what the document has to say about it --
+  // and a per-port setting is runtime state by design (docs/daemon.md §"One document, several
+  // chains"). Recording neither is deliberate; guessing a mapping back would be inventing one.
+  if (port < 0)
+  {
+    const std::string& id = node_ids[static_cast<std::size_t>(index)];
+    for (const graph::NodeSpec& spec : chain.graph.nodes)
+    {
+      if (spec.id == id)
+      {
+        edit.document_node = spec.id;
+        edit.document_param = param;
+        edit.value = value;
+        break;
+      }
+    }
+  }
+  return true;
 }
 
 /// \brief The first absolute path in \p document, or an empty string.
@@ -2005,6 +2337,10 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     nlohmann::json nodes = nlohmann::json::array();
     for (const render::NodeType* type : render::all_node_types())
       nodes.push_back(node_type_schema(*type, assets_));
+    // Macros in the same array, told apart by `kind`: a palette wants one list in one order, and a
+    // client that does not know what a macro is can still show it.
+    for (const graph::MacroType* macro : graph::all_macro_types())
+      nodes.push_back(macro_type_schema(*macro, assets_));
     nlohmann::json body;
     body["protocol"] = kProtocolVersion;
     body["nodes"] = std::move(nodes);
@@ -2250,6 +2586,22 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       // The engine's own parse of what it is running, so a client can see the ids it minted and the
       // element/role of every node. A diagnostic, not a document store (§1.1).
       body["document"] = nlohmann::json::parse(graph::document_to_json(current_document_));
+      // And the lowered view: the primitives each macro became, with the engine-minted ids, which is
+      // the only place to see what a document actually runs (§1.5). Two views of one thing: the
+      // document as the client wrote it, and the graph the render thread executes.
+      nlohmann::json lowered = nlohmann::json::array();
+      for (const graph::Chain& chain : current_document_.chains)
+      {
+        graph::Graph primitives;
+        std::string reason;
+        // A chain that lowered when it was published lowers again now: the function is deterministic,
+        // and this is the control thread with nothing on a deadline.
+        if (!graph::lower_graph(chain.graph, primitives, reason))
+          continue;
+        const nlohmann::json graph = nlohmann::json::parse(graph::graph_to_json(primitives));
+        lowered.push_back({{"chain", chain.id}, {"nodes", graph["nodes"]}, {"connections", graph["connections"]}});
+      }
+      body["lowered"] = std::move(lowered);
       body["chains"] = chains_json();
     }
     return ok_response(id, body);
@@ -2302,72 +2654,67 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // patch is the smooth class: a vtable dispatch on the render thread, no compile, no fade. Any
     // other op means the graph changes, so the whole patch is structural and all-or-nothing: it is
     // applied to a copy and published, which the render thread crossfades into.
+    //
+    // Every op is resolved before any of them is pushed. A patch is one edit from the client's point
+    // of view -- a knob drag is a stream of single-op patches, but a batch is a batch -- and leaving
+    // half of one applied because the fourth op turned out to be structural is the kind of state that
+    // is nobody's intent and everybody's bug report.
+    EditContext context;
+    context.slot = target;
+    context.chain = &current_document_.chains[chain_index];
+    context.chain_index = chain_index;
+
     bool smooth = true;
+    std::vector<ResolvedEdit> edits;
     for (std::size_t i = 0; smooth && i < doc["ops"].size(); ++i)
     {
-      const nlohmann::json& op = doc["ops"][i];
-      if (!op.is_object() || !op.contains("op") || !op["op"].is_string() ||
-          op["op"].get<std::string>() != "set_param")
+      ResolvedEdit edit;
+      bool structural = false;
+      std::string reason;
+      if (resolve_smooth_edit(context, doc["ops"][i], edit, structural, reason))
       {
-        smooth = false;
-        break;
+        edits.push_back(std::move(edit));
+        continue;
       }
-      if (!op.contains("node") || !op["node"].is_string() || !op.contains("param") ||
-          !op["param"].is_string() || !op.contains("value") || !op["value"].is_number())
-      {
-        // Malformed even for the structural path, but let apply_patch produce the precise message.
-        smooth = false;
-        break;
-      }
-      // An optional port: a mixer's per-input settings are addressed by port rather than by a name
-      // like `level3`, and one that the node does not have is not resolved.
-      int port = -1;
-      if (op.contains("port"))
-      {
-        if (!op["port"].is_number_integer() || op["port"].get<int>() < 0)
-        {
-          return error_response(id, "bad_request", "'port' must be a non-negative integer");
-        }
-        port = op["port"].get<int>();
-      }
-      std::size_t node_index = 0;
-      uint32_t param_id = 0;
-      if (!target->plan->resolve_param(op["node"].get<std::string>(), op["param"].get<std::string>(), port,
-                                       node_index, param_id))
-      {
-        // A port-addressed op has no structural fallback: a per-port parameter lives in the node's
-        // state, not in the graph, so rewriting the graph could not express it. Falling through would
-        // turn "lane 2 does not exist" into "the rig failed to compile", which is a worse answer to
-        // the same question.
-        if (port >= 0)
-        {
-          return error_response(id, "patch_rejected",
-                               "node '" + op["node"].get<std::string>() + "' port " + std::to_string(port) +
-                                 " has no settable param '" + op["param"].get<std::string>() + "'");
-        }
-        smooth = false;
-      }
+      if (!structural)
+        return error_response(id, "patch_rejected", "ops[" + std::to_string(i) + "]: " + reason);
+      smooth = false;
     }
 
     if (smooth)
     {
-      unsigned applied = 0;
-      for (const nlohmann::json& op : doc["ops"])
+      for (const ResolvedEdit& edit : edits)
       {
-        int port = -1;
-        if (op.contains("port") && op["port"].is_number_integer())
-          port = op["port"].get<int>();
-        std::string error;
-        if (!publish_param(chain_id, op["node"].get<std::string>(), port, op["param"].get<std::string>(),
-                           op["value"].get<double>(), error))
+        for (const PlanCommand& command : edit.commands)
         {
-          return error_response(id, "patch_rejected", "ops[" + std::to_string(applied) + "]: " + error);
+          if (!commands_.push(command))
+            return error_response(id, "patch_rejected",
+                                  "the command ring is full; the render thread is not consuming edits");
         }
-        ++applied;
       }
+      // The document follows what is playing. Without this, `rig.get` would report the values the
+      // document arrived with rather than the ones the user has been turning, and the next structural
+      // edit -- which is built from this document -- would silently revert every ramped parameter
+      // (docs/macros.md §"What a macro edit records").
+      for (const ResolvedEdit& edit : edits)
+      {
+        if (edit.document_node.empty())
+          continue;
+        for (graph::NodeSpec& spec : current_document_.chains[chain_index].graph.nodes)
+        {
+          if (spec.id != edit.document_node)
+            continue;
+          if (edit.is_text)
+            spec.strings[edit.document_param] = edit.text;
+          else
+            spec.params[edit.document_param] = edit.value;
+          break;
+        }
+      }
+
       nlohmann::json body;
       body["kind"] = "smooth";
-      body["applied"] = applied;
+      body["applied"] = edits.size();
       body["chain"] = chain_id;
       body["generation"] = generation_;
       return ok_response(id, body);
@@ -2376,12 +2723,12 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // The structural class. Only the named chain's graph changes, so only that chain is replanned and
     // crossfaded: publish_document compares each chain and leaves the others' plans alone.
     graph::Document patched = current_document_;
-    graph::PatchContext context;
+    graph::PatchContext patch_context;
     // A model path in a patch is relative to the rig being patched, the same rule a rig's own model
     // paths follow, so the two agree about where models live.
-    context.base_dir = current_base_dir_;
+    patch_context.base_dir = current_base_dir_;
     std::string error;
-    if (!graph::apply_patch(patched.chains[chain_index].graph, doc["ops"].dump(), context, error))
+    if (!graph::apply_patch(patched.chains[chain_index].graph, doc["ops"].dump(), patch_context, error))
       return error_response(id, "patch_rejected", error);
     std::string code = "compile_failed";
     if (!publish_document(patched, current_rig_, current_source_, current_base_dir_, error, &code))

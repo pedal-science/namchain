@@ -119,6 +119,14 @@ void resolve_relative_paths(Document& document, const std::string& base_dir);
 /// rules, which is what makes "did my edit land, and where" answerable.
 std::string document_to_json(const Document& document);
 
+/// \brief One graph as JSON: `{"nodes": [...], "connections": [...]}`, in the same spelling a
+/// document's chain uses.
+///
+/// Used to show the *lowered* graph -- what the engine is actually running, after every macro has
+/// been expanded -- which is the half of `rig.get` that a macro makes worth having: the document says
+/// "a feedback delay", and this says which seven primitives that became.
+std::string graph_to_json(const Graph& graph);
+
 /// \brief Structural checks over a whole document, with the chain named in any failure.
 ///
 /// One chain, one plan: the per-chain checks are \ref validate(const Graph&) unchanged, and this adds

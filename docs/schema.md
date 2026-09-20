@@ -33,7 +33,7 @@ returns
 |---|---|
 | `id` | what a document writes as `"type"` |
 | `name`, `category` | what a palette calls it and groups it under. The engine owns these because a type the app cannot name is a type the app cannot offer |
-| `kind` | `primitive` today; `macro` arrives with the lowering layer (slice E), and a client should not care which it is looking at |
+| `kind` | `primitive` or `macro`. One array holds both, in palette order, because a client that lists blocks wants one list; a macro carries the extra `roles` and per-parameter `targets` that say how it lowers (docs/macros.md) |
 | `ports.in[]`, `ports.out[]` | per-port `channels` and `optional`. **An unconnected input is legal and is bound to silence**, which is what makes a dry lane a matter of not wiring it rather than of wiring a special node |
 | `arity` | for a node whose port count comes from a parameter (`nc.split`, `nc.mix`): the parameter, its bounds and its default. `null` for a fixed shape |
 | `per_port_params[]` | parameters that exist once per port rather than once per node — a mixer's level, mute and polarity per input. The same shapes as `params`, addressed with a `port` in a patch |
@@ -77,6 +77,11 @@ error. The distinction shows up in the message: *"the schema's maximum is 24"* i
 *"30000 Hz is at or above Nyquist for 48000 Hz"* is a client asking for something the rig cannot do.
 
 ### Addressing a parameter
+
+A macro's parameters live in the same namespace as a node's, so an inspector written against this
+catalogue works for both; the only difference is that a macro parameter may drive several node
+parameters at once, and that the engine works out which (its `targets`). Addressing a *target* rather
+than the macro needs `role`; see docs/macros.md.
 
 Three pieces of an address, and a patch may use the one that fits:
 
@@ -125,6 +130,12 @@ Three claims are asserted rather than promised, in `tests/test_schema.cpp`:
    build.
 
 ## What is not here yet
+
+A macro's parameter map is published, but a client that wants to *draw* the lowered graph should read
+`rig.get`'s `lowered` view rather than reconstructing it from `roles` and `targets`: the map says what
+a parameter drives, not how the nodes are wired.
+
+
 
 - **Per-port parameters are runtime, not document.** `nc.mix` declares a level, a mute and a polarity
   per input (`per_port_params`), addressed by port in `rig.patch`, and they are the smooth class — a

@@ -117,6 +117,7 @@ endif()
 add_library(namchain OBJECT
   src/nam/lookback.cpp
   src/assets/registry.cpp
+  src/graph/macro.cpp
   src/io/wav.cpp
   src/io/alsa_params.cpp
   src/io/pcm.cpp
@@ -140,6 +141,7 @@ add_library(namchain OBJECT
   src/latency/latency.cpp
   src/glitch/glitch.cpp
   src/nodes/builtin.cpp
+  src/nodes/macros.cpp
   src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
   ${NAMC_CORE_SOURCES})
@@ -280,6 +282,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_document.cpp
     tests/test_schema.cpp
     tests/test_assets.cpp
+    tests/test_macros.cpp
     tests/test_latency.cpp
     tests/test_glitch.cpp
     tests/test_ramp.cpp

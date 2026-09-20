@@ -12,6 +12,7 @@
 #include <fstream>
 #include <system_error>
 
+#include "namchain/graph/macro.h"
 #include "namchain/graph/plan.h"
 #include "namchain/graph/rig.h"
 
@@ -586,17 +587,36 @@ ScanStats Registry::refresh()
 bool resolve_document(graph::Document& document, const Registry& registry, const std::string& base_dir,
                       std::string& error)
 {
+  // A node's parameters come from its node type; a *macro's* come from the macro's own schema, which
+  // is where a cab macro's `ir` lives. Both are the same declaration shape, so this is one loop with a
+  // different table -- and it means a macro parameter that names a model or an IR is resolved here,
+  // before lowering copies it onto the primitive that will load it.
+  const auto param_count_of = [](const graph::NodeSpec& node) {
+    if (const render::NodeType* type = render::find_node_type(node.type))
+      return type->param_count;
+    if (const graph::MacroType* macro = graph::find_macro_type(node.type))
+      return macro->param_count;
+    return -1; // an unknown type: not this function's error to report
+  };
+  const auto param_at = [](const graph::NodeSpec& node, int index) -> const render::ParamDesc* {
+    if (const render::NodeType* type = render::find_node_type(node.type))
+      return &type->params[index];
+    if (const graph::MacroType* macro = graph::find_macro_type(node.type))
+      return &macro->params[index].desc;
+    return nullptr;
+  };
+
   for (graph::Chain& chain : document.chains)
   {
     for (graph::NodeSpec& node : chain.graph.nodes)
     {
-      const render::NodeType* type = render::find_node_type(node.type);
-      if (type == nullptr || type->params == nullptr)
-        continue; // an unknown node type is the compiler's error to report, not this function's
+      const int param_count = param_count_of(node);
+      if (param_count < 0)
+        continue;
 
-      for (int i = 0; i < type->param_count; ++i)
+      for (int i = 0; i < param_count; ++i)
       {
-        const render::ParamDesc& param = type->params[i];
+        const render::ParamDesc& param = *param_at(node, i);
         if (param.options_from == nullptr)
           continue;
 

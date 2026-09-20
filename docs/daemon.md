@@ -219,15 +219,15 @@ One JSON object per message in each direction, over either transport above. A re
 | method | request | response |
 |---|---|---|
 | `engine.hello` | `{"protocol": 2, "token": "…"?}` | `role`, `version`, `protocol` (what the server speaks), `features`, `transport` (`unix`/`tcp`) and `authenticated`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol`. On TCP the token is required and is checked **before** the version, so a peer without it learns nothing else |
-| `engine.schema` | — | the catalogue: every node type with its ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. A parameter whose choices live in the library carries them, resolved from the same scan `engine.assets` reports. See docs/schema.md |
+| `engine.schema` | — | the catalogue: every node type **and every macro** in one array, told apart by `kind` (`primitive`/`macro`), with ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. A macro additionally carries the `roles` it lowers to and, per parameter, the `targets` it drives. A parameter whose choices live in the library carries them, resolved from the same scan `engine.assets` reports. See docs/schema.md and docs/macros.md |
 | `engine.assets` | `{"refresh": true?}` | the model and impulse-response library: an entry per file with its `id`, where it is, its size and mtime, and the rate/architecture/length when the file's own header says so. See docs/assets.md |
 | `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), and `health`/`issues` (below) |
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `rig.load` | `{"rig": "name.json"}` | compiled and published; returns `rig`, `generation` |
 | `rig.apply` | `{"document": { … }}` — a whole document, parsed by the same parser a rig file goes through | `name`, `chains`, `generation`; relative model paths resolve against the rigs root |
-| `rig.patch` | `{"ops": [...], "chain": "id"?}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass` | `kind` (`smooth` or `structural`), `applied`, `chain`, `generation` |
-| `rig.get` | — | the rig path (empty for an applied document), `source` (`file`/`applied`), `generation`, `loaded`, the current `document` as the engine parsed it, and a per-chain summary |
+| `rig.patch` | `{"ops": [...], "chain": "id"?}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass`. A target is named by `node`, or by `element` with an optional `role` (and `port` for a per-port parameter) | `kind` (`smooth` or `structural`), `applied`, `chain`, `generation` |
+| `rig.get` | — | the rig path (empty for an applied document), `source` (`file`/`applied`), `generation`, `loaded`, the current `document` as the engine parsed it, the `lowered` graph it became (macros expanded, with the engine-minted ids), and a per-chain summary |
 
 Unknown fields are ignored; an unknown method is `unknown_method`. A malformed message never kills
 the connection or the daemon.
@@ -235,6 +235,19 @@ the connection or the daemon.
 `chain` is optional for a document with one chain and **required** when there are several: a patch or
 a mute that did not say which chain would otherwise edit an arbitrary one, and guessing is not a
 service. An unknown chain is `unknown_chain` and names the one that was asked for.
+
+An op names its target one of three ways (`docs/ui-integration-plan.md` §1.3):
+
+```jsonc
+{ "op": "set_param", "element": "b3", "param": "feedback", "value": 0.6 }        // a macro parameter
+{ "op": "set_param", "element": "b3", "role": "line", "param": "ms", "value": 250 } // one lowered node
+{ "op": "set_param", "node": "gain2", "param": "gain_db", "value": -6 }         // a node by id
+```
+
+`element` is the client's own identity for a block and `role` is the engine's name for one node of it
+(docs/macros.md). An element with several nodes and no role is refused with the roles to choose from,
+and an address that names nothing is refused with what exists — no op ever silently does nothing. A
+value may be a number or, for an option parameter, a string.
 
 ### Where a document comes from, and what a client can read back
 
@@ -403,6 +416,18 @@ Two different trust levels, two different rules:
   may still *edit* a document that contains one — the rule is about what the client writes, not about
   what it can reach. Refused as `path_refused`, quoting the path, before anything is compiled.
 
+### Macros: a block the engine lowers
+
+A document may hold **macros** as well as primitives: `fx.eq.bands`, `fx.eq.tilt`, `fx.filter.cut`,
+`fx.mix.drywet`, `fx.delay.feedback`, `fx.amp.tonestack`, `fx.cab.ir`. They are lowered into
+primitives when a chain is compiled, so nothing on the render path — and no node type — knows that
+macros exist. `rig.get` returns both views: the document with its macros, and the primitives they
+became.
+
+A macro is addressed by `element` (its own parameters) or `element` + `role` (one node inside it), and
+`engine.schema` publishes both its parameter map and its roles. docs/macros.md is the reference,
+including what a macro-level `set_param` records and the two bypass rules.
+
 ### Assets: a model is an id, not a file
 
 A `nc.nam` node's `model` and a `nc.cab.ir` node's `ir` are **references**, resolved when a document
@@ -512,7 +537,14 @@ expected.
 
 ## What is built, and what is not
 
-Built: **the asset library** — `models_root` and `irs_root`, a cached recursive scan (id, relative
+Built: **the macro layer** — seven macros (`fx.eq.bands`, `fx.eq.tilt`, `fx.filter.cut`,
+`fx.mix.drywet`, `fx.delay.feedback`, `fx.amp.tonestack`, `fx.cab.ir`) lowered per compile into
+biquads, gains, mixes and the existing delay line; a declared param map with a closed transform set,
+so one knob drives as many node parameters as it means to and a macro-level `set_param` writes exactly
+what the next compile produces; deterministic `element:role` ids; two bypass rules (`roles` and
+`crossfade`) declared per macro; `element`/`role` addressing in `rig.patch`; macros published beside
+primitives in `engine.schema` and expanded in `rig.get`'s `lowered` view; and an equivalence test per
+macro against the hand-built graph it stands for (docs/macros.md); **the asset library** — `models_root` and `irs_root`, a cached recursive scan (id, relative
 path, kind, size, mtime, and the sample rate/architecture/length a file's own header declares),
 `engine.assets` with an explicit `refresh`, `options_from` resolved through the same scan in
 `engine.schema`, model and IR references resolved by id with an `asset_missing` refusal that lists the
@@ -549,13 +581,14 @@ Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
   mixer setting (slice E's lowering is where that belongs);
 - no option (string) parameter can be patched yet, so `mode` and `model` are changed by a reload or a
   `swap_model` rather than by `set_param` (slice B2's remainder);
-- no lowered view in `rig.get`, because there is nothing to lower yet: a node is a node until the
-  macro layer exists (slice E);
+- no macro that lowers to another macro, and no `nc.split` `mode` (`y`/`aB`/`crossover`/`dynamic`): a
+  crossover is real DSP and is a macro of its own when something asks for one (docs/macros.md);
+- no option parameter can be *ramped*, so changing a model, an IR or a filter mode is always a
+  structural edit and a crossfade -- which is also the honest answer, a cabinet swap not being a knob;
 - no TLS and no per-client identity on the TCP transport: one pre-shared token for one appliance, with
   a tunnel as the documented answer off-LAN (see the threat model above);
 - no write path to the library and no `model.load`/`model.unload`/`model.list`: it is what the
   operator put on the device, listed by `engine.assets` (docs/assets.md §"What is not here");
 - no presets, tags or favourites, and no amp/cab metadata beyond the directory tree;
-- no macros, so a block that is really a subgraph has to be written out as one (slice E);
 - no telemetry subscription and no `scene.*`, `model.*`, `bench.run` methods;
 - no state-accurate NAM warm start (M3), so `swap_model` crossfades rather than replaying history.

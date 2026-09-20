@@ -25,6 +25,7 @@
 
 #include "namchain/daemon/config.h"
 #include "namchain/daemon/daemon.h"
+#include "namchain/graph/macro.h"
 #include "namchain/wav.h"
 
 namespace
@@ -1963,4 +1964,315 @@ TEST_CASE("a library root that is not there is an informational issue, not a fai
   CHECK(assets["models"].empty());
   CHECK(assets["roots"]["models"]["readable"] == false);
   CHECK(assets["roots"]["models"]["error"] == "no such directory");
+}
+
+// ---------------------------------------------------------------------------
+// Macros on the wire: element addressing, lowering, and what a patch records
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// A chain with two macros in it, which is the shape the addressing tests need: a feedback delay and
+/// a tone stack, both behind one input.
+const char* const kMacroRig = R"({
+  "name": "macros",
+  "nodes": [
+    { "id": "in", "type": "nc.input" },
+    { "id": "g", "type": "nc.gain", "gain_db": 0 },
+    { "element": "dly", "type": "fx.delay.feedback", "time": 200, "feedback": 0.4, "mix": 0.5 },
+    { "element": "ts", "type": "fx.amp.tonestack", "bass": 2, "mid": -1 },
+    { "id": "out", "type": "nc.output" }
+  ],
+  "connections": [
+    { "from": "in", "to": "g" },
+    { "from": "g", "to": "dly" },
+    { "from": "dly", "to": "ts" },
+    { "from": "ts", "to": "out" }
+  ]
+})";
+
+} // namespace
+
+TEST_CASE("a document with macros renders, reports both views, and is patched by element")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "macros.json", kMacroRig);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.models_root = NAMCHAIN_TEST_DATA_DIR;
+  config.irs_root = NAMCHAIN_TEST_DATA_DIR;
+  config.rig = (root / "macros.json").string();
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["blocks"].get<uint64_t>() > 0;
+  }));
+
+  // Both views: the document as the client wrote it (two macros), and the primitives they became.
+  const auto get = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  REQUIRE(get["ok"] == true);
+  REQUIRE(get["document"]["chains"][0]["nodes"].size() == 5);
+  CHECK(get["document"]["chains"][0]["nodes"][2]["type"] == "fx.delay.feedback");
+  CHECK(get["document"]["chains"][0]["nodes"][2]["element"] == "dly");
+
+  const auto& lowered = get["lowered"][0]["nodes"];
+  CHECK(lowered.size() == 13); // in + gain + 7 for the delay + 3 for the tone stack + out
+  bool saw_role = false;
+  bool saw_minted_id = false;
+  for (const auto& node : lowered)
+  {
+    saw_role = saw_role || node["role"] == "line";
+    saw_minted_id = saw_minted_id || node["id"] == "dly:line";
+  }
+  CHECK(saw_role);
+  CHECK(saw_minted_id);
+
+  // A macro-level parameter, addressed by element alone: one knob, two gains, one smooth edit.
+  const auto mix = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"method":"rig.patch","ops":[{"op":"set_param","element":"dly","param":"mix","value":0.75}]})"));
+  REQUIRE(mix["ok"] == true);
+  CHECK(mix["kind"] == "smooth");
+  CHECK(mix["applied"] == 1);
+  const bool applied = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["params_applied"].get<uint64_t>() >= 2; // both gains of the crossfade
+  });
+  CHECK_MESSAGE(applied, "a macro parameter did not reach both of its targets");
+
+  // The document follows what is playing, so `rig.get` is not a stale answer and a later structural
+  // edit does not silently revert the knob.
+  const auto after = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  CHECK(after["document"]["chains"][0]["nodes"][2]["mix"] == 0.75);
+  CHECK(after["document"]["chains"][0]["nodes"][1]["gain_db"] == 0); // nothing else moved
+
+  // A plain node is addressed by its element too -- which defaults to its id, so a hand-written rig
+  // needs no new field to be addressable this way.
+  const auto gain = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"method":"rig.patch","ops":[{"op":"set_param","element":"g","param":"gain_db","value":-6}]})"));
+  REQUIRE(gain["ok"] == true);
+  CHECK(gain["kind"] == "smooth");
+  CHECK(nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"))["document"]["chains"][0]
+          ["nodes"][1]["gain_db"] == -6);
+
+  // A parameter the lowering itself consumes (a band count) is structural, and goes through the
+  // document rather than the plan.
+  const auto bands = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"method":"rig.patch","ops":[{"op":"set_param","element":"ts","param":"mid_freq","value":800}]})"));
+  REQUIRE(bands["ok"] == true);
+  CHECK(bands["kind"] == "smooth"); // mid_freq is one biquad's frequency: rampable
+
+  // And a parameter that is genuinely structural: `bands` on the EQ macro, which changes which bands
+  // are bypassed rather than a value anywhere.
+  write_file(root / "eq.json", R"({
+    "nodes": [
+      { "id": "in", "type": "nc.input" },
+      { "element": "eq", "type": "fx.eq.bands" },
+      { "id": "out", "type": "nc.output" }
+    ],
+    "connections": [ { "from": "in", "to": "eq" }, { "from": "eq", "to": "out" } ]
+  })");
+  REQUIRE(nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.load","rig":"eq.json"})"))["ok"] ==
+          true);
+  const auto before_generation = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.get"})"))["generation"].get<uint64_t>();
+  const auto band_change = nlohmann::json::parse(call(
+    config.socket_path, R"({"method":"rig.patch","ops":[{"op":"set_param","element":"eq","param":"bands","value":2}]})"));
+  REQUIRE(band_change["ok"] == true);
+  CHECK(band_change["kind"] == "structural");
+  CHECK(band_change["generation"].get<uint64_t>() > before_generation);
+  CHECK(nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"))["document"]["chains"][0]
+          ["nodes"][1]["bands"] == 2);
+
+  // `element` + `role` addresses one node of the lowering, which is the escape hatch for poking a
+  // primitive inside a macro.
+  const auto role_edit = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"method":"rig.patch","ops":[{"op":"set_param","element":"eq","role":"band1","param":"freq","value":250}]})"));
+  REQUIRE(role_edit["ok"] == true);
+  CHECK(role_edit["kind"] == "smooth");
+
+  // Bypassing a whole macro is one flag on the macro, and it is a structural edit -- the lowering
+  // decides what the flag means.
+  const auto bypass = nlohmann::json::parse(call(
+    config.socket_path, R"({"method":"rig.patch","ops":[{"op":"bypass","element":"eq","bypass":true}]})"));
+  REQUIRE(bypass["ok"] == true);
+  CHECK(bypass["kind"] == "structural");
+  const auto bypassed = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  CHECK(bypassed["document"]["chains"][0]["nodes"][1]["bypass"] == true); // the eq rig: nodes[1] is the macro
+  bool every_band_bypassed = true;
+  for (const auto& node : bypassed["lowered"][0]["nodes"])
+    every_band_bypassed = every_band_bypassed && (node["bypass"] == true || node["type"] == "nc.input" ||
+                                                  node["type"] == "nc.output");
+  CHECK(every_band_bypassed);
+
+  // An address that names nothing is refused with what exists, rather than doing nothing.
+  const auto unknown = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"method":"rig.patch","ops":[{"op":"set_param","element":"nope","param":"time","value":1}]})"));
+  REQUIRE(unknown["ok"] == false);
+  CHECK(unknown["error"]["code"] == "patch_rejected");
+  CHECK(unknown["error"]["message"].get<std::string>().find("nope") != std::string::npos);
+
+  const auto unknown_role = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"method":"rig.patch","ops":[{"op":"set_param","element":"eq","role":"band9","param":"freq","value":250}]})"));
+  REQUIRE(unknown_role["ok"] == false);
+  CHECK(unknown_role["error"]["message"].get<std::string>().find("band9") != std::string::npos);
+
+  // A macro parameter that does not exist is refused with the list of the ones that do.
+  const auto unknown_param = nlohmann::json::parse(call(
+    config.socket_path,
+    R"({"method":"rig.patch","ops":[{"op":"set_param","element":"eq","param":"gain","value":1}]})"));
+  REQUIRE(unknown_param["ok"] == false);
+  CHECK(unknown_param["error"]["message"].get<std::string>().find("gain1") != std::string::npos);
+}
+
+TEST_CASE("engine.schema publishes macros beside the primitives, and a macro's IR comes from the library")
+{
+  TempDir dir;
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = (dir.path / "rigs").string();
+  config.models_root = NAMCHAIN_TEST_DATA_DIR;
+  config.irs_root = NAMCHAIN_TEST_DATA_DIR;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  config.reclamation_timeout_ms = 5;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const auto schema = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.schema"})"));
+  REQUIRE(schema["ok"] == true);
+
+  const nlohmann::json* delay = nullptr;
+  const nlohmann::json* cab = nullptr;
+  std::size_t macros = 0;
+  std::size_t primitives = 0;
+  for (const auto& node : schema["nodes"])
+  {
+    if (node["kind"] == "macro")
+    {
+      ++macros;
+      if (node["id"] == "fx.delay.feedback")
+        delay = &node;
+      if (node["id"] == "fx.cab.ir")
+        cab = &node;
+    }
+    else
+    {
+      ++primitives;
+      // A primitive says so too, so one array can be filtered either way.
+      CHECK(node["kind"] == "primitive");
+    }
+  }
+  CHECK(macros == 7);
+  CHECK(primitives >= 11);
+  REQUIRE(delay != nullptr);
+  REQUIRE(cab != nullptr);
+
+  // A macro publishes the same parameter fields as a node type, plus its roles and its param map.
+  CHECK((*delay)["inputs"] == 1);
+  CHECK((*delay)["outputs"] == 1);
+  CHECK((*delay)["bypass"] == "crossfade");
+  bool has_time = false;
+  bool has_target = false;
+  for (const auto& param : (*delay)["params"])
+  {
+    if (param["id"] != "time")
+      continue;
+    has_time = true;
+    CHECK(param["kind"] == "number");
+    CHECK(param["unit"] == "ms");
+    CHECK(param["rampable"] == true);
+    CHECK(param["min"] == 1.0);
+    CHECK(param["max"] == 1000.0);
+    REQUIRE(param["targets"].size() == 1);
+    has_target = param["targets"][0]["role"] == "line" && param["targets"][0]["param"] == "ms" &&
+                 param["targets"][0]["transform"] == "direct";
+  }
+  CHECK(has_time);
+  CHECK(has_target);
+
+  bool saw_line_role = false;
+  for (const auto& role : (*delay)["roles"])
+    saw_line_role = saw_line_role || (role["role"] == "line" && role["type"] == "nc.delay");
+  CHECK(saw_line_role);
+
+  // The cabinet's `ir` is an option whose values come from the device's library -- the same scan
+  // `engine.assets` reports -- and the macro's own schema is what the client reads it from.
+  const auto& ir_param = (*cab)["params"][0];
+  CHECK(ir_param["id"] == "ir");
+  CHECK(ir_param["kind"] == "option");
+  CHECK(ir_param["options_from"] == "irs");
+  CHECK(ir_param["required"] == true);
+  REQUIRE(ir_param["options"].size() >= 1);
+  bool saw_cab_ir = false;
+  for (const auto& option : ir_param["options"])
+    saw_cab_ir = saw_cab_ir || option["value"] == "CabIR";
+  CHECK(saw_cab_ir);
+
+  // A macro names its IR by library id, and it resolves through the registry on the way to the node
+  // that will load it -- which is the piece that makes a macro's asset parameter the same thing as a
+  // primitive's.
+  namchain::graph::Document document;
+  std::string parse_error;
+  const char* const rig = R"({
+    "nodes": [
+      { "id": "in", "type": "nc.input" },
+      { "element": "cab", "type": "fx.cab.ir", "ir": "CabIR" },
+      { "id": "out", "type": "nc.output" }
+    ],
+    "connections": [ { "from": "in", "to": "cab" }, { "from": "cab", "to": "out" } ]
+  })";
+  REQUIRE_MESSAGE(namchain::graph::parse_document_json(rig, document, parse_error), parse_error);
+  namchain::graph::Graph primitives_graph;
+  REQUIRE_MESSAGE(namchain::graph::lower_graph(document.chains[0].graph, primitives_graph, parse_error),
+                  parse_error);
+  // Before resolution the string is still the id; the daemon resolves it on the copy it compiles, so
+  // this checks the lowering carries a string parameter through to the node that reads it.
+  bool carried = false;
+  for (const namchain::graph::NodeSpec& spec : primitives_graph.nodes)
+    carried = carried || (spec.role == "ir" && spec.strings.count("ir") == 1 && spec.strings.at("ir") == "CabIR");
+  CHECK(carried);
 }

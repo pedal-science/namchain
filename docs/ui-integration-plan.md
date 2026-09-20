@@ -25,8 +25,15 @@ recursive scan (size and mtime, at nanosecond resolution where the filesystem ha
 with an explicit `refresh`, `options_from` resolved through the same scan in `engine.schema`, model and
 IR references resolved by id with an `asset_missing` refusal that lists the near misses, and
 `docs/assets.md` as the reference. One departure, recorded in §D3 below: a reference that names a file
-next to the document is resolved **before** the library, not after. Slice D is complete; slice E
-(lowering and the first macros) is next.
+next to the document is resolved **before** the library, not after. Slice D is complete. **E1–E3 landed** — the macro layer: a declared schema, shape, param map (with a
+closed transform set) and bypass rule per macro; deterministic `element:role` id minting; macros
+lowered per compile inside the compiler; `element`/`role` addressing in `rig.patch` with option values
+now patchable as strings; macro-level `set_param` smooth iff every target ramps; `engine.schema`
+publishing macros beside primitives; `rig.get` returning both the document and the lowered graph; and
+the seven macros of E2/E3 lowered to biquads, gains, mixes and the existing delay line, each with an
+equivalence test against the hand-built graph it stands for. One design decision is recorded in §E1
+below: a macro's *shape* never depends on its parameter values — `bands` and `slope` bypass stages
+rather than removing them. Slice E is complete, and with it every slice of this plan.
 Follows
 `docs/ljoss-comparison.md` (the analysis) and the seven decisions recorded below. Slices are ordered
 by dependency, not by appeal; each is independently committable and independently testable, and none
@@ -291,6 +298,20 @@ Compile pipeline becomes: parse → validate → **lint params against the schem
 again → memory plan → `RenderPlan`. Macros are lowered *per compile*, not stored lowered, so
 `rig.get` returns the document the user wrote.
 
+**As built (E1), two refinements to the above**, both recorded because they are visible in the
+schema a client reads:
+
+1. **The 1→1 bypass rule is "every role carries the flag", not "role X does".** A serial chain of five
+   biquads has no single node whose bypass makes the chain transparent; setting the flag on all of
+   them does, because a bypassed node substitutes its dry input. So the rule is `roles` (an OR with
+   whatever the lowering decided for itself — a `slope` above the live count already bypasses those
+   stages) or `crossfade` (two declared gain roles). Both keep every node running, which is the
+   property that matters.
+2. **A macro's shape never depends on its parameter values.** `bands` and `slope` pick how many stages
+   are live by *bypassing* the rest rather than removing them, so the roles a client holds stay valid
+   when a selector moves, and a parameter aimed at a stage that is currently bypassed still means
+   something. The cost is a few tens of flops for stages that are running but unheard.
+
 ### 1.6 Health and issues (Slice B)
 
 The small glowing control needs a cheap, stable answer, not English prose to pattern-match. Add to
@@ -488,14 +509,15 @@ document that names a model by id while the absolute path to the very same file 
 
 | Commit | Contents |
 |---|---|
-| **E1** | `MacroType` infrastructure: declaration, param map with transforms, deterministic id minting, provenance, macro-level `set_param` (smooth iff every target is rampable, one ring record per target in one drain), the bypass rule, macro-level lint |
-| **E2** | `fx.eq.bands`, `fx.eq.tilt`, `fx.filter.cut`, `fx.mix.drywet` |
-| **E3** | `fx.delay.feedback`, `fx.amp.tonestack`, `fx.cab.ir` |
+| **E1** ✅ | `MacroType` infrastructure: declaration (schema, shape, port links, param map with the five transforms), deterministic `element:role` id minting, macro-level lint through the same code as a node's, lowering inside `RenderPlan::compile`, macro-level `set_param` (smooth iff every target ramps; a parameter with no targets is structural), the two bypass rules, and `element`/`role` addressing in `rig.patch` |
+| **E2** ✅ | `fx.eq.bands` (4 bands, shelving ends), `fx.eq.tilt` (one knob, two shelves), `fx.filter.cut` (Butterworth stage Qs per slope), `fx.mix.drywet` (two lanes, one knob) |
+| **E3** ✅ | `fx.delay.feedback` (a cycle through `nc.unit_delay`), `fx.amp.tonestack`, `fx.cab.ir` (with its cuts, and its `ir` resolved through the asset registry) |
 
-**Tests:** for each macro, the lowered shape (nodes, roles, edges) and an **equivalence test** — the
-macro's output is sample-identical to the hand-built graph it stands for, which is the same
-oracle-style argument the compiler already uses; every declared macro param is consumed; every
-rampable macro param ramps through to all its targets; bypass behaves per the declared rule; a macro
+**Tests, as built:** for each macro, the lowered shape (roles, types, edges, minted ids); an
+**equivalence test** — sample-identical to the hand-built graph, written independently in the test,
+which is the same oracle-style argument the compiler uses; every declared macro parameter reaches the
+graph **and only through its declared targets** (which caught two real bugs: `mix` declared one of its
+two gains); bypass per the declared rule, including that a bypassed delay keeps running; a macro
 addressed by element and one addressed by the same param on the underlying node produce the same
 result.
 
