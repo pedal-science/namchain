@@ -2819,8 +2819,14 @@ int Daemon::run()
     // A client can vanish at any point in the walk below; collect the dead indices and erase them
     // after it, so the index arithmetic stays honest. `clients_` does not change during the walk --
     // only this vector of indices does.
+    //
+    // The walk is bounded by the poll set, not by `clients_`: a connection accepted above was not in
+    // `fds` when it was built, so it has no revents to read and is picked up on the next pass.
+    // Bounding by `clients_.size()` would index past the end of `fds` -- into whatever the allocator
+    // freed when `fds` last grew.
+    const std::size_t polled_clients = fds.size() - first_client;
     std::vector<std::size_t> dead;
-    for (std::size_t i = 0; i < clients_.size(); ++i)
+    for (std::size_t i = 0; i < std::min(clients_.size(), polled_clients); ++i)
     {
       Connection& connection = clients_[i];
       const short revents = fds[first_client + i].revents;
