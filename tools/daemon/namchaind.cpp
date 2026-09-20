@@ -31,6 +31,8 @@ void print_usage(std::FILE* stream)
                "      --playback-channels N    default 1\n"
                "      --rig PATH               startup rig; a bare name resolves under --rigs-root\n"
                "      --rigs-root DIR          root for rig.load names (default /etc/namchain/rigs)\n"
+               "      --models-root DIR        the device's .nam model library (default /etc/namchain/models)\n"
+               "      --irs-root DIR           the device's impulse responses (default /etc/namchain/irs)\n"
                "      --socket PATH            control socket (default /run/namchain/namchaind.sock)\n"
                "      --socket-mode OCTAL      socket permissions, default 0660\n"
                "      --tcp-listen             also listen for control connections on TCP (off by default)\n"

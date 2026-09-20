@@ -42,6 +42,15 @@ struct Config
   /// The directory a `rig.load` name is resolved against. A protocol client can name a rig but can
   /// never name a path outside this directory (rig-pipeline.md §5.1 item 1).
   std::string rigs_root = "/etc/namchain/rigs";
+  /// \brief The device's model library and impulse-response library (docs/ui-integration-plan.md
+  /// slice D, docs/assets.md).
+  ///
+  /// Every `.nam` under the models root becomes a model a document can name by id; every `.nam` or
+  /// `.wav` under the IR root becomes an impulse response. Empty disables that library, and a root
+  /// that is missing is an empty library rather than a startup failure -- the registry reports it and
+  /// `engine.status` says so.
+  std::string models_root = "/etc/namchain/models";
+  std::string irs_root = "/etc/namchain/irs";
   /// Unix SOCK_SEQPACKET listening socket.
   std::string socket_path = "/run/namchain/namchaind.sock";
   /// Permission bits for the socket node, as an octal string in the config file.

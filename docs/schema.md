@@ -65,8 +65,8 @@ stereo block is not available rather than discovering it in an error (docs/ui-in
 | `required` | the node cannot be built without it |
 | `one_of` | a group name for alternatives: `nc.delay` takes `samples` **or** `ms`. Giving two members of a group is refused rather than resolved by precedence |
 | `one_of_required` | whether at least one member of that group must be present. True for the delay's time, false for its line length, which may be declared in either unit or not at all |
-| `options` | for `kind: "option"`, an array of `{value, label}` — the wire value and the display label are not assumed to be the same string |
-| `options_from` | for an option whose values live on the device: `"models"` or `"irs"`, resolved through the asset registry (slice D). Exactly one of `options`/`options_from` is present |
+| `options` | for `kind: "option"`, an array of `{value, label}` — the wire value and the display label are not assumed to be the same string. A parameter that declares `options_from` also carries `options`, filled from the device's library, so a palette comes from this one call |
+| `options_from` | for an option whose values live on the device: `"models"` or `"irs"`. The values are the library's **ids** (`tweed/deluxe`), which is what a document and a patch name — never a path, which a network client may not send. Exactly one of `options`/`options_from` is present; an empty library is an empty `options` list, not an error. See docs/assets.md |
 
 ### Ranges: the schema's bounds and the engine's
 

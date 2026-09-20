@@ -1,6 +1,7 @@
 # namchainctl against a real namchaind, over both transports.
 #
-#   cmake -DNAMCHAIND=... -DNAMCHAINCTL=... -DNAMCHAIN_WORK=... -P tests/cli/run_ctl.cmake
+#   cmake -DNAMCHAIND=... -DNAMCHAINCTL=... -DNAMCHAIN_WORK=... -DNAMCHAIN_MODELS=... \
+#         -P tests/cli/run_ctl.cmake
 #
 # This is the only test that runs the daemon as a *process* and talks to it with the reference client,
 # and that is the point of it: everything in tests/test_tcp.cpp exercises the transport in-process,
@@ -12,7 +13,7 @@
 # It also checks the parts of the transport that are only interesting in a real process: the token
 # file, the port the kernel picked (read back from engine.status over the *other* transport), a
 # refusal a client can act on, and the daemon going away when it is asked to.
-foreach(_required NAMCHAIND NAMCHAINCTL NAMCHAIN_WORK)
+foreach(_required NAMCHAIND NAMCHAINCTL NAMCHAIN_WORK NAMCHAIN_MODELS)
   if(NOT DEFINED ${_required})
     message(FATAL_ERROR "run_ctl.cmake: ${_required} is required")
   endif()
@@ -69,6 +70,7 @@ execute_process(
   COMMAND sh -c "exec \"${NAMCHAIND}\" --backend null --no-lock-memory --rt-priority 0 \
       --capture-channels 2 --playback-channels 2 \
       --socket \"${_socket}\" --rigs-root \"${_work}/rigs\" --rig gain.json \
+      --models-root \"${NAMCHAIN_MODELS}\" --irs-root \"${NAMCHAIN_MODELS}\" \
       --tcp-listen --tcp-address 127.0.0.1 --tcp-port 0 --tcp-token-file \"${_work}/token\" \
       > \"${_work}/daemon.log\" 2>&1 & echo $!"
   OUTPUT_VARIABLE _daemon_pid
@@ -207,6 +209,31 @@ execute_process(COMMAND "${NAMCHAINCTL}" --socket "${_socket}" schema --compact
                 RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
 if(NOT _rc EQUAL 0 OR NOT _out MATCHES "nc.gain")
   _fail("`schema` failed (${_rc}): ${_err}")
+endif()
+
+# The library, and the one thing that makes it worth having: a document names an amp by id, and the
+# client never learns where the models live. `assets` is also where a client gets those ids.
+execute_process(COMMAND "${NAMCHAINCTL}" --socket "${_socket}" assets --compact
+                RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+if(NOT _rc EQUAL 0 OR NOT _out MATCHES "A2-Lite")
+  _fail("`assets` did not list the library (${_rc}): ${_out} ${_err}")
+endif()
+file(WRITE "${_work}/by-id.json" [=[
+{
+  "name": "by id",
+  "nodes": [
+    { "id": "in", "type": "nc.input" },
+    { "id": "amp", "type": "nc.nam", "model": "A2-Lite" },
+    { "id": "out", "type": "nc.output" }
+  ],
+  "connections": [ { "from": "in", "to": "amp" }, { "from": "amp", "to": "out" } ]
+}
+]=])
+execute_process(COMMAND "${NAMCHAINCTL}" --host 127.0.0.1 --port ${_port} --token-file "${_work}/token"
+                        apply "${_work}/by-id.json" --compact
+                RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+if(NOT _rc EQUAL 0 OR NOT _out MATCHES "\"ok\":true")
+  _fail("`apply` of a document naming a model by id failed (${_rc}): ${_out} ${_err}")
 endif()
 
 # --- the daemon stops when it is asked to ------------------------------------

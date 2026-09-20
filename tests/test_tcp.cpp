@@ -743,3 +743,71 @@ TEST_CASE("a network client may not name an absolute path, and a local one may")
   REQUIRE(patched["ok"] == false);
   CHECK(patched["error"]["code"] == "path_refused");
 }
+
+TEST_CASE("a network client names models by id, because a path is refused")
+{
+  Server server;
+  // The generated fixtures are a real library: one WaveNet model and two more .nam files. The
+  // registry only reads headers, so pointing it at the build's fixture directory costs nothing.
+  server.config.models_root = NAMCHAIN_TEST_DATA_DIR;
+  server.config.irs_root = NAMCHAIN_TEST_DATA_DIR;
+  REQUIRE(server.start().empty());
+
+  Client client(server.port());
+  client.send_frame(hello_body("h", kToken));
+  REQUIRE(client.receive_json()["ok"] == true);
+
+  // The library as a network client sees it: ids, not paths to depend on. It also carries `path`,
+  // which is what an operator looking at a local daemon wants -- and what a client must *not* put in
+  // a document, which the rest of this case is about.
+  client.send_frame(R"({"method":"engine.assets"})");
+  const auto assets = client.receive_json();
+  REQUIRE(assets["ok"] == true);
+  REQUIRE(assets["models"].size() >= 1);
+  bool found = false;
+  for (const auto& model : assets["models"])
+    found = found || model["id"] == "A2-Lite";
+  CHECK(found);
+
+  const auto document = [](const char* model) {
+    nlohmann::json body;
+    body["name"] = "by id";
+    body["chains"] = nlohmann::json::array();
+    nlohmann::json chain;
+    chain["id"] = "main";
+    chain["nodes"] = {{{"id", "in"}, {"type", "nc.input"}},
+                      {{"id", "amp"}, {"type", "nc.nam"}, {"model", model}},
+                      {{"id", "out"}, {"type", "nc.output"}}};
+    chain["connections"] = {{{"from", "in"}, {"to", "amp"}}, {{"from", "amp"}, {"to", "out"}}};
+    body["chains"].push_back(std::move(chain));
+
+    nlohmann::json request;
+    request["method"] = "rig.apply";
+    request["document"] = std::move(body);
+    return request.dump();
+  };
+
+  // The id compiles into a plan: the engine resolved it to a file under its own models root, which is
+  // the whole reason a client never has to know where that root is.
+  client.send_frame(document("A2-Lite"));
+  const auto applied = client.receive_json();
+  REQUIRE(applied["ok"] == true);
+  CHECK(applied["generation"].get<uint64_t>() >= 1);
+
+  // An id that is not in the library is refused with the near miss, over this transport as over the
+  // other -- and the refusal is about the library, not about permissions.
+  client.send_frame(document("A2-Lit"));
+  const auto missing = client.receive_json();
+  REQUIRE(missing["ok"] == false);
+  CHECK(missing["error"]["code"] == "asset_missing");
+  CHECK(missing["error"]["message"].get<std::string>().find("A2-Lite") != std::string::npos);
+
+  // The path that would work locally is refused here, and the id that works here is the answer: this
+  // is the trade a network client makes, in one place.
+  const std::string in_library =
+    (std::filesystem::path(NAMCHAIN_TEST_DATA_DIR) / "A2-Lite.nam").string();
+  client.send_frame(document(in_library.c_str()));
+  const auto refused = client.receive_json();
+  REQUIRE(refused["ok"] == false);
+  CHECK(refused["error"]["code"] == "path_refused");
+}

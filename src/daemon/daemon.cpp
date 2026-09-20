@@ -80,12 +80,16 @@ nlohmann::json protocol_features()
 {
   return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
                                 "structural_crossfade", "smooth_params", "bypass", "guard",
-                                "per_chain_mute", "schema", "tcp_transport"});
+                                "per_chain_mute", "schema", "tcp_transport", "assets"});
 }
 
 /// One parameter as `engine.schema` reports it. One shape for the node's own parameters and for the
 /// per-port ones, so a client builds a control the same way wherever it is addressed.
-nlohmann::json param_schema(const render::ParamDesc& param)
+///
+/// A parameter whose choices live in the asset registry (`options_from: "models"` / `"irs"`) is
+/// resolved here rather than left for the client to join: the app gets a palette from one call, and
+/// the answer cannot disagree with `engine.assets` because it is the same scan (slice D2).
+nlohmann::json param_schema(const render::ParamDesc& param, const assets::Registry& registry)
 {
   nlohmann::json p;
   p["id"] = param.id;
@@ -115,11 +119,25 @@ nlohmann::json param_schema(const render::ParamDesc& param)
   p["one_of"] = param.one_of == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.one_of);
   p["one_of_required"] = param.one_of_required;
   p["options_from"] = param.options_from == nullptr ? nlohmann::json(nullptr) : nlohmann::json(param.options_from);
+
+  assets::Kind kind = assets::Kind::Model;
+  const bool from_registry = assets::kind_from_options_from(param.options_from, kind);
   if (param.options != nullptr)
   {
     nlohmann::json options = nlohmann::json::array();
     for (int o = 0; o < param.option_count; ++o)
       options.push_back({{"value", param.options[o].value}, {"label", param.options[o].label}});
+    p["options"] = std::move(options);
+  }
+  else if (from_registry)
+  {
+    // The value is the registry id -- what a document names, and what a network client is allowed to
+    // name. The label is the id too: prettifying "tweed/deluxe" into "Deluxe" is presentation, and
+    // presentation is the app's job (docs/ui-integration-plan.md §1.9). An empty library is an empty
+    // list, which is a true answer a client can show as "no models installed".
+    nlohmann::json options = nlohmann::json::array();
+    for (const assets::Asset* asset : registry.of_kind(kind))
+      options.push_back({{"value", asset->id}, {"label", asset->id}});
     p["options"] = std::move(options);
   }
   else
@@ -129,13 +147,45 @@ nlohmann::json param_schema(const render::ParamDesc& param)
   return p;
 }
 
+/// One asset as `engine.assets` reports it.
+nlohmann::json asset_json(const assets::Asset& asset)
+{
+  nlohmann::json entry;
+  entry["id"] = asset.id;
+  entry["relative"] = asset.relative;
+  entry["path"] = asset.path;
+  entry["name"] = asset.name;
+  entry["group"] = asset.group;
+  entry["kind"] = assets::kind_name(asset.kind);
+  entry["size"] = asset.size;
+  entry["mtime"] = asset.mtime;
+  // Null rather than 0 for "the file did not say": a palette showing 0 Hz would be showing a lie,
+  // and a client that wants a number can test for null once.
+  entry["sample_rate"] = asset.sample_rate > 0.0 ? nlohmann::json(asset.sample_rate) : nlohmann::json(nullptr);
+  entry["frames"] = asset.frames == 0 ? nlohmann::json(nullptr) : nlohmann::json(asset.frames);
+  entry["architecture"] = asset.architecture.empty() ? nlohmann::json(nullptr)
+                                                     : nlohmann::json(asset.architecture);
+  return entry;
+}
+
+/// One library root as the scan found it.
+nlohmann::json root_json(const assets::Root& root)
+{
+  nlohmann::json entry;
+  entry["path"] = root.path;
+  entry["readable"] = root.readable;
+  entry["error"] = root.error.empty() ? nlohmann::json(nullptr) : nlohmann::json(root.error);
+  entry["count"] = root.count;
+  return entry;
+}
+
 /// One node type as `engine.schema` reports it: what a palette offers and what an inspector lays out.
 ///
 /// Every parameter carries its kind, unit, default, bounds (with inclusive/exclusive made explicit),
 /// step and whether it can be ramped -- the catalogue a client would otherwise have to guess at, and
 /// the thing that makes "the knob does nothing" impossible rather than merely unlikely
 /// (docs/ui-integration-plan.md §1.4).
-nlohmann::json node_type_schema(const render::NodeType& type)
+nlohmann::json node_type_schema(const render::NodeType& type, const assets::Registry& registry)
 {
   nlohmann::json entry;
   entry["id"] = type.id;
@@ -177,14 +227,14 @@ nlohmann::json node_type_schema(const render::NodeType& type)
 
   nlohmann::json params = nlohmann::json::array();
   for (int i = 0; i < type.param_count; ++i)
-    params.push_back(param_schema(type.params[i]));
+    params.push_back(param_schema(type.params[i], registry));
   entry["params"] = std::move(params);
 
   // Per-port parameters, declared once and addressed with a port. Same shapes as the node's own, so a
   // client builds one control per lane without a naming convention of its own.
   nlohmann::json per_port = nlohmann::json::array();
   for (int i = 0; i < type.per_port_param_count; ++i)
-    per_port.push_back(param_schema(type.per_port_params[i]));
+    per_port.push_back(param_schema(type.per_port_params[i], registry));
   entry["per_port_params"] = std::move(per_port);
   return entry;
 }
@@ -910,16 +960,17 @@ bool Daemon::publish_param(const std::string& chain_id, const std::string& node,
   return true;
 }
 
-bool Daemon::load_rig(const std::string& rig_path, std::string& error)
+bool Daemon::load_rig(const std::string& rig_path, std::string& error, std::string* error_code)
 {
   graph::Document document;
   if (!graph::load_document_json(rig_path, document, error))
     return false;
-  return publish_document(document, rig_path, "file", std::filesystem::path(rig_path).parent_path().string(), error);
+  return publish_document(document, rig_path, "file", std::filesystem::path(rig_path).parent_path().string(),
+                          error, error_code);
 }
 
 bool Daemon::publish_document(const graph::Document& document, const std::string& path, const std::string& source,
-                              const std::string& base_dir, std::string& error)
+                              const std::string& base_dir, std::string& error, std::string* error_code)
 {
   const graph::Validation validation = graph::validate(document);
   if (!validation.ok)
@@ -934,11 +985,25 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     return false;
   }
 
-  // Relative model/IR paths resolve against the base the document arrived with, on a *copy*: the
-  // document the engine remembers and hands back is the one the client wrote, so applying what
-  // `rig.get` returned is a fixed point rather than a rewrite of every relative path.
+  // Model and IR references are resolved on a *copy*: the document the engine remembers and hands
+  // back is the one the client wrote, so applying what `rig.get` returned is a fixed point rather
+  // than a rewrite of every reference -- and a client keeps seeing its own ids rather than this
+  // device's paths (docs/assets.md).
+  //
+  // The order is worth stating, because the two steps can both answer. A reference that names a file
+  // relative to the document is resolved first, exactly as it was before the registry existed, so a
+  // hand-written rig that names the model sitting beside it keeps meaning that model. What is left
+  // is looked up in the library: an id, or a relative filename that matches one exactly. The
+  // alternative -- the library first -- would let a library entry shadow the file a rig was written
+  // against, and would make the daemon and the offline tools resolve the same rig differently.
   graph::Document resolved = document;
   graph::resolve_relative_paths(resolved, base_dir);
+  if (!assets::resolve_document(resolved, assets_, base_dir, error))
+  {
+    if (error_code != nullptr)
+      *error_code = "asset_missing";
+    return false;
+  }
 
   render::CompileOptions options;
   options.max_quantum = static_cast<int>(config_.period_size);
@@ -1128,6 +1193,12 @@ bool Daemon::start(std::string& error)
   // authenticate never gets as far as opening one.
   if (!resolve_tcp_token(config_, error))
     return false;
+
+  // The library is scanned before the startup rig is compiled, because compiling that rig is the
+  // first thing that may need it. A root that is missing is not fatal here: it is an empty library,
+  // and engine.status says so through `assets`.
+  assets_.configure(config_.models_root, config_.irs_root);
+  assets_.refresh();
 
   if (!setup_signals(error))
     return false;
@@ -1795,6 +1866,20 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       add("memory_not_locked", "warn", "mlockall was refused, so the run is not pinned in memory", 1);
     if (transition_active_.load())
       add("transition", "info", "a structural change is being crossfaded", 1);
+
+    // A library root that is configured and not there is worth saying out loud: the palette is empty,
+    // and "no amps installed" and "the amps directory moved" look identical from a client otherwise.
+    // Informational, not a warning: a device with no IRs is a device with no IRs.
+    for (const assets::Kind kind : {assets::Kind::Model, assets::Kind::Ir})
+    {
+      const assets::Root& root = assets_.root(kind);
+      if (root.readable || root.path.empty())
+        continue;
+      add(kind == assets::Kind::Model ? "models_root_missing" : "irs_root_missing", "info",
+          "the " + std::string(assets::kind_name(kind)) +
+            " library is empty because its directory is not there: " + root.error + " (" + root.path + ")",
+          0);
+    }
     return issues;
   };
 
@@ -1919,12 +2004,45 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // node type cannot be invisible to a client or described differently by two of them.
     nlohmann::json nodes = nlohmann::json::array();
     for (const render::NodeType* type : render::all_node_types())
-      nodes.push_back(node_type_schema(*type));
+      nodes.push_back(node_type_schema(*type, assets_));
     nlohmann::json body;
     body["protocol"] = kProtocolVersion;
     body["nodes"] = std::move(nodes);
     body["max_chains"] = kMaxChains;
     body["stereo"] = false; // declared and refused: see NodeType::channels
+    return ok_response(id, body);
+  }
+  // --- engine.assets: what is in the device's library ----------------------
+  if (method == "engine.assets")
+  {
+    // Answered from the scan rather than from the filesystem, so a client can diff two answers and
+    // know that a difference is a difference on disk. `refresh` before the answer is the one way to
+    // ask for the disk again, and it is cheap when nothing changed: an unchanged file costs a stat,
+    // not a read (docs/assets.md).
+    if (doc.contains("refresh"))
+    {
+      if (!doc["refresh"].is_boolean())
+        return error_response(id, "bad_request", "'refresh' must be a boolean");
+      if (doc["refresh"].get<bool>())
+        assets_.refresh();
+    }
+
+    nlohmann::json models = nlohmann::json::array();
+    for (const assets::Asset* asset : assets_.of_kind(assets::Kind::Model))
+      models.push_back(asset_json(*asset));
+    nlohmann::json irs = nlohmann::json::array();
+    for (const assets::Asset* asset : assets_.of_kind(assets::Kind::Ir))
+      irs.push_back(asset_json(*asset));
+
+    nlohmann::json body;
+    body["models_root"] = assets_.models_root();
+    body["irs_root"] = assets_.irs_root();
+    body["roots"] = {{"models", root_json(assets_.root(assets::Kind::Model))},
+                     {"irs", root_json(assets_.root(assets::Kind::Ir))}};
+    body["scan"] = assets_.scans();
+    body["files_parsed"] = assets_.last_scan().parsed;
+    body["models"] = std::move(models);
+    body["irs"] = std::move(irs);
     return ok_response(id, body);
   }
   if (method == "engine.status")
@@ -1976,6 +2094,14 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // through its own transition. The document-level fields above are derived from these, so a client
     // can read either the whole picture or one chain's.
     status["chains"] = chains_json();
+
+    // The library at a glance. The listing is `engine.assets`; this is the size of it, so a client
+    // that shows a palette can tell "no models installed" from "not asked yet".
+    status["assets"] = {{"models_root", assets_.models_root()},
+                        {"irs_root", assets_.irs_root()},
+                        {"models", assets_.of_kind(assets::Kind::Model).size()},
+                        {"irs", assets_.of_kind(assets::Kind::Ir).size()},
+                        {"scan", assets_.scans()}};
 
     // The control transports as they actually are, not as configured: whether the TCP listener came up
     // and on which port (a configured 0 means the kernel chose), and how many connections each
@@ -2067,8 +2193,9 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     std::string error;
     if (!resolve_rig_name(config_, name, path, error))
       return error_response(id, "rig_not_found", error);
-    if (!load_rig(path, error))
-      return error_response(id, "compile_failed", error);
+    std::string code = "compile_failed";
+    if (!load_rig(path, error, &code))
+      return error_response(id, code, error);
     nlohmann::json body;
     body["rig"] = path;
     body["generation"] = generation_;
@@ -2102,8 +2229,9 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       }
     }
 
-    if (!publish_document(document, /*path=*/"", "applied", config_.rigs_root, error))
-      return error_response(id, "compile_failed", error);
+    std::string code = "compile_failed";
+    if (!publish_document(document, /*path=*/"", "applied", config_.rigs_root, error, &code))
+      return error_response(id, code, error);
     nlohmann::json body;
     body["name"] = document.name;
     body["generation"] = generation_;
@@ -2255,8 +2383,9 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     std::string error;
     if (!graph::apply_patch(patched.chains[chain_index].graph, doc["ops"].dump(), context, error))
       return error_response(id, "patch_rejected", error);
-    if (!publish_document(patched, current_rig_, current_source_, current_base_dir_, error))
-      return error_response(id, "compile_failed", error);
+    std::string code = "compile_failed";
+    if (!publish_document(patched, current_rig_, current_source_, current_base_dir_, error, &code))
+      return error_response(id, code, error);
 
     nlohmann::json body;
     body["kind"] = "structural";
@@ -2317,6 +2446,9 @@ int Daemon::run()
           stop_requested_.store(true);
         else if (info.ssi_signo == SIGHUP)
         {
+          // A reload is also the moment an operator expects a newly copied model to appear in the
+          // palette, so the library is rescanned with the rig.
+          assets_.refresh();
           std::string path;
           std::string error;
           if (!config_.rig.empty() && resolve_startup_rig(config_, config_.rig, path, error) &&

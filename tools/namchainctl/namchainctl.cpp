@@ -65,6 +65,8 @@ void print_usage(std::FILE* stream)
     "  hello                  negotiate the protocol and print what the daemon offers\n"
     "  status                 the device, the document, the chains, and engine health\n"
     "  schema                 the node and parameter catalogue (see docs/schema.md)\n"
+    "  assets [--refresh]     the model and impulse-response library as ids, optionally rescanning it\n"
+    "                         first (the scan is cached by size and mtime, so this is cheap)\n"
     "  get                    the document the engine is running, as the engine parsed it\n"
     "  apply FILE             apply a whole document (FILE, or - for stdin)\n"
     "  patch FILE             apply a patch: either an ops array or {\"chain\":..., \"ops\":[...]}\n"
@@ -276,6 +278,8 @@ const char* method_for(const std::string& command)
     return "engine.status";
   if (command == "schema")
     return "engine.schema";
+  if (command == "assets")
+    return "engine.assets";
   if (command == "get")
     return "rig.get";
   if (command == "apply")
@@ -311,6 +315,7 @@ struct Options
   unsigned port = 47810;
   bool compact = false;
   bool quiet = false;
+  bool refresh = false;
 
   std::string command;
   std::vector<std::string> positional;
@@ -355,6 +360,8 @@ int main(int argc, char** argv)
 
     if (word == "--compact")
       options.compact = true;
+    else if (word == "--refresh")
+      options.refresh = true;
     else if (word == "--quiet")
       options.quiet = true;
     else if (word == "--socket")
@@ -470,9 +477,12 @@ int main(int argc, char** argv)
   };
 
   if (options.command == "hello" || options.command == "status" || options.command == "schema" ||
-      options.command == "get" || options.command == "panic")
+      options.command == "get" || options.command == "panic" || options.command == "assets")
   {
-    // No arguments; the method is the whole request.
+    // No arguments; the method is the whole request, except for `assets --refresh`, which asks the
+    // daemon to look at the disk again rather than answer from its scan.
+    if (options.refresh)
+      request["refresh"] = true;
   }
   else if (options.command == "apply")
   {

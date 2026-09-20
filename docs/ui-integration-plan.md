@@ -20,7 +20,13 @@ the TCP transport: u32 little-endian framing over a non-blocking acceptor with p
 buffers, a mandatory pre-shared token compared in constant time with three attempts per connection and
 an authentication deadline, the caps (connections, message bytes, pending output), `path_refused` for
 an absolute path from a network client, `namchainctl` as the reference client over either transport,
-and a threat model in `docs/daemon.md`. Slice C is complete. Slice D (the model/IR registry) is next.
+and a threat model in `docs/daemon.md`. Slice C is complete. **D1–D3 landed** — the asset library: `models_root`/`irs_root` with a cached
+recursive scan (size and mtime, at nanosecond resolution where the filesystem has it), `engine.assets`
+with an explicit `refresh`, `options_from` resolved through the same scan in `engine.schema`, model and
+IR references resolved by id with an `asset_missing` refusal that lists the near misses, and
+`docs/assets.md` as the reference. One departure, recorded in §D3 below: a reference that names a file
+next to the document is resolved **before** the library, not after. Slice D is complete; slice E
+(lowering and the first macros) is next.
 Follows
 `docs/ljoss-comparison.md` (the analysis) and the seven decisions recorded below. Slices are ordered
 by dependency, not by appeal; each is independently committable and independently testable, and none
@@ -463,13 +469,20 @@ correction to the client (it sent `{"method":"hello"}`) is exactly what `ctl_cli
 
 | Commit | Contents |
 |---|---|
-| **D1** | `models_root` / `irs_root` config, a cached scan (id, relative path, kind, size, mtime, sample rate when cheap), `engine.assets` |
-| **D2** | `options_from: "models"` / `"irs"` resolved through the registry in `engine.schema` |
-| **D3** | Model/IR params resolve by registry id first, then as a path (hand-written rigs keep working); a miss is `asset_missing` with the registry's near misses |
+| **D1** ✅ | `models_root` / `irs_root` config, a cached scan (id, relative path, kind, size, mtime, sample rate and architecture when the file's header says so), `engine.assets` with `{"refresh": true}`, `engine.status.assets`, `SIGHUP` rescanning, and `src/assets/registry.cpp` |
+| **D2** ✅ | `options_from: "models"` / `"irs"` resolved through the same scan in `engine.schema` — each such parameter carries `options: [{value: id, label: id}]` beside `options_from` |
+| **D3** ✅ | Model/IR params resolve by library id, then as a path; a miss is `asset_missing` with the registry's near misses. **Revised order:** a reference that names an *existing file relative to the document* is resolved before the library, because the library going first would let a device's entry shadow the model a rig was written against — silently — and would make the daemon and the offline tools (which have no registry) resolve the same rig differently. The two orders agree wherever both can answer |
 
-**Tests:** fixture models and IRs; scan shape; resolution by id and by relative path; unknown id
-rejected with suggestions; `engine.assets` reflects a file added after startup only on refresh (mtime
-cache asserted).
+**Tests, as built:** fixture models and IRs (written by the test, because the registry never loads a
+model); scan shape and ordering; the cache asserted through `ScanStats::parsed` (0 on an unchanged
+refresh, 1 for a same-size edit in the same second); a file added after startup appearing only on
+refresh; resolution by id, by relative filename, by a path relative to the document and by an absolute
+path; an unknown id refused with the near miss named; a missing root as an empty library with an
+informational issue rather than a failure; a symlink out of the root skipped; a document's asset
+parameters rewritten while a non-asset string is left alone; a real model named by id compiling into a
+plan against the generated fixtures (tests/test_daemon.cpp); and, over TCP, a remote client applying a
+document that names a model by id while the absolute path to the very same file is `path_refused`
+(tests/test_tcp.cpp).
 
 ### Slice E — Lowering and the first macros
 
@@ -504,7 +517,7 @@ Listed so the contract can be checked against it, and because it is the other ha
 | `isEnabled` → **bypass**: tile dimmed but alive; bypass toggles are one structural commit | A, B |
 | Slider streams only when `rampable`; other params commit on release; "pending" until `params_applied` | B |
 | Drag is local, drop is one commit; the whole document goes as one `rig.apply` | A |
-| Amps and cabs listed from `engine.assets` | D |
+| Amps and cabs listed from `engine.assets` — ids to send back, with `group` for the palette's folders | D |
 | Hardware params in a labelled out-of-band section, never sent | A |
 | Health control: a small glow bound to `health`, expanding to `issues` on tap | B |
 | `layout` stays a viewing preference; a hidden chain is explicitly muted and shown as muted (see open question 3) | A |

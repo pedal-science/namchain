@@ -1665,6 +1665,13 @@ TEST_CASE("a daemon with nothing wrong reports health ok and no issues")
   config.socket_path = (dir.path / "namchaind.sock").string();
   config.rigs_root = root.string();
   config.rig = (root / "gain.json").string();
+  // Empty libraries that exist, so this case is about a daemon with nothing to report: a *missing*
+  // library directory is an informational issue of its own (see the library case below), which is
+  // honest but not what "nothing wrong" means.
+  config.models_root = (dir.path / "models").string();
+  config.irs_root = (dir.path / "irs").string();
+  std::filesystem::create_directories(config.models_root);
+  std::filesystem::create_directories(config.irs_root);
   config.device_retry_ms = 20;
   config.reclamation_timeout_ms = 5;
   config.lock_memory = false;
@@ -1758,4 +1765,202 @@ TEST_CASE("a device that cannot be opened is an error issue, not just a counter"
   // tracked beside it.
   CHECK(status["device_lost"].get<uint64_t>() >= 1u);
   CHECK(status["health"] == "error");
+}
+
+// ---------------------------------------------------------------------------
+// The library: models and IRs by id (docs/ui-integration-plan.md slice D)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("the library is published, refreshed on request, and compiled by id")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  const auto models = dir.path / "models";
+  const auto irs = dir.path / "irs";
+
+  // A rig that names the model the way a client does: by id, with no path and no extension. Before
+  // slice D this could only be a filename; now it is a library entry.
+  write_file(root / "by-id.json", R"({
+    "name": "by id",
+    "nodes": [
+      { "id": "in", "type": "nc.input" },
+      { "id": "amp", "type": "nc.nam", "model": "A2-Lite" },
+      { "id": "out", "type": "nc.output" }
+    ],
+    "connections": [ { "from": "in", "to": "amp" }, { "from": "amp", "to": "out" } ]
+  })");
+  write_file(root / "missing.json", R"({
+    "nodes": [
+      { "id": "in", "type": "nc.input" },
+      { "id": "amp", "type": "nc.nam", "model": "A2-Lit" },
+      { "id": "out", "type": "nc.output" }
+    ],
+    "connections": [ { "from": "in", "to": "amp" }, { "from": "amp", "to": "out" } ]
+  })");
+
+  // A library with one real model in it, by reference to the generated fixture rather than a copy:
+  // the registry reads a header, and the compiler loads the file it points at.
+  std::filesystem::create_directories(models);
+  std::filesystem::create_directories(irs);
+  std::filesystem::copy_file(std::string(NAMCHAIN_TEST_DATA_DIR) + "/A2-Lite.nam", models / "A2-Lite.nam");
+  std::filesystem::copy_file(std::string(NAMCHAIN_TEST_DATA_DIR) + "/CabIR.nam", irs / "cab.nam");
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.models_root = models.string();
+  config.irs_root = irs.string();
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  // The listing: an id that is what a document names, and the facts a palette wants.
+  const auto assets = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.assets"})"));
+  REQUIRE(assets["ok"] == true);
+  REQUIRE(assets["models"].size() == 1);
+  CHECK(assets["models"][0]["id"] == "A2-Lite");
+  CHECK(assets["models"][0]["kind"] == "model");
+  CHECK(assets["models"][0]["architecture"] == "WaveNet");
+  CHECK(assets["models"][0]["sample_rate"] == 48000.0);
+  CHECK(assets["models"][0]["path"] == std::filesystem::canonical(models / "A2-Lite.nam").string());
+  CHECK(assets["scan"] == 1);
+  CHECK(assets["roots"]["models"]["readable"] == true);
+  REQUIRE(assets["irs"].size() == 1);
+  CHECK(assets["irs"][0]["id"] == "cab");
+
+  // engine.schema resolves the same scan into the node types' option lists, so a palette does not
+  // have to join two answers to build a picker.
+  const auto schema = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.schema"})"));
+  REQUIRE(schema["ok"] == true);
+  nlohmann::json amp_params;
+  for (const auto& node : schema["nodes"])
+  {
+    if (node["id"] == "nc.nam")
+      amp_params = node["params"];
+  }
+  REQUIRE(amp_params.size() == 1);
+  CHECK(amp_params[0]["options_from"] == "models");
+  REQUIRE(amp_params[0]["options"].size() == 1);
+  CHECK(amp_params[0]["options"][0]["value"] == "A2-Lite");
+  CHECK(amp_params[0]["options"][0]["label"] == "A2-Lite");
+
+  // A model added while the daemon runs appears only when the scan is asked for, which is what makes
+  // a refresh a thing a client can decide to do rather than a race it has to survive.
+  std::filesystem::copy_file(std::string(NAMCHAIN_TEST_DATA_DIR) + "/CabIR.nam", models / "second.nam");
+  const auto stale = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.assets"})"));
+  CHECK(stale["models"].size() == 1);
+  const auto refreshed =
+    nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.assets","refresh":true})"));
+  CHECK(refreshed["models"].size() == 2);
+  CHECK(refreshed["scan"] == 2);
+  CHECK(refreshed["files_parsed"] == 1); // one new file; the other two came from the cache
+  const auto now_three = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.schema"})"));
+  for (const auto& node : now_three["nodes"])
+  {
+    if (node["id"] == "nc.nam")
+      CHECK(node["params"][0]["options"].size() == 2);
+  }
+
+  // The point of the whole slice: a document that names an id compiles, renders, and does not have to
+  // know where the file is.
+  const auto applied = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.load","rig":"by-id.json"})"));
+  REQUIRE(applied["ok"] == true);
+  CHECK(applied["generation"].get<uint64_t>() >= 1);
+  const bool adopted = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["adopted_generation"].get<uint64_t>() >= 1 &&
+           status["blocks"].get<uint64_t>() > 0;
+  });
+  CHECK_MESSAGE(adopted, "the plan built from a model id never reached the device");
+
+  // The document the engine hands back still says `A2-Lite`: resolution happened on the copy it
+  // compiled, so a client sees its own ids and not this device's paths.
+  const auto running = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  REQUIRE(running["ok"] == true);
+  CHECK(running["document"]["chains"][0]["nodes"][1]["model"] == "A2-Lite");
+
+  // A miss is refused by name, with the library's near miss, before anything is compiled.
+  const auto missing =
+    nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.load","rig":"missing.json"})"));
+  REQUIRE(missing["ok"] == false);
+  CHECK(missing["error"]["code"] == "asset_missing");
+  CHECK(missing["error"]["message"].get<std::string>().find("A2-Lite") != std::string::npos);
+  CHECK(missing["error"]["message"].get<std::string>().find("did you mean") != std::string::npos);
+
+  // And the same through a patch, because `swap_model` names a model too.
+  const auto swapped = nlohmann::json::parse(call(config.socket_path,
+                                                  R"({"method":"rig.patch","ops":[{"op":"swap_model",
+                                                     "node":"amp","model":"A2-Lit"}]})"));
+  REQUIRE(swapped["ok"] == false);
+  CHECK(swapped["error"]["code"] == "asset_missing");
+}
+
+TEST_CASE("a library root that is not there is an informational issue, not a failure")
+{
+  TempDir dir;
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = (dir.path / "rigs").string();
+  config.models_root = (dir.path / "no-models-here").string();
+  config.irs_root = (dir.path / "no-irs-here").string();
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  config.reclamation_timeout_ms = 5;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  REQUIRE(status["ok"] == true);
+  CHECK(status["status"]["assets"]["models"] == 0);
+  CHECK(status["status"]["assets"]["irs"] == 0);
+
+  bool named = false;
+  for (const auto& issue : status["status"]["issues"])
+  {
+    if (issue["code"] == "models_root_missing")
+      named = issue["severity"] == "info" && issue["message"].get<std::string>().find("no-models-here") !=
+                                               std::string::npos;
+  }
+  CHECK(named);
+  // Informational issues do not colour the light, which is the point of the severity: a device with
+  // no IRs is not a device that is unwell.
+  CHECK(status["status"]["health"] == "ok");
+
+  const auto assets = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.assets"})"));
+  CHECK(assets["models"].empty());
+  CHECK(assets["roots"]["models"]["readable"] == false);
+  CHECK(assets["roots"]["models"]["error"] == "no such directory");
 }

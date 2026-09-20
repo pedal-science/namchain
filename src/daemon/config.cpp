@@ -235,7 +235,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "reclamation_timeout_ms", "verbose", "capture_path", "playback_path",
                                       "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
                                       "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
-                                      "tcp_auth_timeout_ms"};
+                                      "tcp_auth_timeout_ms", "models_root", "irs_root"};
   for (const auto& [key, value] : doc.items())
   {
     bool known = false;
@@ -263,6 +263,8 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_string(doc, "playback_path", config.playback_path, path, error) ||
       !read_string(doc, "rig", config.rig, path, error) ||
       !read_string(doc, "rigs_root", config.rigs_root, path, error) ||
+      !read_string(doc, "models_root", config.models_root, path, error) ||
+      !read_string(doc, "irs_root", config.irs_root, path, error) ||
       !read_string(doc, "socket", config.socket_path, path, error) ||
       !read_string(doc, "tcp_address", config.tcp_address, path, error) ||
       !read_string(doc, "tcp_token", config.tcp_token, path, error) ||
@@ -355,6 +357,16 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
   if (name == "rigs-root")
   {
     config.rigs_root = value;
+    return true;
+  }
+  if (name == "models-root")
+  {
+    config.models_root = value;
+    return true;
+  }
+  if (name == "irs-root")
+  {
+    config.irs_root = value;
     return true;
   }
   if (name == "socket")

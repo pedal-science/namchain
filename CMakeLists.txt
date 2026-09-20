@@ -116,6 +116,7 @@ endif()
 
 add_library(namchain OBJECT
   src/nam/lookback.cpp
+  src/assets/registry.cpp
   src/io/wav.cpp
   src/io/alsa_params.cpp
   src/io/pcm.cpp
@@ -278,6 +279,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_rig.cpp
     tests/test_document.cpp
     tests/test_schema.cpp
+    tests/test_assets.cpp
     tests/test_latency.cpp
     tests/test_glitch.cpp
     tests/test_ramp.cpp
@@ -338,6 +340,7 @@ if(NAMCHAIN_BUILD_TESTS)
         -DNAMCHAIND=$<TARGET_FILE:namchaind>
         -DNAMCHAINCTL=$<TARGET_FILE:namchainctl>
         -DNAMCHAIN_WORK=${CMAKE_CURRENT_BINARY_DIR}/ctl-cli
+        -DNAMCHAIN_MODELS=${_namchain_gen_dir}
         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/run_ctl.cmake")
   endif()
 

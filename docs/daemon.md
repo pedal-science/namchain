@@ -71,6 +71,8 @@ silently ignored.
 | `playback_path` | *(empty)* | `file` backend only: the output WAV, written when the input runs out |
 | `rig` | *(empty)* | startup rig; empty starts silent and waits for `rig.load` |
 | `rigs_root` | `/etc/namchain/rigs` | the directory a `rig.load` **name** resolves under |
+| `models_root` | `/etc/namchain/models` | the device's `.nam` model library; a document names a model by id (docs/assets.md) |
+| `irs_root` | `/etc/namchain/irs` | the device's `.nam`/`.wav` impulse responses |
 | `socket` | `/run/namchain/namchaind.sock` | Unix `SOCK_SEQPACKET` control socket |
 | `socket_mode` | `"0660"` | octal string |
 | `rt_priority` | `80` | `SCHED_FIFO` for the render thread; `0` leaves the policy alone |
@@ -217,7 +219,8 @@ One JSON object per message in each direction, over either transport above. A re
 | method | request | response |
 |---|---|---|
 | `engine.hello` | `{"protocol": 2, "token": "…"?}` | `role`, `version`, `protocol` (what the server speaks), `features`, `transport` (`unix`/`tcp`) and `authenticated`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol`. On TCP the token is required and is checked **before** the version, so a peer without it learns nothing else |
-| `engine.schema` | — | the catalogue: every node type with its ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. See docs/schema.md |
+| `engine.schema` | — | the catalogue: every node type with its ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. A parameter whose choices live in the library carries them, resolved from the same scan `engine.assets` reports. See docs/schema.md |
+| `engine.assets` | `{"refresh": true?}` | the model and impulse-response library: an entry per file with its `id`, where it is, its size and mtime, and the rate/architecture/length when the file's own header says so. See docs/assets.md |
 | `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), and `health`/`issues` (below) |
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
@@ -262,12 +265,12 @@ be careful with.
 
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
-`bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`. It grows as the slices land, and
+`bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`. It grows as the slices land, and
 absence is how a client degrades rather than guesses.
 
 The error codes a client may have to act on are `bad_json`, `bad_request`, `unknown_method`,
-`unknown_chain`, `rig_not_found`, `patch_rejected`, `compile_failed`, `path_refused`, `unauthorized`,
-`message_too_large`, `too_many_connections` and `unsupported_protocol`. A refusal is a normal answer:
+`unknown_chain`, `rig_not_found`, `patch_rejected`, `compile_failed`, `asset_missing`, `path_refused`,
+`unauthorized`, `message_too_large`, `too_many_connections` and `unsupported_protocol`. A refusal is a normal answer:
 the connection stays open (except after a framing error, a third failed authentication, or a full
 connection table) and the running plan is untouched.
 
@@ -400,9 +403,25 @@ Two different trust levels, two different rules:
   may still *edit* a document that contains one — the rule is about what the client writes, not about
   what it can reach. Refused as `path_refused`, quoting the path, before anything is compiled.
 
+### Assets: a model is an id, not a file
+
+A `nc.nam` node's `model` and a `nc.cab.ir` node's `ir` are **references**, resolved when a document
+is compiled: a file relative to the document first (as they always were), then the device's library by
+id, then an absolute path. `engine.assets` lists the library and `engine.schema` resolves the same scan
+into the palette's option lists, so an app never has to know the layout of the disk — and a document
+that names `"model": "tweed/deluxe"` means the same thing on every device that has that model.
+
+Resolution happens on the **copy the engine compiles**, never on the document it remembers: `rig.get`
+hands back the ids the client wrote, and reapplying it is still a fixed point. A reference that
+resolves nowhere is refused as `asset_missing`, naming the library, its size and the nearest ids.
+
+docs/assets.md is the reference — ids, the two roots, what is read from a file (a header sniff, never
+a load), and the `engine.assets` response in full.
+
 ## Reload and device loss
 
-- `SIGHUP` re-resolves and reloads the configured rig, exactly as `rig.load` does. That is what
+- `SIGHUP` re-resolves and reloads the configured rig, exactly as `rig.load` does, and rescans the
+  asset library at the same time. That is what
   `systemctl reload namchaind` means. Watch the rig file yourself and re-read on an explicit request;
   the daemon deliberately does **not** `inotify` the file (docs/rig-pipeline.md §5.2).
 - `SIGTERM`/`SIGINT` stop the loop, stop the render thread and close the device. Exit code 0.
@@ -493,7 +512,11 @@ expected.
 
 ## What is built, and what is not
 
-Built: **the TCP transport** — length-prefixed framing over a non-blocking acceptor and per-connection
+Built: **the asset library** — `models_root` and `irs_root`, a cached recursive scan (id, relative
+path, kind, size, mtime, and the sample rate/architecture/length a file's own header declares),
+`engine.assets` with an explicit `refresh`, `options_from` resolved through the same scan in
+`engine.schema`, model and IR references resolved by id with an `asset_missing` refusal that lists the
+near misses, and the offline tools' path behaviour left exactly as it was (docs/assets.md); **the TCP transport** — length-prefixed framing over a non-blocking acceptor and per-connection
 in/out buffers, a mandatory token with a constant-time compare, three authentication attempts per
 connection, an authentication deadline, and the caps above, with `namchainctl` as the reference client
 and `control` in `engine.status` reporting what actually came up; the lane mixer (`nc.mix` takes a
@@ -530,7 +553,9 @@ Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
   macro layer exists (slice E);
 - no TLS and no per-client identity on the TCP transport: one pre-shared token for one appliance, with
   a tunnel as the documented answer off-LAN (see the threat model above);
-- no model/IR registry, so a model is a path rather than a device-library id (slice D);
+- no write path to the library and no `model.load`/`model.unload`/`model.list`: it is what the
+  operator put on the device, listed by `engine.assets` (docs/assets.md §"What is not here");
+- no presets, tags or favourites, and no amp/cab metadata beyond the directory tree;
 - no macros, so a block that is really a subgraph has to be written out as one (slice E);
 - no telemetry subscription and no `scene.*`, `model.*`, `bench.run` methods;
 - no state-accurate NAM warm start (M3), so `swap_model` crossfades rather than replaying history.

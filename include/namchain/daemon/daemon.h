@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "namchain/assets/registry.h"
 #include "namchain/daemon/config.h"
 #include "namchain/daemon/framing.h"
 #include "namchain/graph/plan.h"
@@ -235,7 +236,7 @@ private:
   void close_transport();
   bool setup_signals(std::string& error);
   /// Compile \p rig_path and publish it. Called for the startup rig, SIGHUP and `rig.load`.
-  bool load_rig(const std::string& rig_path, std::string& error);
+  bool load_rig(const std::string& rig_path, std::string& error, std::string* error_code = nullptr);
   /// \brief Compile every chain of \p document, prewarm the plans, and publish them together.
   ///
   /// Control thread. All-or-nothing: if any chain fails to compile, or its channels are not available,
@@ -248,8 +249,12 @@ private:
   /// disk from one that exists only in this process.
   /// \param base_dir the directory a relative model/IR path resolves against: the rig file's own
   /// directory for a load, the rigs root for an applied document.
+  /// \param error_code the protocol error code a failure should be reported under. `compile_failed`
+  /// unless the asset registry refused a model or IR reference, which is `asset_missing` -- a
+  /// different fix for the user (pick another model) from a graph that will not compile.
   bool publish_document(const graph::Document& document, const std::string& path, const std::string& source,
-                        const std::string& base_dir, std::string& error);
+                        const std::string& base_dir, std::string& error,
+                        std::string* error_code = nullptr);
   /// \brief Resolve a `set_param` against a chain's newest published plan and push it on the ring.
   ///
   /// \param chain_id the chain to resolve against, or empty to resolve by node id -- which is an error
@@ -379,6 +384,9 @@ private:
   };
 
   Config config_;
+  /// The device's model and IR library (slice D). Control thread only: it is read when a document is
+  /// compiled and when `engine.assets`/`engine.schema` is answered, never on the render path.
+  assets::Registry assets_;
   // Sized once; the render path only pushes/pops. Big enough for a whole document plus a burst of
   // parameter edits, because a document publish is all-or-nothing: if every chain's command does not
   // fit, none of them is pushed.
