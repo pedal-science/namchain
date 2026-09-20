@@ -21,14 +21,15 @@ enum class BackendKind
 {
   File,    ///< WAV in, WAV out, as fast as the disk allows. The offline instance of the interface.
   Null,    ///< Real-time paced against the wall clock, with no device: silence in, discarded out.
+  Pipe,    ///< A WAV looped in, raw frames out to a FIFO: the monitoring instance (§9.1, see below).
   AlsaRaw, ///< /dev/snd PCM ioctls, no libasound (Linux only, §4.3).
   PipeWire ///< Not implemented; refused by name rather than silently falling back.
 };
 
 const char* backend_kind_name(BackendKind kind);
 
-/// Parse "file", "null", "alsa", "alsa_raw", "pipewire". \return false on an unknown name, so a
-/// typo is an error rather than a silent fallback to a different backend.
+/// Parse "file", "null", "pipe", "alsa", "alsa_raw", "pipewire". \return false on an unknown name,
+/// so a typo is an error rather than a silent fallback to a different backend.
 bool parse_backend_kind(const std::string& text, BackendKind& kind);
 
 struct BackendConfig
@@ -42,7 +43,8 @@ struct BackendConfig
   unsigned playback_channels = 1;
   /// Device spec for the device backends: "hw:4,0", "4,0", or a /dev/snd path.
   std::string device;
-  /// `file` only.
+  /// `file` and `pipe`: the WAV read as capture. `file` also writes \ref output_path as a WAV;
+  /// `pipe` writes raw interleaved frames to it, and it is expected to be a FIFO.
   std::string input_path;
   std::string output_path;
   /// `null` only: pace against the wall clock the way a device would. False runs flat out, which is
@@ -292,6 +294,13 @@ protected:
   /// it, and every concrete backend needs it.
   AudioBackend() = default;
 };
+
+/// \brief How long \ref BackendKind::Pipe waits for something to read its FIFO before giving up.
+///
+/// The open blocks until a reader arrives, which is the behaviour that makes attaching and
+/// detaching a player at will work. A bound on it means a daemon started with no listener reports a
+/// lost device and retries, rather than hanging in `open` where nothing can see it.
+inline constexpr int kPipeOpenTimeoutMs = 2000;
 
 /// \brief Open a backend, or return nullptr with \p error set.
 ///

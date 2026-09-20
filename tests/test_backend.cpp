@@ -12,6 +12,11 @@
 #include <string>
 #include <vector>
 
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "namchain/io/backend.h"
 #include "namchain/pcm.h"
 #include "namchain/wav.h"
@@ -142,6 +147,133 @@ TEST_CASE("the file backend stops at end of input instead of repeating it")
 
   backend->stop();
   std::remove(path.c_str());
+}
+
+TEST_CASE("the pipe backend loops its input where the file backend stops")
+{
+  // The other half of the case above, and the reason the two are separate classes. `file` is the
+  // offline reference and must never invent audio; `pipe` is for listening and must never run out.
+  const std::string path = temp_wav("loop");
+  std::vector<float> source(100);
+  for (std::size_t i = 0; i < source.size(); ++i)
+    source[i] = static_cast<float>(i) / 100.0f;
+
+  std::string error;
+  REQUIRE(namchain::save_wav_float32(path, source.data(), source.size(), 1, 48000.0, error));
+
+  const std::string fifo = temp_wav("fifo");
+  std::remove(fifo.c_str());
+  REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+
+  namchain::BackendConfig config;
+  config.input_path = path;
+  config.output_path = fifo;
+  config.sample_rate = 48000;
+  config.period_size = 64;
+  config.capture_channels = 1;
+  config.playback_channels = 1;
+
+  std::unique_ptr<namchain::AudioBackend> backend =
+    namchain::open_backend(config, namchain::BackendKind::Pipe, error);
+  REQUIRE(backend != nullptr);
+
+  // Nothing is reading yet, so there is no device: the same answer an absent sound card gives,
+  // which is what lets the daemon report "lost" and wait rather than die at startup.
+  CHECK_FALSE(backend->start(error));
+  CHECK(error.find("nothing is reading it") != std::string::npos);
+
+  const int reader = ::open(fifo.c_str(), O_RDONLY | O_NONBLOCK);
+  REQUIRE(reader >= 0);
+  REQUIRE(backend->start(error));
+
+  std::vector<unsigned char> buffer(64u * 4u);
+  std::vector<float> got;
+  for (int period = 0; period < 3; ++period)
+  {
+    // Every period is full, for ever: 192 frames read out of a 100-frame file, and never a short
+    // read or an exhausted flag.
+    CHECK(backend->read_capture(buffer.data(), 64, 1000, error) == 64);
+    CHECK_FALSE(backend->info().capture_exhausted);
+    for (unsigned i = 0; i < 64; ++i)
+      got.push_back(namchain::pcm_decode(buffer.data() + i * 4u, namchain::PcmFormat::F32_LE));
+  }
+
+  // Sample 100 is sample 0 again, and 101 is 1: the wrap is exact, with nothing dropped or repeated
+  // at the seam beyond the seam itself.
+  CHECK(got[100] == doctest::Approx(source[0]));
+  CHECK(got[101] == doctest::Approx(source[1]));
+  CHECK(got[150] == doctest::Approx(source[50]));
+
+  backend->stop();
+  ::close(reader);
+  std::remove(path.c_str());
+  std::remove(fifo.c_str());
+}
+
+TEST_CASE("the pipe backend writes raw frames to its listener, and a listener leaving is an error")
+{
+  const std::string path = temp_wav("raw");
+  std::vector<float> source(64, 0.25f);
+
+  std::string error;
+  REQUIRE(namchain::save_wav_float32(path, source.data(), source.size(), 1, 48000.0, error));
+
+  const std::string fifo = temp_wav("rawfifo");
+  std::remove(fifo.c_str());
+  REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+
+  namchain::BackendConfig config;
+  config.input_path = path;
+  config.output_path = fifo;
+  config.sample_rate = 48000;
+  config.period_size = 64;
+  config.capture_channels = 1;
+  config.playback_channels = 1;
+
+  std::unique_ptr<namchain::AudioBackend> backend =
+    namchain::open_backend(config, namchain::BackendKind::Pipe, error);
+  REQUIRE(backend != nullptr);
+
+  int reader = ::open(fifo.c_str(), O_RDONLY | O_NONBLOCK);
+  REQUIRE(reader >= 0);
+  REQUIRE(backend->start(error));
+
+  std::vector<unsigned char> buffer(64u * 4u);
+  REQUIRE(backend->read_capture(buffer.data(), 64, 1000, error) == 64);
+  CHECK(backend->write_playback(buffer.data(), 64, 1000, error) == 64);
+
+  // No header, no conversion: what the engine handed over is what reaches the listener, which is
+  // what lets `ffplay -f f32le` be the whole of the monitoring path.
+  std::vector<unsigned char> heard(64u * 4u);
+  std::size_t have = 0;
+  while (have < heard.size())
+  {
+    const ssize_t got = ::read(reader, heard.data() + have, heard.size() - have);
+    if (got > 0)
+      have += static_cast<std::size_t>(got);
+    else if (got < 0 && (errno == EAGAIN || errno == EINTR))
+      continue;
+    else
+      break;
+  }
+  REQUIRE(have == heard.size());
+  for (unsigned i = 0; i < 64; ++i)
+    CHECK(namchain::pcm_decode(heard.data() + i * 4u, namchain::PcmFormat::F32_LE) ==
+          doctest::Approx(0.25f));
+
+  // The listener quits. The next write fails rather than blocking or silently succeeding, which is
+  // what the daemon reads as a device loss and retries from.
+  ::close(reader);
+  reader = -1;
+  int result = 0;
+  for (int attempt = 0; attempt < 100 && result >= 0; ++attempt)
+    result = backend->write_playback(buffer.data(), 64, 1000, error);
+  CHECK(result < 0);
+  CHECK(error.find("listener has gone") != std::string::npos);
+
+  backend->stop();
+  std::remove(path.c_str());
+  std::remove(fifo.c_str());
 }
 
 TEST_CASE("the file backend writes back what it was given")

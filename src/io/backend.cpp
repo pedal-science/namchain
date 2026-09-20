@@ -3,11 +3,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <thread>
 #include <vector>
 
 #include "namchain/wav.h"
+
+#include <csignal>
+#include <fcntl.h>
+#include <unistd.h>
 
 #if defined(__linux__)
   #include "namchain/io/alsa_params.h"
@@ -246,6 +251,215 @@ private:
   std::string output_path_;
 };
 
+/// \brief A WAV looped in, raw interleaved frames out to a FIFO.
+///
+/// The backend for auditioning a rig on a machine with no interface plugged into it: the "device"
+/// is another process -- `ffplay`, `sox`, anything that reads raw floats -- and the signal is a file
+/// on a loop instead of a guitar.
+///
+/// **It loops, and `file` deliberately does not.** That is the whole reason this is a separate class
+/// rather than a flag on `FileBackend`: a file backend that wrapped would turn a 100-frame fixture
+/// into an infinite one and make every soak "pass" (tests/test_backend.cpp). Here wrapping is the
+/// point and nothing is being measured, so the two behaviours get two names.
+///
+/// **It is paced by whoever is listening, not by a clock of its own.** The write blocks when the
+/// pipe is full, so the reader's audio device is the only clock in the system. That is deliberate:
+/// pacing here *and* feeding a player would set two clocks against each other and they would drift
+/// apart over a long session. The cost is that a block time measured against this backend is the
+/// reader's scheduling rather than the engine's work -- so `namchain-soak` figures taken here mean
+/// nothing, and that is not a subtlety anyone should have to rediscover.
+///
+/// **A listener going away is a device loss**, reported as one. `EPIPE` becomes a failed write, the
+/// daemon closes and reopens, and the reopen waits for the next reader -- which is exactly what it
+/// does when an audio interface is unplugged and plugged back in.
+class PipeBackend final : public AudioBackend
+{
+public:
+  static std::unique_ptr<AudioBackend> create(const BackendConfig& config, std::string& error)
+  {
+    if (config.output_path.empty())
+    {
+      error = "the pipe backend needs an output path: a FIFO for the listener to read";
+      return nullptr;
+    }
+
+    std::unique_ptr<PipeBackend> self(new PipeBackend());
+
+    std::vector<float> interleaved;
+    unsigned channels = 0;
+    double rate = 0.0;
+    if (!load_wav(config.input_path, interleaved, channels, rate, error))
+      return nullptr;
+    if (static_cast<unsigned>(rate + 0.5) != config.sample_rate)
+    {
+      error = "input '" + config.input_path + "' is " + std::to_string(static_cast<long long>(rate)) +
+              " Hz but the engine runs at " + std::to_string(config.sample_rate) + " Hz";
+      return nullptr;
+    }
+    if (interleaved.empty() || channels == 0)
+    {
+      // A loop over nothing is an infinite silence that looks like a working device.
+      error = "input '" + config.input_path + "' has no frames to loop";
+      return nullptr;
+    }
+
+    self->input_ = std::move(interleaved);
+    self->input_frames_ = self->input_.size() / channels;
+
+    self->info_.period_size = config.period_size;
+    self->info_.buffer_size = config.period_size * (config.periods == 0 ? 4 : config.periods);
+    self->info_.sample_rate = config.sample_rate;
+    self->info_.capture_channels = channels;
+    self->info_.playback_channels = std::max(1u, config.playback_channels);
+    self->info_.format = PcmFormat::F32_LE;
+    self->info_.bytes_per_sample = 4;
+    self->info_.capture_bytes_per_frame = self->info_.capture_channels * self->info_.bytes_per_sample;
+    self->info_.playback_bytes_per_frame = self->info_.playback_channels * self->info_.bytes_per_sample;
+    self->info_.period_exact = true;
+    self->info_.capture_name = config.input_path;
+    self->info_.playback_name = config.output_path;
+    // Whatever the reader buffers is the latency, and this backend cannot see it. A floor of zero is
+    // a smaller lie than a number nobody measured.
+    self->info_.buffer_floor_frames = 0;
+    self->output_path_ = config.output_path;
+    return self;
+  }
+
+  ~PipeBackend() override { close_fifo(); }
+
+  const BackendInfo& info() const override { return info_; }
+
+  bool start(std::string& error) override
+  {
+    read_frames_ = 0;
+    info_.capture_exhausted = false;
+
+    // O_NONBLOCK first: opening a FIFO for writing blocks until a reader arrives, and blocking
+    // inside start() is a hang with nothing to see it. Non-blocking turns "nobody is listening" into
+    // ENXIO, which is a device that is not there -- the same answer an absent sound card gives, and
+    // the daemon already knows what to do with it.
+    const auto deadline = Clock::now() + std::chrono::milliseconds(kPipeOpenTimeoutMs);
+    for (;;)
+    {
+      fd_ = ::open(output_path_.c_str(), O_WRONLY | O_NONBLOCK);
+      if (fd_ >= 0)
+        break;
+      if (errno != ENXIO || Clock::now() >= deadline)
+      {
+        error = "open '" + output_path_ + "' for writing: " +
+                (errno == ENXIO ? "nothing is reading it -- start a listener first"
+                                : std::strerror(errno));
+        return false;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    // Back to blocking for the writes themselves. That is the pacing: a full pipe stops the render
+    // loop until the listener has taken a period, and the listener's device clock is the only clock.
+    const int flags = ::fcntl(fd_, F_GETFL);
+    if (flags < 0 || ::fcntl(fd_, F_SETFL, flags & ~O_NONBLOCK) < 0)
+    {
+      error = std::string("fcntl: ") + std::strerror(errno);
+      close_fifo();
+      return false;
+    }
+
+    // A listener that quits must give this backend an EPIPE to report, not a signal that kills the
+    // process before it can. `MSG_NOSIGNAL` is a socket flag and a FIFO is not a socket, so there
+    // are two spellings: Darwin has a per-descriptor one, and Linux has only the disposition.
+#if defined(F_SETNOSIGPIPE)
+    ::fcntl(fd_, F_SETNOSIGPIPE, 1);
+#else
+    // Saved and restored with the descriptor, because this is a library: a program that wanted
+    // SIGPIPE fatal should get it back the moment the backend is gone.
+    previous_sigpipe_ = ::signal(SIGPIPE, SIG_IGN);
+    sigpipe_changed_ = true;
+#endif
+    return true;
+  }
+
+  void stop() override { close_fifo(); }
+
+  bool wait_capture(int /*timeout_ms*/, std::string& /*error*/) override { return true; }
+
+  int read_capture(void* dst, unsigned frames, int /*timeout_ms*/, std::string& /*error*/) override
+  {
+    const size_t stride = info_.capture_bytes_per_frame;
+    for (unsigned i = 0; i < frames; ++i)
+    {
+      // Wrapped per frame rather than per period, so a file whose length is not a whole number of
+      // periods still plays end to end instead of losing its tail to a short read every time round.
+      if (read_frames_ >= input_frames_)
+        read_frames_ = 0;
+      for (unsigned c = 0; c < info_.capture_channels; ++c)
+        pcm_encode(static_cast<unsigned char*>(dst) + static_cast<size_t>(i) * stride +
+                     static_cast<size_t>(c) * info_.bytes_per_sample,
+                   PcmFormat::F32_LE, input_[read_frames_ * info_.capture_channels + c]);
+      ++read_frames_;
+    }
+    return static_cast<int>(frames);
+  }
+
+  int write_playback(const void* src, unsigned frames, int /*timeout_ms*/, std::string& error) override
+  {
+    if (fd_ < 0)
+    {
+      error = "the listener's pipe is closed";
+      return -1;
+    }
+    const size_t total = static_cast<size_t>(frames) * info_.playback_bytes_per_frame;
+    const unsigned char* bytes = static_cast<const unsigned char*>(src);
+    size_t sent = 0;
+    while (sent < total)
+    {
+      const ssize_t wrote = ::write(fd_, bytes + sent, total - sent);
+      if (wrote > 0)
+      {
+        sent += static_cast<size_t>(wrote);
+        continue;
+      }
+      if (wrote < 0 && errno == EINTR)
+        continue;
+      // EPIPE is the listener having quit. Reported as an error so the daemon treats it as a device
+      // loss and reopens, which is what makes detaching and reattaching a player work.
+      error = "write to '" + output_path_ + "': " +
+              (errno == EPIPE ? "the listener has gone" : std::strerror(errno));
+      return -1;
+    }
+    return static_cast<int>(frames);
+  }
+
+  uint64_t driver_xruns() const override { return 0; }
+
+private:
+  PipeBackend() = default;
+
+  void close_fifo()
+  {
+    if (fd_ >= 0)
+      ::close(fd_);
+    fd_ = -1;
+#if !defined(F_SETNOSIGPIPE)
+    if (sigpipe_changed_)
+    {
+      ::signal(SIGPIPE, previous_sigpipe_);
+      sigpipe_changed_ = false;
+    }
+#endif
+  }
+
+  BackendInfo info_;
+  std::vector<float> input_; ///< interleaved, capture_channels wide
+  size_t input_frames_ = 0;
+  size_t read_frames_ = 0;
+  std::string output_path_;
+  int fd_ = -1;
+#if !defined(F_SETNOSIGPIPE)
+  void (*previous_sigpipe_)(int) = SIG_DFL;
+  bool sigpipe_changed_ = false;
+#endif
+};
+
 #if defined(__linux__)
 
 /// The adapter that makes the raw ALSA stream one of the backends.
@@ -390,6 +604,7 @@ const char* backend_kind_name(BackendKind kind)
   {
   case BackendKind::File: return "file";
   case BackendKind::Null: return "null";
+  case BackendKind::Pipe: return "pipe";
   case BackendKind::AlsaRaw: return "alsa_raw";
   case BackendKind::PipeWire: return "pipewire";
   }
@@ -406,6 +621,11 @@ bool parse_backend_kind(const std::string& text, BackendKind& kind)
   if (text == "null")
   {
     kind = BackendKind::Null;
+    return true;
+  }
+  if (text == "pipe")
+  {
+    kind = BackendKind::Pipe;
     return true;
   }
   if (text == "alsa" || text == "alsa_raw")
@@ -443,6 +663,7 @@ std::unique_ptr<AudioBackend> open_backend(const BackendConfig& config, BackendK
   {
   case BackendKind::Null: return std::make_unique<NullBackend>(config);
   case BackendKind::File: return FileBackend::create(config, error);
+  case BackendKind::Pipe: return PipeBackend::create(config, error);
   case BackendKind::AlsaRaw:
 #if defined(__linux__)
     if (config.device.empty())
