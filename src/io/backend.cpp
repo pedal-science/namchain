@@ -82,7 +82,15 @@ public:
       // An absolute deadline rather than a relative sleep. Sleeping for one period each time would
       // accumulate however late each sleep woke up, so a run would measure the sleeper's drift; this
       // way a late period is late on its own and the next one is still on time.
-      std::this_thread::sleep_until(origin_ + period_ * period_ns_);
+      //
+      // The cast is load-bearing. `period_` is unsigned, and an unsigned multiplicand makes the
+      // whole duration unsigned -- whereupon libc++'s steady_clock `sleep_until` hands
+      // `deadline - now()` straight to `sleep_for`, and a deadline already in the past underflows
+      // to about 585 years. libstdc++ guards that subtraction, which is why this ran on Linux for
+      // months: the very first period hits it every time, because its deadline is `origin_` itself
+      // and the loop is always a few microseconds past that by the time it reaches the sleep.
+      std::this_thread::sleep_until(
+        origin_ + static_cast<std::chrono::nanoseconds::rep>(period_) * period_ns_);
     }
     ++period_;
     return true;

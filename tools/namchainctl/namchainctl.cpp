@@ -28,6 +28,7 @@
 #include <json.hpp>
 
 #include "namchain/daemon/framing.h"
+#include "namchain/daemon/platform.h"
 #include "namchain/version.h"
 
 namespace
@@ -111,7 +112,7 @@ struct Transport
 
   bool connect_unix(const std::string& path, std::string& error)
   {
-    fd = ::socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    fd = ::socket(AF_UNIX, namchain::daemon::platform::local_socket_type(), 0);
     if (fd < 0)
     {
       error = std::string("socket: ") + std::strerror(errno);
@@ -130,7 +131,10 @@ struct Transport
       error = "connect " + path + ": " + std::strerror(errno);
       return false;
     }
-    framed = false;
+    // Datagrams where the local socket is SOCK_SEQPACKET, the length prefix where it is a
+    // stream -- the same choice the daemon makes, from the same constant, so the two ends
+    // cannot disagree about it (namchain/daemon/platform.h).
+    framed = namchain::daemon::platform::local_transport_is_stream;
     return true;
   }
 

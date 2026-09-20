@@ -10,6 +10,7 @@
 #include <doctest.h>
 
 #include <sys/stat.h>
+#include <unistd.h> // getpid: transitive on glibc, explicit everywhere else
 
 #include <atomic>
 #include <chrono>

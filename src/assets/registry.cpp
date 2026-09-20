@@ -507,7 +507,15 @@ ScanStats Registry::refresh()
         ++stats.skipped;
         continue;
       }
-#if defined(__linux__)
+      // Sub-second where the platform has it, which is both of the ones this builds on. It is the
+      // whole point of the key: a model corrected and copied back inside the same second changes
+      // neither its size nor its whole-second stamp, so a second-resolution key would serve the old
+      // one until something else touched the directory. Darwin spells the field `st_mtimespec`;
+      // `st_mtim` is there too, but only under a feature-test macro this build does not promise.
+#if defined(__APPLE__)
+      const std::int64_t mtime_ns =
+        static_cast<std::int64_t>(info.st_mtimespec.tv_sec) * 1000000000ll + info.st_mtimespec.tv_nsec;
+#elif defined(__linux__)
       const std::int64_t mtime_ns =
         static_cast<std::int64_t>(info.st_mtim.tv_sec) * 1000000000ll + info.st_mtim.tv_nsec;
 #else

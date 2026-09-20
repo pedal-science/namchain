@@ -1,13 +1,14 @@
 // namchaind: the reference daemon (plan.md §8.2) and the control thread of docs/rig-pipeline.md.
 //
-// Platform note: the control transport is a Unix SOCK_SEQPACKET socket plus signalfd, which is the
-// Linux spelling of "block in one poll set". On a platform without signalfd the class is declared
-// but not defined, and the daemon is not built (CMake builds it on Linux only).
+// Platform note: the control transport wants "block in one poll set", and signalfd, accept4 and a
+// Unix SOCK_SEQPACKET listener are the Linux spelling of it. The four places that spelling shows
+// through go via namchain/daemon/platform.h, so this file stays one implementation rather than two
+// interleaved by preprocessor. Ports beyond Linux and macOS need that header, not this one.
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
 #endif
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 
 #include "namchain/daemon/daemon.h"
 
@@ -18,7 +19,6 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
-#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -34,6 +34,7 @@
 
 #include <json.hpp>
 
+#include "namchain/daemon/platform.h"
 #include "namchain/graph/macro.h"
 #include "namchain/graph/rig.h"
 #include "namchain/graph/patch.h"
@@ -52,6 +53,17 @@ namespace
 /// Every plan gets its own arena; 1 MiB is what the soak compiles any sane rig out of, and a rig
 /// that needs more gets "arena exhausted" rather than a silently truncated graph.
 constexpr std::size_t kArenaBytes = 1u << 20;
+
+/// \brief Whether this peer's messages carry a length prefix rather than being one datagram each.
+///
+/// A TCP peer always does: a stream has no message boundaries of its own. A local peer does only
+/// where the local socket is a stream too, which is everywhere `PF_LOCAL` has no `SOCK_SEQPACKET`
+/// (see namchain/daemon/platform.h). The two carry identical bytes inside the envelope, so this is
+/// the only thing the rest of the daemon needs to know about the difference.
+constexpr bool peer_is_framed(PeerKind peer)
+{
+  return peer == PeerKind::Remote || platform::local_transport_is_stream;
+}
 
 /// One SEQPACKET message. A request names a rig, it does not carry one, so this is generous; a
 /// message that fills it is refused rather than truncated into something that parses. The TCP
@@ -707,8 +719,8 @@ bool Daemon::setup_signals(std::string& error)
   sigaddset(&mask, SIGINT);
   sigaddset(&mask, SIGHUP);
 
-  // Blocked before the render thread exists, so every thread inherits the block and the signalfd is
-  // the only reader. Blocking after the thread started would leave a window where the default
+  // Blocked before the render thread exists, so every thread inherits the block and the reader is
+  // the only consumer. Blocking after the thread started would leave a window where the default
   // disposition killed the process. The old mask is kept and restored by stop().
   if (::pthread_sigmask(SIG_BLOCK, &mask, &previous_mask_) != 0)
   {
@@ -716,12 +728,9 @@ bool Daemon::setup_signals(std::string& error)
     return false;
   }
   mask_saved_ = true;
-  const int fd = ::signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
+  const int fd = platform::open_signal_reader(mask, error);
   if (fd < 0)
-  {
-    error = std::string("signalfd: ") + std::strerror(errno);
     return false;
-  }
   signal_fd_ = fd;
   return true;
 }
@@ -745,7 +754,7 @@ bool Daemon::bind_socket(std::string& error)
   // Non-blocking, because accepting is a loop until EAGAIN now that more than one connection can be
   // waiting; on a blocking listener that loop would stop in accept() rather than in the poll that
   // said there was something to accept.
-  const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+  const int fd = platform::open_socket(AF_UNIX, platform::local_socket_type(), 0);
   if (fd < 0)
   {
     error = std::string("socket: ") + std::strerror(errno);
@@ -836,8 +845,7 @@ bool Daemon::bind_tcp(std::string& error)
   std::string last;
   for (addrinfo* candidate = candidates; candidate != nullptr; candidate = candidate->ai_next)
   {
-    fd = ::socket(candidate->ai_family, candidate->ai_socktype | SOCK_CLOEXEC | SOCK_NONBLOCK,
-                  candidate->ai_protocol);
+    fd = platform::open_socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
     if (fd < 0)
     {
       last = std::strerror(errno);
@@ -890,7 +898,7 @@ void Daemon::close_transport()
   close_socket();
   if (signal_fd_ >= 0)
   {
-    ::close(signal_fd_);
+    platform::close_signal_reader(signal_fd_);
     signal_fd_ = -1;
   }
   if (mask_saved_)
@@ -921,7 +929,7 @@ void Daemon::refuse_connection(int fd, PeerKind peer, const char* code, const st
   // a connection that is being dropped.
   const std::string reply = error_response("", code, message);
   std::vector<char> bytes;
-  if (peer == PeerKind::Remote)
+  if (peer_is_framed(peer))
     append_frame(bytes, reply);
   else
     bytes.assign(reply.begin(), reply.end());
@@ -934,7 +942,7 @@ void Daemon::accept_connections(int listener, PeerKind peer)
   const std::size_t cap = peer == PeerKind::Remote ? config_.tcp_max_connections : kMaxLocalClients;
   for (;;)
   {
-    const int fd = ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
+    const int fd = platform::accept_socket(listener);
     if (fd < 0)
     {
       if (errno == EINTR)
@@ -982,7 +990,7 @@ void Daemon::accept_connections(int listener, PeerKind peer)
 
 void Daemon::queue_reply(Connection& connection, std::string reply)
 {
-  if (connection.session.peer == PeerKind::Remote)
+  if (peer_is_framed(connection.session.peer))
     append_frame(connection.out, reply);
   else
     connection.out.insert(connection.out.end(), reply.begin(), reply.end());
@@ -1099,7 +1107,11 @@ bool Daemon::read_datagrams(Connection& connection)
 /// Reassemble length-prefixed messages from a stream and answer each.
 bool Daemon::read_framed(Connection& connection)
 {
-  const std::size_t cap = config_.tcp_max_message_bytes;
+  // The cap follows the peer, not the transport. This read used to serve only TCP connections, so
+  // naming tcp_max_message_bytes directly was the same thing; a local peer reaching it (which is
+  // what a stream local socket does) would otherwise be measured against a limit meant for the
+  // network, and queue_reply's matching check against max_message_bytes() would disagree with it.
+  const std::size_t cap = max_message_bytes(connection.session.peer);
   for (;;)
   {
     // How many bytes the message being assembled needs. The length prefix is checked against the cap
@@ -1171,7 +1183,7 @@ bool Daemon::read_framed(Connection& connection)
 
 bool Daemon::read_connection(Connection& connection)
 {
-  return connection.session.peer == PeerKind::Remote ? read_framed(connection) : read_datagrams(connection);
+  return peer_is_framed(connection.session.peer) ? read_framed(connection) : read_datagrams(connection);
 }
 
 bool Daemon::push_slot(uint32_t chain, uint32_t chain_count, PlanSlot* slot)
@@ -1988,11 +2000,22 @@ void Daemon::render_loop()
       fail_device(error);
       continue;
     }
-    if (device_->read_capture(capture_buffer_.data(), info.period_size, 1000, error) < 0)
+    const int captured = device_->read_capture(capture_buffer_.data(), info.period_size, 1000, error);
+    if (captured < 0)
     {
       if (!running_.load())
         break;
       fail_device(error);
+      continue;
+    }
+    if (captured == 0 && info.capture_exhausted)
+    {
+      // No frames, and there will be no more: rendering this period would write one period of
+      // silence past the end of the input. That is the same artefact BackendInfo::needs_bringup_cycle
+      // describes at the other end of the file -- "an output one period longer than the renderer's",
+      // which would be blamed on the DSP -- and it is the reason a `--backend file` run could not be
+      // compared with namchain-render without trimming it first. A short read is still rendered: its
+      // tail is defined silence and it is the last real audio there is.
       continue;
     }
 
@@ -2781,12 +2804,12 @@ int Daemon::run()
       accept_connections(listen_fd_, PeerKind::Local);
     if ((fds[1].revents & POLLIN) != 0)
     {
-      signalfd_siginfo info{};
-      while (::read(signal_fd_, &info, sizeof(info)) == static_cast<ssize_t>(sizeof(info)))
+      int signo = 0;
+      while (platform::read_signal(signal_fd_, signo))
       {
-        if (info.ssi_signo == SIGTERM || info.ssi_signo == SIGINT)
+        if (signo == SIGTERM || signo == SIGINT)
           stop_requested_.store(true);
-        else if (info.ssi_signo == SIGHUP)
+        else if (signo == SIGHUP)
         {
           // A reload is also the moment an operator expects a newly copied model to appear in the
           // palette, so the library is rescanned with the rig.
@@ -2825,7 +2848,16 @@ int Daemon::run()
     {
       Connection& connection = clients_[i];
       const short revents = fds[first_client + i].revents;
-      if ((revents & (POLLIN | POLLHUP | POLLERR)) == 0)
+      // POLLOUT belongs in this guard, not only in the branch below. A connection whose *only*
+      // ready event is "writable" is one that owes the peer bytes and has nothing more to say --
+      // which is exactly a reply too big for the socket's send buffer, waiting for room. Skipping
+      // it here left that reply in the outbox for ever and the caller blocked in recv.
+      //
+      // It took a stream socket with an 8 KiB buffer to show: a Unix SOCK_SEQPACKET reply is one
+      // datagram and fits, and a TCP connection is given its own SO_SNDBUF and answers small
+      // requests. A large answer -- engine.schema, engine.assets -- over a stream whose buffer is
+      // smaller than the answer is the case none of those cover.
+      if ((revents & (POLLIN | POLLOUT | POLLHUP | POLLERR)) == 0)
         continue;
 
       bool alive = true;
@@ -2853,4 +2885,4 @@ int Daemon::run()
 } // namespace daemon
 } // namespace namchain
 
-#endif // __linux__
+#endif // __linux__ || __APPLE__

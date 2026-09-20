@@ -36,6 +36,7 @@
 #include "namchain/daemon/config.h"
 #include "namchain/daemon/daemon.h"
 #include "namchain/daemon/framing.h"
+#include "namchain/daemon/platform.h"
 
 namespace
 {
@@ -278,23 +279,90 @@ struct Client
   int fd = -1;
 };
 
-/// One SEQPACKET request over the Unix socket, for the cases that need to compare the two transports
-/// or to read status while every TCP slot is busy.
-nlohmann::json local_call(const std::string& socket_path, const std::string& request)
+/// \brief One request, one response, over the local socket.
+///
+/// The envelope follows the socket type: one datagram where `PF_LOCAL` has `SOCK_SEQPACKET`,
+/// the same length prefix the TCP transport uses where it does not (see
+/// namchain/daemon/platform.h). The daemon picks from the same constant, so a test that
+/// passes here is testing the transport the daemon actually opened.
+std::string local_exchange(const std::string& socket_path, const std::string& request)
 {
-  const int fd = ::socket(AF_UNIX, SOCK_SEQPACKET, 0);
+  namespace platform = namchain::daemon::platform;
+
+  const int fd = ::socket(AF_UNIX, platform::local_socket_type(), 0);
   REQUIRE(fd >= 0);
+
   sockaddr_un address{};
   address.sun_family = AF_UNIX;
   REQUIRE(socket_path.size() < sizeof(address.sun_path));
   std::memcpy(address.sun_path, socket_path.c_str(), socket_path.size() + 1);
   REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
-  REQUIRE(::send(fd, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()));
-  std::vector<char> buffer(1 << 16);
-  const ssize_t got = ::recv(fd, buffer.data(), buffer.size(), 0);
+
+  // A reply that never comes should fail this test, not hang the whole binary with no clue which
+  // case it was in. Generous: the daemon answers in microseconds when it answers at all.
+  timeval timeout{};
+  timeout.tv_sec = 5;
+  ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+  std::vector<char> out;
+  if (platform::local_transport_is_stream)
+    namchain::daemon::append_frame(out, request);
+  else
+    out.assign(request.begin(), request.end());
+
+  std::size_t sent = 0;
+  while (sent < out.size())
+  {
+    const ssize_t wrote = ::send(fd, out.data() + sent, out.size() - sent, 0);
+    if (wrote < 0 && errno == EINTR)
+      continue;
+    REQUIRE(wrote > 0);
+    sent += static_cast<std::size_t>(wrote);
+  }
+
+  std::string body;
+  if (platform::local_transport_is_stream)
+  {
+    // A stream does not preserve what the sender wrote, so read the header, then exactly the
+    // length it names. Anything less is a truncated reply reported as a short one.
+    char header[namchain::daemon::kFrameHeaderBytes] = {};
+    std::size_t have = 0;
+    while (have < sizeof(header))
+    {
+      const ssize_t got = ::recv(fd, header + have, sizeof(header) - have, 0);
+      if (got < 0 && errno == EINTR)
+        continue;
+      REQUIRE(got > 0);
+      have += static_cast<std::size_t>(got);
+    }
+    body.resize(namchain::daemon::frame_length(header));
+    have = 0;
+    while (have < body.size())
+    {
+      const ssize_t got = ::recv(fd, body.data() + have, body.size() - have, 0);
+      if (got < 0 && errno == EINTR)
+        continue;
+      REQUIRE(got > 0);
+      have += static_cast<std::size_t>(got);
+    }
+  }
+  else
+  {
+    std::vector<char> buffer(1 << 16);
+    const ssize_t got = ::recv(fd, buffer.data(), buffer.size(), 0);
+    REQUIRE(got > 0);
+    body.assign(buffer.data(), static_cast<std::size_t>(got));
+  }
+
   ::close(fd);
-  REQUIRE(got > 0);
-  return nlohmann::json::parse(std::string(buffer.data(), static_cast<std::size_t>(got)));
+  return body;
+}
+
+/// The same exchange, parsed, for the cases that compare the two transports or read status
+/// while every TCP slot is busy.
+nlohmann::json local_call(const std::string& socket_path, const std::string& request)
+{
+  return nlohmann::json::parse(local_exchange(socket_path, request));
 }
 
 std::string hello_body(const std::string& id, const std::string& token)

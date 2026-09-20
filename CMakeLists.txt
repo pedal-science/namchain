@@ -137,6 +137,7 @@ add_library(namchain OBJECT
   src/graph/patch.cpp
   src/daemon/config.cpp
   src/daemon/daemon.cpp
+  src/daemon/platform.cpp
   src/render/timeline.cpp
   src/latency/latency.cpp
   src/glitch/glitch.cpp
@@ -212,9 +213,11 @@ if(NAMCHAIN_BUILD_TOOLS)
   target_link_libraries(namchain-latency PRIVATE namchain)
   target_compile_options(namchain-latency PRIVATE ${NAMCHAIN_WARN_FLAGS})
 
-  # The reference daemon (plan.md §8.2). Linux only: its control transport is a Unix SEQPACKET
-  # socket plus signalfd, and src/daemon/daemon.cpp is an empty translation unit elsewhere.
-  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # The reference daemon (plan.md §8.2). Linux and macOS: the four Linux-only spellings its
+  # control transport used -- signalfd, accept4, the SOCK_CLOEXEC/SOCK_NONBLOCK socket flags and a
+  # Unix SOCK_SEQPACKET listener -- now go through src/daemon/platform.cpp, and
+  # src/daemon/daemon.cpp is an empty translation unit on anything else.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     add_executable(namchaind tools/daemon/namchaind.cpp)
     target_link_libraries(namchaind PRIVATE namchain)
     target_compile_options(namchaind PRIVATE ${NAMCHAIN_WARN_FLAGS})
@@ -289,9 +292,10 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_crossfade.cpp
     tests/test_timeline.cpp
     tests/test_splice_fader.cpp)
-  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    # The daemon's socket/signalfd control loop and its config/rig-resolution surface, and the TCP
-    # transport that only exists there (framing, the token, the caps: tests/test_tcp.cpp).
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    # The daemon's socket/signal control loop and its config/rig-resolution surface, and the TCP
+    # transport (framing, the token, the caps: tests/test_tcp.cpp). These are also what says whether
+    # a port of the control transport is sound, so they run wherever the daemon is built.
     target_sources(namchain-tests PRIVATE tests/test_daemon.cpp tests/test_tcp.cpp)
   endif()
   add_dependencies(namchain-tests namchain-test-data)
@@ -337,7 +341,7 @@ if(NAMCHAIN_BUILD_TESTS)
   # The reference client against the reference daemon, as two processes, over both transports. This
   # is the only test that joins the two halves of the protocol instead of testing each against its own
   # idea of the other -- see tests/cli/run_ctl.cmake for the bug that made that worth a test.
-  if(NAMCHAIN_BUILD_TOOLS AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  if(NAMCHAIN_BUILD_TOOLS AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
     add_test(NAME ctl_cli
       COMMAND ${CMAKE_COMMAND}
         -DNAMCHAIND=$<TARGET_FILE:namchaind>

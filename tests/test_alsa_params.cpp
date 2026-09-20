@@ -271,8 +271,6 @@ TEST_CASE("an invalid channel count is rejected before touching the device")
   CHECK(error.find("channel") != std::string::npos);
 }
 
-#endif // __linux__
-
 TEST_CASE("the floor controller tops up only when the queue is short and a period fits")
 {
   // The other end of the cap's policy (plan.md §9.5 item 9). A short queue can only be refilled by
@@ -302,3 +300,5 @@ TEST_CASE("the floor controller tops up only when the queue is short and a perio
   CHECK_FALSE(namchain::alsa::queue_needs_top_up(buffer - period + 1, greedy_floor, period, buffer));
   CHECK_FALSE(namchain::alsa::queue_needs_top_up(0, floor, period, 0)); // no ring at all
 }
+
+#endif // __linux__

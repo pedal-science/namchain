@@ -122,8 +122,19 @@ execute_process(
 if(NOT _sched_rc EQUAL 0)
   message(FATAL_ERROR "scheduling run: expected exit 0, got ${_sched_rc}\n--- stdout ---\n${_sched_out}\n--- stderr ---\n${_sched_err}")
 endif()
-if(NOT _sched_out MATCHES "scheduling:[^\n]*cpu 0")
-  message(FATAL_ERROR "the report did not say the thread was confined to cpu 0:\n--- stdout ---\n${_sched_out}")
+# What "the report is honest" means depends on whether the platform has an affinity API at all.
+# Linux does, so `--cpu 0` must show up as cpu 0. macOS does not, and the honest answer there is to
+# say so -- which is the same property under test, not an exemption from it: what is forbidden is a
+# run that claims a confinement it does not hold.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+  set(_sched_expected "scheduling:[^\n]*cpu 0")
+  set(_sched_wanted "say the thread was confined to cpu 0")
+else()
+  set(_sched_expected "scheduling:[^\n]*only implemented on Linux")
+  set(_sched_wanted "say that it could not confine the thread on this platform")
+endif()
+if(NOT _sched_out MATCHES "${_sched_expected}")
+  message(FATAL_ERROR "the report did not ${_sched_wanted}:\n--- stdout ---\n${_sched_out}")
 endif()
 
 # --- 7. the output-queue target is applied or refused, never silently ignored --------------------

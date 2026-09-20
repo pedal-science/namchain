@@ -139,6 +139,8 @@ std::string describe_scheduling(const SchedulingState& state)
 
 #else // not Linux
 
+  #include <thread>
+
 // A fallback that links and tells the truth: there is no scheduling state to read or set here, so a
 // report from a non-Linux build says so rather than claiming a real-time thread it does not have.
 namespace namchain
@@ -154,6 +156,12 @@ std::string SchedulingState::affinity_text() const
 SchedulingState current_scheduling()
 {
   SchedulingState state;
+  // The policy is not readable here, but the CPU count is, and it is a different claim. Leaving it
+  // zero would report a machine with no processors -- a lie where "I cannot tell you the policy" is
+  // the truth. There is no affinity API to narrow it, so every CPU is one this thread may run on,
+  // which is exactly what the Linux path derives from the affinity mask.
+  const unsigned reported = std::thread::hardware_concurrency();
+  state.cpu_count = reported == 0 ? 1 : static_cast<int>(reported);
   state.detail = "scheduling introspection is only implemented on Linux";
   return state;
 }
