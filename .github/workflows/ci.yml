@@ -6,44 +6,80 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Every job runs on the self-hosted runner machina registers for this host: a
+# Raspberry Pi 500 (`piv`), labels self-hosted,Linux,ARM64,machina. Hosted runners cost
+# money on a private repository, and this is the machine plan-rt-piv.md measures on in
+# any case.
+#
+# One runner means one job at a time, so a superseded branch run is cancelled rather
+# than left queued behind an hour of work nobody will read.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Architecture coverage, now that there is no x86_64 machine:
+#   * aarch64       -- native: pi-native (build, unit tests, golden), rtsan, tsan;
+#   * x86_64        -- cross-compiled with gcc-13; its tests run under qemu-user;
+#   * armv7         -- cross-compiled, build only (as before);
+#   * aarch64-cross -- keeps the shipping cross toolchain file and its qemu test path
+#                      exercised. On this host the parity gate it exists for is also
+#                      covered natively by pi-native.
+#
+# The runner image ships cmake, ninja, g++-13, clang-18, clang-20, the
+# x86_64/armv7/aarch64 cross toolchains and qemu-user-static, so no job installs a
+# toolchain. Jobs run as root in the container and can still apt-get what they need.
+
 jobs:
+  # ---------------------------------------------------------------------------
+  # The desktop/server target, cross-compiled. Compilation runs at native speed on
+  # the aarch64 host; only the test binaries are emulated.
+  # ---------------------------------------------------------------------------
   linux-x86_64:
-    name: linux-x86_64 (build + unit tests)
-    runs-on: ubuntu-24.04
+    name: x86_64 (cross-compiled, tests under qemu)
+    runs-on: [self-hosted, machina]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - uses: ./.github/actions/clean-workspace
+      - name: Toolchain
+        run: |
+          x86_64-linux-gnu-g++ --version | head -1
+          qemu-x86_64-static --version | head -1
       - name: Configure
         run: >
-          cmake -S . -B build -G Ninja
+          cmake -S . -B build-x86_64 -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/x86_64-linux-gnu.cmake
           -DCMAKE_BUILD_TYPE=Release
           -DNAMCHAIN_WERROR=ON
       - name: Build
-        run: cmake --build build -j"$(nproc)"
+        run: cmake --build build-x86_64 -j2
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build-x86_64 --output-on-failure -E soak_cli
       - name: Golden comparison numbers
-        # Recorded verbosely because ctest hides the output of a passing test. The measured
-        # max|diff| is what tells us whether NAMCHAIN_GOLDEN_TOLERANCE is still meaningful:
-        # on AArch64 (planar kernels) it is 0, and this is the only place the x86_64 value
-        # (Eigen path) is visible.
-        run: ctest --test-dir build -R golden_a2_lite -V
+        # Recorded verbosely because ctest hides the output of a passing test. This is
+        # the x86_64 (Eigen path) reading: 0 on AArch64's planar kernels and non-zero
+        # here, which is what keeps NAMCHAIN_GOLDEN_TOLERANCE meaningful. qemu-user
+        # does not change the arithmetic -- it executes the same SSE2 instructions.
+        run: ctest --test-dir build-x86_64 -R golden_a2_lite -V
 
-  # RealtimeSanitizer flags allocations/locks/syscalls on the render path (plan.md §10.4).
-  # It requires clang >= 20: Ubuntu 24.04's default clang 18 rejects -fsanitize=realtime
-  # with "unsupported argument 'realtime' to option '-fsanitize='".
+  # ---------------------------------------------------------------------------
+  # RealtimeSanitizer flags allocations/locks/syscalls on the render path (plan.md
+  # §10.4). It requires clang >= 20: Ubuntu 24.04's default clang 18 rejects
+  # -fsanitize=realtime with "unsupported argument 'realtime' to option '-fsanitize='".
+  #
+  # Native aarch64 rather than emulated x86_64: the sanitizer instruments the code this
+  # project actually ships, and a sanitizer runtime under emulation would be measuring
+  # qemu.
+  # ---------------------------------------------------------------------------
   rtsan:
-    name: linux-x86_64 (RealtimeSanitizer, clang-20)
-    runs-on: ubuntu-24.04
+    name: aarch64 (RealtimeSanitizer, clang-20)
+    runs-on: [self-hosted, machina]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-20
+      - uses: ./.github/actions/clean-workspace
       - name: Verify the toolchain actually supports RTSan
         run: |
           printf 'int main(){return 0;}\n' > /tmp/rtsan-probe.cpp
@@ -56,28 +92,28 @@ jobs:
           -DCMAKE_CXX_COMPILER=clang++-20
           -DNAMCHAIN_RTSAN=ON
       - name: Build
-        run: cmake --build build-rtsan -j"$(nproc)"
+        run: cmake --build build-rtsan -j2
       - name: Test
-        run: ctest --test-dir build-rtsan --output-on-failure
+        # soak_cli is excluded across CI: it asserts on SCHED_FIFO/affinity/mlockall
+        # behaviour, which is a normal-build concern, not a CI one (see the note at the
+        # end of this file).
+        run: ctest --test-dir build-rtsan --output-on-failure -E soak_cli
 
-  # This job is load-bearing, not just a smoke test: it is the only CI job where the A2 planar
-  # NEON kernels are compiled in (they are AArch64/ARMv7-only), so it is where the bit-identity
-  # parity gate against the reference A2FastModel actually executes. qemu emulates NEON, so the
-  # memcmp parity checks are meaningful here even though the timings are not.
-  # ThreadSanitizer for the RT primitives (plan.md §10.1). The SPSC ring and the reclaimer are the
-  # only concurrent code in the engine, and a race in them corrupts audio in ways nothing else
-  # catches. TSan is far too slow for the render path, so it is a correctness instrument only --
-  # which is also why the allocation interposer is auto-disabled here: a sanitizer runtime
-  # intercepts operator new and would bypass it.
+  # ---------------------------------------------------------------------------
+  # ThreadSanitizer for the RT primitives (plan.md §10.1). The SPSC ring and the
+  # reclaimer are the only concurrent code in the engine, and a race in them corrupts
+  # audio in ways nothing else catches. TSan is far too slow for the render path, so it
+  # is a correctness instrument only -- which is also why the allocation interposer is
+  # auto-disabled here: a sanitizer runtime intercepts operator new and would bypass it.
+  # ---------------------------------------------------------------------------
   tsan:
-    name: linux-x86_64 (ThreadSanitizer -- RT primitives)
-    runs-on: ubuntu-24.04
+    name: aarch64 (ThreadSanitizer, clang-20)
+    runs-on: [self-hosted, machina]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Install build deps
-        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-20
+      - uses: ./.github/actions/clean-workspace
       - name: Configure
         run: >
           cmake -S . -B build-tsan -G Ninja
@@ -86,21 +122,26 @@ jobs:
           -DCMAKE_CXX_COMPILER=clang++-20
           -DNAMCHAIN_TSAN=ON
       - name: Build
-        run: cmake --build build-tsan -j"$(nproc)"
+        run: cmake --build build-tsan -j2
       - name: Test
         run: ctest --test-dir build-tsan -R unit --output-on-failure
 
+  # ---------------------------------------------------------------------------
+  # The shipping cross toolchain (an aarch64 desktop cross-building for the Pi), plus
+  # the A2 planar parity gate it can reach. Load-bearing, not just a smoke test: the
+  # A2 planar NEON kernels are AArch64/ARMv7-only, so the bit-identity gate against the
+  # reference A2FastModel executes where those kernels are compiled in. pi-native
+  # covers that gate natively; this job covers the toolchain file and the qemu test
+  # path a cross-build user takes.
+  # ---------------------------------------------------------------------------
   aarch64-cross:
     name: aarch64 cross + qemu (incl. A2 planar parity gate)
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, machina]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Install cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build g++-aarch64-linux-gnu qemu-user-static
+      - uses: ./.github/actions/clean-workspace
       - name: Configure
         run: >
           cmake -S . -B build-aarch64 -G Ninja
@@ -108,36 +149,101 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DNAMCHAIN_REQUIRE_A2_PARITY=ON
       - name: Build
-        run: cmake --build build-aarch64 -j"$(nproc)"
+        run: cmake --build build-aarch64 -j2
       - name: Test under qemu
         run: qemu-aarch64-static -L /usr/aarch64-linux-gnu ./build-aarch64/namchain-tests
       - name: A2 planar parity gate must have actually run
-        # NAMCHAIN_REQUIRE_A2_PARITY turns a self-skip into a failure, so this cannot pass
-        # vacuously if the build type or arch gating changes underneath us.
+        # NAMCHAIN_REQUIRE_A2_PARITY turns a self-skip into a failure, so this cannot
+        # pass vacuously if the build type or arch gating changes underneath us.
         run: |
           qemu-aarch64-static -L /usr/aarch64-linux-gnu ./build-aarch64/namchain-tests \
             --test-case="planar*"
 
+  # ---------------------------------------------------------------------------
+  # The only 32-bit ARM target, and the only cross build whose output is not run: the
+  # RK3288 in the Tinker Board has no toolchain and 2 GB of RAM. -mfpu decides the
+  # *arithmetic* here, not just the scheduling (see the NB_ARMV7 block of
+  # CMakeLists.txt), so this job catches a missing -mfpu=neon-vfpv4 turning every
+  # pmadd into a non-fused vmlaq_f32.
+  # ---------------------------------------------------------------------------
   armv7-cross:
     name: armv7 cross (build only)
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, machina]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - name: Install cross toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build g++-arm-linux-gnueabihf
+      - uses: ./.github/actions/clean-workspace
       - name: Configure
         run: >
           cmake -S . -B build-armv7 -G Ninja
           -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/armv7-linux-gnueabihf.cmake
           -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build-armv7 -j"$(nproc)"
+        run: cmake --build build-armv7 -j2
 
-  # NOTE: the authoritative performance/soak numbers come from a self-hosted bare-metal
-  # Raspberry Pi job (plan.md §1, §10.5), not from a shared cloud runner. It is
-  # deliberately not defined here until the Pi is registered as a runner; numbers
-  # measured under a cloud VM's noisy-neighbour CPU would be meaningless.
+  # ---------------------------------------------------------------------------
+  # Bare-metal Raspberry Pi 5 (BCM2712, quad Cortex-A76), native aarch64 -- no
+  # cross-compiler and no qemu anywhere in the job. This is the machine plan.md §1 and
+  # §10.5 measure on, and the only CI job where the A2 planar NEON kernels run on the
+  # real core rather than under an emulator's model of one.
+  #
+  # It runs on the self-hosted runner registered by machina for this host (capability
+  # `github-actions-runner`; labels self-hosted,Linux,ARM64,machina,pi). cmake, ninja,
+  # g++-13 and clang-18 are baked into that image.
+  #
+  # This job is a correctness gate. The authoritative performance and soak numbers are
+  # not CI's to produce -- they come from the RT arms in plan-rt-piv.md, which need the
+  # real audio device, the RT kernel and core isolation, none of which a shared CI
+  # container has (see the note at the end of this file).
+  # ---------------------------------------------------------------------------
+  pi-native:
+    name: Raspberry Pi 5 (native aarch64, bare metal)
+    runs-on: [self-hosted, machina]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/clean-workspace
+      - name: Toolchain
+        run: |
+          cmake --version | head -1
+          ninja --version
+          g++ --version | head -1
+          echo "cores: $(nproc)"
+      - name: Configure
+        run: >
+          cmake -S . -B build-pi -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DNAMCHAIN_WERROR=ON
+          -DNAMCHAIN_REQUIRE_A2_PARITY=ON
+      - name: Build
+        # -j2, not -j"$(nproc)": this runner shares an 8 GB Pi with the other
+        # repository's jobs and the host has no swap (deliberately -- it is an RT audio
+        # machine). Two four-way C++ builds at once have already OOM-killed cc1plus
+        # here. Two jobs' worth of parallelism fits; four do not.
+        run: cmake --build build-pi -j2
+      - name: Test
+        # soak_cli is excluded on purpose. It is the one ctest entry that asserts on
+        # the harness's own scheduling: it sets SCHED_FIFO and affinity and takes an
+        # mlockall path under a memlock limit. Unprivileged it reports those as caveats
+        # rather than failing, but that is RT behaviour and this runner is a container
+        # -- no CAP_SYS_NICE, no isolation, no device. It is exercised on a normal
+        # build, not here.
+        #
+        # The instruments that really need the host (tools/soak/piv-isolation-ab.sh,
+        # rt-manipulation-check.sh, heartbeat-run.sh, the hour-long arms) are not wired
+        # into ctest at all and never run in CI.
+        run: ctest --test-dir build-pi --output-on-failure -E soak_cli
+      - name: Golden comparison numbers
+        # On AArch64 (planar kernels) the measured max|diff| is 0. Recorded verbosely
+        # here so the Pi's number sits next to the x86_64 (Eigen path) one printed by
+        # the cross-compiled linux-x86_64 job.
+        run: ctest --test-dir build-pi -R golden_a2_lite -V
+
+  # NOTE: the authoritative performance/soak numbers come from bare-metal RT runs on
+  # this same Raspberry Pi (plan-rt-piv.md), not from a shared cloud runner and not from
+  # the containerised jobs above: they need the audio device, the RT kernel parameters
+  # and the core isolation. Numbers measured under a cloud VM's noisy-neighbour CPU
+  # would be meaningless; numbers measured without the device would be a different
+  # measurement, not a worse one.
