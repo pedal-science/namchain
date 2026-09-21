@@ -372,7 +372,11 @@ if(NAMCHAIN_BUILD_TESTS)
   set(NAMCHAIN_GOLDEN_TOLERANCE "1e-5" CACHE STRING
       "Maximum |difference| allowed against the core's render output (see tests/golden)")
 
-  if(NAMCHAIN_BUILD_GOLDEN_REFERENCE AND NOT CMAKE_CROSSCOMPILING AND NAMCHAIN_BUILD_TOOLS)
+  # A cross build can still produce the golden number when an emulator is configured
+  # (CMAKE_CROSSCOMPILING_EMULATOR): CMake then runs the reference render tool it just
+  # built for the target, and the comparison with it, under qemu -- which is how CI
+  # keeps the x86_64 (Eigen path) reading visible without an x86_64 machine.
+  if(NAMCHAIN_BUILD_GOLDEN_REFERENCE AND (NOT CMAKE_CROSSCOMPILING OR CMAKE_CROSSCOMPILING_EMULATOR) AND NAMCHAIN_BUILD_TOOLS)
     set(_namchain_ref_build "${CMAKE_CURRENT_BINARY_DIR}/namcore-ref")
     set(_namchain_ref_render "${_namchain_ref_build}/tools/render")
 

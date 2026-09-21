@@ -1,0 +1,13 @@
+name: Clean the reused workspace
+description: >-
+  Reset and clean every submodule. A self-hosted runner keeps _work between jobs, and
+  actions/checkout leaves untracked files inside submodules, so configure-time
+  patching (NAMCHAIN_APPLY_VENDOR_PATCHES) fails on the second run with
+  "already exists in working directory". The patch touches tracked files as well as
+  adding new ones, hence the reset as well as the clean.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: git submodule foreach --recursive 'git reset --hard -q && git clean -ffdxq'
