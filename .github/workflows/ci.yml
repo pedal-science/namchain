@@ -177,7 +177,17 @@ jobs:
         # cc1plus here. Two jobs' worth of parallelism fits; four do not.
         run: cmake --build build-pi -j2
       - name: Test
-        run: ctest --test-dir build-pi --output-on-failure
+        # soak_cli is excluded on purpose. It is the one ctest entry that asserts on
+        # the harness's own scheduling: it sets SCHED_FIFO and affinity and takes an
+        # mlockall path under a memlock limit. Unprivileged it reports those as
+        # caveats rather than failing, but that is RT behaviour and this runner is a
+        # container -- no CAP_SYS_NICE, no isolation, no device. It is exercised on a
+        # normal build, not here.
+        #
+        # The instruments that really need the host (tools/soak/piv-isolation-ab.sh,
+        # rt-manipulation-check.sh, heartbeat-run.sh, the hour-long arms) are not
+        # wired into ctest at all and never run in CI.
+        run: ctest --test-dir build-pi --output-on-failure -E soak_cli
       - name: Golden comparison numbers
         # On AArch64 (planar kernels) the measured max|diff| is 0. Recorded
         # verbosely here so the Pi's number sits next to the x86_64 (Eigen path)
