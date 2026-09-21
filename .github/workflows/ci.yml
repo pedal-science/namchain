@@ -24,7 +24,13 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        # soak_cli is excluded from CI everywhere, not just the Pi job: it is the one
+        # ctest entry that asserts on the harness's own scheduling (SCHED_FIFO,
+        # affinity, an mlockall path under a memlock limit), and no CI machine --
+        # hosted VM or container -- is where RT behaviour should be judged. Run it on
+        # a normal build; the host-only instruments in tools/soak/ were never in
+        # ctest to begin with.
+        run: ctest --test-dir build --output-on-failure -E soak_cli
       - name: Golden comparison numbers
         # Recorded verbosely because ctest hides the output of a passing test. The measured
         # max|diff| is what tells us whether NAMCHAIN_GOLDEN_TOLERANCE is still meaningful:
