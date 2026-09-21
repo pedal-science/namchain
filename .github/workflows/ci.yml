@@ -171,7 +171,11 @@ jobs:
           -DNAMCHAIN_WERROR=ON
           -DNAMCHAIN_REQUIRE_A2_PARITY=ON
       - name: Build
-        run: cmake --build build-pi -j"$(nproc)"
+        # -j2, not -j"$(nproc)": this runner shares an 8 GB Pi with the other
+        # repository's jobs and the host has no swap (deliberately -- it is an RT
+        # audio machine). Two four-way C++ builds at once have already OOM-killed
+        # cc1plus here. Two jobs' worth of parallelism fits; four do not.
+        run: cmake --build build-pi -j2
       - name: Test
         run: ctest --test-dir build-pi --output-on-failure
       - name: Golden comparison numbers
