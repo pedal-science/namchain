@@ -31,9 +31,11 @@ struct CompileOptions
 /// (docs/ui-integration-plan.md §1.4).
 enum class ParamKind
 {
-  Number, ///< A continuous or stepped quantity.
+  Number, ///< A continuous or stepped quantity. A count (`nc.split`'s `outputs`) is a Number with a
+          ///< step of 1 and `snap`, not a Flag.
   Option, ///< One of a set of named values. Carried in the spec's string params.
-  Flag,   ///< A boolean. Carried as 0 or 1 in the numeric params.
+  Flag,   ///< A boolean, drawn as a switch. Carried as 0 or 1 in the numeric params, with no bounds or
+          ///< step of its own.
 };
 
 /// How a client should lay a numeric parameter out. Presentation, but presentation the *engine* knows:

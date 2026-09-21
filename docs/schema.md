@@ -53,7 +53,7 @@ stereo block is not available rather than discovering it in an error (docs/ui-in
 |---|---|
 | `id` | the name a document and a patch use |
 | `name` | what a control is labelled |
-| `kind` | `number`, `option` (a string value) or `flag` (0/1) |
+| `kind` | `number`, `option` (a string value) or `flag` (0/1, a switch). A count, such as `nc.split`'s `outputs` or `nc.mix`'s `inputs`, is a `number` with `step` 1 and `snap`; a `flag` never carries bounds or a step |
 | `unit` | `"Hz"`, `"dB"`, `"ms"`, `"samples"`, `"%"`, … or `null`. This is what stops a dB knob being wired to a linear gain |
 | `default` | the **effective** value when the parameter is absent, or `null` when it has none (a `required` parameter, or one of a `one_of` group) |
 | `min`, `max` | bounds, or `null` for unbounded *by the schema*. `min_inclusive`/`max_inclusive` say whether the bound itself is allowed: a Q of 0 and a frequency of 0 are excluded rather than clamped |

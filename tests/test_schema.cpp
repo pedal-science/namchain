@@ -150,6 +150,19 @@ nlohmann::json other_value(const std::string& type, const ParamDesc& param)
   return param.default_value + 1.0;
 }
 
+/// A flag is what a client draws as a switch, so it has two values and nothing else. A bounded or
+/// stepped "flag" is a count wearing the wrong kind: `nc.split`'s `outputs` was one, and a
+/// schema-driven inspector would have offered a 64-lane split as an on/off toggle.
+void check_flag_is_a_switch(const ParamDesc& param)
+{
+  if (param.kind != namchain::render::ParamKind::Flag)
+    return;
+  CHECK_FALSE(param.has_min);
+  CHECK_FALSE(param.has_max);
+  CHECK(param.step == 0.0);
+  CHECK((param.default_value == 0.0 || param.default_value == 1.0));
+}
+
 } // namespace
 
 TEST_CASE("every registered node type describes itself")
@@ -190,6 +203,12 @@ TEST_CASE("every registered node type describes itself")
       }
       if (param.has_min && param.has_max)
         CHECK(param.min < param.max);
+      check_flag_is_a_switch(param);
+    }
+    for (int i = 0; i < type->per_port_param_count; ++i)
+    {
+      CAPTURE(type->per_port_params[i].id);
+      check_flag_is_a_switch(type->per_port_params[i]);
     }
   }
 

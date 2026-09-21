@@ -1152,12 +1152,12 @@ void process_unit_delay(void*, const float* const* in, float* const* out, int fr
 // checks each one against what the node actually reads.
 
 const ParamDesc kSplitParams[] = {
-  {.id = "outputs", .name = "Outputs", .kind = ParamKind::Flag, .default_value = 2.0, .has_min = true,
+  {.id = "outputs", .name = "Outputs", .kind = ParamKind::Number, .default_value = 2.0, .has_min = true,
    .min = 1.0, .has_max = true, .max = 64.0, .step = 1.0, .snap = true},
 };
 
 const ParamDesc kMixParams[] = {
-  {.id = "inputs", .name = "Inputs", .kind = ParamKind::Flag, .default_value = 2.0, .has_min = true,
+  {.id = "inputs", .name = "Inputs", .kind = ParamKind::Number, .default_value = 2.0, .has_min = true,
    .min = 1.0, .has_max = true, .max = 64.0, .step = 1.0, .snap = true},
   {.id = "ramp_ms", .name = "Ramp", .unit = "ms", .default_value = 5.0, .has_min = true, .min = 0.0,
    .has_max = true, .max = 1000.0},
