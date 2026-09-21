@@ -158,6 +158,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Clean the reused workspace
+        # A self-hosted runner keeps _work between jobs. actions/checkout resets
+        # tracked files in this repository but leaves untracked files inside the
+        # submodules, so on the second run NAMCHAIN_APPLY_VENDOR_PATCHES fails with
+        # "NAM/wavenet/a2_planar.cpp: already exists in working directory". Reset
+        # and clean every submodule (the patch touches tracked files too).
+        run: git submodule foreach --recursive 'git reset --hard -q && git clean -ffdxq'
+
       - name: Toolchain
         run: |
           cmake --version | head -1
