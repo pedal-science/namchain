@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -436,7 +437,32 @@ TEST_CASE("a requested backend that does not exist fails by name")
   CHECK(kind == namchain::BackendKind::AlsaRaw);
   CHECK(namchain::parse_backend_kind("file", kind));
   CHECK(kind == namchain::BackendKind::File);
-  CHECK_FALSE(namchain::parse_backend_kind("coreaudio", kind));
+  // coreaudio is implemented now, so it parses -- on every platform. What it does with a machine
+  // that is not a Mac is a property of open_backend, checked in its own case below.
+  CHECK(namchain::parse_backend_kind("coreaudio", kind));
+  CHECK(kind == namchain::BackendKind::CoreAudio);
+  CHECK(std::string(namchain::backend_kind_name(namchain::BackendKind::CoreAudio)) == "coreaudio");
+  // A near miss is still a miss: a typo must not quietly become a different backend.
+  CHECK_FALSE(namchain::parse_backend_kind("core_audio", kind));
+  CHECK_FALSE(namchain::parse_backend_kind("CoreAudio", kind));
+}
+
+TEST_CASE("the coreaudio backend is refused by name where there is no CoreAudio")
+{
+  // A backend that does not exist *here* fails by name rather than falling back to one that does:
+  // otherwise "I ran it on coreaudio" would be a claim nobody could check, which is the rule
+  // pipewire already follows. On macOS the first refusal is the missing capture path instead -- the
+  // device half of that backend is covered by tests/test_coreaudio_file.cpp, which is Darwin-only.
+  namchain::BackendConfig config;
+  std::string error;
+  std::unique_ptr<namchain::AudioBackend> backend =
+    namchain::open_backend(config, namchain::BackendKind::CoreAudio, error);
+  CHECK(backend == nullptr);
+#if defined(__APPLE__)
+  CHECK(error.find("--capture-path") != std::string::npos);
+#else
+  CHECK(error.find("coreaudio") != std::string::npos);
+#endif
 }
 
 TEST_CASE("an out-of-range period is refused rather than rounded")

@@ -251,15 +251,18 @@ int main(int argc, char** argv)
   options.rt_priority = rt_priority;
   options.cpu = cpu;
 
-  // Refused by name rather than ignored. Only the ALSA backend has an output ring to hold a queue in,
-  // and a run that reports a latency it is not actually carrying is worse than one that will not
-  // start -- the whole point of the knob is that the number is a stated trade (plan.md §9.5 item 7).
-  if ((options.output_queue_periods != 0 || options.output_queue_floor_periods != 0) &&
-      options.backend != namchain::BackendKind::AlsaRaw)
+  // Refused by name rather than ignored on the backends that have no ring to hold a queue in. A run
+  // that reports a latency it is not actually carrying is worse than one that will not start -- the
+  // whole point of the knob is that the number is a stated trade (plan.md §9.5 item 7). alsa_raw and
+  // coreaudio both have one; `null`, `file` and `pipe` do not.
+  const bool has_output_ring = options.backend == namchain::BackendKind::AlsaRaw ||
+                               options.backend == namchain::BackendKind::CoreAudio;
+  if ((options.output_queue_periods != 0 || options.output_queue_floor_periods != 0) && !has_output_ring)
   {
     std::fprintf(stderr,
-                 "error: the output-queue settings only apply to --backend alsa_raw; the %s backend has no\n"
-                 "       output ring to hold a queue in, so they would be reported and not applied\n",
+                 "error: the output-queue settings only apply to the backends with an output ring\n"
+                 "       (alsa_raw, coreaudio); the %s backend has none, so they would be reported and\n"
+                 "       not applied\n",
                  namchain::backend_kind_name(options.backend));
     return 2;
   }

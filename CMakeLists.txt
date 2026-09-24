@@ -32,6 +32,10 @@ option(NAMCHAIN_RT_CHECK "Compile the render-path allocation interposer" ON)
 # path: it is far too slow to run in real time, so it is a correctness instrument only.
 option(NAMCHAIN_TSAN "Build with ThreadSanitizer" OFF)
 option(NAMCHAIN_WERROR "Treat warnings as errors" OFF)
+# Captures what the CoreAudio backend hands the device, into a WAV, so the live device path can be
+# null-tested the way the `file` backend already can. Off by default: it is a measurement instrument,
+# it writes a file from the audio callback, and a shipping daemon should do neither.
+option(NAMCHAIN_COREAUDIO_CAPTURE "Let the CoreAudio backend record what it sends the device" OFF)
 
 set(NAMCHAIN_NAM_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/NeuralAmpModelerCore"
     CACHE PATH "Path to the vendored NeuralAmpModelerCore checkout")
@@ -122,6 +126,7 @@ add_library(namchain OBJECT
   src/io/alsa_params.cpp
   src/io/pcm.cpp
   src/io/backend.cpp
+  src/io/loop_source.cpp
   src/io/alsa_raw.cpp
   src/offline/render.cpp
   src/rt/telemetry.cpp
@@ -157,6 +162,16 @@ target_include_directories(namchain PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include"
 target_compile_features(namchain PUBLIC cxx_std_20)
 target_compile_options(namchain PRIVATE ${NAMCHAIN_WARN_FLAGS})
 
+# The CoreAudio backend (plan.md §9.1). One platform's framework and one platform's source file, in
+# the same shape as alsa_raw's `__linux__`: the file compiles to an empty translation unit anywhere
+# else, so nothing about the framework leaks into a Linux build.
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  target_sources(namchain PRIVATE src/io/coreaudio.cpp)
+  # INTERFACE, not PRIVATE: `namchain` is an OBJECT library, so the link line is built by whichever
+  # executable consumes its objects.
+  target_link_libraries(namchain INTERFACE "-framework CoreAudio" "-framework AudioToolbox" "-framework CoreFoundation")
+endif()
+
 if(NAMCHAIN_A2_FAST)
   target_compile_definitions(namchain PUBLIC NAM_ENABLE_A2_FAST)
 endif()
@@ -174,6 +189,11 @@ endif()
 
 if(_namchain_rt_check)
   target_compile_definitions(namchain PRIVATE NAMCHAIN_RT_CHECK_ENABLED)
+endif()
+
+if(NAMCHAIN_COREAUDIO_CAPTURE)
+  target_compile_definitions(namchain PRIVATE NAMCHAIN_COREAUDIO_CAPTURE)
+  message(STATUS "CoreAudio capture enabled: --capture-device-path writes what the device is sent")
 endif()
 
 if(NAMCHAIN_RTSAN)
@@ -276,6 +296,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_pcm.cpp
     tests/test_wav.cpp
     tests/test_backend.cpp
+    tests/test_loop_source.cpp
     tests/test_rt_primitives.cpp
     tests/test_graph.cpp
     tests/test_patch.cpp
@@ -297,6 +318,12 @@ if(NAMCHAIN_BUILD_TESTS)
     # transport (framing, the token, the caps: tests/test_tcp.cpp). These are also what says whether
     # a port of the control transport is sound, so they run wherever the daemon is built.
     target_sources(namchain-tests PRIVATE tests/test_daemon.cpp tests/test_tcp.cpp)
+  endif()
+  if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    # The CoreAudio backend's refusals, plus one opt-in case that plays a short blip on the default
+    # output device. Darwin-only because the backend's source is: on Linux this file would be a test
+    # of code that is not compiled in.
+    target_sources(namchain-tests PRIVATE tests/test_coreaudio_file.cpp)
   endif()
   add_dependencies(namchain-tests namchain-test-data)
   target_link_libraries(namchain-tests PRIVATE namchain)
