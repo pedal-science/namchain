@@ -626,7 +626,7 @@ state-continuity budget, not on speed. Option (a) would also make the engine's o
 ### 6.2 Built-ins
 
 `nc.input`, `nc.output`, `nc.gain` (ramped), `nc.split` (1→N), `nc.mix` (N→1 with ramped gains/pan),
-`nc.pan`, `nc.eq.biquad`, `nc.delay`, `nc.cab.ir` (via `nam::Linear`, zero-latency, lookback-aware),
+`nc.pan`, `nc.eq.biquad`, `nc.delay`, `nc.cab.ir` (AudioDSPTools' partitioned convolver, zero-latency, lookback-aware),
 `nc.nam` (§7), `nc.gate`, `nc.limiter` (declares latency), `nc.reverb` (declares tail; M5),
 `nc.unit_delay`, `nc.resample` (rate adapter, declares latency), `nc.meter` (telemetry tap,
 audio-transparent), `nc.bypass` (wrapper).
@@ -648,13 +648,21 @@ audio-transparent), `nc.bypass` (wrapper).
 - **`nc.delay`** takes `samples` or `ms` and nothing else; a sub-sample delay or a typo'd
   millisecond value is refused instead of approximated. The ring is `delay + 1` slots so the read
   pointer is visibly `delay` behind the write pointer rather than coinciding with it.
-- **`nc.cab.ir`** loads a mono `.wav` IR (checking the IR's rate against the engine's — there is no
-  resampler yet, and a 44.1 kHz cab at 48 kHz is detuned, not broken-sounding) or a `Linear` `.nam`.
-  The tap order is the natural one: the core's `Linear` reverses its weights internally, so a WAV's
-  first sample is the direct sound. A test pins that with a two-tap IR, because a reversal here is
-  inaudible as an error and audible as a wrong-sounding cabinet.
-- **`nc.nam` and `nc.cab.ir` refuse a rate mismatch.** The core has no rate guard of its own: a
-  44.1 kHz model driven at 48 kHz runs happily and is simply wrong.
+- **`nc.cab.ir`** loads a mono `.wav` IR or a `Linear` `.nam`, and convolves it with
+  `dsp::PartitionedConvolution` from rikkus/AudioDSPTools `partitioned-ir` (`vendor/AudioDSPTools`,
+  pinned at `b505422`; NAMBench/IR-PATH.md has the measurements): direct up to 512 taps, above that a
+  direct head plus partitioned FFT with the partition multiplies spread across the quiet callbacks.
+  It replaced the core's `nam::Linear`, whose FFT path does every partition in the one callback:
+  on `tib` at 8192 taps that was p99 62.5% of a 64-frame deadline and 117% of a 32-frame one, and is
+  now 10% and 16% (`bench-results/tib-cab-ir.txt`). The IR is prepared the way the NAM plugin
+  prepares one, less its -18 dB gain: cubic-resampled to the engine rate and truncated at 8192 taps.
+  The tap order is the natural one, so a WAV's first sample is the direct sound; a test pins that
+  with a two-tap IR, because a reversal is inaudible as an error and audible as a wrong-sounding
+  cabinet. The FFT path is not bit-identical to a direct FIR; the tests hold it to -110 dB of the
+  peak at 2 to 8192 taps and at block sizes that straddle its transform boundary.
+- **`nc.nam` refuses a rate mismatch.** The core has no rate guard of its own: a 44.1 kHz model
+  driven at 48 kHz runs happily and is simply wrong. `nc.cab.ir` resamples instead, since an IR is
+  data that can be converted and a model is not.
 - **Arity is per-spec**: `nc.split` fans out to the rig's `"outputs"` and `nc.mix` sums its
   `"inputs"`, both defaulting to 2 so a rig written before this means exactly what it did. This is
   per-spec arity in the vtable (`NodeType::arity_param`, bounds 1..64), resolved from the spec by

@@ -30,6 +30,8 @@ Run cross-built tests with `qemu-arm-static -cpu cortex-a15 -L /usr/arm-linux-gn
   allocator to catch it, and there are RTSan and TSan builds (`NAMCHAIN_RTSAN`, `NAMCHAIN_TSAN`).
 - **The vendored NAM core is patched** from `vendor/patches/` at configure time. Change the
   patches, not the vendored files.
+- **`nc.cab.ir`'s convolver comes from `vendor/AudioDSPTools`**, rikkus's fork pinned on
+  `partitioned-ir`. Changes to it go to the fork and come back as a new pin.
 - **The A2 planar parity test only means something in Release.** At -O0 it self-skips;
   `-DNAMCHAIN_REQUIRE_A2_PARITY=ON` turns the skip into a failure.
 - **`tib` is armv7 with no compiler.** Build for it on piv with the NEON toolchain file.

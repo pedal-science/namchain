@@ -1,0 +1,33 @@
+nc.cab.ir on tib: the core's nam::Linear against AudioDSPTools' PartitionedConvolution
+=======================================================================================
+
+2026-09-25. tib (Tinker Board S, Cortex-A17), kernel 7.2.6-tib1 PREEMPT_RT, 1416 MHz cap, core 3
+isolated, namchain-soak --graph <rig> --seconds 20 --cpu 3 (SCHED_FIFO 80), wall-clock pacing, armv7
+NEON build (-mfpu=neon-vfpv4). IR: York Audio ORNG 412 V30 421v-CN, 48 kHz, 24000 taps, truncated
+by hand to the shorter lengths.
+
+"before" is namchain 412e151: nam::Linear from the vendored core (2563c0f), Auto implementation.
+"after" is PartitionedConvolution from rikkus/AudioDSPTools partitioned-ir b505422, which also caps
+the IR at 8192 taps (the before build convolved all 24000).
+
+Cab alone, p99 as % of the deadline (overruns in 20 s):
+
+  taps     q64 before     q64 after      q32 before      q32 after
+  512      2.1  (0)       2.1  (0)       2.4  (0)        2.4  (0)
+  2048     20.9 (2)       4.3  (0)       36.6 (2)        9.5  (1)
+  8192     62.5 (0)       10.0 (0)       117.0 (462)     16.2 (2)
+  24000    111.2 (229)    9.0  (0)       118.3 (709)     19.3 (0)
+
+The after column matches NAMBench's own tib figures for b505422 at 8192 taps (9.89% at 64, 16.0%
+at 32), measured in a different harness.
+
+A2-Full + full-length cab (24000-tap file), p99 as % of the deadline (overruns in 20 s):
+
+  q64: before 168.3 (828), after 70.2 (5)
+  q32: before 179.8 (1842), after 73.6 (9)
+
+0 render-path allocations. The remaining overruns are not the cab's: A2-Full alone in the same
+session, 30 s at q64, gives p99 65.7% / 64.8% with 7 and 9 overruns, against A2-Full + cab at 73.0%
+/ 68.5% with 23 and 5. The same A2-Full load was recorded clean for an hour on 2026-09-16 (p99
+58.6%, 0 overruns of 2 700 000; tib-summary.txt), so tib is noisier today than it was then, and
+that belongs to the Phase 1 soak rather than to this change.

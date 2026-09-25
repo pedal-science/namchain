@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <typeinfo>
@@ -19,7 +20,9 @@
 
 #include "NAM/dsp.h"
 #include "NAM/get_dsp.h"
-#include "NAM/linear.h"
+#include "dsp/Resample.h" // AudioDSPTools, rikkus partitioned-ir
+#include "dsp/PartitionedConvolution.h" // AudioDSPTools, rikkus partitioned-ir
+#include "json.hpp"
 
 #include "namchain/wav.h"
 
@@ -503,10 +506,80 @@ void* create_nam(const graph::NodeSpec& spec, const CompileOptions& options, std
   return prepare_dsp(std::move(model), options, "nc.nam", error).release();
 }
 
-/// Load a mono impulse response and wrap it as a zero-latency `nam::Linear` (§6.2).
-///
+// --- nc.cab.ir --------------------------------------------------------------
+//
+// Zero-latency convolution through AudioDSPTools' PartitionedConvolution (the fork's
+// `partitioned-ir` branch): a direct head, then uniformly partitioned FFT convolution for the
+// rest, with the partition multiplies spread across the callbacks between transforms. Up to 512
+// taps it is a plain direct FIR. On `tib` this is the difference between a full-length cab not
+// fitting at all and costing about a tenth of a 64-frame deadline (NAMBench/IR-PATH.md).
+//
+// The IR is loaded the way the NAM plugin loads one, less its gain law: resampled to the engine
+// rate with the same cubic resampler, then truncated at 8192 taps (170 ms at 48 kHz). What that
+// cut discards is -59 dB median across a 1538-file library (IR-PATH.md, "Is a shorter IR good
+// enough?"). The plugin also scales by -18 dB; namchain has always run IRs at unity and still
+// does.
+
+constexpr std::size_t kCabIrMaxTaps = 8192;
+
+struct CabIrState
+{
+  dsp::PartitionedConvolution conv;
+  std::vector<float> input; ///< a copy, so the convolver never sees `out` aliasing `in`
+  std::string description;
+};
+
+/// The taps of a `Linear` .nam: the core's own container for an impulse response.
+bool load_linear_nam(const std::string& path, std::vector<float>& taps, double& rate, std::string& error)
+{
+  nlohmann::json doc;
+  try
+  {
+    std::ifstream file(path);
+    if (!file)
+    {
+      error = "cannot open '" + path + "'";
+      return false;
+    }
+    doc = nlohmann::json::parse(file);
+    if (doc.value("architecture", std::string()) != "Linear")
+    {
+      error = "'" + path + "' is not a Linear model";
+      return false;
+    }
+    const auto& config = doc.at("config");
+    if (config.value("bias", false))
+    {
+      error = "'" + path + "' has a bias term, which an impulse response does not";
+      return false;
+    }
+    if (config.value("in_channels", 1) != 1 || config.value("out_channels", 1) != 1)
+    {
+      error = "'" + path + "' is not mono";
+      return false;
+    }
+    const std::size_t count = config.at("receptive_field").get<std::size_t>();
+    const auto& weights = doc.at("weights");
+    if (count == 0 || weights.size() < count)
+    {
+      error = "'" + path + "' has fewer weights than its receptive field";
+      return false;
+    }
+    taps.resize(count);
+    for (std::size_t i = 0; i < count; ++i)
+      taps[i] = weights[i].get<float>();
+    rate = doc.value("sample_rate", 48000.0);
+  }
+  catch (const std::exception& e)
+  {
+    error = "cannot load '" + path + "': " + e.what();
+    return false;
+  }
+  return true;
+}
+
 /// Two sources, because both are things people actually have: a `.wav` of the IR, or a `.nam`
-/// containing a `Linear` model (which is the same data in the core's own container).
+/// containing a `Linear` model (the same data in the core's own container).
 void* create_cab_ir(const graph::NodeSpec& spec, const CompileOptions& options, std::string& error)
 {
   const std::string path = string_param(spec, "ir");
@@ -516,53 +589,98 @@ void* create_cab_ir(const graph::NodeSpec& spec, const CompileOptions& options, 
     return nullptr;
   }
 
-  const std::filesystem::path fs_path(path);
-  std::unique_ptr<nam::DSP> model;
-  if (fs_path.extension() == ".nam")
+  std::vector<float> taps;
+  double ir_rate = 0.0;
+  std::string load_error;
+  const bool loaded = std::filesystem::path(path).extension() == ".nam"
+                        ? load_linear_nam(path, taps, ir_rate, load_error)
+                        : load_wav_mono(path, taps, ir_rate, load_error);
+  if (!loaded)
   {
-    try
-    {
-      model = nam::get_dsp(fs_path);
-    }
-    catch (const std::exception& e)
-    {
-      error = reject("nc.cab.ir", "cannot load '" + path + "': " + e.what());
-      return nullptr;
-    }
+    error = reject("nc.cab.ir", load_error);
+    return nullptr;
   }
-  else
+  if (taps.empty())
   {
-    std::vector<float> taps;
-    double ir_rate = 0.0;
-    std::string wav_error;
-    if (!load_wav_mono(path, taps, ir_rate, wav_error))
+    error = reject("nc.cab.ir", "'" + path + "' contains no samples");
+    return nullptr;
+  }
+  if (!(ir_rate > 0.0) || !std::isfinite(ir_rate))
+  {
+    error = reject("nc.cab.ir", "'" + path + "' has no usable sample rate");
+    return nullptr;
+  }
+  for (const float tap : taps)
+  {
+    if (!std::isfinite(tap))
     {
-      error = reject("nc.cab.ir", wav_error);
-      return nullptr;
-    }
-    if (taps.empty())
-    {
-      error = reject("nc.cab.ir", "'" + path + "' contains no samples");
-      return nullptr;
-    }
-    if (std::abs(ir_rate - options.sample_rate) > 0.5)
-    {
-      error = reject("nc.cab.ir", "'" + path + "' is " + quoted(ir_rate) + " Hz but the engine runs at " +
-                                    quoted(options.sample_rate) + " Hz; there is no resampler yet");
-      return nullptr;
-    }
-    try
-    {
-      model = std::make_unique<nam::Linear>(1, 1, static_cast<int>(taps.size()), false, taps, ir_rate);
-    }
-    catch (const std::exception& e)
-    {
-      error = reject("nc.cab.ir", std::string("cannot build the convolution: ") + e.what());
+      error = reject("nc.cab.ir", "'" + path + "' contains a non-finite sample");
       return nullptr;
     }
   }
 
-  return prepare_dsp(std::move(model), options, "nc.cab.ir", error).release();
+  const std::size_t source_taps = taps.size();
+  if (std::abs(ir_rate - options.sample_rate) > 0.5)
+  {
+    // As the plugin does it: one zero of padding each side, so the cubic has neighbours at the ends.
+    std::vector<float> padded(taps.size() + 2, 0.0f);
+    std::copy(taps.begin(), taps.end(), padded.begin() + 1);
+    std::vector<float> resampled;
+    try
+    {
+      dsp::ResampleCubic<float>(padded, ir_rate, options.sample_rate, 0.0, resampled);
+    }
+    catch (const std::exception& e)
+    {
+      error = reject("nc.cab.ir", "cannot resample '" + path + "': " + e.what());
+      return nullptr;
+    }
+    taps = std::move(resampled);
+  }
+  if (taps.size() > kCabIrMaxTaps)
+    taps.resize(kCabIrMaxTaps);
+
+  auto state = std::make_unique<CabIrState>();
+  try
+  {
+    state->conv.SetKernel(taps.data(), taps.size(), dsp::ConvolutionImplementation::Auto);
+    state->conv.Reset(static_cast<std::size_t>(options.max_quantum));
+  }
+  catch (const std::exception& e)
+  {
+    error = reject("nc.cab.ir", std::string("cannot build the convolution: ") + e.what());
+    return nullptr;
+  }
+  state->input.assign(static_cast<std::size_t>(options.max_quantum), 0.0f);
+
+  const bool fft = state->conv.GetActiveImplementation() == dsp::ConvolutionImplementation::FFT;
+  state->description = "dsp::PartitionedConvolution (" + std::string(fft ? "FFT" : "direct") + ", " +
+                       std::to_string(state->conv.NumTaps()) + " taps";
+  if (fft)
+    state->description += ", " + std::to_string(state->conv.GetNumPartitions()) + " partitions of " +
+                          std::to_string(state->conv.GetFftBlockSize());
+  if (source_taps != state->conv.NumTaps())
+    state->description += ", from " + std::to_string(source_taps) + " at " + quoted(ir_rate) + " Hz";
+  state->description += ")";
+  return state.release();
+}
+
+void destroy_cab_ir(void* state)
+{
+  delete static_cast<CabIrState*>(state);
+}
+
+std::string describe_cab_ir(void* raw)
+{
+  const CabIrState* state = static_cast<const CabIrState*>(raw);
+  return state != nullptr ? state->description : std::string();
+}
+
+void process_cab_ir(void* raw, const float* const* in, float* const* out, int frames) noexcept
+{
+  CabIrState* state = static_cast<CabIrState*>(raw);
+  std::copy(in[0], in[0] + frames, state->input.begin());
+  state->conv.Process(state->input.data(), out[0], static_cast<std::size_t>(frames));
 }
 
 // --- nc.eq.biquad ----------------------------------------------------------
@@ -1264,8 +1382,8 @@ const NodeType kNam{.id = "nc.nam", .name = "NAM model", .category = "amp", .inp
                     .describe = describe_dsp, .arity_param = nullptr, .min_ports = 1, .max_ports = 64,
                     .params = kNamParams, .param_count = 1};
 const NodeType kCabIr{.id = "nc.cab.ir", .name = "Cabinet IR", .category = "cab", .inputs = 1,
-                      .outputs = 1, .create = create_cab_ir, .destroy = destroy_dsp,
-                      .process = process_dsp, .describe = describe_dsp, .arity_param = nullptr,
+                      .outputs = 1, .create = create_cab_ir, .destroy = destroy_cab_ir,
+                      .process = process_cab_ir, .describe = describe_cab_ir, .arity_param = nullptr,
                       .min_ports = 1, .max_ports = 64, .params = kCabIrParams, .param_count = 1};
 const NodeType kBiquad{.id = "nc.eq.biquad", .name = "Biquad EQ", .category = "eq", .inputs = 1,
                        .outputs = 1, .create = create_biquad, .destroy = destroy_biquad,

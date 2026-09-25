@@ -2,3 +2,6 @@
 	path = vendor/NeuralAmpModelerCore
 	url = https://github.com/sdatkinson/NeuralAmpModelerCore
 	ignore = dirty
+[submodule "vendor/AudioDSPTools"]
+	path = vendor/AudioDSPTools
+	url = https://github.com/rikkus/AudioDSPTools
