@@ -398,8 +398,14 @@ private:
   mutable uint64_t occupancy_mismatches_ = 0;
 };
 
-/// Resolve "hw:4,0", "4,0" or a "/dev/snd/..." path to a PCM device node.
+/// Resolve a PCM spec to a device node. Accepts "hw:CARD=<id>[,DEV=<d>]", "hw:<card>[,<d>]" and
+/// "<card>[,<d>]", where <card> is an index or a card id, or a "/dev/snd/..." path. Use an id:
+/// card indices follow probe order and can change across a reboot, and an id does not.
 bool resolve_pcm_node(const std::string& spec, bool capture, std::string& node, std::string& error);
+
+/// As above, looking card ids up under `asound_root` instead of /proc/asound. For tests.
+bool resolve_pcm_node(const std::string& spec, bool capture, std::string& node, std::string& error,
+                      const std::string& asound_root);
 
 } // namespace namchain
 

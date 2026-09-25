@@ -20,7 +20,7 @@ namespace daemon
 struct Config
 {
   BackendKind backend = BackendKind::AlsaRaw;
-  /// Device spec for the device backends: "hw:4,0", "4,0", or a /dev/snd path. Empty = platform
+  /// Device spec for the device backends: "hw:CARD=<id>", "hw:<id>,<d>", "hw:4,0", "4,0", or a /dev/snd path. Empty = platform
   /// default. Ignored by `null` and `file`.
   std::string device;
   unsigned sample_rate = 48000;

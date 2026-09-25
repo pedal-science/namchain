@@ -7,6 +7,7 @@
   #include <cstdio>
   #include <cstdlib>
   #include <cstring>
+  #include <dirent.h>
   #include <fcntl.h>
   #include <poll.h>
   #include <sound/asound.h>
@@ -44,20 +45,67 @@ std::string timeout_text(int timeout_ms, int state, long long ring, uint64_t gat
   return text;
 }
 
-bool parse_card_device(const std::string& text, unsigned& card, unsigned& device)
+bool parse_unsigned(const std::string& text, unsigned& value)
 {
-  unsigned c = 0;
-  unsigned d = 0;
-  if (std::sscanf(text.c_str(), "%u,%u", &c, &d) != 2)
+  if (text.empty() || text.size() > 9 || text.find_first_not_of("0123456789") != std::string::npos)
     return false;
-  card = c;
-  device = d;
+  value = static_cast<unsigned>(std::stoul(text));
   return true;
+}
+
+/// The card ids under `asound_root`: each is a symlink to its "cardN" directory.
+std::string list_card_ids(const std::string& asound_root)
+{
+  std::string ids;
+  DIR* dir = ::opendir(asound_root.c_str());
+  if (dir == nullptr)
+    return ids;
+  while (const dirent* entry = ::readdir(dir))
+  {
+    const std::string name = entry->d_name;
+    if (name == "." || name == "..")
+      continue;
+    char target[64];
+    const ssize_t n = ::readlink((asound_root + "/" + name).c_str(), target, sizeof(target) - 1);
+    if (n > 4 && std::strncmp(target, "card", 4) == 0)
+      ids += (ids.empty() ? "" : ", ") + name;
+  }
+  ::closedir(dir);
+  return ids;
+}
+
+/// A card given by index or by id. An id is looked up through `asound_root`, so it names the same
+/// interface however the cards were numbered at boot.
+bool resolve_card(const std::string& card_text, const std::string& asound_root, unsigned& card,
+                  std::string& error)
+{
+  if (parse_unsigned(card_text, card))
+    return true;
+
+  char target[64];
+  const ssize_t n = ::readlink((asound_root + "/" + card_text).c_str(), target, sizeof(target) - 1);
+  if (n > 0)
+  {
+    target[n] = '\0';
+    if (std::strncmp(target, "card", 4) == 0 && parse_unsigned(target + 4, card))
+      return true;
+  }
+
+  const std::string ids = list_card_ids(asound_root);
+  error = "no sound card with id '" + card_text + "'" +
+          (ids.empty() ? " (none found in " + asound_root + ")" : "; cards present: " + ids);
+  return false;
 }
 
 } // namespace
 
 bool resolve_pcm_node(const std::string& spec, bool capture, std::string& node, std::string& error)
+{
+  return resolve_pcm_node(spec, capture, node, error, "/proc/asound");
+}
+
+bool resolve_pcm_node(const std::string& spec, bool capture, std::string& node, std::string& error,
+                      const std::string& asound_root)
 {
   if (spec.rfind("/dev/", 0) == 0)
   {
@@ -69,11 +117,40 @@ bool resolve_pcm_node(const std::string& spec, bool capture, std::string& node, 
   if (rest.rfind("hw:", 0) == 0)
     rest = rest.substr(3);
 
-  unsigned card = 0;
-  unsigned device = 0;
-  if (!parse_card_device(rest, card, device))
+  // Either "CARD=<card>[,DEV=<device>]" (ALSA's own long form) or "<card>[,<device>]", where
+  // <card> is an index or an id. The device defaults to 0, as it does in ALSA.
+  std::string card_text = rest;
+  std::string device_text = "0";
+  const bool long_form = rest.rfind("CARD=", 0) == 0;
+  const std::size_t comma = rest.find(',');
+  if (comma != std::string::npos)
   {
-    error = "cannot parse PCM device '" + spec + "'; expected hw:C,D, C,D or /dev/snd/pcmC*D*";
+    card_text = rest.substr(0, comma);
+    device_text = rest.substr(comma + 1);
+    if (long_form)
+    {
+      if (device_text.rfind("DEV=", 0) != 0)
+        device_text.clear();
+      else
+        device_text = device_text.substr(4);
+    }
+  }
+  if (long_form)
+    card_text = card_text.substr(5);
+
+  unsigned device = 0;
+  if (card_text.empty() || card_text.find_first_of("=/") != std::string::npos ||
+      !parse_unsigned(device_text, device))
+  {
+    error = "cannot parse PCM device '" + spec +
+            "'; expected hw:CARD=<id>[,DEV=<d>], hw:<id>[,<d>], hw:C,D, C,D or /dev/snd/pcmC*D*";
+    return false;
+  }
+
+  unsigned card = 0;
+  if (!resolve_card(card_text, asound_root, card, error))
+  {
+    error = "PCM device '" + spec + "': " + error;
     return false;
   }
 

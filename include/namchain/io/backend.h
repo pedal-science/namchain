@@ -41,7 +41,7 @@ struct BackendConfig
   unsigned periods = 4;
   unsigned capture_channels = 1;
   unsigned playback_channels = 1;
-  /// Device spec for the device backends: "hw:4,0", "4,0", or a /dev/snd path.
+  /// Device spec for the device backends: "hw:CARD=<id>", "hw:<id>,<d>", "hw:4,0", "4,0", or a /dev/snd path.
   std::string device;
   /// `file` and `pipe`: the WAV read as capture. `file` also writes \ref output_path as a WAV;
   /// `pipe` writes raw interleaved frames to it, and it is expected to be a FIFO.

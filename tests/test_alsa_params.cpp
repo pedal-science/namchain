@@ -6,6 +6,8 @@
 #include <doctest.h>
 
 #include <string>
+#include <unistd.h>
+#include <cstdlib>
 
 #include "namchain/io/alsa_params.h"
 #include "namchain/io/alsa_raw.h"
@@ -140,6 +142,47 @@ TEST_CASE("PCM device specifications resolve to the right node")
   CHECK_FALSE(namchain::resolve_pcm_node("not-a-device", true, node, error));
   CHECK_FALSE(error.empty());
   CHECK_FALSE(namchain::resolve_pcm_node("hw:", true, node, error));
+}
+
+TEST_CASE("PCM device specifications resolve card ids through /proc/asound")
+{
+  // A stand-in for /proc/asound as tib has it: each card id is a symlink to its cardN directory.
+  // "II" is the SSL 2+ Mk II; ALSA derives the id from the product name.
+  char root_template[] = "/tmp/namchain-asound-XXXXXX";
+  const char* made = ::mkdtemp(root_template);
+  REQUIRE(made != nullptr);
+  const std::string root = made;
+  REQUIRE(::symlink("card1", (root + "/II").c_str()) == 0);
+  REQUIRE(::symlink("card2", (root + "/rockchiptinkerc").c_str()) == 0);
+
+  std::string node;
+  std::string error;
+  CHECK(namchain::resolve_pcm_node("hw:CARD=II,DEV=0", true, node, error, root));
+  CHECK(node == "/dev/snd/pcmC1D0c");
+  CHECK(namchain::resolve_pcm_node("hw:CARD=II", false, node, error, root));
+  CHECK(node == "/dev/snd/pcmC1D0p");
+  CHECK(namchain::resolve_pcm_node("hw:II,1", false, node, error, root));
+  CHECK(node == "/dev/snd/pcmC1D1p");
+  CHECK(namchain::resolve_pcm_node("rockchiptinkerc", false, node, error, root));
+  CHECK(node == "/dev/snd/pcmC2D0p");
+  // An index still works, and never touches the lookup.
+  CHECK(namchain::resolve_pcm_node("hw:4", true, node, error, root));
+  CHECK(node == "/dev/snd/pcmC4D0c");
+
+  // A missing id is an error that says which ids exist, not a guess at another card.
+  error.clear();
+  CHECK_FALSE(namchain::resolve_pcm_node("hw:CARD=WM8960", true, node, error, root));
+  CHECK(error.find("WM8960") != std::string::npos);
+  CHECK(error.find("II") != std::string::npos);
+  CHECK(error.find("rockchiptinkerc") != std::string::npos);
+
+  CHECK_FALSE(namchain::resolve_pcm_node("hw:CARD=II,0", true, node, error, root));
+  CHECK_FALSE(namchain::resolve_pcm_node("hw:II,x", true, node, error, root));
+  CHECK_FALSE(namchain::resolve_pcm_node("hw:CARD=", true, node, error, root));
+
+  ::unlink((root + "/II").c_str());
+  ::unlink((root + "/rockchiptinkerc").c_str());
+  ::rmdir(root.c_str());
 }
 
 TEST_CASE("opening a device that does not exist fails cleanly")

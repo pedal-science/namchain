@@ -61,7 +61,7 @@ silently ignored.
 | field | default | meaning |
 |---|---|---|
 | `backend` | `alsa_raw` | `alsa_raw`, `null`, `file`, or `pipewire` (refused by name) |
-| `device` | *(empty)* | ALSA spec: `hw:4,0`, `4,0`, or a `/dev/snd` path |
+| `device` | *(empty)* | ALSA spec: `hw:CARD=<id>[,DEV=<d>]`, `hw:<id>,<d>`, `hw:4,0`, `4,0`, or a `/dev/snd` path. Prefer an id (the names in `/proc/asound`, e.g. `II` for the SSL 2+ Mk II): card numbers follow probe order and change across reboots |
 | `sample_rate` | `48000` | |
 | `period_size` | `64` | quantum in frames |
 | `periods` | `4` | device buffer length in periods |

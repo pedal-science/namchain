@@ -1,6 +1,6 @@
 {
   "backend": "alsa_raw",
-  "device": "hw:4,0",
+  "device": "hw:CARD=II,DEV=0",
   "sample_rate": 48000,
   "period_size": 64,
   "periods": 6,
