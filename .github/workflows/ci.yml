@@ -137,6 +137,32 @@ jobs:
       - name: Build
         run: cmake --build build-armv7 -j"$(nproc)"
 
+  armv7-neon-cross:
+    name: armv7 NEON cross + qemu (incl. A2 planar parity gate)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-arm-linux-gnueabihf qemu-user-static
+      - name: Configure
+        run: >
+          cmake -S . -B build-armv7-neon -G Ninja
+          -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/armv7-neon-linux-gnueabihf.cmake
+          -DCMAKE_BUILD_TYPE=Release
+          -DNAMCHAIN_REQUIRE_A2_PARITY=ON
+      - name: Build
+        run: cmake --build build-armv7-neon -j"$(nproc)"
+      - name: Test under qemu
+        run: qemu-arm-static -cpu cortex-a15 -L /usr/arm-linux-gnueabihf ./build-armv7-neon/namchain-tests
+      - name: A2 planar parity gate must have actually run
+        run: |
+          qemu-arm-static -cpu cortex-a15 -L /usr/arm-linux-gnueabihf ./build-armv7-neon/namchain-tests \
+            --test-case="planar*"
+
   # NOTE: the authoritative performance/soak numbers come from a self-hosted bare-metal
   # Raspberry Pi job (plan.md §1, §10.5), not from a shared cloud runner. It is
   # deliberately not defined here until the Pi is registered as a runner; numbers

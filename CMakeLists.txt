@@ -410,9 +410,21 @@ endif()
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+# Mirror the preprocessor gate in NAM/wavenet/a2_planar.h rather than guessing from the
+# processor name: armv7 builds get the planar kernels only with NEON and FMA enabled.
 set(NAMCHAIN_A2_PLANAR_ACTIVE OFF)
-if(NAMCHAIN_A2_FAST AND NAMCHAIN_APPLY_VENDOR_PATCHES AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|armv8)")
-  set(NAMCHAIN_A2_PLANAR_ACTIVE ON)
+if(NAMCHAIN_A2_FAST AND NAMCHAIN_APPLY_VENDOR_PATCHES)
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles("
+#if defined(__aarch64__)
+#elif defined(__arm__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA)
+#else
+#error no planar kernels
+#endif
+int main() { return 0; }" NAMCHAIN_A2_PLANAR_TARGET)
+  if(NAMCHAIN_A2_PLANAR_TARGET)
+    set(NAMCHAIN_A2_PLANAR_ACTIVE ON)
+  endif()
 endif()
 
 # The planar-kernel parity gate is only meaningful in an optimised build: at -O0 the reference
