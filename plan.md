@@ -649,12 +649,12 @@ audio-transparent), `nc.bypass` (wrapper).
   millisecond value is refused instead of approximated. The ring is `delay + 1` slots so the read
   pointer is visibly `delay` behind the write pointer rather than coinciding with it.
 - **`nc.cab.ir`** loads a mono `.wav` IR or a `Linear` `.nam`, and convolves it with
-  `dsp::PartitionedConvolution` from rikkus/AudioDSPTools `partitioned-ir` (`vendor/AudioDSPTools`,
-  pinned at `b505422`; NAMBench/IR-PATH.md has the measurements): direct up to 512 taps, above that a
-  direct head plus partitioned FFT with the partition multiplies spread across the quiet callbacks.
-  It replaced the core's `nam::Linear`, whose FFT path does every partition in the one callback:
-  on `tib` at 8192 taps that was p99 62.5% of a 64-frame deadline and 117% of a 32-frame one, and is
-  now 10% and 16% (`bench-results/tib-cab-ir.txt`). The IR is prepared the way the NAM plugin
+  the core's `nam::Linear` (Auto: direct for short IRs, FFT for long ones). From 79939b4 to
+  2026-09-26 it used `dsp::PartitionedConvolution` from rikkus/AudioDSPTools `partitioned-ir`, which
+  spreads the partition multiplies across the quiet callbacks; that fork is deprecated, so it is back
+  on `nam::Linear`. The cost of going back is on `tib`: at 8192 taps `nam::Linear` was p99 62.5% of a
+  64-frame deadline and 117% of a 32-frame one, against 10% and 16% (`bench-results/tib-cab-ir.txt`).
+  The IR is prepared the way the NAM plugin
   prepares one, less its -18 dB gain: cubic-resampled to the engine rate and truncated at 8192 taps.
   The tap order is the natural one, so a WAV's first sample is the direct sound; a test pins that
   with a two-tap IR, because a reversal is inaudible as an error and audible as a wrong-sounding

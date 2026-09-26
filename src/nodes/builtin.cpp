@@ -20,8 +20,8 @@
 
 #include "NAM/dsp.h"
 #include "NAM/get_dsp.h"
-#include "dsp/Resample.h" // AudioDSPTools, rikkus partitioned-ir
-#include "dsp/PartitionedConvolution.h" // AudioDSPTools, rikkus partitioned-ir
+#include "NAM/linear.h"
+#include "dsp/Resample.h" // AudioDSPTools, as the vendored core pins it
 #include "json.hpp"
 
 #include "namchain/wav.h"
@@ -508,26 +508,19 @@ void* create_nam(const graph::NodeSpec& spec, const CompileOptions& options, std
 
 // --- nc.cab.ir --------------------------------------------------------------
 //
-// Zero-latency convolution through AudioDSPTools' PartitionedConvolution (the fork's
-// `partitioned-ir` branch): a direct head, then uniformly partitioned FFT convolution for the
-// rest, with the partition multiplies spread across the callbacks between transforms. Up to 512
-// taps it is a plain direct FIR. On `tib` this is the difference between a full-length cab not
-// fitting at all and costing about a tenth of a 64-frame deadline (NAMBench/IR-PATH.md).
+// Zero-latency convolution through the vendored core's `nam::Linear`, wrapped like nc.nam's DSP.
+// Its Auto implementation is direct for short IRs and FFT for long ones, with every partition's
+// multiply done in the callback that completes a block. On `tib` that burst was p99 62.5% of a
+// 64-frame deadline at 8192 taps (bench-results/tib-cab-ir.txt), too much beside A2-Full; the
+// fork's spread convolver that fixed it is deprecated. On piv it fits.
 //
 // The IR is loaded the way the NAM plugin loads one, less its gain law: resampled to the engine
 // rate with the same cubic resampler, then truncated at 8192 taps (170 ms at 48 kHz). What that
-// cut discards is -59 dB median across a 1538-file library (IR-PATH.md, "Is a shorter IR good
-// enough?"). The plugin also scales by -18 dB; namchain has always run IRs at unity and still
+// cut discards is -59 dB median across a 1538-file library (NAMBench/IR-PATH.md, "Is a shorter IR
+// good enough?"). The plugin also scales by -18 dB; namchain has always run IRs at unity and still
 // does.
 
 constexpr std::size_t kCabIrMaxTaps = 8192;
-
-struct CabIrState
-{
-  dsp::PartitionedConvolution conv;
-  std::vector<float> input; ///< a copy, so the convolver never sees `out` aliasing `in`
-  std::string description;
-};
 
 /// The taps of a `Linear` .nam: the core's own container for an impulse response.
 bool load_linear_nam(const std::string& path, std::vector<float>& taps, double& rate, std::string& error)
@@ -619,7 +612,6 @@ void* create_cab_ir(const graph::NodeSpec& spec, const CompileOptions& options, 
     }
   }
 
-  const std::size_t source_taps = taps.size();
   if (std::abs(ir_rate - options.sample_rate) > 0.5)
   {
     // As the plugin does it: one zero of padding each side, so the cubic has neighbours at the ends.
@@ -640,47 +632,17 @@ void* create_cab_ir(const graph::NodeSpec& spec, const CompileOptions& options, 
   if (taps.size() > kCabIrMaxTaps)
     taps.resize(kCabIrMaxTaps);
 
-  auto state = std::make_unique<CabIrState>();
+  std::unique_ptr<nam::DSP> model;
   try
   {
-    state->conv.SetKernel(taps.data(), taps.size(), dsp::ConvolutionImplementation::Auto);
-    state->conv.Reset(static_cast<std::size_t>(options.max_quantum));
+    model = std::make_unique<nam::Linear>(1, 1, static_cast<int>(taps.size()), false, taps, options.sample_rate);
   }
   catch (const std::exception& e)
   {
     error = reject("nc.cab.ir", std::string("cannot build the convolution: ") + e.what());
     return nullptr;
   }
-  state->input.assign(static_cast<std::size_t>(options.max_quantum), 0.0f);
-
-  const bool fft = state->conv.GetActiveImplementation() == dsp::ConvolutionImplementation::FFT;
-  state->description = "dsp::PartitionedConvolution (" + std::string(fft ? "FFT" : "direct") + ", " +
-                       std::to_string(state->conv.NumTaps()) + " taps";
-  if (fft)
-    state->description += ", " + std::to_string(state->conv.GetNumPartitions()) + " partitions of " +
-                          std::to_string(state->conv.GetFftBlockSize());
-  if (source_taps != state->conv.NumTaps())
-    state->description += ", from " + std::to_string(source_taps) + " at " + quoted(ir_rate) + " Hz";
-  state->description += ")";
-  return state.release();
-}
-
-void destroy_cab_ir(void* state)
-{
-  delete static_cast<CabIrState*>(state);
-}
-
-std::string describe_cab_ir(void* raw)
-{
-  const CabIrState* state = static_cast<const CabIrState*>(raw);
-  return state != nullptr ? state->description : std::string();
-}
-
-void process_cab_ir(void* raw, const float* const* in, float* const* out, int frames) noexcept
-{
-  CabIrState* state = static_cast<CabIrState*>(raw);
-  std::copy(in[0], in[0] + frames, state->input.begin());
-  state->conv.Process(state->input.data(), out[0], static_cast<std::size_t>(frames));
+  return prepare_dsp(std::move(model), options, "nc.cab.ir", error).release();
 }
 
 // --- nc.eq.biquad ----------------------------------------------------------
@@ -1382,8 +1344,8 @@ const NodeType kNam{.id = "nc.nam", .name = "NAM model", .category = "amp", .inp
                     .describe = describe_dsp, .arity_param = nullptr, .min_ports = 1, .max_ports = 64,
                     .params = kNamParams, .param_count = 1};
 const NodeType kCabIr{.id = "nc.cab.ir", .name = "Cabinet IR", .category = "cab", .inputs = 1,
-                      .outputs = 1, .create = create_cab_ir, .destroy = destroy_cab_ir,
-                      .process = process_cab_ir, .describe = describe_cab_ir, .arity_param = nullptr,
+                      .outputs = 1, .create = create_cab_ir, .destroy = destroy_dsp,
+                      .process = process_dsp, .describe = describe_dsp, .arity_param = nullptr,
                       .min_ports = 1, .max_ports = 64, .params = kCabIrParams, .param_count = 1};
 const NodeType kBiquad{.id = "nc.eq.biquad", .name = "Biquad EQ", .category = "eq", .inputs = 1,
                        .outputs = 1, .create = create_biquad, .destroy = destroy_biquad,

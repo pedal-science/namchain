@@ -105,14 +105,6 @@ set(NAMCHAIN_AUDIODSPTOOLS_DIR "${NAMCHAIN_NAM_CORE_DIR}/Dependencies/AudioDSPTo
 set(NAMCHAIN_AUDIODSPTOOLS_WAV "${NAMCHAIN_AUDIODSPTOOLS_DIR}/dsp/wav.cpp")
 set_source_files_properties(${NAMCHAIN_AUDIODSPTOOLS_WAV} PROPERTIES COMPILE_FLAGS "-w")
 
-# nc.cab.ir's convolver, from rikkus/AudioDSPTools `partitioned-ir`: a direct head for zero latency,
-# uniformly partitioned FFT convolution behind it, half-spectrum multiplies, and the partition
-# multiplies spread across the quiet callbacks. Only this class is taken from the fork; the WAV
-# loader above stays the core's own. Measurements: NAMBench/IR-PATH.md.
-set(NAMCHAIN_IR_CONV_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/AudioDSPTools")
-set(NAMCHAIN_IR_CONV_SOURCES "${NAMCHAIN_IR_CONV_DIR}/dsp/PartitionedConvolution.cpp")
-set_source_files_properties(${NAMCHAIN_IR_CONV_SOURCES} PROPERTIES COMPILE_FLAGS "-w")
-
 # Our own code is held to -Wall -Wextra (and -Werror where CI asks for it). Set before the
 # library target so that libnamchain's own sources are covered too, not just the tools and
 # tests -- third-party sources opt out individually via COMPILE_FLAGS "-w" above.
@@ -153,7 +145,6 @@ add_library(namchain OBJECT
   src/nodes/macros.cpp
   src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
-  ${NAMCHAIN_IR_CONV_SOURCES}
   ${NAMC_CORE_SOURCES})
 
 target_include_directories(namchain SYSTEM PUBLIC
@@ -162,7 +153,8 @@ target_include_directories(namchain SYSTEM PUBLIC
   "${NAMCHAIN_NAM_CORE_DIR}/Dependencies/nlohmann")
 # Private: the WAV loader is an implementation detail of libnamchain, not part of its surface.
 target_include_directories(namchain PRIVATE "${NAMCHAIN_AUDIODSPTOOLS_DIR}/dsp")
-target_include_directories(namchain SYSTEM PRIVATE "${NAMCHAIN_IR_CONV_DIR}")
+# nc.cab.ir includes "dsp/Resample.h" from the same AudioDSPTools.
+target_include_directories(namchain SYSTEM PRIVATE "${NAMCHAIN_AUDIODSPTOOLS_DIR}")
 target_include_directories(namchain PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(namchain PUBLIC cxx_std_20)
 target_compile_options(namchain PRIVATE ${NAMCHAIN_WARN_FLAGS})
