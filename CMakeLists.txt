@@ -211,6 +211,14 @@ if(NAMCHAIN_BUILD_TOOLS)
   target_compile_options(namchain-soak PRIVATE ${NAMCHAIN_WARN_FLAGS})
 
   # True round-trip latency over a loopback or a patch cable (plan.md §10.5.1).
+  # The pedal's experiment E1 (pedal.project plan.md 3.8). Linux only: it paces with
+  # clock_nanosleep and pins threads to isolated cores.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(namchain-warm-bench tools/warm/namchain-warm-bench.cpp)
+    target_link_libraries(namchain-warm-bench PRIVATE namchain)
+    target_compile_options(namchain-warm-bench PRIVATE ${NAMCHAIN_WARN_FLAGS})
+  endif()
+
   add_executable(namchain-latency tools/latency/namchain-latency.cpp)
   target_link_libraries(namchain-latency PRIVATE namchain)
   target_compile_options(namchain-latency PRIVATE ${NAMCHAIN_WARN_FLAGS})

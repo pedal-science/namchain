@@ -1,0 +1,71 @@
+E1: keeping candidate rigs warm, on piv (pedal.project plan.md 3.8)
+====================================================================
+
+2026-09-26. piv (Raspberry Pi 500, BCM2712, 4 x Cortex-A76 at 2.4 GHz, no cap; the same SoC as
+vip, the Pi 5 that will be the pedal), kernel 7.0.0-1017-raspi-realtime PREEMPT_RT, cores 2-3
+isolated, services on 0-1 (pedal.project devices/piv). namchaind stopped. Tool:
+tools/warm/namchain-warm-bench (this commit). Every rig is a library A2 model (SlimmableContainer)
+plus York Audio ORNG 412 V30 421v-CNT, 48 kHz, truncated to 8192 taps. Input: a 23.7 s guitar DI
+recording, looped. Quantum 64 (deadline 1333 us).
+
+Arms (plan.md 3.8): A cold (load at the switch), B loaded and prewarmed with NAM's own prewarm
+(silence state), C as B plus a replay of recent real input just before the switch, D always warm
+(runs on the live input all the time).
+
+
+1. State: does the switched-to rig sound right straight away?  (mode `state`)
+---------------------------------------------------------------------------
+
+Live: AMPEG_CH 2 NEUTRAL G5. Four candidates, a switch every 2 s, 11 switches each, 5 ms
+equal-power crossfade. Each output judged by namchain::glitch against the candidate having run
+all along (D is that by construction offline). Error = |output - always-on output|.
+
+  arm   clicks (glitch detector)     error, first 200 ms       error after       switch cost
+  B     0/44 pass (convergence)      +1.1 to +15.5 dBFS         -61 to -101 dBFS  none
+  C     39/44 pass                   -51 to -68 dBFS            -120 to -139 dBFS 13.4-14.2 ms
+        (replay = 8192 samples, the longer of the amp's prewarm count (6347) and the cab)
+  C'    replay 340 ms: 11/11 on the worst candidate, -114 dBFS; replay 1 s: -120 dBFS
+        replay cost 27 ms (340 ms) and 81 ms (1 s), on a housekeeping core under nice
+  D     44/44 pass                   identical                  identical         none
+
+No arm clicks by continuity (second difference within 1.1x of the signal's own). B's failure is
+that the new rig is the wrong sound for ~170-340 ms: its amp and cab start from silence, so the
+cab's tail and the amp's memory of what was just played are missing. That is also what the cold
+path A does today: namchaind prewarms on zeros. The A2 models remember a little longer than their
+nominal receptive field; replaying 340 ms rather than 170 ms takes C from -51 to -114 dBFS.
+
+
+2. Contention: what running candidates on core 2 costs the render core  (mode `contention`)
+------------------------------------------------------------------------------------------
+
+Live rig on cpu 3 at SCHED_FIFO 80, paced to the wall clock; N candidate rigs on cpu 2 at FIFO 70,
+following the render thread block by block. 30 s cool-down between runs, 36-40 C, throttled=0x0
+throughout.
+
+   N  secs   render p99 / max (% deadline)   overruns        warm p50 / p99 (% quantum)  behind  MB each
+   0    60   14.7 / 18.6                     0 of 45000      -                           -       -
+   1    60   15.0 / 18.2                     0 of 45000      7 / 15                      1       2.0
+   2    60   15.7 / 21.0                     0 of 45000      15 / 32                     1       2.0
+   4    60   16.4 / 21.8                     0 of 45000      36 / 72                     1       2.0
+   5   600   16.7 / 30.2                     0 of 450000     50 / 97                     1       -
+   6    60   16.6 / 21.8                     0 of 45000      64 / 121                    1       -
+   8    60   17.4 / 30.2                     0 of 45000      95 / 171                    2       1.9
+
+The render core barely notices: p99 +2.7 points at N=8, no overruns. The shared L3 and memory bus
+are not the limit. Core 2 is: a rig costs ~7% of a quantum alone and ~12% each at N=8 (they crowd
+the cache), so one core holds ~5 with its p99 under a quantum, and 6-8 on average but not at the
+tail (a candidate then runs a block or two late, which a switch can wait out: <= 2.7 ms). Memory is
+~2 MB per rig: 1 GB is no constraint.
+
+
+Switch time, event to the new sound at the jack (D9's budget is 50 ms)
+----------------------------------------------------------------------
+
+  output path after the engine (queue ~2.3-3.1 periods + converters): ~5 ms  (namchain-latency,
+  loopback out 3 -> in 1: 8.7 ms round trip)
+  A cold, measured through namchaind (pedal.project tools/measure-switch.py):
+      page cache warm: 25 ms median, 27 max; from disk: 33 ms median, 35 max  -> ~38-40 ms
+      but it sounds like B for the first 170-340 ms
+  B  <= 1 block + 5 ms fade + output  -> ~11 ms, wrong sound for 170-340 ms
+  C  27 ms replay (340 ms) + that     -> ~38 ms, right sound
+  D  <= 1 block + 5 ms fade + output  -> ~11 ms, right sound
