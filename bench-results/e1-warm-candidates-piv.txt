@@ -58,7 +58,7 @@ tail (a candidate then runs a block or two late, which a switch can wait out: <=
 ~2 MB per rig: 1 GB is no constraint.
 
 
-Switch time, event to the new sound at the jack (D9's budget is 50 ms)
+Switch time, event to the new sound at the jack (D10's budget is 50 ms)
 ----------------------------------------------------------------------
 
   output path after the engine (queue ~2.3-3.1 periods + converters): ~5 ms  (namchain-latency,
