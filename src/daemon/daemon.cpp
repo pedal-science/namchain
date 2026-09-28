@@ -1766,6 +1766,22 @@ void Daemon::account_period()
   last_queue_ = queue;
 }
 
+void Daemon::account_render_time(std::chrono::steady_clock::duration elapsed, const BackendInfo& info) noexcept
+{
+  if (info.sample_rate == 0)
+    return;
+  const uint64_t deadline = static_cast<uint64_t>(info.period_size) * 1'000'000'000ull / info.sample_rate;
+  if (deadline == 0)
+    return;
+  deadline_ns_.store(deadline, std::memory_order_relaxed);
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
+  const uint64_t took = ns > 0 ? static_cast<uint64_t>(ns) : 0;
+  const std::size_t bucket = std::min<uint64_t>(took * 100 / deadline, kLoadBuckets - 1);
+  load_histogram_[bucket].fetch_add(1, std::memory_order_relaxed);
+  if (took > worst_block_ns_.load(std::memory_order_relaxed))
+    worst_block_ns_.store(took, std::memory_order_relaxed);
+}
+
 void Daemon::end_recording()
 {
   if (recorder_ == nullptr || recorder_live_.load() == nullptr)
@@ -2101,6 +2117,8 @@ void Daemon::render_loop()
       // tail is defined silence and it is the last real audio there is.
       continue;
     }
+    // The block's clock starts once its input is in hand: waiting for the device is not render time.
+    const auto block_start = std::chrono::steady_clock::now();
 
     {
       // The render path proper: everything here was bound before publication, so it must not touch
@@ -2201,6 +2219,7 @@ void Daemon::render_loop()
       fail_device(error);
       continue;
     }
+    account_render_time(std::chrono::steady_clock::now() - block_start, info);
     account_period();
 
     reclaimer_.advance_epoch();
@@ -2556,6 +2575,29 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
                        {"floor_insertions", floor_insertions_.load()},
                        {"capture_bursts", capture_bursts_.load()}};
     status["record"] = recording_json();
+    // Each block's time from its capture read to its playback write, against the period's deadline.
+    // `load_histogram` is [percent, blocks] for the buckets that have any; 100 is "at or past it".
+    {
+      nlohmann::json histogram = nlohmann::json::array();
+      uint64_t over_90 = 0;
+      for (std::size_t b = 0; b < kLoadBuckets; ++b)
+      {
+        const uint64_t count = load_histogram_[b].load(std::memory_order_relaxed);
+        if (count == 0)
+          continue;
+        histogram.push_back({b, count});
+        if (b >= 90)
+          over_90 += count;
+      }
+      const uint64_t deadline = deadline_ns_.load(std::memory_order_relaxed);
+      const uint64_t worst = worst_block_ns_.load(std::memory_order_relaxed);
+      status["render"] = {{"deadline_us", static_cast<double>(deadline) / 1000.0},
+                          {"worst_us", static_cast<double>(worst) / 1000.0},
+                          {"worst_percent", deadline == 0 ? 0.0 : 100.0 * static_cast<double>(worst) / static_cast<double>(deadline)},
+                          {"over_90_percent", over_90},
+                          {"over_deadline", load_histogram_[kLoadBuckets - 1].load(std::memory_order_relaxed)},
+                          {"load_histogram", std::move(histogram)}};
+    }
 
     // One entry per chain, in the document's order. This is where a client learns what its document
     // became: the chain ids it owns, the channels it was bound to, and how far each chain has got

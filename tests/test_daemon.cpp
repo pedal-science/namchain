@@ -636,6 +636,19 @@ TEST_CASE("the daemon runs the null backend and serves the control socket")
   // A published plan is not adopted by magic: the generation the render thread runs tracks the one
   // the control thread assigned.
   CHECK(status["status"]["generation"] == status["status"]["adopted_generation"]);
+  // Every block is timed against its deadline (64 frames at 48 kHz), and the histogram accounts for
+  // at least the blocks counted before it was read (the render thread keeps going in between).
+  const auto& render = status["status"]["render"];
+  CHECK(render["deadline_us"].get<double>() == doctest::Approx(1333.333).epsilon(0.001));
+  uint64_t timed = 0;
+  for (const auto& bucket : render["load_histogram"])
+  {
+    CHECK(bucket[0].get<unsigned>() <= 100);
+    timed += bucket[1].get<uint64_t>();
+  }
+  CHECK(timed > 0);
+  CHECK(render["worst_us"].get<double>() > 0.0);
+  CHECK(render["over_deadline"].get<uint64_t>() <= render["over_90_percent"].get<uint64_t>());
 
   // The `smooth` op class, end to end: the control thread resolves the vtable dispatch, the render
   // thread drains it and applies it, and the status counter proves it happened rather than assuming.

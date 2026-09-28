@@ -10,6 +10,7 @@
 //     reclaimer's retire FIFO (render -> control).
 #include <signal.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -538,6 +539,20 @@ private:
   std::atomic<uint64_t> capture_bursts_{0};
   /// Render thread: the counters as of the last block, so a recording can be given the deltas.
   StreamQueueStats last_queue_{};
+
+  /// \brief How long each block took, from the capture read returning to the playback write
+  /// returning, as a share of the period's deadline.
+  ///
+  /// An xrun says the device noticed. This says how close the render came, which is what a soak's
+  /// gate is written in: the worst block, and how many went past 90% and past 100% of the deadline.
+  /// One bucket per percent; the last holds everything at or past the deadline. Cumulative for the
+  /// daemon's life, so a poller takes deltas.
+  static constexpr std::size_t kLoadBuckets = 101;
+  std::array<std::atomic<uint64_t>, kLoadBuckets> load_histogram_{};
+  std::atomic<uint64_t> worst_block_ns_{0};
+  std::atomic<uint64_t> deadline_ns_{0};
+  /// Render thread: file one block's time.
+  void account_render_time(std::chrono::steady_clock::duration elapsed, const BackendInfo& info) noexcept;
 
   /// \brief The recording `engine.record` started, if any.
   ///
