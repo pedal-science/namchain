@@ -605,6 +605,34 @@ TEST_CASE("an oversized message is refused before a byte of it is buffered")
   CHECK(client.is_closed(5000));
 }
 
+TEST_CASE("a reply larger than the request limit arrives whole, and the connection stays open")
+{
+  Server server;
+  // A request limit far below what `engine.schema` answers with. Replies are bounded apart from
+  // requests, because they list what the daemon holds rather than what a client sent: a real asset
+  // library makes `engine.assets` and `engine.schema` about a megabyte each, which is the default
+  // request limit.
+  server.config.tcp_max_message_bytes = 4096;
+  REQUIRE(server.start().empty());
+
+  Client client(server.port());
+  client.send_frame(hello_body("h", kToken));
+  REQUIRE(client.receive_json()["ok"] == true);
+
+  client.send_frame(R"({"id":"s","method":"engine.schema"})");
+  const auto schema = client.receive_frame();
+  REQUIRE(schema.has_value());
+  CHECK(schema->size() > 4096);
+  const auto parsed = nlohmann::json::parse(*schema);
+  CHECK(parsed["ok"] == true);
+  CHECK(parsed["id"] == "s");
+
+  // Still there to be asked again. Before replies had their own limit, this one was sent and the
+  // connection closed straight after it.
+  client.send_frame(R"({"id":"t","method":"engine.status"})");
+  CHECK(client.receive_json()["id"] == "t");
+}
+
 TEST_CASE("the connection cap answers rather than hanging up")
 {
   Server server;

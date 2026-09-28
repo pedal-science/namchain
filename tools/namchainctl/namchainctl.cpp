@@ -42,9 +42,10 @@ constexpr int kExitOk = 0;
 constexpr int kExitUsage = 1;  ///< the command line, or the connection, did not work
 constexpr int kExitRefused = 2; ///< the daemon answered, and said no
 
-/// The receive buffer for one response. Generous, because the largest answer (`rig.get` on a large
-/// document) is the one an operator asks for while something is wrong.
-constexpr std::size_t kReceiveBytes = 4u << 20;
+/// The largest response this reads: the daemon's own reply limit. `engine.assets` and `engine.schema`
+/// list the whole library, and the largest answer is the one an operator asks for while something is
+/// wrong.
+constexpr std::size_t kReceiveBytes = namchain::daemon::kMaxReplyBytes;
 
 void print_usage(std::FILE* stream)
 {

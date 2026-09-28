@@ -1029,10 +1029,13 @@ void Daemon::queue_reply(Connection& connection, std::string reply)
     connection.out.insert(connection.out.end(), reply.begin(), reply.end());
 
   // A client that never reads would otherwise grow this buffer for as long as it keeps asking. One
-  // message's worth of undelivered replies is the cap; past it the connection is finished, because a
-  // peer that cannot absorb a single answer is not a peer this daemon can serve.
+  // reply's worth of undelivered bytes is the cap; past it the connection is finished, because a
+  // peer that cannot absorb a single answer is not a peer this daemon can serve. It is the reply
+  // limit, not the request limit: a reply lists what the daemon holds, and `engine.assets` alone is
+  // about a megabyte for a real library.
   const std::size_t pending = connection.out.size() - connection.out_sent;
-  if (pending > max_message_bytes(connection.session.peer) + kFrameHeaderBytes)
+  const std::size_t cap = std::max(kMaxReplyBytes, max_message_bytes(connection.session.peer));
+  if (pending > cap + kFrameHeaderBytes)
     connection.close_after_flush = true;
 }
 

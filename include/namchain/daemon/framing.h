@@ -23,6 +23,15 @@ namespace daemon
 /// Bytes of length prefix in front of every body on the TCP transport.
 inline constexpr std::size_t kFrameHeaderBytes = 4;
 
+/// \brief The largest reply: the most undelivered reply a connection may hold before the daemon gives
+/// up on it, and so what a client must be ready to read.
+///
+/// Bounded apart from requests (`Config::tcp_max_message_bytes`), because the two grow with different
+/// things. A request is what a client chose to send. A reply lists what the daemon holds, and
+/// `engine.assets` and `engine.schema` carry the whole library: about 1 MB each for 1,500 impulse
+/// responses, so 16 MiB is room for about 20,000.
+inline constexpr std::size_t kMaxReplyBytes = 16u << 20;
+
 /// \brief Append one framed message to \p out.
 ///
 /// The length is written little-endian by hand rather than by copying a `uint32_t`, because the wire

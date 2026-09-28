@@ -87,7 +87,7 @@ silently ignored.
 | `tcp_address` | `127.0.0.1` | TCP address to bind; numeric only (no DNS at startup) |
 | `tcp_port` | `47810` | TCP port; `0` lets the kernel choose, and `engine.status` reports it |
 | `tcp_max_connections` | `4` | TCP connections open at once, authenticated or not |
-| `tcp_max_message_bytes` | `1048576` | largest framed message accepted, checked before the body is read |
+| `tcp_max_message_bytes` | `1048576` | largest framed request accepted, checked before the body is read. Replies have their own limit, 16 MiB ("The wire, byte for byte") |
 | `tcp_token` | *(empty)* | pre-shared token a TCP client presents in `engine.hello` |
 | `tcp_token_file` | *(empty)* | read the token from the first line of this file instead |
 | `tcp_auth_timeout_ms` | `10000` | how long a connection may stay unauthenticated; `0` disables |
@@ -110,8 +110,16 @@ transport is a detail it picks at startup.
 | Framing | none: `SOCK_SEQPACKET` preserves message boundaries | **u32 little-endian length prefix** + one JSON body |
 | Auth | filesystem permissions (`socket_mode`) | **pre-shared token** in `engine.hello`, constant-time compare |
 | Trust | the local operator | untrusted network; off unless `tcp_listen` |
-| Caps | 16 connections, 256 KiB message | `tcp_max_connections` (4), `tcp_max_message_bytes` (1 MiB), 3 auth failures then close |
+| Caps | 16 connections, 256 KiB request, a reply no larger than one datagram (below) | `tcp_max_connections` (4), `tcp_max_message_bytes` (1 MiB request), 16 MiB reply, 3 auth failures then close |
 | Bind | `socket` | `tcp_address`/`tcp_port`, **loopback by default** |
+
+**On Linux, the Unix socket carries each reply as one datagram.** A datagram can be no larger than
+the socket's send buffer, about 208 KiB with the kernel's default `net.core.wmem_default`. So a larger
+reply can't be sent there, and `namchainctl` reports "the daemon closed the connection". That includes
+`engine.assets` or `engine.schema` for a library of more than a few hundred impulse responses. TCP
+has no such limit, so ask over it instead, on the device itself if need be:
+`namchainctl --host 127.0.0.1 --token-file /etc/namchain/token assets`. On macOS the local socket is
+a stream with the length prefix, so the limit doesn't apply there.
 
 TCP is off unless an operator turns it on, and the daemon **refuses to start** with `tcp_listen` set
 and no token: an unauthenticated control port that can rewrite the rig and mute the output is worse
@@ -153,9 +161,13 @@ Three consequences a client has to get right, and the daemon's own tests assert:
   connection is then closed — a stream cannot be resynchronised after a framing error, so
   "keep reading and hope" is not an option.
 - **Writes are non-blocking, and a reply may be queued rather than sent.** A client that stops reading
-  fills its own socket buffer and then the daemon's per-connection outbox; past one message's worth of
-  pending replies the connection is closed. The control loop never waits for a client, which is what
-  keeps a slow reader from being everyone's problem.
+  fills its own socket buffer and then the daemon's per-connection outbox. Past 16 MiB of undelivered
+  reply (`kMaxReplyBytes`, in `framing.h`) the connection is closed. The control loop never waits for
+  a client, which is what keeps a slow reader from being everyone's problem.
+- **A reply can be much larger than a request.** Replies have their own limit because they list what
+  the daemon holds. `engine.assets` and `engine.schema` carry the whole library, about 1 MB each for
+  1,500 impulse responses, while `tcp_max_message_bytes` bounds only what a client may send. A client
+  has to be ready to read a reply of up to 16 MiB.
 
 `engine.status` reports the transports as they are, not as configured — `control` carries
 `unix_socket`, `unix_connections`, `tcp_listening`, `tcp_address`, `tcp_port`, `tcp_connections`,
