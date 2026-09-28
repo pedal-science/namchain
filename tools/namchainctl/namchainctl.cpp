@@ -75,6 +75,10 @@ void print_usage(std::FILE* stream)
     "                         the common case: one parameter, one commit\n"
     "  mute [on|off] [--chain C]   mute the engine, or one chain\n"
     "  panic                  mute unconditionally\n"
+    "  record [start NAME [--seconds S] | stop]\n"
+    "                         record the device's capture and the engine's playback, a period at a\n"
+    "                         time, into the daemon's record_dir/NAME (default 600 s, at most 3600);\n"
+    "                         with no action, say what is being recorded\n"
     "\n"
     "output:\n"
     "  --compact              one line of JSON instead of the indented form\n"
@@ -294,6 +298,8 @@ const char* method_for(const std::string& command)
     return "engine.mute";
   if (command == "panic")
     return "engine.panic";
+  if (command == "record")
+    return "engine.record";
   return nullptr;
 }
 
@@ -328,6 +334,7 @@ struct Options
   std::string param;
   std::string value;
   int node_port = -1;
+  std::string seconds;
 };
 
 } // namespace
@@ -413,6 +420,11 @@ int main(int argc, char** argv)
     else if (word == "--value")
     {
       if (!value_of(options.value))
+        return kExitUsage;
+    }
+    else if (word == "--seconds")
+    {
+      if (!value_of(options.seconds))
         return kExitUsage;
     }
     else if (word == "--node-port")
@@ -578,6 +590,31 @@ int main(int argc, char** argv)
       }
     }
     request["mute"] = muted;
+  }
+  else if (options.command == "record")
+  {
+    const std::string action = options.positional.empty() ? "status" : options.positional[0];
+    const bool start = action == "start";
+    if ((start && options.positional.size() != 2) || (!start && options.positional.size() > 1) ||
+        (action != "start" && action != "stop" && action != "status"))
+    {
+      std::fprintf(stderr, "namchainctl: record takes start NAME, stop, or nothing\n");
+      return kExitUsage;
+    }
+    request["action"] = action;
+    if (start)
+      request["name"] = options.positional[1];
+    if (!options.seconds.empty())
+    {
+      char* end = nullptr;
+      const double seconds = std::strtod(options.seconds.c_str(), &end);
+      if (!start || end == options.seconds.c_str() || *end != '\0')
+      {
+        std::fprintf(stderr, "namchainctl: --seconds is a number, and only for record start\n");
+        return kExitUsage;
+      }
+      request["seconds"] = seconds;
+    }
   }
   else
   {

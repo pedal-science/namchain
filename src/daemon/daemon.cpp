@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <system_error>
 
@@ -88,7 +89,39 @@ nlohmann::json protocol_features()
 {
   return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
                                 "structural_crossfade", "smooth_params", "bypass", "guard",
-                                "per_chain_mute", "schema", "tcp_transport", "assets"});
+                                "per_chain_mute", "schema", "tcp_transport", "assets", "record"});
+}
+
+/// The longest recording `engine.record` will make, so a client that forgets to stop one cannot fill
+/// the disk with it. An hour of eight channels at 48 kHz is about 5 GB; the WAV format's 4 GiB
+/// limit, which the recorder also enforces, is reached first on an interface that wide.
+constexpr double kMaxRecordSeconds = 3600.0;
+constexpr double kDefaultRecordSeconds = 600.0;
+
+/// A recording's name: one plain path component, so it can only ever name a directory directly under
+/// Config::record_dir. Letters, digits, '.', '_' and '-', not starting with '.', at most 64.
+bool valid_recording_name(const std::string& name)
+{
+  if (name.empty() || name.size() > 64 || name[0] == '.')
+    return false;
+  for (char c : name)
+  {
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' ||
+                    c == '_' || c == '-';
+    if (!ok)
+      return false;
+  }
+  return true;
+}
+
+std::string utc_now_iso8601()
+{
+  const std::time_t now = std::time(nullptr);
+  std::tm parts{};
+  gmtime_r(&now, &parts);
+  char text[32];
+  std::strftime(text, sizeof(text), "%Y-%m-%dT%H:%M:%SZ", &parts);
+  return text;
 }
 
 /// One parameter as `engine.schema` reports it. One shape for the node's own parameters and for the
@@ -1579,6 +1612,8 @@ void Daemon::stop()
   running_.store(false);
   if (render_thread_.joinable())
     render_thread_.join();
+  // After the join, so nothing can be pushing; the files are closed properly on a clean shutdown.
+  end_recording();
 
   // Anything published but never adopted (a plan loaded before the render thread drained it) is
   // still owned by the command ring. Free it here; the loop has stopped, so nothing else can.
@@ -1697,7 +1732,55 @@ bool Daemon::open_device(std::string& error)
   active_period_.store(info.period_size);
   active_capture_channels_.store(info.capture_channels);
   active_playback_channels_.store(info.playback_channels);
+  active_format_.store(static_cast<int>(info.format));
+  // A new backend counts from zero, as its xruns do.
+  last_queue_ = StreamQueueStats{};
   return true;
+}
+
+void Daemon::account_period()
+{
+  const StreamQueueStats queue = device_->queue_stats();
+  output_drops_.store(queue.output_drops);
+  output_target_drops_.store(queue.output_target_drops);
+  floor_insertions_.store(queue.floor_insertions);
+  capture_bursts_.store(queue.capture_bursts);
+
+  // Busy before the load, both sequentially consistent: if this thread saw the recorder, then
+  // end_recording's store of null came later and its wait will see busy (recorder.h).
+  recorder_busy_.store(true);
+  Recorder* recorder = recorder_live_.load();
+  if (recorder != nullptr)
+  {
+    const BackendInfo& info = device_->info();
+    RecorderEvents events;
+    events.dropped = static_cast<uint32_t>(queue.output_drops - last_queue_.output_drops);
+    events.inserted = static_cast<uint32_t>(queue.floor_insertions - last_queue_.floor_insertions);
+    events.bursts = static_cast<uint32_t>(queue.capture_bursts - last_queue_.capture_bursts);
+    events.xruns = static_cast<uint32_t>(device_->driver_xruns() - last_xruns_);
+    recorder->push(capture_buffer_.data(), static_cast<std::size_t>(info.period_size) * info.capture_bytes_per_frame,
+                   playback_buffer_.data(),
+                   static_cast<std::size_t>(info.period_size) * info.playback_bytes_per_frame, events);
+  }
+  recorder_busy_.store(false);
+  last_queue_ = queue;
+}
+
+void Daemon::end_recording()
+{
+  if (recorder_ == nullptr || recorder_live_.load() == nullptr)
+    return;
+  recorder_live_.store(nullptr);
+  while (recorder_busy_.load())
+    std::this_thread::yield();
+  // Stopped but kept: `engine.record` and `engine.status` still describe the last recording until the
+  // next one starts.
+  recorder_->stop();
+  if (config_.verbose)
+    std::fprintf(stderr, "[namchaind] recording '%s' finished: %llu periods, %llu dropped, %llu inserted\n",
+                 recording_name_.c_str(), static_cast<unsigned long long>(recorder_->periods()),
+                 static_cast<unsigned long long>(recorder_->dropped()),
+                 static_cast<unsigned long long>(recorder_->inserted()));
 }
 
 void Daemon::finish_device(std::string& /*error*/)
@@ -2118,6 +2201,7 @@ void Daemon::render_loop()
       fail_device(error);
       continue;
     }
+    account_period();
 
     reclaimer_.advance_epoch();
     blocks_.fetch_add(1);
@@ -2231,6 +2315,28 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
           0);
     }
     return issues;
+  };
+
+  // The recording, as `engine.record` and `engine.status` both describe it.
+  auto recording_json = [this]() {
+    nlohmann::json out;
+    out["active"] = recorder_live_.load() != nullptr;
+    out["enabled"] = !config_.record_dir.empty();
+    if (recorder_ == nullptr)
+      return out;
+    const RecorderFormat& format = recorder_->format();
+    out["name"] = recording_name_;
+    out["path"] = recorder_->directory();
+    out["periods"] = recorder_->periods();
+    out["seconds"] = static_cast<double>(recorder_->periods()) * format.period_size / format.sample_rate;
+    out["overflows"] = recorder_->overflows();
+    out["dropped"] = recorder_->dropped();
+    out["inserted"] = recorder_->inserted();
+    out["xruns"] = recorder_->xruns();
+    const std::string failure = recorder_->write_error();
+    if (!failure.empty())
+      out["error"] = failure;
+    return out;
   };
 
   // One shape for the per-chain array wherever it appears, so a client can read the same entry from
@@ -2442,6 +2548,14 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["transitions_started"] = transitions_started_.load();
     status["max_concurrent_transitions"] = max_concurrent_transitions_.load();
     status["fade_ms"] = config_.fade_ms;
+    // The output queue's own losses. A dropped or an inserted period is a click, and neither is an xrun.
+    status["queue"] = {{"output_queue_periods", config_.output_queue_periods},
+                       {"output_queue_floor_periods", config_.output_queue_floor_periods},
+                       {"output_drops", output_drops_.load()},
+                       {"output_target_drops", output_target_drops_.load()},
+                       {"floor_insertions", floor_insertions_.load()},
+                       {"capture_bursts", capture_bursts_.load()}};
+    status["record"] = recording_json();
 
     // One entry per chain, in the document's order. This is where a client learns what its document
     // became: the chain ids it owns, the channels it was bound to, and how far each chain has got
@@ -2494,6 +2608,91 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     nlohmann::json body;
     body["status"] = status;
     return ok_response(id, body);
+  }
+
+  // --- engine.record -------------------------------------------------------
+  if (method == "engine.record")
+  {
+    std::string action = "status";
+    if (doc.contains("action"))
+    {
+      if (!doc["action"].is_string())
+        return error_response(id, "bad_request", "'action' must be a string");
+      action = doc["action"].get<std::string>();
+    }
+    if (action == "status")
+      return ok_response(id, {{"record", recording_json()}});
+    if (action == "stop")
+    {
+      if (recorder_live_.load() == nullptr)
+        return error_response(id, "not_recording", "nothing is being recorded");
+      end_recording();
+      return ok_response(id, {{"record", recording_json()}});
+    }
+    if (action != "start")
+      return error_response(id, "bad_request", "'action' is start, stop or status, not '" + action + "'");
+
+    if (config_.record_dir.empty())
+      return error_response(id, "record_disabled", "recording is off: record_dir is empty");
+    if (recorder_live_.load() != nullptr)
+      return error_response(id, "record_busy", "already recording '" + recording_name_ + "'");
+    if (!doc.contains("name") || !doc["name"].is_string() ||
+        !valid_recording_name(doc["name"].get<std::string>()))
+      return error_response(id, "bad_request",
+                            "'name' must be 1-64 of letters, digits, '.', '_' and '-', not starting with '.'");
+    const std::string name = doc["name"].get<std::string>();
+    double seconds = kDefaultRecordSeconds;
+    if (doc.contains("seconds"))
+    {
+      if (!doc["seconds"].is_number() || !(doc["seconds"].get<double>() > 0.0))
+        return error_response(id, "bad_request", "'seconds' must be a number greater than zero");
+      seconds = std::min(doc["seconds"].get<double>(), kMaxRecordSeconds);
+    }
+    if (device_state() != DeviceState::Running)
+      return error_response(id, "device_not_running", "the device is not running, so there is nothing to record");
+
+    RecorderFormat format;
+    format.sample_rate = active_rate_.load();
+    format.period_size = active_period_.load();
+    format.capture_channels = active_capture_channels_.load();
+    format.playback_channels = active_playback_channels_.load();
+    format.format = static_cast<PcmFormat>(active_format_.load());
+
+    std::error_code ignored;
+    std::filesystem::create_directories(config_.record_dir, ignored);
+
+    // Enough to read the files without this conversation: what the channels are and what was
+    // running when the recording started.
+    nlohmann::json meta;
+    meta["name"] = name;
+    meta["started"] = utc_now_iso8601();
+    meta["device"] = config_.device;
+    meta["backend"] = backend_kind_name(config_.backend);
+    meta["sample_rate"] = format.sample_rate;
+    meta["period_size"] = format.period_size;
+    meta["format"] = pcm_format_name(format.format);
+    meta["capture_channels"] = format.capture_channels;
+    meta["playback_channels"] = format.playback_channels;
+    meta["output_queue_periods"] = config_.output_queue_periods;
+    meta["output_queue_floor_periods"] = config_.output_queue_floor_periods;
+    meta["rig_name"] = current_name_;
+    meta["generation"] = generation_;
+    meta["chains"] = chains_json();
+    meta["files"] = {{"capture.wav", "every capture channel, as the device delivered it"},
+                     {"playback.wav", "every playback period the render loop offered, dropped or not"},
+                     {"events.tsv", "per period: dropped, inserted (after it), xrun, burst; gap = ring overflow"}};
+
+    std::string error;
+    recorder_.reset();
+    recorder_ = Recorder::start(config_.record_dir + "/" + name, format, seconds, meta.dump(2), error);
+    if (recorder_ == nullptr)
+      return error_response(id, "record_failed", error);
+    recording_name_ = name;
+    recorder_live_.store(recorder_.get());
+    if (config_.verbose)
+      std::fprintf(stderr, "[namchaind] recording '%s' for up to %.0f s in %s\n", name.c_str(), seconds,
+                   recorder_->directory().c_str());
+    return ok_response(id, {{"record", recording_json()}});
   }
 
   // --- engine.mute / engine.panic ----------------------------------------
@@ -2872,6 +3071,11 @@ int Daemon::run()
       close_connection(dead[i]);
 
     drop_expired_connections();
+
+    // A recording that has all its audio is finished here rather than when someone next asks, so its
+    // files are complete on disk as soon as they can be.
+    if (recorder_live_.load() != nullptr && recorder_->complete())
+      end_recording();
 
     // The reclamation window of rig-pipeline.md §5.3: this is the "somebody" that frees a plan once
     // its grace has closed, and the reason the poll timeout is neither zero nor infinite.

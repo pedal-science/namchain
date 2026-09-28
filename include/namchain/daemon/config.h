@@ -104,6 +104,11 @@ struct Config
   /// before the old is retired. 5 ms is §5.3's default; 0 would be a hard switch, which the glitch
   /// detector catches, so it is accepted but not recommended.
   double fade_ms = 5.0;
+  /// \brief Where `engine.record` writes its recordings, one directory each. Empty disables it.
+  ///
+  /// A client names a recording, never a path: the name is one plain directory component under this,
+  /// so a control connection can create files here and nowhere else.
+  std::string record_dir = "/var/lib/namchain/recordings";
   /// How long the render thread waits before retrying a device that failed or is not present.
   unsigned device_retry_ms = 250;
   /// How long the control loop's poll sleeps when nothing is pending. This is the reclamation

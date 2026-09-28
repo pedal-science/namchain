@@ -138,6 +138,7 @@ add_library(namchain OBJECT
   src/daemon/config.cpp
   src/daemon/daemon.cpp
   src/daemon/platform.cpp
+  src/daemon/recorder.cpp
   src/render/timeline.cpp
   src/latency/latency.cpp
   src/glitch/glitch.cpp
@@ -298,6 +299,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_macros.cpp
     tests/test_latency.cpp
     tests/test_glitch.cpp
+    tests/test_recorder.cpp
     tests/test_ramp.cpp
     tests/test_crossfade.cpp
     tests/test_timeline.cpp

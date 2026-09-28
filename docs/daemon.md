@@ -91,6 +91,7 @@ silently ignored.
 | `tcp_token` | *(empty)* | pre-shared token a TCP client presents in `engine.hello` |
 | `tcp_token_file` | *(empty)* | read the token from the first line of this file instead |
 | `tcp_auth_timeout_ms` | `10000` | how long a connection may stay unauthenticated; `0` disables |
+| `record_dir` | `/var/lib/namchain/recordings` | where `engine.record` writes, one directory per recording; empty disables it |
 | `verbose` | `false` | log lifecycle events to stderr |
 
 The daemon refuses a device that does not give the configured quantum and rate exactly
@@ -221,9 +222,10 @@ One JSON object per message in each direction, over either transport above. A re
 | `engine.hello` | `{"protocol": 2, "token": "…"?}` | `role`, `version`, `protocol` (what the server speaks), `features`, `transport` (`unix`/`tcp`) and `authenticated`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol`. On TCP the token is required and is checked **before** the version, so a peer without it learns nothing else |
 | `engine.schema` | — | the catalogue: every node type **and every macro** in one array, told apart by `kind` (`primitive`/`macro`), with ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. A macro additionally carries the `roles` it lowers to and, per parameter, the `targets` it drives. A parameter whose choices live in the library carries them, resolved from the same scan `engine.assets` reports. See docs/schema.md and docs/macros.md |
 | `engine.assets` | `{"refresh": true?}` | the model and impulse-response library: an entry per file with its `id`, where it is, its size and mtime, and the rate/architecture/length when the file's own header says so. See docs/assets.md |
-| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), and `health`/`issues` (below) |
+| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, a `queue` object (the output queue's cap and floor, and its `output_drops`, `output_target_drops`, `floor_insertions` and `capture_bursts`), a `record` object (as `engine.record`), device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), and `health`/`issues` (below) |
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
+| `engine.record` | `{"action": "start", "name": "…", "seconds": 600?}`, `{"action": "stop"}`, or `{}` | `record`: whether one is running, its name and path, periods and seconds so far, ring overflows, and the dropped/inserted/xrun totals. See "Recording what the device heard", below |
 | `rig.load` | `{"rig": "name.json"}` | compiled and published; returns `rig`, `generation` |
 | `rig.apply` | `{"document": { … }}` — a whole document, parsed by the same parser a rig file goes through | `name`, `chains`, `generation`; relative model paths resolve against the rigs root |
 | `rig.patch` | `{"ops": [...], "chain": "id"?}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass`. A target is named by `node`, or by `element` with an optional `role` (and `port` for a per-port parameter) | `kind` (`smooth` or `structural`), `applied`, `chain`, `generation` |
@@ -442,6 +444,33 @@ resolves nowhere is refused as `asset_missing`, naming the library, its size and
 
 docs/assets.md is the reference — ids, the two roots, what is read from a file (a header sniff, never
 a load), and the `engine.assets` response in full.
+
+## Recording what the device heard
+
+`engine.record` (`namchainctl record start NAME [--seconds S]`, `record stop`, `record`) answers "where
+does this click come from". It writes `record_dir/NAME/`:
+
+- `capture.wav`: every capture channel, exactly the bytes the device delivered, period after period.
+  On an interface that returns its playback on a loopback channel, that channel is what the interface
+  received.
+- `playback.wav`: every playback period the render loop offered, all channels, whether or not the
+  backend wrote it.
+- `events.tsv`: one line per event, `period`, `frame` (in `capture.wav`), `event`, `count`. `dropped`
+  means that period was not written (the output queue was full); `inserted` means the floor
+  controller wrote that many periods of its own after it; `xrun` and `burst` are the driver's and the
+  loop's. `gap` means the recorder's ring overflowed and that many periods are missing from both
+  files, so everything after it is early by that much.
+- `meta.json`: the format, the channels, and the rig and chains when it started.
+
+The two WAVs are the same length and period-aligned: period *n* of one is period *n* of the other. A
+drop or an insertion is a click that is not an xrun, which is why the queue counters are in
+`engine.status` as well.
+
+The render thread only copies each period into a four-second ring; a writer thread does the I/O. A
+recording ends at its length (default 600 s, at most 3600 s, and never past a WAV's 4 GiB), on
+`stop`, when the device reopens with another shape, or at shutdown. A name is one plain directory
+component and an existing one is refused, so a client can create files under `record_dir` and nowhere
+else, and cannot overwrite anything.
 
 ## Reload and device loss
 

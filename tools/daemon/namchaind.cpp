@@ -39,6 +39,8 @@ void print_usage(std::FILE* stream)
                "      --rigs-root DIR          root for rig.load names (default /etc/namchain/rigs)\n"
                "      --models-root DIR        the device's .nam model library (default /etc/namchain/models)\n"
                "      --irs-root DIR           the device's impulse responses (default /etc/namchain/irs)\n"
+               "      --record-dir DIR         where engine.record writes; empty disables it\n"
+               "                               (default /var/lib/namchain/recordings)\n"
                "      --socket PATH            control socket (default /run/namchain/namchaind.sock)\n"
                "      --socket-mode OCTAL      socket permissions, default 0660\n"
                "      --tcp-listen             also listen for control connections on TCP (off by default)\n"

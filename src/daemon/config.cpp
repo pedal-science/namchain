@@ -235,7 +235,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "reclamation_timeout_ms", "verbose", "capture_path", "playback_path",
                                       "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
                                       "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
-                                      "tcp_auth_timeout_ms", "models_root", "irs_root"};
+                                      "tcp_auth_timeout_ms", "models_root", "irs_root", "record_dir"};
   for (const auto& [key, value] : doc.items())
   {
     bool known = false;
@@ -265,6 +265,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_string(doc, "rigs_root", config.rigs_root, path, error) ||
       !read_string(doc, "models_root", config.models_root, path, error) ||
       !read_string(doc, "irs_root", config.irs_root, path, error) ||
+      !read_string(doc, "record_dir", config.record_dir, path, error) ||
       !read_string(doc, "socket", config.socket_path, path, error) ||
       !read_string(doc, "tcp_address", config.tcp_address, path, error) ||
       !read_string(doc, "tcp_token", config.tcp_token, path, error) ||
@@ -412,6 +413,12 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
       return false;
     }
     config.tcp_token_file = value;
+    return true;
+  }
+  if (name == "record-dir")
+  {
+    // Empty is allowed: it is how a command line turns recording off.
+    config.record_dir = value;
     return true;
   }
   if (name == "socket-mode")

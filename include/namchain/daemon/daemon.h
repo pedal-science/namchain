@@ -21,6 +21,7 @@
 #include "namchain/assets/registry.h"
 #include "namchain/daemon/config.h"
 #include "namchain/daemon/framing.h"
+#include "namchain/daemon/recorder.h"
 #include "namchain/graph/plan.h"
 #include "namchain/graph/rig.h"
 #include "namchain/io/backend.h"
@@ -316,6 +317,10 @@ private:
   void close_connection(std::size_t index);
   /// Close connections whose authentication window or flush deadline has passed.
   void drop_expired_connections();
+  /// \brief Take the recording away from the render thread and finish its files. The stopped recorder
+  /// is kept, so its summary stays readable until the next recording. Control thread; a no-op when
+  /// nothing is recording.
+  void end_recording();
   /// The largest message accepted on \p peer's transport. Local keeps the fixed SEQPACKET size;
   /// remote uses \ref Config::tcp_max_message_bytes.
   std::size_t max_message_bytes(PeerKind peer) const;
@@ -329,6 +334,9 @@ private:
   void close_device();
   void fail_device(const std::string& reason);
   void drain_commands();
+  /// After a period is written: publish the backend's queue counters, and hand the period to the
+  /// recording if there is one. Render thread.
+  void account_period();
   /// Begin an equal-power transition for one chain. Render thread.
   void start_transition(int index, PlanSlot* next);
   /// Retire the faded-out plan, promote the incoming one, and start whatever is queued. Render thread.
@@ -520,6 +528,26 @@ private:
   std::atomic<int> rt_policy_{0};
   std::atomic<int> rt_priority_{0};
   std::atomic<bool> rt_realtime_{false};
+  std::atomic<int> active_format_{static_cast<int>(PcmFormat::Unknown)};
+
+  /// The backend's output-queue counters (StreamQueueStats), published per block. A dropped or an
+  /// inserted period is a click that is not an xrun, so these belong in `engine.status` beside it.
+  std::atomic<uint64_t> output_drops_{0};
+  std::atomic<uint64_t> output_target_drops_{0};
+  std::atomic<uint64_t> floor_insertions_{0};
+  std::atomic<uint64_t> capture_bursts_{0};
+  /// Render thread: the counters as of the last block, so a recording can be given the deltas.
+  StreamQueueStats last_queue_{};
+
+  /// \brief The recording `engine.record` started, if any.
+  ///
+  /// The control thread owns it. The render thread sees it only through \ref recorder_live_, and
+  /// holds \ref recorder_busy_ while it pushes, so \ref end_recording can take it away without a
+  /// lock: clear the pointer, wait for busy to drop, then destroy.
+  std::unique_ptr<Recorder> recorder_;
+  std::string recording_name_;
+  std::atomic<Recorder*> recorder_live_{nullptr};
+  std::atomic<bool> recorder_busy_{false};
 };
 
 } // namespace daemon
