@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Replay a recorded session against namchaind: the same requests at the same times.
+
+It restores the session's starting rig first (rig.apply, then each chain's mute), waits
+--settle seconds, then sends every request at its recorded offset. With --loops or
+--duration it goes round again, restoring the starting rig each time, which is itself a
+structural transition, as switching back to a rig would be.
+
+    namchain-session-replay edit.session.jsonl --host piv \\
+        --token-command "ssh piv sudo cat /etc/namchain/token" --duration 3600
+
+Before it sends anything it checks that every model and IR the session names is in the
+daemon's library (--no-asset-check skips that). A summary goes to stdout as JSON (or
+--summary FILE): requests by method, answers by kind and error code, the time each method
+took to answer, and how late the replay itself ran. --log FILE writes every request and its
+answer as JSON lines. It exits 0 when every answer was ok, 1 when any was refused, and 2 when
+it could not run. See docs/sessions.md.
+"""
+import argparse
+import asyncio
+import json
+import os
+import signal
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nc_session as nc  # noqa: E402
+
+
+def percentile(values, p):
+    if not values:
+        return None
+    values = sorted(values)
+    return round(values[min(len(values) - 1, int(round(p / 100 * (len(values) - 1))))], 2)
+
+
+class Replay:
+    def __init__(self, args, header, events):
+        self.args = args
+        self.header = header
+        self.requests = [e for e in events if "request" in e]
+        if args.writes_only:
+            self.requests = [e for e in self.requests if e["request"].get("method") not in nc.QUERIES]
+        self.log = open(args.log, "w") if args.log else None
+        self.sent = {}
+        self.latency = {}
+        self.kinds = {}
+        self.errors = {}
+        self.lag = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.outstanding = set()
+        self.generations = []
+        self.stopping = False
+
+    def record(self, method, t, reply, ms):
+        self.in_flight -= 1
+        self.latency.setdefault(method, []).append(ms)
+        if reply.get("ok"):
+            if "kind" in reply:
+                self.kinds[reply["kind"]] = self.kinds.get(reply["kind"], 0) + 1
+            if "generation" in reply:
+                self.generations.append(reply["generation"])
+        else:
+            code = (reply.get("error") or {}).get("code", "?")
+            key = "%s %s" % (method, code)
+            self.errors[key] = self.errors.get(key, 0) + 1
+            if self.errors[key] <= 3:
+                print("refused: %s: %s" % (method, nc.describe_error(reply)), file=sys.stderr)
+        if self.log:
+            entry = {"t": t, "method": method, "ok": bool(reply.get("ok")), "ms": ms}
+            for key in ("kind", "generation"):
+                if key in reply:
+                    entry[key] = reply[key]
+            if not reply.get("ok"):
+                entry["error"] = (reply.get("error") or {}).get("code")
+            self.log.write(json.dumps(entry) + "\n")
+
+    def send(self, client, request, t):
+        method = request.get("method", "?")
+        self.sent[method] = self.sent.get(method, 0) + 1
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        started = time.monotonic()
+        future = client.send(request)
+
+        def done(f):
+            self.outstanding.discard(f)
+            if f.cancelled() or f.exception():
+                return
+            self.record(method, t, f.result(), round((time.monotonic() - started) * 1000, 2))
+
+        future.add_done_callback(done)
+        self.outstanding.add(future)
+        return future
+
+    async def restore(self, client):
+        """The starting rig, then each chain's mute, as a client applying it would."""
+        initial = self.header["initial"]
+        reply = await self.send(client, {"method": "rig.apply", "document": initial["document"]}, 0)
+        if not reply.get("ok"):
+            raise RuntimeError("the starting rig was refused: %s" % nc.describe_error(reply))
+        for chain, muted in initial.get("muted", {}).items():
+            await self.send(client, {"method": "engine.mute", "mute": muted, "chain": chain}, 0)
+        await asyncio.sleep(self.args.settle)
+
+    async def check_assets(self, client):
+        reply = await client.call({"method": "engine.assets"}, timeout=60)
+        if not reply.get("ok"):
+            raise RuntimeError("engine.assets failed: %s" % nc.describe_error(reply))
+        have = {("model", a["id"]) for a in reply.get("models", [])}
+        have |= {("ir", a["id"]) for a in reply.get("irs", [])}
+        missing = sorted(nc.assets_in_session(self.header, self.requests) - have)
+        if missing:
+            for kind, name in missing:
+                print("missing %s: %s" % (kind, name), file=sys.stderr)
+            raise RuntimeError("%d assets the session names are not in the daemon's library"
+                               % len(missing))
+
+    async def run(self):
+        host, port = nc.split_host(self.args.host, self.args.port)
+        token = nc.read_token(self.args.token_file, self.args.token_command)
+        client, hello = await nc.Client.connect(host, port, token)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self.stop)
+        span = self.requests[-1]["t"] if self.requests else 0
+        print("replaying %r: %d requests over %.0f s, to %s:%d (namchaind %s)"
+              % (self.header.get("name"), len(self.requests), span, host, port,
+                 hello.get("version")), file=sys.stderr)
+        began = time.monotonic()
+        loops = 0
+        try:
+            if not self.args.no_asset_check:
+                await self.check_assets(client)
+            while not self.stopping:
+                await self.restore(client)
+                t0 = time.monotonic()
+                for event in self.requests:
+                    due = t0 + event["t"] / self.args.speed
+                    wait = due - time.monotonic()
+                    if self.args.duration is not None:
+                        # A long quiet stretch in the session doesn't carry the replay past its end.
+                        wait = min(wait, began + self.args.duration - time.monotonic())
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    if self.stopping or self.past_duration(began):
+                        break
+                    self.lag.append(max(0.0, (time.monotonic() - due) * 1000))
+                    self.send(client, event["request"], round(event["t"], 4))
+                    await client.writer.drain()
+                loops += 1
+                if self.stopping or self.past_duration(began):
+                    break
+                if self.args.duration is None and loops >= self.args.loops:
+                    break
+            if self.outstanding:
+                await asyncio.wait(list(self.outstanding), timeout=30)
+        finally:
+            await client.close()
+        return self.summary(host, port, loops, time.monotonic() - began)
+
+    def past_duration(self, began):
+        return self.args.duration is not None and time.monotonic() - began >= self.args.duration
+
+    def stop(self):
+        self.stopping = True
+
+    def summary(self, host, port, loops, seconds):
+        return {
+            "session": self.header.get("name"),
+            "source": self.header.get("source"),
+            "target": "%s:%d" % (host, port),
+            "speed": self.args.speed,
+            "writes_only": self.args.writes_only,
+            "loops": loops,
+            "seconds": round(seconds, 1),
+            "sent": dict(sorted(self.sent.items())),
+            "answered": sum(len(v) for v in self.latency.values()),
+            "kinds": self.kinds,
+            "errors": self.errors,
+            "unanswered": len(self.outstanding),
+            "reply_ms": {m: {"n": len(v), "p50": percentile(v, 50), "p99": percentile(v, 99),
+                             "max": round(max(v), 2)}
+                         for m, v in sorted(self.latency.items())},
+            "send_lag_ms": {"p50": percentile(self.lag, 50), "p99": percentile(self.lag, 99),
+                            "max": round(max(self.lag), 2) if self.lag else None},
+            "max_in_flight": self.max_in_flight,
+            "generations": [self.generations[0], self.generations[-1]] if self.generations else None,
+        }
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("session", help="a session file (namchain-session-record, or rebuilt)")
+    p.add_argument("--host", default="127.0.0.1", help="the daemon, host[:port]")
+    p.add_argument("--port", type=int, default=47810)
+    p.add_argument("--token-file", help="read the token from this file")
+    p.add_argument("--token-command", help="run this and read the token from its first line")
+    p.add_argument("--speed", type=float, default=1.0, help="2 replays twice as fast")
+    p.add_argument("--loops", type=int, default=1, help="how many times round (default 1)")
+    p.add_argument("--duration", type=float, help="go round until this many seconds have passed")
+    p.add_argument("--settle", type=float, default=2.0,
+                   help="seconds between restoring the starting rig and the first request")
+    p.add_argument("--writes-only", action="store_true",
+                   help="leave out requests that only ask (engine.status, rig.get, ...)")
+    p.add_argument("--no-asset-check", action="store_true")
+    p.add_argument("--log", help="write every request and its answer here, as JSON lines")
+    p.add_argument("--summary", help="write the summary here instead of stdout")
+    args = p.parse_args()
+    if args.speed <= 0:
+        p.error("--speed must be above 0")
+
+    header, events = nc.load(args.session)
+    replay = Replay(args, header, events)
+    try:
+        summary = asyncio.run(replay.run())
+    except (OSError, ConnectionError, RuntimeError, asyncio.TimeoutError) as e:
+        print("namchain-session-replay: %s" % (e or type(e).__name__), file=sys.stderr)
+        sys.exit(2)
+    text = json.dumps(summary, indent=2)
+    if args.summary:
+        with open(args.summary, "w") as f:
+            f.write(text + "\n")
+    else:
+        print(text)
+    sys.exit(1 if summary["errors"] or summary["unanswered"] else 0)
+
+
+if __name__ == "__main__":
+    main()

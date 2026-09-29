@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Record what a client sends to namchaind, so it can be replayed (namchain-session-replay).
+
+A proxy: point the client (ljoss) at the listening port instead of the daemon's, and every
+request it sends is written to the session file with its time, then passed on unchanged. The
+answers pass back unchanged too; the file keeps only a summary of each (ok, kind, generation,
+error code, and how long it took).
+
+    namchain-session-record --upstream piv:47810 --out edit.session.jsonl
+    # then connect ljoss to 127.0.0.1:47811, edit, and press Ctrl-C to finish
+
+Before the first request is passed on, the recorder asks the daemon for the rig it is running
+(rig.get) and which chains are muted (engine.status), on a connection of its own. That is the
+session's starting point, which a replay restores first. It authenticates with the token the
+client itself sent, held in memory only; the token is never written to the file.
+
+The file is written a line at a time, so an interrupted recording is still a usable session.
+See docs/sessions.md.
+"""
+import argparse
+import asyncio
+import datetime
+import json
+import os
+import signal
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nc_session as nc  # noqa: E402
+
+
+class Recorder:
+    def __init__(self, args):
+        self.args = args
+        self.upstream = nc.split_host(args.upstream, 47810)
+        self.out = open(args.out, "x")
+        self.t0 = None
+        self.header_written = asyncio.Event()
+        self.snapshot_lock = asyncio.Lock()
+        self.connections = 0
+        self.counts = {}
+
+    def now(self):
+        return round(time.monotonic() - self.t0, 4)
+
+    def write(self, obj):
+        self.out.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        self.out.flush()
+
+    async def snapshot(self, token):
+        """Write the header: the daemon's rig and mutes, as they are before the first edit."""
+        async with self.snapshot_lock:
+            if self.header_written.is_set():
+                return
+            client, hello = await nc.Client.connect(*self.upstream, token)
+            try:
+                got = await client.call({"method": "rig.get"})
+                status = await client.call({"method": "engine.status"})
+            finally:
+                await client.close()
+            if not got.get("ok") or not status.get("ok"):
+                raise RuntimeError("could not read the starting rig: %s"
+                                   % nc.describe_error(got if not got.get("ok") else status))
+            chains = status["status"].get("chains", [])
+            self.write({
+                "namchain_session": nc.FORMAT,
+                "name": self.args.name or os.path.basename(self.args.out).split(".")[0],
+                "source": "recorded",
+                "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+                "upstream": "%s:%d" % self.upstream,
+                "daemon": {"version": hello.get("version"), "protocol": hello.get("protocol")},
+                "notes": self.args.note or [],
+                "initial": {
+                    "document": got["document"],
+                    "muted": {c["id"]: bool(c.get("muted")) for c in chains},
+                    "generation": got.get("generation"),
+                },
+            })
+            self.t0 = time.monotonic()
+            self.header_written.set()
+            print("recording from %r (generation %s)" % (got["document"].get("name"),
+                                                          got.get("generation")), file=sys.stderr)
+
+    async def handle(self, client_reader, client_writer):
+        self.connections += 1
+        conn = self.connections
+        try:
+            up_reader, up_writer = await asyncio.open_connection(*self.upstream, limit=nc.MAX_REPLY)
+        except OSError as e:
+            print("connection %d: cannot reach %s:%d: %s" % ((conn,) + self.upstream + (e,)),
+                  file=sys.stderr)
+            client_writer.close()
+            return
+        print("connection %d from %s" % (conn, client_writer.get_extra_info("peername")),
+              file=sys.stderr)
+        pending = []            # (method, sent at, recorded?) in the order the requests went
+        hello_done = asyncio.Event()
+        token = {}
+
+        async def client_to_daemon():
+            while True:
+                body = await nc.read_frame(client_reader, nc.MAX_REQUEST)
+                if body is None:
+                    break
+                try:
+                    request = json.loads(body)
+                except ValueError:
+                    request = None
+                method = request.get("method") if isinstance(request, dict) else None
+                if method == "engine.hello":
+                    token["value"] = request.get("token", "")
+                    pending.append((method, time.monotonic(), False))
+                    up_writer.write(len(body).to_bytes(4, "little") + body)
+                    await up_writer.drain()
+                    await hello_done.wait()
+                    continue
+                recorded = self.header_written.is_set() and method is not None
+                if recorded:
+                    event = {k: v for k, v in request.items() if k not in ("id", "token")}
+                    self.write({"t": self.now(), "conn": conn, "request": event})
+                    self.counts[method] = self.counts.get(method, 0) + 1
+                pending.append((method, time.monotonic(), recorded))
+                up_writer.write(len(body).to_bytes(4, "little") + body)
+                await up_writer.drain()
+
+        async def daemon_to_client():
+            while True:
+                body = await nc.read_frame(up_reader, nc.MAX_REPLY)
+                if body is None:
+                    break
+                client_writer.write(len(body).to_bytes(4, "little") + body)
+                await client_writer.drain()
+                if not pending:
+                    continue
+                method, sent, recorded = pending.pop(0)
+                if method == "engine.hello":
+                    try:
+                        if json.loads(body).get("ok") and token.get("value"):
+                            await self.snapshot(token["value"])
+                    except Exception as e:  # the recording fails, the client carries on
+                        print("connection %d: %s" % (conn, e), file=sys.stderr)
+                    hello_done.set()
+                    continue
+                if recorded:
+                    reply = json.loads(body)
+                    summary = {"t": self.now(), "conn": conn, "reply_to": method,
+                               "ok": bool(reply.get("ok")),
+                               "ms": round((time.monotonic() - sent) * 1000, 2)}
+                    for key in ("kind", "generation", "applied"):
+                        if key in reply:
+                            summary[key] = reply[key]
+                    if not reply.get("ok"):
+                        summary["error"] = (reply.get("error") or {}).get("code")
+                    self.write(summary)
+
+        tasks = [asyncio.create_task(client_to_daemon()), asyncio.create_task(daemon_to_client())]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                task.cancel()
+            for writer in (client_writer, up_writer):
+                writer.close()
+            print("connection %d closed" % conn, file=sys.stderr)
+
+    async def run(self):
+        host, port = nc.split_host(self.args.listen, 47811)
+        server = await asyncio.start_server(self.handle, host, port, limit=nc.MAX_REPLY)
+        print("listening on %s:%d, passing on to %s:%d; Ctrl-C ends the recording"
+              % ((host, port) + self.upstream), file=sys.stderr)
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
+        async with server:
+            await stop.wait()
+        self.out.close()
+        total = sum(self.counts.values())
+        print("recorded %d requests: %s -> %s" % (total, json.dumps(self.counts, sort_keys=True),
+                                                  self.args.out), file=sys.stderr)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--upstream", required=True, help="the daemon, host[:port] (port 47810)")
+    p.add_argument("--listen", default="127.0.0.1:47811", help="where the client connects")
+    p.add_argument("--out", required=True, help="the session file to write (must not exist)")
+    p.add_argument("--name", help="the session's name (default: from the file name)")
+    p.add_argument("--note", action="append", help="a line of notes for the header (repeatable)")
+    asyncio.run(Recorder(p.parse_args()).run())
+
+
+if __name__ == "__main__":
+    main()

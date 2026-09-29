@@ -42,7 +42,8 @@ Run cross-built tests with `qemu-arm-static -cpu cortex-a15 -L /usr/arm-linux-gn
 
 - `plan.md` is the engine's own plan and history. It is long, so start at "How to resume".
 - `docs/`: `daemon.md` (run it, the protocol), `schema.md`, `rig-pipeline.md`,
-  `transitions.md`, `assets.md`, `macros.md`, `tuning.md`.
+  `transitions.md`, `assets.md`, `macros.md`, `tuning.md`, `sessions.md` (recording a client and
+  replaying it: `tools/session/`).
 - The CoreAudio and loop backends are on the `local-engine` branch, not `main`.
 
 System context (the pedal, how the repos fit together, the plan): `~/code.local/pedal.project`, starting at its `CLAUDE.md` and `docs/working-across-repos.md`.

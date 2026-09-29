@@ -500,6 +500,7 @@ else, and cannot overwrite anything.
 ## A client
 
 `namchainctl` is the reference implementation, over either transport (`tools/namchainctl/namchainctl.cpp`).
+To record what a client sends and replay it later, as a repeatable test, see docs/sessions.md.
 The smallest thing that works over the Unix socket is still four lines, because the datagram transport
 has no framing to implement:
 
