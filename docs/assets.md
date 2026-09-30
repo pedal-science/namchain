@@ -53,7 +53,27 @@ A reference is resolved in this order:
 > the same rig differently. The two orders agree in every case where they can both answer, because an
 > id is normally extension-less and a filename is not.
 
-A reference that resolves nowhere is refused as **`asset_missing`**, naming the library that was
+A reference that resolves nowhere does **not** refuse the rig. The block that names it plays **as if
+bypassed**: on the copy the engine compiles, the node is replaced by an `nc.bypass` with the same id,
+element and role, so connections and ops still name it, and `rig.get` still hands back what was
+written. The rig plays, just not as written, and every client is told which block: an `asset_missing`
+issue per block (severity `warn`, with its `chain`, `node`, `element`, `param`, `kind` and
+`reference`), `missing_assets` in each chain of `engine.status`, and a `missing_assets` list in the
+reply to `rig.load`, `rig.apply`, `rig.patch` and `rig.get`. A client marks the block as not
+configured (ljoss does).
+
+Why not refuse: a pedal whose library is incomplete -- a fresh card before the library is synced, a
+model deleted from the library -- would otherwise start silent with nothing playing, and the pedal's
+boot guard would take the failed engine for a broken system (pedal.project, vip's first card,
+2026-09-30).
+
+When the library changes, a rig with stand-ins is re-resolved: `engine.assets` with `refresh` (what
+the pedal's `sync-library` sends) and SIGHUP both republish it, so a model copied in afterwards
+replaces its stand-in without anyone touching the rig. Whether a chain changed is decided on the
+resolved document, so this is a new generation for exactly the chains it affects.
+
+Only a 1->1 block can stand in (it needs a dry path). A reference on any other node still refuses the
+document as **`asset_missing`**. The message is the same in both cases, naming the library that was
 searched, how many entries it has, and the nearest ids:
 
 ```

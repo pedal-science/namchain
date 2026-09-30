@@ -373,6 +373,7 @@ stops being true disappears, which is the property that makes the light worth ha
 | `render_errors` | warn | the render thread has reported errors recently |
 | `not_realtime` | warn | a real-time policy was asked for and is not in force |
 | `memory_not_locked` | warn | `mlockall` was refused while `lock_memory` is on |
+| `asset_missing` | warn | a block's model or IR is not in the library, so it plays as if bypassed. One per block, with `element`, `param`, `kind` and `reference` besides `chain` and `node` (docs/assets.md) |
 | `transition` | info | a structural change is being crossfaded (normal, and it does not colour `health`) |
 
 Two things deliberately *not* issues: a daemon asked for no real-time priority that has none, and one
@@ -452,7 +453,10 @@ that names `"model": "tweed/deluxe"` means the same thing on every device that h
 
 Resolution happens on the **copy the engine compiles**, never on the document it remembers: `rig.get`
 hands back the ids the client wrote, and reapplying it is still a fixed point. A reference that
-resolves nowhere is refused as `asset_missing`, naming the library, its size and the nearest ids.
+resolves nowhere makes its block play as if bypassed, reported as an `asset_missing` issue and in
+`missing_assets` (in the rig replies and each chain of `engine.status`), naming the library, its size
+and the nearest ids; a rescan republishes the rig, so a model copied in later takes over. Only a
+reference on a node that isn't 1->1 still refuses the document as `asset_missing`.
 
 docs/assets.md is the reference — ids, the two roots, what is read from a file (a header sniff, never
 a load), and the `engine.assets` response in full.

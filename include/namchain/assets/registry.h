@@ -172,6 +172,24 @@ private:
   std::size_t scans_ = 0;
 };
 
+/// \brief A model or IR reference that resolved nowhere, and the block that stands in for it.
+struct MissingAsset
+{
+  std::string chain;
+  std::string node;
+  /// The node's element (its id when the document gave none): what a client keys a block on.
+  std::string element;
+  /// The node's type as the document wrote it (`nc.nam`, `nc.cab.ir`, a macro).
+  std::string type;
+  /// The parameter that named the asset (`model`, `ir`).
+  std::string param;
+  Kind kind = Kind::Model;
+  /// The reference as written.
+  std::string reference;
+  /// The registry's message: which library was searched, and the near misses.
+  std::string message;
+};
+
 /// \brief Rewrite every asset reference in \p document into an absolute path.
 ///
 /// Which strings are asset references is the *node type's* declaration -- a parameter whose schema
@@ -192,8 +210,15 @@ private:
 ///
 /// \param error a message naming the node, the reference and the near misses. The caller reports it
 /// as `asset_missing`.
+/// \param missing when given, a reference that resolves nowhere does not fail the document: the node
+/// that names it is replaced, in \p document (the resolved copy), by an `nc.bypass` stand-in with the
+/// same id, element and role, and the miss is appended here. The block then plays as if bypassed and
+/// the client is told which one and why (`asset_missing` in `engine.status`), so a rig whose library
+/// is incomplete -- a fresh card, a model deleted from the library -- still plays, rather than taking
+/// the whole engine down with it. A node that is not 1->1 has no dry path to stand in with, and still
+/// fails the document.
 bool resolve_document(graph::Document& document, const Registry& registry, const std::string& base_dir,
-                      std::string& error);
+                      std::string& error, std::vector<MissingAsset>* missing = nullptr);
 
 /// \brief The two `.nam` fields a palette wants, read without loading the model.
 ///

@@ -434,6 +434,16 @@ private:
   /// structural `rig.patch` mutates, and it is replaced only by a successful publish.
   graph::Document current_document_;
   std::vector<PlanSlot*> published_slots_; ///< parallel to current_document_.chains
+  /// \ref current_document_ with its asset references resolved and its missing assets stood in for:
+  /// what the plans were actually compiled from. Whether a chain changed is decided on this, so a
+  /// model that has appeared in the library since (or gone from it) is a change to recompile.
+  graph::Document current_resolved_;
+  /// The references in \ref current_document_ that resolved nowhere, each played as a bypass
+  /// (assets::resolve_document). Reported as `asset_missing` issues and per chain in `engine.status`.
+  std::vector<assets::MissingAsset> missing_assets_;
+  /// Republish the running document after a library rescan, when it has missing assets: a model
+  /// copied in since then replaces its stand-in without anyone editing the rig.
+  void republish_after_rescan();
   /// The signal mask in force before \ref setup_signals, restored on stop so a library that started
   /// this daemon does not inherit a blocked SIGTERM for the rest of the process's life.
   sigset_t previous_mask_{};

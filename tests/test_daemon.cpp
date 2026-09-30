@@ -1978,20 +1978,64 @@ TEST_CASE("the library is published, refreshed on request, and compiled by id")
   REQUIRE(running["ok"] == true);
   CHECK(running["document"]["chains"][0]["nodes"][1]["model"] == "A2-Lite");
 
-  // A miss is refused by name, with the library's near miss, before anything is compiled.
+  // A miss does not refuse the rig: the block plays as if bypassed, and the reply, `engine.status` and
+  // its issues all say which block and why, with the library's near miss. A pedal whose library is
+  // incomplete still plays; one refused rig would leave it silent (pedal.project, vip's first card).
   const auto missing =
     nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.load","rig":"missing.json"})"));
-  REQUIRE(missing["ok"] == false);
-  CHECK(missing["error"]["code"] == "asset_missing");
-  CHECK(missing["error"]["message"].get<std::string>().find("A2-Lite") != std::string::npos);
-  CHECK(missing["error"]["message"].get<std::string>().find("did you mean") != std::string::npos);
+  REQUIRE(missing["ok"] == true);
+  const uint64_t stood_in = missing["generation"].get<uint64_t>();
+  REQUIRE(missing["missing_assets"].size() == 1);
+  CHECK(missing["missing_assets"][0]["node"] == "amp");
+  CHECK(missing["missing_assets"][0]["element"] == "amp");
+  CHECK(missing["missing_assets"][0]["param"] == "model");
+  CHECK(missing["missing_assets"][0]["kind"] == "model");
+  CHECK(missing["missing_assets"][0]["reference"] == "A2-Lit");
+  CHECK(missing["missing_assets"][0]["message"].get<std::string>().find("did you mean") != std::string::npos);
+
+  const auto warned = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  REQUIRE(warned["ok"] == true);
+  CHECK(warned["status"]["health"] == "warn");
+  bool issued = false;
+  for (const auto& issue : warned["status"]["issues"])
+  {
+    if (issue["code"] != "asset_missing")
+      continue;
+    issued = true;
+    CHECK(issue["severity"] == "warn");
+    CHECK(issue["node"] == "amp");
+    CHECK(issue["element"] == "amp");
+    CHECK(issue["reference"] == "A2-Lit");
+  }
+  CHECK_MESSAGE(issued, "no asset_missing issue for the stood-in block");
+  REQUIRE(warned["status"]["chains"].size() == 1);
+  CHECK(warned["status"]["chains"][0]["missing_assets"].size() == 1);
+
+  // The document handed back is the one written: the stand-in is the engine's, not the client's.
+  const auto as_written = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  CHECK(as_written["document"]["chains"][0]["nodes"][1]["type"] == "nc.nam");
+  CHECK(as_written["document"]["chains"][0]["nodes"][1]["model"] == "A2-Lit");
+
+  // The model arrives, and a rescan brings the block in without anyone touching the rig: the same
+  // document now compiles to something else, which is a new generation.
+  std::filesystem::copy_file(std::string(NAMCHAIN_TEST_DATA_DIR) + "/A2-Lite.nam", models / "A2-Lit.nam");
+  const auto rescanned =
+    nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.assets","refresh":true})"));
+  REQUIRE(rescanned["ok"] == true);
+  const auto healed = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  CHECK(healed["generation"].get<uint64_t>() > stood_in);
+  CHECK(healed["missing_assets"].empty());
+  const auto clear = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  for (const auto& issue : clear["status"]["issues"])
+    CHECK(issue["code"] != "asset_missing");
 
   // And the same through a patch, because `swap_model` names a model too.
   const auto swapped = nlohmann::json::parse(call(config.socket_path,
                                                   R"({"method":"rig.patch","ops":[{"op":"swap_model",
-                                                     "node":"amp","model":"A2-Lit"}]})"));
-  REQUIRE(swapped["ok"] == false);
-  CHECK(swapped["error"]["code"] == "asset_missing");
+                                                     "node":"amp","model":"A2-Litt"}]})"));
+  REQUIRE(swapped["ok"] == true);
+  REQUIRE(swapped["missing_assets"].size() == 1);
+  CHECK(swapped["missing_assets"][0]["reference"] == "A2-Litt");
 }
 
 TEST_CASE("a library root that is not there is an informational issue, not a failure")

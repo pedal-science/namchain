@@ -1344,6 +1344,24 @@ bool Daemon::load_rig(const std::string& rig_path, std::string& error, std::stri
                           error, error_code);
 }
 
+void Daemon::republish_after_rescan()
+{
+  if (missing_assets_.empty() || current_document_.chains.empty())
+    return;
+  // A copy: publishing assigns current_document_, and must not read from what it is overwriting.
+  const graph::Document document = current_document_;
+  std::string error;
+  std::string code;
+  if (publish_document(document, current_rig_, current_source_, current_base_dir_, error, &code))
+  {
+    if (config_.verbose)
+      std::fprintf(stderr, "[namchaind] library rescanned: %zu asset%s still missing\n", missing_assets_.size(),
+                   missing_assets_.size() == 1 ? "" : "s");
+  }
+  else
+    std::fprintf(stderr, "[namchaind] library rescanned, but the rig did not republish: %s\n", error.c_str());
+}
+
 bool Daemon::publish_document(const graph::Document& document, const std::string& path, const std::string& source,
                               const std::string& base_dir, std::string& error, std::string* error_code)
 {
@@ -1373,7 +1391,8 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   // against, and would make the daemon and the offline tools resolve the same rig differently.
   graph::Document resolved = document;
   graph::resolve_relative_paths(resolved, base_dir);
-  if (!assets::resolve_document(resolved, assets_, base_dir, error))
+  std::vector<assets::MissingAsset> missing;
+  if (!assets::resolve_document(resolved, assets_, base_dir, error, &missing))
   {
     if (error_code != nullptr)
       *error_code = "asset_missing";
@@ -1387,15 +1406,18 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   // Which chains actually changed. An unchanged chain keeps the plan it has: republishing it would
   // recompile it -- reloading every model on this thread -- and crossfade it, for an edit somebody
   // made to a different chain.
+  //
+  // Compared as resolved, not as written: a chain whose model has since arrived in the library (or
+  // gone from it) reads the same but compiles to something else.
   std::vector<bool> changed(document.chains.size(), true);
   std::size_t changed_count = document.chains.size();
-  if (document.chains.size() == current_document_.chains.size())
+  if (resolved.chains.size() == current_resolved_.chains.size())
   {
     changed_count = 0;
-    for (std::size_t i = 0; i < document.chains.size(); ++i)
+    for (std::size_t i = 0; i < resolved.chains.size(); ++i)
     {
-      const graph::Chain& before = current_document_.chains[i];
-      const graph::Chain& after = document.chains[i];
+      const graph::Chain& before = current_resolved_.chains[i];
+      const graph::Chain& after = resolved.chains[i];
       changed[i] = before.id != after.id || before.name != after.name ||
                    before.input_channel != after.input_channel ||
                    before.output_channel != after.output_channel || !graph::same_graph(before.graph, after.graph);
@@ -1413,6 +1435,8 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     current_source_ = source;
     current_base_dir_ = base_dir;
     current_name_ = document.name;
+    current_document_ = document;
+    missing_assets_ = std::move(missing);
     return true;
   }
 
@@ -1491,6 +1515,8 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   current_base_dir_ = base_dir;
   current_name_ = document.name;
   current_document_ = document;
+  current_resolved_ = std::move(resolved);
+  missing_assets_ = std::move(missing);
   published_slots_ = std::move(raw);
   last_published_ = &current_document_;
 
@@ -2323,6 +2349,19 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     if (transition_active_.load())
       add("transition", "info", "a structural change is being crossfaded", 1);
 
+    // A block whose model or IR is not in the library plays as if bypassed. A warning, one per block,
+    // naming the block's element so a client can mark it: the rig plays, just not as written.
+    for (const assets::MissingAsset& miss : missing_assets_)
+    {
+      add("asset_missing", "warn", "node '" + miss.node + "' plays as if bypassed: " + miss.message, 1, miss.chain,
+          miss.node);
+      nlohmann::json& issue = issues.back();
+      issue["element"] = miss.element;
+      issue["param"] = miss.param;
+      issue["kind"] = assets::kind_name(miss.kind);
+      issue["reference"] = miss.reference;
+    }
+
     // A library root that is configured and not there is worth saying out loud: the palette is empty,
     // and "no amps installed" and "the amps directory moved" look identical from a client otherwise.
     // Informational, not a warning: a device with no IRs is a device with no IRs.
@@ -2361,6 +2400,17 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     return out;
   };
 
+  // The blocks standing in as a bypass for an asset the library lacks, in every reply that says which
+  // generation is running: the client that sent the rig learns it at once, not at the next poll.
+  auto missing_json = [this]() {
+    nlohmann::json list = nlohmann::json::array();
+    for (const assets::MissingAsset& miss : missing_assets_)
+      list.push_back({{"chain", miss.chain}, {"node", miss.node}, {"element", miss.element}, {"param", miss.param},
+                      {"kind", assets::kind_name(miss.kind)}, {"reference", miss.reference},
+                      {"message", miss.message}});
+    return list;
+  };
+
   // One shape for the per-chain array wherever it appears, so a client can read the same entry from
   // `engine.status` and from `rig.get` and not learn two vocabularies for one thing.
   auto chains_json = [this]() {
@@ -2382,6 +2432,16 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       entry["muted"] = runtime.mute.load();
       entry["failed_nodes"] = runtime.failed_nodes.load();
       entry["guard_trips"] = runtime.guard_trips.load();
+      // The blocks of this chain standing in as a bypass for a model or IR the library lacks.
+      nlohmann::json missing = nlohmann::json::array();
+      for (const assets::MissingAsset& miss : missing_assets_)
+      {
+        if (miss.chain != chain.id)
+          continue;
+        missing.push_back({{"node", miss.node}, {"element", miss.element}, {"param", miss.param},
+                           {"kind", assets::kind_name(miss.kind)}, {"reference", miss.reference}});
+      }
+      entry["missing_assets"] = std::move(missing);
       list.push_back(std::move(entry));
     }
     return list;
@@ -2506,7 +2566,10 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       if (!doc["refresh"].is_boolean())
         return error_response(id, "bad_request", "'refresh' must be a boolean");
       if (doc["refresh"].get<bool>())
+      {
         assets_.refresh();
+        republish_after_rescan();
+      }
     }
 
     nlohmann::json models = nlohmann::json::array();
@@ -2797,6 +2860,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     nlohmann::json body;
     body["rig"] = path;
     body["generation"] = generation_;
+    body["missing_assets"] = missing_json();
     return ok_response(id, body);
   }
   if (method == "rig.apply")
@@ -2833,6 +2897,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     nlohmann::json body;
     body["name"] = document.name;
     body["generation"] = generation_;
+    body["missing_assets"] = missing_json();
     body["chains"] = document.chains.size();
     return ok_response(id, body);
   }
@@ -2842,6 +2907,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["rig"] = current_rig_;
     body["source"] = current_source_;
     body["generation"] = generation_;
+    body["missing_assets"] = missing_json();
     body["loaded"] = current_document_.chains.empty() ? false : true;
     if (!current_document_.chains.empty())
     {
@@ -2979,6 +3045,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       body["applied"] = edits.size();
       body["chain"] = chain_id;
       body["generation"] = generation_;
+      body["missing_assets"] = missing_json();
       return ok_response(id, body);
     }
 
@@ -3001,6 +3068,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["applied"] = static_cast<unsigned>(doc["ops"].size());
     body["chain"] = chain_id;
     body["generation"] = generation_;
+    body["missing_assets"] = missing_json();
     return ok_response(id, body);
   }
 

@@ -23,6 +23,7 @@
 #include "namchain/assets/registry.h"
 #include "namchain/graph/plan.h"
 #include "namchain/graph/rig.h"
+#include "namchain/rt/arena.h"
 #include "namchain/wav.h"
 
 namespace
@@ -420,9 +421,33 @@ TEST_CASE("a document's asset parameters are resolved and nothing else is touche
   namchain::graph::Document missing = document;
   missing.chains.front().graph.nodes[1].strings["model"] = "tweed/delux";
   error.clear();
-  CHECK_FALSE(namchain::assets::resolve_document(missing, registry, "", error));
+  namchain::graph::Document strict = missing;
+  CHECK_FALSE(namchain::assets::resolve_document(strict, registry, "", error));
   CHECK(error.find("tweed/deluxe") != std::string::npos);
   CHECK(error.find("'amp'") != std::string::npos); // and which node asked for it
+
+  // Unless the caller takes the misses: then the block is stood in for by a bypass with the same id
+  // and element, the rest of the document still resolves, and the miss says which node and why.
+  std::vector<namchain::assets::MissingAsset> misses;
+  error.clear();
+  REQUIRE_MESSAGE(namchain::assets::resolve_document(missing, registry, "", error, &misses), error);
+  REQUIRE(misses.size() == 1);
+  CHECK(misses[0].node == "amp");
+  CHECK(misses[0].element == "amp");
+  CHECK(misses[0].param == "model");
+  CHECK(misses[0].kind == namchain::assets::Kind::Model);
+  CHECK(misses[0].reference == "tweed/delux");
+  CHECK(misses[0].message.find("tweed/deluxe") != std::string::npos);
+  const auto& stood = missing.chains.front().graph.nodes;
+  CHECK(stood[1].id == "amp");
+  CHECK(stood[1].type == "nc.bypass");
+  CHECK(stood[1].strings.empty());
+  CHECK(stood[2].strings.at("ir") == std::filesystem::weakly_canonical(library.irs / "cab-b.wav").string());
+
+  // The stand-in compiles: that is the point of it.
+  namchain::rt::Arena arena(1 << 20);
+  auto plan = namchain::graph::RenderPlan::compile(missing.chains.front().graph, 64, arena, error);
+  CHECK_MESSAGE(plan != nullptr, error);
 }
 
 TEST_CASE("a WAV header is read rather than guessed at")

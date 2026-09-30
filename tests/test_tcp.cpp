@@ -818,7 +818,9 @@ TEST_CASE("a network client may not name an absolute path, and a local one may")
   };
 
   // The local operator is the one who chose this daemon's filesystem; an absolute path is theirs.
-  const auto local = local_call(server.config.socket_path, document("/etc/hostname"));
+  // A text file that is there wherever the tests are (this one): it is found, so it isn't stood in
+  // for as missing, and then it fails later, as a model.
+  const auto local = local_call(server.config.socket_path, document(__FILE__));
   CHECK(local["ok"] == false);
   CHECK(local["error"]["code"] != "path_refused"); // it fails later, on the model itself
 
@@ -890,13 +892,14 @@ TEST_CASE("a network client names models by id, because a path is refused")
   REQUIRE(applied["ok"] == true);
   CHECK(applied["generation"].get<uint64_t>() >= 1);
 
-  // An id that is not in the library is refused with the near miss, over this transport as over the
-  // other -- and the refusal is about the library, not about permissions.
+  // An id that is not in the library plays as a bypass and is reported with the near miss, over this
+  // transport as over the other -- and it is about the library, not about permissions.
   client.send_frame(document("A2-Lit"));
   const auto missing = client.receive_json();
-  REQUIRE(missing["ok"] == false);
-  CHECK(missing["error"]["code"] == "asset_missing");
-  CHECK(missing["error"]["message"].get<std::string>().find("A2-Lite") != std::string::npos);
+  REQUIRE(missing["ok"] == true);
+  REQUIRE(missing["missing_assets"].size() == 1);
+  CHECK(missing["missing_assets"][0]["node"] == "amp");
+  CHECK(missing["missing_assets"][0]["message"].get<std::string>().find("A2-Lite") != std::string::npos);
 
   // The path that would work locally is refused here, and the id that works here is the answer: this
   // is the trade a network client makes, in one place.

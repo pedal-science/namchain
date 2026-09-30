@@ -593,7 +593,7 @@ ScanStats Registry::refresh()
 }
 
 bool resolve_document(graph::Document& document, const Registry& registry, const std::string& base_dir,
-                      std::string& error)
+                      std::string& error, std::vector<MissingAsset>* missing)
 {
   // A node's parameters come from its node type; a *macro's* come from the macro's own schema, which
   // is where a cab macro's `ir` lives. Both are the same declaration shape, so this is one loop with a
@@ -612,6 +612,15 @@ bool resolve_document(graph::Document& document, const Registry& registry, const
     if (const graph::MacroType* macro = graph::find_macro_type(node.type))
       return &macro->params[index].desc;
     return nullptr;
+  };
+
+  // Whether a node has a dry path to stand in with: one input and one output.
+  const auto one_to_one = [](const graph::NodeSpec& node) {
+    if (const render::NodeType* type = render::find_node_type(node.type))
+      return type->inputs == 1 && type->outputs == 1;
+    if (const graph::MacroType* macro = graph::find_macro_type(node.type))
+      return macro->inputs == 1 && macro->outputs == 1;
+    return false;
   };
 
   for (graph::Chain& chain : document.chains)
@@ -644,8 +653,21 @@ bool resolve_document(graph::Document& document, const Registry& registry, const
         std::string reason;
         if (!registry.resolve_path(kind, value->second, base_dir, path, reason))
         {
-          error = "chain '" + chain.id + "': node '" + node.id + "' (" + node.type + "): " + reason;
-          return false;
+          if (missing == nullptr || !one_to_one(node))
+          {
+            error = "chain '" + chain.id + "': node '" + node.id + "' (" + node.type + "): " + reason;
+            return false;
+          }
+          // The block plays as if bypassed. The stand-in keeps the node's id, element and role, so
+          // connections, ops and a client's view of the chain all still name the same thing; it has
+          // no parameters, so nothing else about the missing block is checked or loaded.
+          missing->push_back(MissingAsset{chain.id, node.id, node.element.empty() ? node.id : node.element,
+                                          node.type, param.id, kind, value->second, reason});
+          node.type = "nc.bypass";
+          node.params.clear();
+          node.strings.clear();
+          node.bypass = false;
+          break;
         }
         value->second = path;
       }
