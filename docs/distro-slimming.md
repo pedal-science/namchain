@@ -795,11 +795,16 @@ that distinction before blaming a change. Also note that `journald` is `Storage=
 the boot oneshot's own log lines may be gone by the time anyone looks — the durable evidence is
 the unit's `result` and the cgroup read-back, not the journal.
 
-`host-slim.sh` is **currently applied on both boards** — piv via
-`/home/rik/code.local/namchain/tools/soak/host-slim.sh`, tib via
-`/home/rik/namchain/tools/soak/host-slim.sh`. To re-record the evidence:
-`tools/soak/host-slim-capture.sh piv` (or `tib`). To undo:
-`sudo tools/soak/host-slim.sh --revert`.
+`host-slim.sh` is **currently applied on piv**, via
+`/home/rik/code.local/namchain/tools/soak/host-slim.sh`. To re-record the evidence:
+`tools/soak/host-slim-capture.sh piv`. To undo: `sudo tools/soak/host-slim.sh --revert`.
+
+**tib is no longer configured by this script.** Since 2026-09-25 its userspace configuration lives
+in the pedal repo, `pedal.project/devices/tib/`, which took over host-slim's masks and files on
+its first apply. By then the slice drop-ins had gone missing, so `system.slice` and `user.slice`
+were back on all four cores. The pedal's version confines housekeeping to 0–2 (matching
+`isolcpus=3`, which tib's kernel has had since 2026-09-19), adds `pedal-rt.slice` for work that
+must pin to core 3, and makes the 1416 MHz clock cap persistent.
 
 The kernel half stays where it already is — `rtpi` for piv and tib, `docs/tuning.md` for
 what a *user* should do. This document and its script are the third layer: what to do to the
