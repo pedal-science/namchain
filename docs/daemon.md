@@ -292,7 +292,7 @@ be careful with.
 
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
-`bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`. It grows as the slices land, and
+`bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`, `local_transitions`. It grows as the slices land, and
 absence is how a client degrades rather than guesses.
 
 The error codes a client may have to act on are `bad_json`, `bad_request`, `unknown_method`,
@@ -323,6 +323,13 @@ output device channel, and its own graph (docs/rig-pipeline.md §2). What that m
   keeps the peak at two of the *largest* chain instead. `engine.status` reports
   `max_concurrent_transitions`, which is that rule as a number: 1 means it has never overlapped. The
   cost is that applying a document takes up to `chains × fade_ms` rather than `fade_ms`.
+- **A structural edit fades only where it changed the chain.** What the edit did not touch keeps its
+  instance and state, and a change only to values that ramp builds no plan at all
+  (docs/transitions.md, "Local transitions"). The reply says what each changed chain got
+  (`transitions`), and `engine.status` counts `local_transitions` and repeats the newest list as
+  `last_transitions`. `local_base_mismatches` counts a local plan that found a different plan playing
+  than the one it was built against and switched straight to its final plan, without a fade; it
+  should stay 0.
 - **A chain whose graph and channels did not change is not replanned and does not fade.** A patch to
   the guitar chain leaves the vocal chain's plan, its models and its generation exactly where they
   were. A publish that changes nothing at all does not advance the generation, so reloading the same

@@ -27,15 +27,18 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <set>
 #include <system_error>
 
 #include <json.hpp>
 
 #include "namchain/daemon/platform.h"
+#include "namchain/graph/carry.h"
 #include "namchain/graph/macro.h"
 #include "namchain/graph/rig.h"
 #include "namchain/graph/patch.h"
@@ -89,7 +92,8 @@ nlohmann::json protocol_features()
 {
   return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
                                 "structural_crossfade", "smooth_params", "bypass", "guard",
-                                "per_chain_mute", "schema", "tcp_transport", "assets", "record"});
+                                "per_chain_mute", "schema", "tcp_transport", "assets", "record",
+                                "local_transitions"});
 }
 
 /// The longest recording `engine.record` will make, so a client that forgets to stop one cannot fill
@@ -518,6 +522,7 @@ bool resolve_smooth_edit(const EditContext& context, const nlohmann::json& op, R
         }
         PlanCommand command;
         command.kind = PlanCommand::Kind::SetParam;
+        command.slot = const_cast<PlanSlot*>(slot); // compared on the render thread, never dereferenced
         command.chain = static_cast<uint32_t>(context.chain_index);
         command.generation = slot->generation;
         command.node = static_cast<uint32_t>(node_index);
@@ -603,6 +608,7 @@ bool resolve_smooth_edit(const EditContext& context, const nlohmann::json& op, R
 
   PlanCommand command;
   command.kind = PlanCommand::Kind::SetParam;
+  command.slot = const_cast<PlanSlot*>(slot); // compared on the render thread, never dereferenced
   command.chain = static_cast<uint32_t>(context.chain_index);
   command.generation = slot->generation;
   command.node = static_cast<uint32_t>(node_index);
@@ -1322,6 +1328,7 @@ bool Daemon::publish_param(const std::string& chain_id, const std::string& node,
 
   PlanCommand command;
   command.kind = PlanCommand::Kind::SetParam;
+  command.slot = slot; // compared on the render thread, never dereferenced
   command.chain = static_cast<uint32_t>(index);
   command.generation = slot->generation;
   command.node = static_cast<uint32_t>(node_index);
@@ -1437,19 +1444,10 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     current_name_ = document.name;
     current_document_ = document;
     missing_assets_ = std::move(missing);
+    last_transitions_.clear();
     return true;
   }
 
-  // Room for every chain's command before any of them is pushed: a document publish is all-or-nothing,
-  // and half a document installed is the one outcome worse than a rejected one.
-  if (commands_.size() + changed_count > commands_.capacity())
-  {
-    error = "the command ring is full; the render thread is not consuming plans";
-    return false;
-  }
-
-  const uint64_t generation = generation_ + 1;
-  std::vector<std::unique_ptr<PlanSlot>> built;
   for (const graph::Chain& chain : document.chains)
   {
     if (chain.input_channel >= static_cast<int>(config_.capture_channels))
@@ -1465,51 +1463,228 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
       return false;
     }
   }
-  for (std::size_t i = 0; i < document.chains.size(); ++i)
+
+  // A crossfade is the same length wherever it is: inside a chain for a local transition, or across the
+  // whole chain for the render thread's own.
+  unsigned rate = active_rate_.load();
+  if (rate == 0)
+    rate = config_.sample_rate;
+  const int fade_frames = std::clamp(
+    static_cast<int>(std::llround(config_.fade_ms * static_cast<double>(rate) / 1000.0)), 1, kMaxTransitionFrames);
+
+  const uint64_t generation = generation_ + 1;
+  const std::size_t count = document.chains.size();
+  // Per chain: the slot to push (none for a chain that is unchanged, or that only ramps), and what the
+  // chain's published plan becomes. Ramps are pushed after every plan, resolved against the plan whose
+  // node indices they carry.
+  std::vector<std::unique_ptr<PlanSlot>> built(count);
+  std::vector<PlanSlot*> finals(count, nullptr);
+  std::vector<PlanCommand> ramp_commands;
+  std::vector<ChainTransition> transitions;
+  std::size_t plans_built = 0;
+
+  const auto resolve_ramps = [&](std::size_t index, PlanSlot* slot, const std::vector<graph::CarriedRamp>& ramps,
+                                 std::vector<PlanCommand>& commands, std::string& why) {
+    for (const graph::CarriedRamp& ramp : ramps)
+    {
+      std::size_t node_index = 0;
+      uint32_t param_id = 0;
+      if (!slot->plan->resolve_param(ramp.node, ramp.param, -1, node_index, param_id))
+      {
+        why = "'" + ramp.node + "." + ramp.param + "' cannot be ramped";
+        return false;
+      }
+      PlanCommand command;
+      command.kind = PlanCommand::Kind::SetParam;
+      command.slot = slot;
+      command.chain = static_cast<uint32_t>(index);
+      command.generation = slot->generation;
+      command.node = static_cast<uint32_t>(node_index);
+      command.param = param_id;
+      command.value = static_cast<float>(ramp.value);
+      commands.push_back(command);
+    }
+    return true;
+  };
+
+  for (std::size_t i = 0; i < count; ++i)
   {
     if (!changed[i])
       continue;
     const graph::Chain& chain = resolved.chains[i];
-    auto slot = std::make_unique<PlanSlot>(kArenaBytes);
-    slot->plan = graph::RenderPlan::compile(chain.graph, options, slot->arena, error);
-    if (slot->plan == nullptr)
+    ChainTransition record;
+    record.chain = chain.id;
+
+    // A local transition keeps what the edit did not touch and fades only what it changed
+    // (docs/transitions.md, "Local transitions"). It shares instances with the plan the render thread is
+    // playing for this chain, so it is planned only against that plan, settled, and only when it is the
+    // same chain: a different chain in the same position is a different rig, and is crossfaded whole.
+    PlanSlot* base = i < published_slots_.size() ? published_slots_[i] : nullptr;
+    const bool same_chain = base != nullptr && base->plan != nullptr && i < current_resolved_.chains.size() &&
+                            current_resolved_.chains[i].id == chain.id &&
+                            base->input_channel == chain.input_channel &&
+                            base->output_channel == chain.output_channel;
+    bool planned = false;
+    if (same_chain)
     {
-      error = "chain '" + chain.id + "': " + error;
-      return false;
+      std::string why;
+      graph::Graph before;
+      graph::Graph after;
+      graph::LocalPlan local;
+      std::set<std::string> unusable;
+      for (std::size_t n = 0; n < base->plan->node_ids().size(); ++n)
+      {
+        if (base->plan->node_failed(n))
+          unusable.insert(base->plan->node_ids()[n]);
+      }
+      // Room is left for every other chain's plan, so a chain that ramps cannot crowd one out.
+      const std::size_t room = commands_.capacity() - std::min(commands_.capacity(), commands_.size() + count);
+      if (!wait_until_settled(i))
+      {
+        why = "the chain was still changing";
+      }
+      else if (!graph::lower_graph(current_resolved_.chains[i].graph, before, why) ||
+               !graph::lower_graph(chain.graph, after, why))
+      {
+        // The whole-chain compile below meets the same problem and reports it.
+      }
+      else if (graph::plan_local_transition(before, after, unusable, fade_frames, local, why))
+      {
+        if (local.ramps_only)
+        {
+          std::vector<PlanCommand> commands;
+          if (ramp_commands.size() + local.ramps.size() > room)
+            why = "too many values moved at once to ramp them";
+          else if (resolve_ramps(i, base, local.ramps, commands, why))
+          {
+            ramp_commands.insert(ramp_commands.end(), commands.begin(), commands.end());
+            finals[i] = base;
+            record.kind = "ramps";
+            record.ramps = static_cast<int>(local.ramps.size());
+            planned = true;
+          }
+        }
+        else
+        {
+          auto first = std::make_unique<PlanSlot>(kArenaBytes);
+          std::unique_ptr<PlanSlot> second = local.instant ? nullptr : std::make_unique<PlanSlot>(kArenaBytes);
+          graph::CarriedPlans plans;
+          if (!graph::build_carried_plans(*base->plan, local, options, first->arena,
+                                          local.instant ? first->arena : second->arena, plans, why))
+          {
+            why = "the local transition did not compile: " + why;
+          }
+          else
+          {
+            first->local = true;
+            first->base = base;
+            first->generation = generation;
+            first->input_channel = chain.input_channel;
+            first->output_channel = chain.output_channel;
+            first->on_adopt = std::move(plans.on_adopt);
+            PlanSlot* final_slot = first.get();
+            if (local.instant)
+            {
+              first->plan = std::move(plans.final_plan);
+            }
+            else
+            {
+              first->plan = std::move(plans.transitional);
+              first->fade_frames = fade_frames;
+              first->on_then = std::move(plans.on_final);
+              second->plan = std::move(plans.final_plan);
+              second->generation = generation;
+              second->input_channel = chain.input_channel;
+              second->output_channel = chain.output_channel;
+              final_slot = second.get();
+              first->then = second.release();
+            }
+            std::vector<PlanCommand> commands;
+            if (ramp_commands.size() + local.ramps.size() > room)
+              why = "too many values moved at once to ramp them";
+            else if (resolve_ramps(i, final_slot, local.ramps, commands, why))
+            {
+              ramp_commands.insert(ramp_commands.end(), commands.begin(), commands.end());
+              finals[i] = final_slot;
+              built[i] = std::move(first);
+              ++plans_built;
+              record.kind = local.instant ? "instant" : "local";
+              record.fades = local.fades;
+              record.kept = local.kept;
+              record.created = local.created;
+              record.retiring = local.retiring;
+              record.ramps = static_cast<int>(local.ramps.size());
+              planned = true;
+            }
+          }
+        }
+      }
+      if (!planned)
+        record.reason = why;
     }
-    // The first process() call on a freshly built node is tens of times its steady-state cost, and a
-    // stall that long can drain the device ring. It is control-thread work, before publication (§3.3).
-    slot->plan->prewarm();
-    slot->input_channel = chain.input_channel;
-    slot->output_channel = chain.output_channel;
-    slot->generation = generation;
-    built.push_back(std::move(slot));
+
+    if (!planned)
+    {
+      // The whole chain, as it always was: a fresh plan, dual-rendered and crossfaded by the render thread.
+      auto slot = std::make_unique<PlanSlot>(kArenaBytes);
+      slot->plan = graph::RenderPlan::compile(chain.graph, options, slot->arena, error);
+      if (slot->plan == nullptr)
+      {
+        error = "chain '" + chain.id + "': " + error;
+        return false;
+      }
+      // The first process() call on a freshly built node is tens of times its steady-state cost, and a
+      // stall that long can drain the device ring. It is control-thread work, before publication (§3.3).
+      slot->plan->prewarm();
+      slot->input_channel = chain.input_channel;
+      slot->output_channel = chain.output_channel;
+      slot->generation = generation;
+      finals[i] = slot.get();
+      built[i] = std::move(slot);
+      ++plans_built;
+      record.kind = "crossfade";
+    }
+    transitions.push_back(std::move(record));
+  }
+
+  // Room for every chain's command before any of them is pushed: a document publish is all-or-nothing,
+  // and half a document installed is the one outcome worse than a rejected one.
+  if (commands_.size() + plans_built + ramp_commands.size() > commands_.capacity())
+  {
+    error = "the command ring is full; the render thread is not consuming plans";
+    return false;
   }
 
   // Every plan exists, is prewarmed and is bound before any of them becomes visible. The pushes cannot
   // fail: the room for all of them was checked above and this thread is the only producer.
   std::vector<PlanSlot*> raw;
-  raw.reserve(document.chains.size());
-  std::size_t next_built = 0;
-  for (std::size_t i = 0; i < document.chains.size(); ++i)
+  raw.reserve(count);
+  for (std::size_t i = 0; i < count; ++i)
   {
-    if (!changed[i])
+    if (built[i] == nullptr)
     {
-      raw.push_back(published_slots_[i]); // still owned by the render thread or the reclaimer
+      // Unchanged, or only ramped: the plan it has, still owned by the render thread or the reclaimer.
+      raw.push_back(changed[i] ? finals[i] : published_slots_[i]);
       continue;
     }
-    PlanSlot* slot = built[next_built++].release();
-    if (!push_slot(static_cast<uint32_t>(i), static_cast<uint32_t>(document.chains.size()), slot))
+    if (!push_slot(static_cast<uint32_t>(i), static_cast<uint32_t>(count), built[i].release()))
     {
       error = "the publication ring is full; the render thread is not consuming plans";
       return false;
     }
-    raw.push_back(slot);
+    raw.push_back(finals[i]);
   }
+  // The ramps go after the plans, so one resolved against a local transition's final plan finds that
+  // plan already taken up (or queued) when the render thread reaches it.
+  for (const PlanCommand& command : ramp_commands)
+    commands_.push(command);
 
   // Only now does anything about the running engine change. A failed compile, a chain whose channels
   // are not available, or a full ring leaves the previous document, plans and generation as they were.
-  generation_ = generation;
+  // A publish that only ramped built no plan, so the generation does not move: there is nothing new for
+  // a client that polls for adoption to wait for.
+  if (plans_built > 0)
+    generation_ = generation;
   current_rig_ = path;
   current_source_ = source;
   current_base_dir_ = base_dir;
@@ -1519,15 +1694,61 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   missing_assets_ = std::move(missing);
   published_slots_ = std::move(raw);
   last_published_ = &current_document_;
+  last_transitions_ = std::move(transitions);
 
   if (config_.verbose)
   {
     const std::string what = path.empty() ? (document.name.empty() ? "(applied document)" : document.name) : path;
-    std::fprintf(stderr, "[namchaind] published %s (generation %llu, %zu chain%s, %zu replanned)\n", what.c_str(),
-                 static_cast<unsigned long long>(generation_), document.chains.size(),
-                 document.chains.size() == 1 ? "" : "s", built.size());
+    std::string how;
+    for (const ChainTransition& transition : last_transitions_)
+    {
+      how += how.empty() ? "" : ", ";
+      how += transition.kind;
+      if (transition.kind == "local")
+        how += " (" + std::to_string(transition.fades) + " fade" + (transition.fades == 1 ? "" : "s") + ", " +
+               std::to_string(transition.kept) + " kept, " + std::to_string(transition.created) + " new, " +
+               std::to_string(transition.retiring) + " retiring)";
+      if (!transition.reason.empty())
+        how += " [" + transition.reason + "]";
+    }
+    std::fprintf(stderr, "[namchaind] published %s (generation %llu, %zu chain%s: %s)\n", what.c_str(),
+                 static_cast<unsigned long long>(generation_), count, count == 1 ? "" : "s", how.c_str());
   }
   return true;
+}
+
+bool Daemon::chain_settled(std::size_t index) const
+{
+  if (index >= published_slots_.size() || index >= static_cast<std::size_t>(kMaxChains) ||
+      published_slots_[index] == nullptr)
+    return false;
+  const uint64_t generation = published_slots_[index]->generation;
+  const ChainRuntime& chain = chains_[index];
+  return !chain.transition_active.load() && chain.audible_generation.load() == generation &&
+         chain.target_generation.load() == generation;
+}
+
+bool Daemon::wait_until_settled(std::size_t index)
+{
+  if (chain_settled(index))
+    return true;
+  // Only a running render thread moves a chain along: with no device there is nothing to wait for.
+  if (device_state() != DeviceState::Running)
+    return false;
+  // Long enough for every chain of a document to finish its fade in turn, short enough that a client is
+  // not kept waiting for a reply when something is wrong.
+  const auto limit = std::chrono::milliseconds(
+    50 + static_cast<long long>(std::ceil(config_.fade_ms)) * 2 * static_cast<long long>(kMaxChains));
+  const auto deadline = std::chrono::steady_clock::now() + limit;
+  while (std::chrono::steady_clock::now() < deadline)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // This thread is also the one that frees retired plans, and a fade retires them.
+    reclaimer_.collect();
+    if (chain_settled(index))
+      return true;
+  }
+  return false;
 }
 
 bool Daemon::start(std::string& error)
@@ -1899,6 +2120,88 @@ void Daemon::finish_transition(int index)
   update_aggregate_state();
 }
 
+void Daemon::start_local_transition(int index, PlanSlot* slot)
+{
+  ChainRuntime& chain = chains_[index];
+  chain.target_generation.store(slot->generation);
+  chain.adopted_generation.store(slot->generation);
+  transitions_started_.fetch_add(1);
+
+  if (slot->base != chain.current)
+  {
+    // Planned against a plan that is not the one playing. The control thread plans a local transition
+    // only against a settled chain, so this is not expected; but the slot shares instances with the plan
+    // it was planned against, and running it beside anything else could run one of them twice. So go
+    // straight to its final plan, which is safe whatever is playing, and count it.
+    local_base_mismatches_.fetch_add(1);
+    PlanSlot* final_slot = slot;
+    if (slot->then != nullptr)
+    {
+      final_slot = slot->then;
+      slot->then = nullptr;
+      reclaimer_.retire(slot, &delete_plan_slot);
+    }
+    if (chain.current != nullptr)
+      reclaimer_.retire(chain.current, &delete_plan_slot);
+    chain.current = final_slot;
+    chain.local_remaining = 0;
+    chain.transition_active.store(false);
+    chain.audible_generation.store(final_slot->generation);
+    update_aggregate_state();
+    return;
+  }
+
+  // The plan this one shares its instances with stops in the block this one starts: nothing runs twice.
+  // A block-delay node's state is its input buffer, which lives in the plan, so that is copied across.
+  const std::size_t floats = static_cast<std::size_t>(slot->plan->max_quantum());
+  for (const auto& [from, to] : slot->on_adopt)
+    std::copy(from, from + floats, to);
+  if (chain.current != nullptr)
+    reclaimer_.retire(chain.current, &delete_plan_slot);
+  chain.current = slot;
+  local_transitions_.fetch_add(1);
+
+  if (slot->then != nullptr)
+  {
+    chain.local_remaining = std::max(1, slot->fade_frames);
+    chain.transition_active.store(true);
+    transitioning_chain_ = index;
+  }
+  else
+  {
+    // An instant one: nothing to fade, so this plan is already the final one.
+    chain.local_remaining = 0;
+    chain.transition_active.store(false);
+    chain.audible_generation.store(slot->generation);
+  }
+  update_aggregate_state();
+}
+
+void Daemon::finish_local_transition(int index)
+{
+  ChainRuntime& chain = chains_[index];
+  chain.local_remaining = 0;
+  PlanSlot* finished = chain.current;
+  if (finished != nullptr && finished->then != nullptr)
+  {
+    PlanSlot* final_slot = finished->then;
+    finished->then = nullptr;
+    const std::size_t floats = static_cast<std::size_t>(finished->plan->max_quantum());
+    for (const auto& [from, to] : finished->on_then)
+      std::copy(from, from + floats, to);
+    chain.current = final_slot;
+    // What was going away goes with the transitional plan; what was kept lives on in the final one.
+    reclaimer_.retire(finished, &delete_plan_slot);
+  }
+  chain.transition_active.store(false);
+  if (chain.current != nullptr)
+    chain.audible_generation.store(chain.current->generation);
+  if (transitioning_chain_ == index)
+    transitioning_chain_ = -1;
+  start_queued_transition();
+  update_aggregate_state();
+}
+
 void Daemon::start_queued_transition()
 {
   if (transitioning_chain_ >= 0)
@@ -1910,7 +2213,10 @@ void Daemon::start_queued_transition()
       continue;
     PlanSlot* pending = chain.pending;
     chain.pending = nullptr;
-    start_transition(i, pending);
+    if (pending->local)
+      start_local_transition(i, pending);
+    else
+      start_transition(i, pending);
     return;
   }
   update_aggregate_state();
@@ -1941,6 +2247,7 @@ void Daemon::drop_chain(int index)
     reclaimer_.retire(chain.current, &delete_plan_slot);
     chain.current = nullptr;
   }
+  chain.local_remaining = 0;
   chain.transition_active.store(false);
   chain.audible_generation.store(0);
   chain.target_generation.store(0);
@@ -1992,14 +2299,25 @@ void Daemon::drain_commands()
         params_stale_.fetch_add(1);
         continue;
       }
+      // Matched by the slot it was resolved against, not only by generation: a local transition's two
+      // plans share a generation, and a node's index differs between them. An edit resolved against a
+      // local transition's final plan reaches it while the transitional plan is the one playing, which
+      // is right -- the node is the same instance in both.
       ChainRuntime& chain = chains_[command.chain];
+      const auto named = [&command](const PlanSlot* slot) {
+        return slot != nullptr && slot == command.slot && slot->generation == command.generation;
+      };
       graph::RenderPlan* plan = nullptr;
-      if (chain.current != nullptr && chain.current->generation == command.generation)
+      if (named(chain.current))
         plan = chain.current->plan.get();
-      else if (chain.next != nullptr && chain.next->generation == command.generation)
+      else if (chain.current != nullptr && named(chain.current->then))
+        plan = chain.current->then->plan.get();
+      else if (named(chain.next))
         plan = chain.next->plan.get();
-      else if (chain.pending != nullptr && chain.pending->generation == command.generation)
+      else if (named(chain.pending))
         plan = chain.pending->plan.get();
+      else if (chain.pending != nullptr && named(chain.pending->then))
+        plan = chain.pending->then->plan.get();
 
       if (plan != nullptr && plan->set_param(command.node, command.param, command.value))
         params_applied_.fetch_add(1);
@@ -2031,7 +2349,15 @@ void Daemon::drain_commands()
     if (chain.current == nullptr)
     {
       // Nothing to fade from: adopt it. This is the startup rig, and the first appearance of a chain
-      // added by a document -- the device has not produced a block, or the chain is new.
+      // added by a document -- the device has not produced a block, or the chain is new. A local slot is
+      // never planned against nothing, but if one arrives here its final plan is what to adopt.
+      if (next->then != nullptr)
+      {
+        PlanSlot* final_slot = next->then;
+        next->then = nullptr;
+        reclaimer_.retire(next, &delete_plan_slot);
+        next = final_slot;
+      }
       chain.next = nullptr;
       chain.current = next;
       chain.audible_generation.store(next->generation);
@@ -2041,7 +2367,7 @@ void Daemon::drain_commands()
       continue;
     }
 
-    if (chain.next != nullptr || transitioning_chain_ >= 0)
+    if (chain.next != nullptr || chain.local_remaining > 0 || transitioning_chain_ >= 0)
     {
       // This chain is fading, or another one is and this daemon fades one chain at a time. A burst
       // coalesces to the newest request (the superseded plan is retired here) rather than nesting
@@ -2055,7 +2381,10 @@ void Daemon::drain_commands()
       continue;
     }
 
-    start_transition(index, next);
+    if (next->local)
+      start_local_transition(index, next);
+    else
+      start_transition(index, next);
   }
 
   // A document with fewer chains than the last one: the chains that are gone stop now. Done after the
@@ -2190,7 +2519,15 @@ void Daemon::render_loop()
         }
         else
         {
+          // One plan, also during a local transition: its crossfades sit inside it, at the inputs the
+          // edit changed, and everything the edit did not touch runs once.
           chain.current->plan->execute(chain.in.data(), chain.out.data(), frames);
+          if (chain.local_remaining > 0)
+          {
+            chain.local_remaining -= frames;
+            if (chain.local_remaining <= 0)
+              finish_local_transition(c);
+          }
         }
 
         // Mute is a zeroing of the *emitted* copy, applied after execute so the chain keeps running:
@@ -2447,6 +2784,29 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     return list;
   };
 
+  // What the newest publish did with each chain it changed: kept what it could and faded locally, kept
+  // everything, only ramped, or crossfaded the whole chain -- and why, when it had to be the last.
+  auto transitions_json = [this]() {
+    nlohmann::json list = nlohmann::json::array();
+    for (const ChainTransition& transition : last_transitions_)
+    {
+      nlohmann::json entry{{"chain", transition.chain}, {"kind", transition.kind}};
+      if (transition.kind == "local" || transition.kind == "instant")
+      {
+        entry["fades"] = transition.fades;
+        entry["kept"] = transition.kept;
+        entry["created"] = transition.created;
+        entry["retiring"] = transition.retiring;
+      }
+      if (transition.ramps > 0)
+        entry["ramps"] = transition.ramps;
+      if (!transition.reason.empty())
+        entry["reason"] = transition.reason;
+      list.push_back(std::move(entry));
+    }
+    return list;
+  };
+
   nlohmann::json doc;
   try
   {
@@ -2624,13 +2984,19 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["failed_nodes"] = failed_nodes_.load();
     status["guard_trips"] = guard_trips_.load();
     // Two honest labels: parameter edits are ramped inside the node (no recompile, no step); a
-    // structural reload is dual-rendered and equal-power crossfaded for fade_ms.
+    // structural change is equal-power crossfaded for fade_ms -- where the edit is, when what it did not
+    // touch can be kept (`local_transitions`), and across the whole chain when it cannot.
     status["param_edits"] = "ramped";
     status["structural_transitions"] = "crossfade";
     status["transition_active"] = transition_active_.load();
     status["audible_generation"] = audible_generation_.load();
     status["target_generation"] = target_generation_.load();
     status["transitions_started"] = transitions_started_.load();
+    // Of those, the ones that kept what the edit did not touch and faded only what it changed
+    // (docs/transitions.md, "Local transitions"); and what the newest publish did, chain by chain.
+    status["local_transitions"] = local_transitions_.load();
+    status["local_base_mismatches"] = local_base_mismatches_.load();
+    status["last_transitions"] = transitions_json();
     status["max_concurrent_transitions"] = max_concurrent_transitions_.load();
     status["fade_ms"] = config_.fade_ms;
     // The output queue's own losses. A dropped or an inserted period is a click, and neither is an xrun.
@@ -2861,6 +3227,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["rig"] = path;
     body["generation"] = generation_;
     body["missing_assets"] = missing_json();
+    body["transitions"] = transitions_json();
     return ok_response(id, body);
   }
   if (method == "rig.apply")
@@ -2899,6 +3266,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["generation"] = generation_;
     body["missing_assets"] = missing_json();
     body["chains"] = document.chains.size();
+    body["transitions"] = transitions_json();
     return ok_response(id, body);
   }
   if (method == "rig.get")
@@ -3024,19 +3392,28 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       // document arrived with rather than the ones the user has been turning, and the next structural
       // edit -- which is built from this document -- would silently revert every ramped parameter
       // (docs/macros.md §"What a macro edit records").
+      //
+      // And the resolved copy follows too: it is what the next publish is compared against, node by
+      // node, to find what changed (docs/transitions.md, "Local transitions"). A ramp is never a model
+      // or IR reference, so the two copies agree about every value a ramp can move.
       for (const ResolvedEdit& edit : edits)
       {
         if (edit.document_node.empty())
           continue;
-        for (graph::NodeSpec& spec : current_document_.chains[chain_index].graph.nodes)
+        for (graph::Document* copy : {&current_document_, &current_resolved_})
         {
-          if (spec.id != edit.document_node)
+          if (chain_index >= copy->chains.size())
             continue;
-          if (edit.is_text)
-            spec.strings[edit.document_param] = edit.text;
-          else
-            spec.params[edit.document_param] = edit.value;
-          break;
+          for (graph::NodeSpec& spec : copy->chains[chain_index].graph.nodes)
+          {
+            if (spec.id != edit.document_node)
+              continue;
+            if (edit.is_text)
+              spec.strings[edit.document_param] = edit.text;
+            else
+              spec.params[edit.document_param] = edit.value;
+            break;
+          }
         }
       }
 
@@ -3069,6 +3446,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["chain"] = chain_id;
     body["generation"] = generation_;
     body["missing_assets"] = missing_json();
+    body["transitions"] = transitions_json();
     return ok_response(id, body);
   }
 

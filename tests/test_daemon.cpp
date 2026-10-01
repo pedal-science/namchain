@@ -854,12 +854,15 @@ namespace
 
 /// A two-chain document: guitar on capture channel 0, vocal on capture channel 1, each an
 /// `nc.input -> nc.gain -> nc.output` chain at the given gain, writing the given playback channels.
+/// With \p second_stage, each chain has a second gain stage (`g2`, unity) after the first, which makes
+/// the two documents differ structurally rather than only in values that ramp.
 ///
 /// Built with nlohmann rather than a string literal so a test can vary one thing at a time and the
 /// difference between two documents is visible in the call.
-std::string two_chain_document(double guitar_gain, double vocal_gain, int guitar_out, int vocal_out)
+std::string two_chain_document(double guitar_gain, double vocal_gain, int guitar_out, int vocal_out,
+                               bool second_stage = false)
 {
-  const auto chain = [](const char* id, int in_channel, int out_channel, double gain) {
+  const auto chain = [second_stage](const char* id, int in_channel, int out_channel, double gain) {
     nlohmann::json c;
     c["id"] = id;
     c["input_channel"] = in_channel;
@@ -869,10 +872,15 @@ std::string two_chain_document(double guitar_gain, double vocal_gain, int guitar
       {{"id", "g"}, {"type", "nc.gain"}, {"gain", gain}},
       {{"id", "out"}, {"type", "nc.output"}},
     });
-    c["connections"] = nlohmann::json::array({
-      {{"from", "in"}, {"to", "g"}},
-      {{"from", "g"}, {"to", "out"}},
-    });
+    c["connections"] = nlohmann::json::array({{{"from", "in"}, {"to", "g"}}});
+    if (second_stage)
+    {
+      c["nodes"].push_back({{"id", "g2"}, {"type", "nc.gain"}, {"gain", 1.0}});
+      c["connections"].push_back({{"from", "g"}, {"to", "g2"}});
+      c["connections"].push_back({{"from", "g2"}, {"to", "out"}});
+    }
+    else
+      c["connections"].push_back({{"from", "g"}, {"to", "out"}});
     return c;
   };
 
@@ -1041,7 +1049,8 @@ TEST_CASE("a document apply transitions its chains one at a time")
   TempDir dir;
   const auto root = dir.path / "rigs";
   write_file(root / "a.json", two_chain_document(0.5, 0.5, 0, 1));
-  write_file(root / "b.json", two_chain_document(0.25, 0.25, 0, 1));
+  // A structural change to both chains: a change only to gains would ramp, with no new plan to stagger.
+  write_file(root / "b.json", two_chain_document(0.25, 0.25, 0, 1, /*second_stage=*/true));
 
   Config config;
   config.backend = BackendKind::Null;
@@ -1120,6 +1129,92 @@ TEST_CASE("a document apply transitions its chains one at a time")
   // The rule the stagger exists for, as a number rather than a promise: two chains changed, and never
   // two crossfades at once.
   CHECK(status["status"]["max_concurrent_transitions"] == 1);
+}
+
+TEST_CASE("a structural load keeps what did not change, and a load that only moves gains ramps")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "a.json", two_chain_document(0.5, 0.5, 0, 1));
+  write_file(root / "b.json", two_chain_document(0.5, 0.5, 0, 1, /*second_stage=*/true));
+  write_file(root / "c.json", two_chain_document(0.25, 0.125, 0, 1, /*second_stage=*/true));
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "a.json").string();
+  config.capture_channels = 2;
+  config.playback_channels = 2;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const auto settled_at = [](uint64_t generation) {
+    return [generation](const nlohmann::json& status) {
+      return status["state"] == "running" && status["transition_active"] == false &&
+             status["audible_generation"].get<uint64_t>() == generation;
+    };
+  };
+  REQUIRE(wait_for(config.socket_path, settled_at(1)));
+
+  // A second gain stage in each chain: input, first gain and output carry over; one fade, on the
+  // output's input, which now comes from the new stage.
+  const auto loaded =
+    nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"rig.load","rig":"b.json"})"));
+  REQUIRE(loaded["ok"] == true);
+  CHECK(loaded["generation"] == 2);
+  REQUIRE(loaded["transitions"].size() == 2);
+  for (const auto& transition : loaded["transitions"])
+  {
+    CHECK(transition["kind"] == "local");
+    CHECK(transition["fades"] == 1);
+    CHECK(transition["kept"] == 3);
+    CHECK(transition["created"] == 1);
+    CHECK(transition["retiring"] == 0);
+  }
+  REQUIRE(wait_for(config.socket_path, settled_at(2)));
+  auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["local_transitions"] == 2);
+  CHECK(status["local_base_mismatches"] == 0);
+  CHECK(status["max_concurrent_transitions"] == 1);
+  const uint64_t params_before = status["params_applied"].get<uint64_t>();
+
+  // Only the gains move: no plan is built, the generation stays, and each chain's gain ramps.
+  const auto ramped =
+    nlohmann::json::parse(call(config.socket_path, R"({"id":"m","method":"rig.load","rig":"c.json"})"));
+  REQUIRE(ramped["ok"] == true);
+  CHECK(ramped["generation"] == 2);
+  REQUIRE(ramped["transitions"].size() == 2);
+  for (const auto& transition : ramped["transitions"])
+  {
+    CHECK(transition["kind"] == "ramps");
+    CHECK(transition["ramps"] == 1);
+  }
+  const bool applied = wait_for(config.socket_path, [params_before](const nlohmann::json& s) {
+    return s["params_applied"].get<uint64_t>() == params_before + 2;
+  });
+  CHECK_MESSAGE(applied, "the two gain ramps never reached the render thread");
+  status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["generation"] == 2);
+  CHECK(status["local_transitions"] == 2);
 }
 
 TEST_CASE("a patch to one chain leaves the other chain's plan alone")

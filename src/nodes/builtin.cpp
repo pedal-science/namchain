@@ -1359,6 +1359,52 @@ const NodeType kDelay{.id = "nc.delay", .name = "Delay", .category = "delay", .i
 const NodeType kUnitDelay{"nc.unit_delay", "Unit delay", "utility", 1, 1, nullptr, nullptr,
                           process_unit_delay, nullptr, nullptr, true};
 
+// --- nc.xfade (engine-internal) ----------------------------------------------
+//
+// The crossfade inside a local transition (docs/transitions.md, "Local transitions"). Input 0 is the
+// signal as it was and input 1 the signal as it is becoming; the output moves from one to the other
+// over `frames` samples from the node's first block, with the same equal-power law and the same exact
+// landing as the whole-chain fade (rt::Crossfade), then passes input 1. Only the engine places one,
+// at the point in a chain where an edit's old and new signals meet. It is left out of prewarm, which
+// would otherwise spend the fade on silence before the plan is heard.
+
+struct XfadeState
+{
+  explicit XfadeState(int frames) : fade(frames) { fade.start(frames); }
+  rt::Crossfade fade;
+};
+
+void* create_xfade(const graph::NodeSpec& spec, const CompileOptions&, std::string& error)
+{
+  const auto found = spec.params.find("frames");
+  const double frames = found == spec.params.end() ? 0.0 : found->second;
+  if (!std::isfinite(frames) || frames < 1.0 || frames > 1048576.0)
+  {
+    error = reject("nc.xfade", "'frames' must be between 1 and 1048576");
+    return nullptr;
+  }
+  return new XfadeState(static_cast<int>(frames));
+}
+
+void destroy_xfade(void* raw)
+{
+  delete static_cast<XfadeState*>(raw);
+}
+
+void process_xfade(void* raw, const float* const* in, float* const* out, int frames) noexcept
+{
+  static_cast<XfadeState*>(raw)->fade.mix(in[0], in[1], out[0], frames);
+}
+
+const ParamDesc kXfadeParams[] = {
+  {.id = "frames", .name = "Frames", .kind = ParamKind::Number, .default_value = 240.0, .has_min = true,
+   .min = 1.0, .step = 1.0, .snap = true, .required = true},
+};
+
+const NodeType kXfade{.id = "nc.xfade", .name = "Transition crossfade", .category = "utility", .inputs = 2,
+                      .outputs = 1, .create = create_xfade, .destroy = destroy_xfade, .process = process_xfade,
+                      .params = kXfadeParams, .param_count = 1, .internal = true, .skip_prewarm = true};
+
 } // namespace
 
 /// Every registered type, in the order `engine.schema` reports them: the palette's order, grouped by
@@ -1366,9 +1412,17 @@ const NodeType kUnitDelay{"nc.unit_delay", "Unit delay", "utility", 1, 1, nullpt
 const NodeType* const kNodeTypes[] = {&kInput,  &kOutput, &kGain,  &kBiquad, &kDelay, &kNam,
                                       &kCabIr,  &kSplit,  &kMix,   &kBypass, &kUnitDelay};
 
+/// Types only the engine places. Found by the compiler like any other, never listed in the catalogue.
+const NodeType* const kInternalNodeTypes[] = {&kXfade};
+
 const NodeType* find_node_type(const std::string& id)
 {
   for (const NodeType* type : kNodeTypes)
+  {
+    if (id == type->id)
+      return type;
+  }
+  for (const NodeType* type : kInternalNodeTypes)
   {
     if (id == type->id)
       return type;

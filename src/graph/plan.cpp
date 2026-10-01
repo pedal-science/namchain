@@ -568,6 +568,16 @@ Validation validate(const Document& document)
     if (chain.output_channel < 0)
       return Validation::failure(where + " has a negative output_channel");
 
+    // An engine-internal type is the engine's to place (a local transition's crossfade); a document
+    // that names one is asking for machinery, not for an effect.
+    for (const NodeSpec& node : chain.graph.nodes)
+    {
+      const render::NodeType* type = render::find_node_type(node.type);
+      if (type != nullptr && type->internal)
+        return Validation::failure(where + ": node '" + node.id + "' names '" + node.type +
+                                   "', which only the engine may place");
+    }
+
     const Validation inner = validate(chain.graph);
     if (!inner.ok)
       return Validation::failure(where + ": " + inner.message);
@@ -610,6 +620,13 @@ std::vector<int> topological_order(const Graph& graph, const Indexed& indexed)
 
 std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render::CompileOptions& options,
                                                 rt::Arena& arena, std::string& error)
+{
+  return compile(graph, options, arena, error, nullptr);
+}
+
+std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render::CompileOptions& options,
+                                                rt::Arena& arena, std::string& error,
+                                                const CarriedInstances* carried)
 {
   const int max_quantum = options.max_quantum;
   if (max_quantum < 1)
@@ -733,6 +750,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
 
   auto plan = std::unique_ptr<RenderPlan>(new RenderPlan());
   plan->max_quantum_ = max_quantum;
+  plan->silence_buffer_ = silence_buffer;
   plan->failed_ = std::vector<std::atomic<bool>>(lowered_graph.nodes.size());
   for (std::atomic<bool>& flag : plan->failed_)
     flag.store(false, std::memory_order_relaxed);
@@ -765,12 +783,31 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
     // Bypass runs the node and replaces its output (see execute), so `create` still runs: the node's
     // state must stay warm for the un-bypass.
     plan_node.bypass = spec.bypass;
-    // A null `create` means the type carries no state at all (nc.input, nc.split, ...). Using the
-    // vtable rather than a list of ids keeps this honest as node types are added: a type that does
-    // have a constructor and fails to allocate is an error, and cannot be mistaken for a marker.
-    plan_node.state = type->create == nullptr ? nullptr : type->create(spec, options, error);
-    if (type->create != nullptr && plan_node.state == nullptr)
-      return nullptr; // create() set `error`
+    // A carried node keeps the instance it already has, state and all: that is the whole of a local
+    // transition's saving (docs/transitions.md, "Local transitions"). Everything else is created here.
+    const auto carried_instance = carried != nullptr ? carried->find(spec.id) : CarriedInstances::const_iterator{};
+    if (carried != nullptr && carried_instance != carried->end() && carried_instance->second != nullptr)
+    {
+      plan_node.instance = carried_instance->second;
+      plan_node.state = plan_node.instance.get();
+      plan_node.fresh = false;
+    }
+    else if (type->create != nullptr)
+    {
+      // A null `create` means the type carries no state at all (nc.input, nc.split, ...). Using the
+      // vtable rather than a list of ids keeps this honest as node types are added: a type that does
+      // have a constructor and fails to allocate is an error, and cannot be mistaken for a marker.
+      void* state = type->create(spec, options, error);
+      if (state == nullptr)
+        return nullptr; // create() set `error`
+      // The instance owns the state from here: `destroy` runs when the last plan holding it is freed,
+      // which may be a later plan this one hands it to rather than this one.
+      plan_node.instance = NodeInstance(state, [type](void* raw) {
+        if (type->destroy != nullptr && raw != nullptr)
+          type->destroy(raw);
+      });
+      plan_node.state = state;
+    }
 
     const render::PortCounts ports = indexed.ports[static_cast<std::size_t>(node)];
     plan_node.inputs.assign(static_cast<std::size_t>(ports.inputs), plan->buffers_[static_cast<std::size_t>(silence_buffer)]);
@@ -822,12 +859,9 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   return plan;
 }
 
-RenderPlan::~RenderPlan()
-{
-  for (PlanNode& node : nodes_)
-    if (node.type != nullptr && node.type->destroy != nullptr && node.state != nullptr)
-      node.type->destroy(node.state);
-}
+// Each node's state is destroyed by its instance's owner count reaching zero: here, unless a plan this
+// one handed it to still holds it.
+RenderPlan::~RenderPlan() = default;
 
 std::size_t RenderPlan::buffer_bytes() const noexcept
 {
@@ -908,6 +942,60 @@ void RenderPlan::prewarm() noexcept
 {
   if (max_quantum_ > 0)
     execute(nullptr, nullptr, max_quantum_);
+}
+
+void RenderPlan::prewarm_fresh() noexcept
+{
+  if (max_quantum_ <= 0)
+    return;
+  for (PlanNode& node : nodes_)
+  {
+    if (!node.fresh || node.type->skip_prewarm)
+      continue;
+    // A fresh input node is handed no block, which it plays as silence, the same as prewarm().
+    if (node.type->set_block_input != nullptr && node.state != nullptr)
+      node.type->set_block_input(node.state, nullptr);
+    node.type->process(node.state, node.inputs.data(), node.outputs.data(), max_quantum_);
+  }
+  // Start from silence. A carried block-delay node's input is copied in when the plan takes over; any
+  // other buffer is rewritten by its producer before it is read.
+  for (float* buffer : buffers_)
+    std::fill(buffer, buffer + max_quantum_, 0.0f);
+}
+
+NodeInstance RenderPlan::instance_of(const std::string& node_id) const
+{
+  const int index = index_of(node_id);
+  return index < 0 ? NodeInstance{} : nodes_[static_cast<std::size_t>(index)].instance;
+}
+
+int RenderPlan::index_of(const std::string& node_id) const
+{
+  for (std::size_t i = 0; i < node_ids_.size(); ++i)
+  {
+    if (node_ids_[i] == node_id)
+      return static_cast<int>(i);
+  }
+  return -1;
+}
+
+float* RenderPlan::input_buffer(std::size_t node_index, int port) const noexcept
+{
+  if (node_index >= nodes_.size() || port < 0)
+    return nullptr;
+  const PlanNode& node = nodes_[node_index];
+  // The input array carries a terminator, so its real ports are all but the last entry.
+  if (static_cast<std::size_t>(port) + 1 >= node.inputs.size())
+    return nullptr;
+  const float* bound = node.inputs[static_cast<std::size_t>(port)];
+  if (bound == nullptr ||
+      (silence_buffer_ >= 0 && bound == buffers_[static_cast<std::size_t>(silence_buffer_)]))
+    return nullptr;
+  // Every bound input is one of this plan's own arena buffers, which the plan owns as writable memory.
+  for (float* buffer : buffers_)
+    if (buffer == bound)
+      return buffer;
+  return nullptr;
 }
 
 bool RenderPlan::resolve_param(const std::string& node_id, const std::string& param, std::size_t& node_index,

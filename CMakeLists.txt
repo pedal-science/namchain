@@ -117,6 +117,7 @@ endif()
 add_library(namchain OBJECT
   src/nam/lookback.cpp
   src/assets/registry.cpp
+  src/graph/carry.cpp
   src/graph/macro.cpp
   src/io/wav.cpp
   src/io/alsa_params.cpp
@@ -201,6 +202,9 @@ if(NAMCHAIN_BUILD_TOOLS)
   add_executable(namchain-render tools/render/namchain-render.cpp)
   target_link_libraries(namchain-render PRIVATE namchain)
   target_compile_options(namchain-render PRIVATE ${NAMCHAIN_WARN_FLAGS})
+  add_executable(namchain-transition tools/render/namchain-transition.cpp)
+  target_link_libraries(namchain-transition PRIVATE namchain)
+  target_compile_options(namchain-transition PRIVATE ${NAMCHAIN_WARN_FLAGS})
 
   add_executable(namchain-wavcmp tools/wavcmp/namchain-wavcmp.cpp)
   target_link_libraries(namchain-wavcmp PRIVATE namchain)
@@ -301,6 +305,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_glitch.cpp
     tests/test_recorder.cpp
     tests/test_ramp.cpp
+    tests/test_carry.cpp
     tests/test_crossfade.cpp
     tests/test_timeline.cpp
     tests/test_splice_fader.cpp)

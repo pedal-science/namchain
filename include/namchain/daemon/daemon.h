@@ -127,6 +127,10 @@ inline uint64_t decay_recent_trouble(uint64_t value)
 struct PlanSlot
 {
   explicit PlanSlot(std::size_t arena_bytes) : arena(arena_bytes) {}
+  ~PlanSlot() { delete then; }
+
+  PlanSlot(const PlanSlot&) = delete;
+  PlanSlot& operator=(const PlanSlot&) = delete;
 
   rt::Arena arena;
   std::unique_ptr<graph::RenderPlan> plan;
@@ -136,6 +140,24 @@ struct PlanSlot
   int input_channel = 0;
   int output_channel = 0;
   uint64_t generation = 0;
+
+  /// \brief Taken over from \ref base without a whole-chain crossfade (docs/transitions.md, "Local
+  /// transitions"): this plan shares the instances it kept with that one, so the switch is at a block
+  /// boundary and nothing runs twice.
+  bool local = false;
+  /// The slot this one was planned against, and the only one it may take over from. Compared, never
+  /// dereferenced: by the time it could be, it may have been reclaimed.
+  const PlanSlot* base = nullptr;
+  /// A local transition's final plan, which takes over once this one has run \ref fade_frames frames;
+  /// null when this slot is itself the final plan. Owned: retiring a transitional slot that never ran
+  /// frees its final plan too, and the render thread detaches it before it takes over.
+  PlanSlot* then = nullptr;
+  int fade_frames = 0;
+  /// Buffers copied when this slot takes over from \ref base, and when \ref then takes over from it:
+  /// (source, destination), one period each. A block-delay node's state is the input buffer its plan
+  /// last wrote, not anything in the node, so this is what carries a feedback loop across.
+  std::vector<std::pair<const float*, float*>> on_adopt;
+  std::vector<std::pair<const float*, float*>> on_then;
 };
 
 /// \brief The most chains one document may hold.
@@ -160,7 +182,9 @@ struct PlanCommand
   };
 
   Kind kind = Kind::PublishPlan;
-  PlanSlot* slot = nullptr; ///< PublishPlan: one chain's prepared plan
+  /// PublishPlan: one chain's prepared plan. SetParam: the plan the edit was resolved against, which
+  /// the render thread compares (with \ref generation) and never dereferences.
+  PlanSlot* slot = nullptr;
   /// PublishPlan: which chain this plan belongs to, and how many chains the document it came from
   /// holds. Every command of one document carries the same count, so the render thread learns the
   /// document's shape from the commands themselves and never from state the control thread mutates.
@@ -283,6 +307,14 @@ private:
   bool publish_param(const std::string& chain_id, const std::string& node, int port, const std::string& param,
                      double value, std::string& error);
   bool push_slot(uint32_t chain, uint32_t chain_count, PlanSlot* slot);
+  /// \brief Whether the render thread is playing \ref published_slots_ for chain \p index and has
+  /// nothing in flight or queued for it: the only state a local transition may be planned against,
+  /// because it shares instances with exactly that plan. Control thread.
+  bool chain_settled(std::size_t index) const;
+  /// Wait, briefly, for \ref chain_settled. A fade is a few milliseconds, so a burst of edits is
+  /// usually settled by the time the next one has compiled; if not, the caller falls back to a
+  /// whole-chain crossfade, which can be queued behind anything. Control thread.
+  bool wait_until_settled(std::size_t index);
   /// The index of the chain with this id in the running document, or -1. Control thread.
   int find_chain(const std::string& chain_id) const;
   /// The index of the one chain whose newest plan holds \p node, or -1 for none and -2 for several.
@@ -342,6 +374,11 @@ private:
   void start_transition(int index, PlanSlot* next);
   /// Retire the faded-out plan, promote the incoming one, and start whatever is queued. Render thread.
   void finish_transition(int index);
+  /// Take over a chain with a local transition's first plan: copy the carried buffers across and swap,
+  /// with no whole-chain fade. Render thread.
+  void start_local_transition(int index, PlanSlot* slot);
+  /// The local transition's crossfades have closed: hand over to its final plan. Render thread.
+  void finish_local_transition(int index);
   /// Start the next queued chain transition, if one is waiting and none is running. Render thread.
   void start_queued_transition();
   /// Retire a chain's plans and forget it: a document with fewer chains than the last one. Render
@@ -362,6 +399,9 @@ private:
     /// A publish that arrived for this chain while it was waiting its turn. One slot, newest wins:
     /// a burst coalesces to the last request and the superseded plan is retired.
     PlanSlot* pending = nullptr;
+    /// Frames left before a local transition's final plan takes over from \ref current; 0 when no
+    /// local transition is running.
+    int local_remaining = 0;
     rt::Crossfade crossfade{kMaxTransitionFrames};
     std::vector<float> in;
     std::vector<float> out;
@@ -413,13 +453,14 @@ private:
   /// The device's model and IR library (slice D). Control thread only: it is read when a document is
   /// compiled and when `engine.assets`/`engine.schema` is answered, never on the render path.
   assets::Registry assets_;
-  // Sized once; the render path only pushes/pops. Big enough for a whole document plus a burst of
-  // parameter edits, because a document publish is all-or-nothing: if every chain's command does not
-  // fit, none of them is pushed.
-  rt::SpscRing<PlanCommand> commands_{kMaxChains + 8};
+  // Sized once; the render path only pushes/pops. Big enough for a whole document plus the ramps a
+  // document apply can turn into (every value a kept node changed is one command), because a document
+  // publish is all-or-nothing: if every chain's commands do not fit, none of them is pushed.
+  rt::SpscRing<PlanCommand> commands_{kMaxChains + 504};
   // `fade + 2` blocks of grace. There is no fade yet, so two epochs; capacity is a publish storm's
-  // worth, and a full queue is counted rather than silently growing.
-  rt::Reclaimer reclaimer_{2, 16};
+  // worth (a local transition retires two slots: the plan it replaced and its own transitional one),
+  // and a full queue is counted rather than silently growing.
+  rt::Reclaimer reclaimer_{2, 64};
 
   int listen_fd_ = -1;
   /// The TCP listener, and the port it actually bound (read back from the socket, so `tcp_port: 0`
@@ -441,6 +482,23 @@ private:
   /// The references in \ref current_document_ that resolved nowhere, each played as a bypass
   /// (assets::resolve_document). Reported as `asset_missing` issues and per chain in `engine.status`.
   std::vector<assets::MissingAsset> missing_assets_;
+  /// \brief What the newest publish did with each chain it changed. Control thread; reported in the
+  /// publish's reply and in `engine.status`, so a soak can say which edits faded locally.
+  struct ChainTransition
+  {
+    std::string chain;
+    /// `"local"` (kept what it could, faded what changed), `"instant"` (kept everything, nothing to
+    /// fade), `"ramps"` (only values that ramp moved: no new plan), or `"crossfade"` (the whole chain).
+    std::string kind;
+    int fades = 0;
+    int kept = 0;
+    int created = 0;
+    int retiring = 0;
+    int ramps = 0;
+    /// Why a chain was crossfaded whole rather than locally; empty otherwise.
+    std::string reason;
+  };
+  std::vector<ChainTransition> last_transitions_;
   /// Republish the running document after a library rescan, when it has missing assets: a model
   /// copied in since then replaces its stand-in without anyone editing the rig.
   void republish_after_rescan();
@@ -510,6 +568,11 @@ private:
   std::atomic<uint64_t> audible_generation_{0};
   std::atomic<uint64_t> target_generation_{0};
   std::atomic<uint64_t> transitions_started_{0};
+  /// Of those, the ones that kept what the edit did not touch and faded only what it changed.
+  std::atomic<uint64_t> local_transitions_{0};
+  /// Local transitions that found a different plan playing than the one they were planned against, and
+  /// were switched to at once instead. Never expected; counted so it is seen if it happens.
+  std::atomic<uint64_t> local_base_mismatches_{0};
   /// The most chains that were ever mid-crossfade at the same moment. "One transition at a time" is
   /// the rule that keeps a document apply's peak cost at two of the largest chain rather than two of
   /// the whole document, and this is that rule as a number a client can read instead of a promise:

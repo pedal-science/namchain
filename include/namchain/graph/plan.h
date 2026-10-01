@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -204,6 +205,16 @@ struct NodeType
   /// its state untouched rather than jumping: an unramped step is the click this exists to avoid
   /// (§5.3, the `smooth` op class). Nothing here may allocate, lock or throw.
   bool (*set_param)(void* state, uint32_t param_id, float value) noexcept = nullptr;
+  /// \brief An engine-internal type: compiled like any other, but never offered to a client.
+  ///
+  /// `engine.schema` leaves it out and a document may not name it; only the engine places one, as
+  /// the crossfade inside a local transition (docs/transitions.md, "Local transitions").
+  bool internal = false;
+  /// \brief Leave this node out of \ref graph::RenderPlan::prewarm_fresh.
+  ///
+  /// For a node whose first `process` call is the start of something timed -- a local transition's
+  /// crossfade -- rather than a cold start to get out of the way.
+  bool skip_prewarm = false;
 };
 
 /// \brief How a per-port parameter is encoded in the one integer a ramp dispatch carries.
@@ -245,7 +256,8 @@ struct PortCounts
 /// or when the type's ports are wider than the engine's audio path.
 bool resolve_ports(const NodeType& type, const graph::NodeSpec& spec, PortCounts& ports, std::string& error);
 
-/// \return the built-in type, or nullptr if the id is unknown.
+/// \return the built-in type, or nullptr if the id is unknown. Internal types are found here, so the
+/// compiler can build them; a document cannot name one (\ref graph::validate refuses it).
 const NodeType* find_node_type(const std::string& id);
 
 /// Every registered type, in the order the catalogue reports them. What `engine.schema` serves and
@@ -256,6 +268,18 @@ std::vector<const NodeType*> all_node_types();
 
 namespace graph
 {
+
+/// \brief A node's state, as its type's `create` made it, shared by every plan that runs it.
+///
+/// One instance may belong to several plans at once -- the plan that is playing, a local transition's
+/// plan and the plan after it -- but the render thread only ever runs one of them, so the state is
+/// never processed twice in a block. The type's `destroy` runs when the last plan holding it is
+/// freed, which is on the control thread (plans are reclaimed there, never on the render thread).
+/// Null for a type with no state.
+using NodeInstance = std::shared_ptr<void>;
+
+/// Instances a compile adopts instead of creating, keyed by the (lowered) node id they are for.
+using CarriedInstances = std::map<std::string, NodeInstance>;
 
 /// One node placed into a plan, with its buffers already bound.
 ///
@@ -269,7 +293,15 @@ struct PlanNode
   /// against a document that may have moved on.
   std::string element;
   std::string role;
+  /// Owns the state (shared with any other plan that carried it); \ref state is the same pointer,
+  /// kept beside it so the render path reads a plain pointer.
+  NodeInstance instance;
   void* state = nullptr;
+  /// \brief True when this plan created the state, false when it carried it from another plan.
+  ///
+  /// Only a fresh node may be prewarmed (\ref RenderPlan::prewarm_fresh): a carried one is still being
+  /// run by the plan that is playing.
+  bool fresh = true;
   std::vector<const float*> inputs;
   std::vector<float*> outputs;
   /// \brief The node is bypassed: it still runs, but its output is replaced by its dry input.
@@ -305,6 +337,15 @@ public:
   /// Convenience for the common case where the engine rate is the 48 kHz default.
   static std::unique_ptr<RenderPlan> compile(const Graph& graph, int max_quantum, rt::Arena& arena,
                                              std::string& error);
+
+  /// \brief Compile, adopting the instances in \p carried instead of creating those nodes.
+  ///
+  /// A node whose id is in \p carried takes that instance, state and all, and is not fresh; every
+  /// other node is created as usual. This is how a local transition keeps the nodes an edit did not
+  /// touch (docs/transitions.md, "Local transitions"). The caller vouches that each carried instance
+  /// was created for a node of the same type and settings: the compiler cannot check a `void*`.
+  static std::unique_ptr<RenderPlan> compile(const Graph& graph, const render::CompileOptions& options,
+                                             rt::Arena& arena, std::string& error, const CarriedInstances* carried);
 
   ~RenderPlan();
 
@@ -369,6 +410,33 @@ public:
   /// It is not part of `execute` because it mutates node state: the oracle has to be warmed too.
   void prewarm() noexcept;
 
+  /// \brief Prewarm only the nodes this plan created, leaving carried ones alone.
+  ///
+  /// A carried node is still being run by the plan that is playing, so touching its state from the
+  /// control thread would race the render thread; it is warm anyway. Each fresh node runs one quantum
+  /// of silence in schedule order (types marked `skip_prewarm` excepted), and every buffer is zeroed
+  /// again afterwards, so the plan starts from silence wherever it does not start from a carried
+  /// buffer.
+  void prewarm_fresh() noexcept;
+
+  /// The instance behind a node, by id, for a later plan to carry; null when there is none.
+  NodeInstance instance_of(const std::string& node_id) const;
+
+  /// The node index of an id in execution order, or -1.
+  int index_of(const std::string& node_id) const;
+
+  /// \brief The buffer bound to one of a node's input ports, or null for an unconnected port.
+  ///
+  /// What a local transition copies across for a block-delay node, whose input buffer holds the
+  /// previous block (its state lives in the plan's memory, not in the node).
+  float* input_buffer(std::size_t node_index, int port) const noexcept;
+
+  /// Whether the node at \p node_index was created by this plan rather than carried into it.
+  bool node_fresh(std::size_t node_index) const noexcept
+  {
+    return node_index < nodes_.size() && nodes_[node_index].fresh;
+  }
+
   int max_quantum() const noexcept { return max_quantum_; }
   /// Intermediate buffers the memory plan needed. Fewer than the node count means it worked.
   int buffer_count() const noexcept { return static_cast<int>(buffers_.size()); }
@@ -403,6 +471,7 @@ private:
   std::atomic<uint64_t> guard_trips_{0};
   int input_node_ = -1;            // index in nodes_ whose block input is sampled from the graph
   int output_buffer_ = -1;         // buffer the graph output is read from
+  int silence_buffer_ = -1;        // the zeroed buffer every unconnected input is bound to
   int max_quantum_ = 0;
   std::vector<std::vector<int>> output_buffers_; // per node, per port
 };

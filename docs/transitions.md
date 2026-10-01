@@ -149,6 +149,72 @@ the superseded pending plan retired. Parameter edits are routed to whichever liv
 generation, and a patch for a superseded plan is counted stale rather than applied to the wrong chain.
 
 
+## Local transitions
+
+The structural transition above rebuilds the whole chain: every model and IR loaded again and
+prewarmed on silence, every delay emptied, and both chains rendered for the fade. Adding one amp to a
+one-amp rig ran three amps for 5 ms, after building two of them from nothing. On vip that was the
+replayed ljoss session's only failure (two blocks at 92-94 %, both rebuilds of Ambient Wash).
+
+So a structural publish now compares the chain's two *lowered* graphs node by node
+(`graph/carry.h`, `plan_local_transition`) and carries over what the edit did not touch:
+
+| The node in the new graph | What happens |
+|---|---|
+| same type, same settings | keeps its instance, state and all (a delay keeps its echoes) |
+| only values that ramp moved | keeps its instance; the values ramp (`SetParam`), no rebuild |
+| new, or changed in a way that cannot ramp | created and prewarmed on the control thread |
+| an input now comes from somewhere else | an internal `nc.xfade` on that input, old driver to new |
+| bypass changed | a `~bypass:<id>` crossfade between its wet and dry signals |
+| gone | renamed `~old:<id>`, kept running only while a fade still reads it |
+
+Instances are shared (`RenderPlan::instance_of`, a `shared_ptr` with the type's destroy as deleter),
+so the plan that is playing, the transitional plan and the final plan can all name one model; it is
+freed with the last of them, by the reclaimer as before. The render thread runs one plan at a time:
+the transitional plan while its fades are open, then the final one. A feedback loop's `nc.unit_delay`
+keeps its sample in a plan buffer, which is copied across at each switch.
+
+Cases, from cheapest:
+
+- **ramps only**: no plan is built and the generation does not advance;
+- **instant**: no fade is needed and nothing old must keep running (a node that fed nothing was
+  dropped, an element renamed): the final plan takes over at the next block;
+- **local**: a transitional plan, then the final one. Its peak is the larger of the two rigs plus the
+  fades, not the sum of both rigs.
+
+It falls back to the whole-chain crossfade when the chain's input or output node is not the same node,
+when nothing with state would be kept (a different rig in the same chain), when a node the guard
+failed would have to be kept (a failed node is rebuilt: that is how an edit heals one), or when the
+chain is not settled at the moment of the edit (a fade still open or a plan still pending), because
+instances may only be carried from the plan that is actually playing. Two kept nodes that trade places
+would make the transitional graph cyclic; one of them is rebuilt to break the cycle.
+
+`nc.xfade` is internal: `validate(Document)` refuses it in a rig, and `engine.schema` does not list it.
+`rig.load`, `rig.apply` and a structural `rig.patch` answer with `transitions` (per changed chain:
+`kind` `local`/`instant`/`ramps`/`crossfade`, the counts, and the `reason` for a crossfade), and
+`engine.status` reports `local_transitions` and `last_transitions`.
+
+### Measured offline: `namchain-transition`
+
+`namchain-transition <before.json> <after.json> <input.wav>` renders one structural edit of real
+rigs (models and IRs resolved from the library, `--models`/`--irs`) both ways, at an exact sample, and
+times every quantum. Each way is judged against itself made instantly (a one-frame fade), which is the
+oracle a fade has to match: the same instances and the same history, only the fade missing. Rules 1-3
+of the detector judge the edit; convergence is reported as a time instead, because a rig with a
+feedback delay remembers seconds of what it played and an oracle rendered from the start has a
+different history.
+
+The replayed session's three structural edits, on the Mac (M-series, quantum 64, fade 5 ms):
+
+| Edit | Steady before -> after | Whole-chain crossfade, during | Local, during |
+|---|---|---|---|
+| Ambient Wash: add an amp (18 -> 22 nodes) | 31 -> 54 us | 83 us mean, 92 max | 52 mean, 64 max: 1 fade, 18 kept, 4 new |
+| Ambient Wash: remove it | 53 -> 31 us | 82 mean, 89 max | 52 mean, 63 max: 1 fade, 18 kept, 4 retiring |
+| Crunch Lead: add an amp (10 -> 14) | 0.5 -> 22 us | 26 mean, 28 max | 22 mean, 23 max: 2 fades, 10 kept, 4 new |
+
+All six pass rules 1-3. The whole-chain crossfade also drops Ambient Wash's 620 ms feedback delay to
+silence at every edit; the local edit keeps its echoes.
+
 ## The `smooth` class
 
 A node declares what can be set and how to set it in its vtable:
@@ -242,9 +308,9 @@ full 60 s / 500-edit torture becomes a routine run.
    bypassed node, which deliberately keeps costing CPU to stay warm.
 2. The **tail path**: a `tail_hold` for a bypassed node with a tail, which needs the first tail node
    (reverb, M5) to have anything to hold.
-3. A **structural op in the timeline**, so the offline harness can drive a plan change and the
-   detector can judge it per edit. Today the transition is measured by `tests/test_crossfade.cpp`
-   with two compiled plans and the same primitive; the timeline knows only `set_param`.
+3. A **structural op in the timeline**, so the offline harness can drive many plan changes in one
+   render. One structural edit between two rigs is judged today by `namchain-transition` (above); the
+   timeline itself knows only `set_param`.
 4. The **node parameter schema** (`params_schema_json`, §6.1), so the structural `set_param` path can
    reject a name no node reads instead of accepting it as a rig does.
 5. The **acceptance sweep**: 60 s / 500 edits at 32/64/128/256 and 44.1/48/96 kHz, with the per-edit
