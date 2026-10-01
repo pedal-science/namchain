@@ -93,7 +93,7 @@ nlohmann::json protocol_features()
   return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
                                 "structural_crossfade", "smooth_params", "bypass", "guard",
                                 "per_chain_mute", "schema", "tcp_transport", "assets", "record",
-                                "local_transitions", "meta"});
+                                "local_transitions", "meta", "bypass_ramp"});
 }
 
 /// The longest recording `engine.record` will make, so a client that forgets to stop one cannot fill
@@ -1506,6 +1506,29 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     }
     return true;
   };
+  const auto resolve_bypasses = [&](std::size_t index, PlanSlot* slot,
+                                    const std::vector<graph::CarriedBypass>& bypasses,
+                                    std::vector<PlanCommand>& commands, std::string& why) {
+    for (const graph::CarriedBypass& bypass : bypasses)
+    {
+      const int node_index = slot->plan->index_of(bypass.node);
+      if (node_index < 0 || !slot->plan->node_bypassable(static_cast<std::size_t>(node_index)))
+      {
+        why = "'" + bypass.node + "' cannot be bypassed as a ramp";
+        return false;
+      }
+      PlanCommand command;
+      command.kind = PlanCommand::Kind::SetBypass;
+      command.slot = slot;
+      command.chain = static_cast<uint32_t>(index);
+      command.generation = slot->generation;
+      command.node = static_cast<uint32_t>(node_index);
+      command.param = static_cast<uint32_t>(fade_frames);
+      command.value = bypass.bypass ? 1.0f : 0.0f;
+      commands.push_back(command);
+    }
+    return true;
+  };
 
   for (std::size_t i = 0; i < count; ++i)
   {
@@ -1553,14 +1576,16 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
         if (local.ramps_only)
         {
           std::vector<PlanCommand> commands;
-          if (ramp_commands.size() + local.ramps.size() > room)
+          if (ramp_commands.size() + local.ramps.size() + local.bypasses.size() > room)
             why = "too many values moved at once to ramp them";
-          else if (resolve_ramps(i, base, local.ramps, commands, why))
+          else if (resolve_ramps(i, base, local.ramps, commands, why) &&
+                   resolve_bypasses(i, base, local.bypasses, commands, why))
           {
             ramp_commands.insert(ramp_commands.end(), commands.begin(), commands.end());
             finals[i] = base;
             record.kind = "ramps";
             record.ramps = static_cast<int>(local.ramps.size());
+            record.bypasses = static_cast<int>(local.bypasses.size());
             planned = true;
           }
         }
@@ -2288,7 +2313,7 @@ void Daemon::drain_commands()
   PlanCommand command;
   while (commands_.pop(command))
   {
-    if (command.kind == PlanCommand::Kind::SetParam)
+    if (command.kind == PlanCommand::Kind::SetParam || command.kind == PlanCommand::Kind::SetBypass)
     {
       // The command names the chain and the generation it was resolved against. During a transition
       // two plans are live for that chain, so the edit goes to whichever of them it names; a plan a
@@ -2319,7 +2344,11 @@ void Daemon::drain_commands()
       else if (chain.pending != nullptr && named(chain.pending->then))
         plan = chain.pending->then->plan.get();
 
-      if (plan != nullptr && plan->set_param(command.node, command.param, command.value))
+      const bool applied =
+        plan != nullptr && (command.kind == PlanCommand::Kind::SetParam
+                              ? plan->set_param(command.node, command.param, command.value)
+                              : plan->set_bypass(command.node, command.value > 0.5f, static_cast<int>(command.param)));
+      if (applied)
         params_applied_.fetch_add(1);
       else
         params_stale_.fetch_add(1); // an unknown param is a control-side bug; counted, not fatal
@@ -2800,6 +2829,8 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       }
       if (transition.ramps > 0)
         entry["ramps"] = transition.ramps;
+      if (transition.bypasses > 0)
+        entry["bypasses"] = transition.bypasses;
       if (!transition.reason.empty())
         entry["reason"] = transition.reason;
       list.push_back(std::move(entry));

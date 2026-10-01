@@ -110,6 +110,37 @@ void substitute_dry(PlanNode& node, int frames) noexcept
 namespace
 {
 
+constexpr float kHalfPi = 1.57079632679489661923f;
+
+/// A bypass crossfade's next \p frames: the node's output (already written) and its input, with the
+/// same equal-power law as rt::Crossfade and the same exact landing on the last frame. Once the fade
+/// closes, a bypassed node's remaining frames are its input.
+void fade_bypass(PlanNode& node, int frames) noexcept
+{
+  const float* dry = node.inputs.size() > 1 ? node.inputs[0] : nullptr;
+  float* out = node.outputs[0];
+  const int length = node.bypass_fade;
+  int i = 0;
+  for (; i < frames && node.bypass_position < length; ++i, ++node.bypass_position)
+  {
+    const float t = length > 1 ? static_cast<float>(node.bypass_position) / static_cast<float>(length - 1) : 1.0f;
+    const float from = std::cos(kHalfPi * t);
+    const float to = std::sin(kHalfPi * t);
+    const float wet = out[i];
+    const float input = dry != nullptr ? dry[i] : 0.0f;
+    out[i] = node.bypass ? wet * from + input * to : input * from + wet * to;
+  }
+  if (node.bypass_position < length)
+    return;
+  node.bypass_fade = 0;
+  node.bypass_position = 0;
+  if (node.bypass)
+  {
+    for (; i < frames; ++i)
+      out[i] = dry != nullptr ? dry[i] : 0.0f;
+  }
+}
+
 /// All of a node's outputs finite? The non-finite guard's scan: one compare per sample, on buffers
 /// the node has just written and which are therefore hot in cache.
 bool outputs_finite(const PlanNode& node, int frames) noexcept
@@ -929,7 +960,9 @@ void RenderPlan::execute(const float* input, float* output, int frames) noexcept
       continue;
     }
 
-    if (node.bypass)
+    if (node.bypass_fade > 0)
+      fade_bypass(node, frames);
+    else if (node.bypass)
       substitute_dry(node, frames);
   }
 
@@ -1093,6 +1126,26 @@ bool RenderPlan::set_param(std::size_t node_index, uint32_t param_id, float valu
   if (type->set_param == nullptr || type->params == nullptr)
     return false;
   return type->set_param(nodes_[node_index].state, param_id, value);
+}
+
+bool RenderPlan::set_bypass(std::size_t node_index, bool bypass, int frames) noexcept
+{
+  if (!node_bypassable(node_index))
+    return false;
+  PlanNode& node = nodes_[node_index];
+  if (node.bypass == bypass)
+    return true;
+  node.bypass = bypass;
+  if (node.bypass_fade > 0)
+  {
+    // Turned around mid-fade: the weights are a quarter turn, so the fade the other way passes through
+    // the same pair of weights at the mirrored position, and the signal carries on from where it is.
+    node.bypass_position = std::max(0, node.bypass_fade - 1 - node.bypass_position);
+    return true;
+  }
+  node.bypass_fade = std::max(frames, 1);
+  node.bypass_position = 0;
+  return true;
 }
 
 std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, int max_quantum, rt::Arena& arena,

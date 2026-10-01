@@ -459,15 +459,21 @@ bool plan_local_transition(const Graph& before, const Graph& after, const std::s
     return false;
   }
 
-  // Only values that ramp moved, on the same nodes wired the same way: no plan at all.
+  // Only values that ramp moved, or bypass flags flipped, on the same nodes wired the same way: no plan
+  // at all. A bypass is then a crossfade inside the running plan, between the node's output and its
+  // input, as a value ramps.
   bool structural = identity_changed || before.nodes.size() != after.nodes.size() || was.driver != now.driver;
   for (const auto& [id, kind] : delta)
-    structural = structural || kind == Delta::Replaced || kind == Delta::Bypass;
+    structural = structural || kind == Delta::Replaced;
   if (!structural)
   {
     plan.ramps_only = true;
     for (const std::string& id : now.order)
+    {
       plan.ramps.insert(plan.ramps.end(), ramps[id].begin(), ramps[id].end());
+      if (delta[id] == Delta::Bypass)
+        plan.bypasses.push_back({id, now.nodes.at(id)->bypass});
+    }
     plan.final_graph = after;
     return true;
   }

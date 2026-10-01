@@ -172,13 +172,15 @@ inline constexpr int kMaxChains = 8;
 /// One tagged record rather than one ring per op: the render thread drains it in order at the top of
 /// the block, and `kind` is what selects the work. `PublishPlan` carries a finished plan for one
 /// chain; `SetParam` carries the vtable dispatch of §5.3's `smooth` class, which is why it needs no
-/// plan compile and no fade.
+/// plan compile and no fade; `SetBypass` is a bypass flipped the same way, as a crossfade inside the
+/// running plan.
 struct PlanCommand
 {
   enum class Kind : uint32_t
   {
     PublishPlan,
     SetParam,
+    SetBypass,
   };
 
   Kind kind = Kind::PublishPlan;
@@ -190,10 +192,10 @@ struct PlanCommand
   /// document's shape from the commands themselves and never from state the control thread mutates.
   uint32_t chain = 0;
   uint32_t chain_count = 0;
-  uint64_t generation = 0; ///< SetParam: the plan generation it targets
-  uint32_t node = 0;       ///< SetParam: index into the plan's execution order
-  uint32_t param = 0;      ///< SetParam: the node's param id
-  float value = 0.0f;      ///< SetParam
+  uint64_t generation = 0; ///< SetParam, SetBypass: the plan generation it targets
+  uint32_t node = 0;       ///< SetParam, SetBypass: index into the plan's execution order
+  uint32_t param = 0;      ///< SetParam: the node's param id. SetBypass: the crossfade's length in frames
+  float value = 0.0f;      ///< SetParam. SetBypass: 1 to bypass, 0 to bring the node back
 };
 
 /// The longest structural crossfade the weight table covers; a larger `fade_ms` is clamped to it.
@@ -488,13 +490,15 @@ private:
   {
     std::string chain;
     /// `"local"` (kept what it could, faded what changed), `"instant"` (kept everything, nothing to
-    /// fade), `"ramps"` (only values that ramp moved: no new plan), or `"crossfade"` (the whole chain).
+    /// fade), `"ramps"` (only values that ramp moved and bypasses flipped: no new plan), or
+    /// `"crossfade"` (the whole chain).
     std::string kind;
     int fades = 0;
     int kept = 0;
     int created = 0;
     int retiring = 0;
     int ramps = 0;
+    int bypasses = 0; ///< bypasses crossfaded inside the running plan
     /// Why a chain was crossfaded whole rather than locally; empty otherwise.
     std::string reason;
   };

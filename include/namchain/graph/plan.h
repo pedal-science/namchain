@@ -306,10 +306,15 @@ struct PlanNode
   std::vector<float*> outputs;
   /// \brief The node is bypassed: it still runs, but its output is replaced by its dry input.
   ///
-  /// Set from `NodeSpec::bypass` at compile time and read-only on the render path. The node is *not*
-  /// removed from the plan -- keeping it there is what keeps its state warm (plan.md G14), and it is
-  /// what makes un-bypassing a crossfade back to a node that never stopped running.
+  /// Set from `NodeSpec::bypass` at compile time. The node is *not* removed from the plan -- keeping it
+  /// there is what keeps its state warm (plan.md G14), and it is what makes un-bypassing a crossfade
+  /// back to a node that never stopped running. \ref RenderPlan::set_bypass changes it on the render
+  /// path, and the flag is then where the node is going: \ref bypass_fade says it is still on its way.
   bool bypass = false;
+  /// The length in frames of a bypass crossfade in progress, 0 when the node is settled.
+  int bypass_fade = 0;
+  /// How many frames of that crossfade have played.
+  int bypass_position = 0;
 };
 
 /// \brief Overwrite a node's outputs with its dry input, or with silence when it has none.
@@ -376,11 +381,12 @@ public:
   const std::string& element_of(std::size_t node_index) const;
   const std::string& role_of(std::size_t node_index) const;
 
-  /// Whether a node is bypassed in the running plan. Read for reports; the render path reads the flag
-  /// directly.
-  bool node_bypassed(std::size_t node_index) const
+  /// Whether a node can be bypassed: only a 1->1 node has a dry path. What \ref set_bypass checks,
+  /// for the control thread to ask before it queues one.
+  bool node_bypassable(std::size_t node_index) const
   {
-    return node_index < nodes_.size() && nodes_[node_index].bypass;
+    return node_index < nodes_.size() && nodes_[node_index].type->inputs == 1 &&
+           nodes_[node_index].type->outputs == 1;
   }
 
   /// \brief Resolve a parameter of one port of \p node_id, or of the node itself when \p port is -1.
@@ -398,6 +404,14 @@ public:
   /// locks; the node smooths the change over its own ramp, so this is the no-recompile, no-click
   /// path of §5.3's `smooth` class.
   bool set_param(std::size_t node_index, uint32_t param_id, float value) noexcept;
+
+  /// \brief Render path: bypass one node, or bring it back, with an equal-power crossfade of
+  /// \p frames between its output and its input.
+  ///
+  /// The node keeps running either way, so this needs no new plan: it is bypass as a ramp
+  /// (docs/transitions.md, "Bypass"). A toggle that arrives mid-fade turns the fade around from where
+  /// it is, rather than jumping. \return false for an out-of-range index or a node that is not 1->1.
+  bool set_bypass(std::size_t node_index, bool bypass, int frames) noexcept;
 
   /// Node ids in execution order, parallel to \ref nodes.
   const std::vector<std::string>& node_ids() const noexcept { return node_ids_; }

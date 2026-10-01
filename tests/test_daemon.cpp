@@ -780,29 +780,40 @@ TEST_CASE("a structural rig.patch rebuilds the running rig and crossfades into i
   CHECK(smooth["kind"] == "smooth");
   CHECK(smooth["generation"] == 2);
 
-  // Bypass is structural: the plan changes, so the render thread crossfades into the new one.
+  // Bypass changes the document, so it goes the structural way, but it is a ramp: the running plan
+  // crossfades the node between its output and its input, and no new plan is built.
   const auto bypass = nlohmann::json::parse(call(
     config.socket_path, R"({"id":"b","method":"rig.patch","ops":[{"op":"bypass","node":"g2"}]})"));
   REQUIRE(bypass["ok"] == true);
   CHECK(bypass["kind"] == "structural");
-  CHECK(bypass["generation"] == 3);
-
-  const bool bypassed = wait_for(config.socket_path, [](const nlohmann::json& status) {
-    return status["transition_active"] == false && status["audible_generation"].get<uint64_t>() == 3;
-  });
-  CHECK_MESSAGE(bypassed, "the render thread never finished the bypass transition");
+  CHECK(bypass["generation"] == 2);
+  REQUIRE(bypass["transitions"].size() == 1);
+  CHECK(bypass["transitions"][0]["kind"] == "ramps");
+  CHECK(bypass["transitions"][0]["bypasses"] == 1);
+  const auto g2 = [&config] {
+    const auto got = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+    for (const auto& node : got["document"]["chains"][0]["nodes"])
+    {
+      if (node["id"] == "g2")
+        return node;
+    }
+    return nlohmann::json();
+  };
+  CHECK(g2()["bypass"] == true);
 
   // The guard reports through status, and a well-behaved rig reports zero.
   const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
   CHECK(status["status"]["failed_nodes"] == 0);
   CHECK(status["status"]["guard_trips"] == 0);
 
-  // Un-bypass restores the node: another structural change, another generation.
+  // Un-bypass restores the node the same way.
   const auto restored = nlohmann::json::parse(call(
     config.socket_path,
     R"({"id":"r","method":"rig.patch","ops":[{"op":"bypass","node":"g2","bypass":false}]})"));
   REQUIRE(restored["ok"] == true);
-  CHECK(restored["generation"] == 4);
+  CHECK(restored["generation"] == 2);
+  CHECK(restored["transitions"][0]["kind"] == "ramps");
+  CHECK_FALSE(g2().contains("bypass"));
 }
 
 TEST_CASE("the daemon stays up and reports lost when the device cannot be opened")
@@ -2342,7 +2353,8 @@ TEST_CASE("a document with macros renders, reports both views, and is patched by
   CHECK(bands["kind"] == "smooth"); // mid_freq is one biquad's frequency: rampable
 
   // And a parameter that is genuinely structural: `bands` on the EQ macro, which changes which bands
-  // are bypassed rather than a value anywhere.
+  // are bypassed rather than a value anywhere. The lowering then differs only in bypass flags, so the
+  // running plan crossfades the bands in and out, and builds no new plan.
   write_file(root / "eq.json", R"({
     "nodes": [
       { "id": "in", "type": "nc.input" },
@@ -2359,7 +2371,9 @@ TEST_CASE("a document with macros renders, reports both views, and is patched by
     config.socket_path, R"({"method":"rig.patch","ops":[{"op":"set_param","element":"eq","param":"bands","value":2}]})"));
   REQUIRE(band_change["ok"] == true);
   CHECK(band_change["kind"] == "structural");
-  CHECK(band_change["generation"].get<uint64_t>() > before_generation);
+  CHECK(band_change["generation"].get<uint64_t>() == before_generation);
+  CHECK(band_change["transitions"][0]["kind"] == "ramps");
+  CHECK(band_change["transitions"][0]["bypasses"].get<int>() > 0);
   CHECK(nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"))["document"]["chains"][0]
           ["nodes"][1]["bands"] == 2);
 

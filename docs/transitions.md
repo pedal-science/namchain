@@ -33,7 +33,7 @@ that knows a crossfade of correlated copies sums rather than splices.
 | edit | mechanism | state |
 |---|---|---|
 | Parameter change, `smooth` class | per-sample ramp inside the node's param slot | **built** — `NodeType::set_param`, no recompile, no step |
-| Bypass / enable | equal-power crossfade to/from dry | **built** — a `bypass` flag in the IR; the node keeps running and its output is replaced by its dry input |
+| Bypass / enable | equal-power crossfade to/from dry | **built** — a `bypass` flag in the IR; the node keeps running, and the running plan crossfades its output to its dry input (`RenderPlan::set_bypass`), no recompile |
 | Model swap in `nc.nam` | warm start, then a short crossfade | **partial** — the `swap_model` op rebuilds the node and crossfades; warm start is M3, so it is not yet state-accurate |
 | Rewire / add / remove / scene recall | dual-render old and new plan, equal-power crossfade, retire | **built** — `graph::apply_patch` builds the modified graph, `rt::Crossfade` carries it |
 
@@ -82,8 +82,17 @@ calls its `process` — and its output is then replaced by its dry input
   inference freezes state and glitches on unmute".
 - A node with several inputs has no single dry signal, so only a 1→1 node can be bypassed; the compiler
   refuses the rest by name rather than guessing a port.
-- The equal-power part of "crossfade to/from dry" is the *structural transition* above, not a second
-  crossfade inside the node: bypass changes the plan, the render thread dual-renders and crossfades.
+- **Bypass is a ramp** (since 2026-10-01; pedal.project's docs/rig-edits.md, C4). Flipping the flag
+  builds no plan: the plan that is playing crossfades the node between its output and its input, over
+  `fade_ms` with the same equal-power law as `rt::Crossfade` (`RenderPlan::set_bypass`, a `SetBypass`
+  command on the ring beside `SetParam`). A toggle that arrives mid-fade turns the fade around from
+  where it is. The generation does not advance, as for a ramp. An edit that is otherwise structural
+  still crossfades a bypass with a `~bypass:<id>` fade in its transitional plan (§"Local
+  transitions"), and the whole-chain fallback crossfades it with everything else.
+- A macro's bypass that lowers to several nodes (an amp's preamp and cab, say) crossfades each node
+  around itself, at the same time, rather than the block from its input to its output as one unit.
+  Both are click-free; mid-fade they differ (half of the amp's preamp without its cab is heard for a
+  few ms). One fade per block, grouped by `element`, is the better shape, and not built.
 - The plan also asks a tail node to keep ringing through a bypass (`tail_hold`). No built-in has a tail
   yet, and the flag has no tail state, so that is deferred to the reverb/tail work.
 
@@ -165,7 +174,7 @@ So a structural publish now compares the chain's two *lowered* graphs node by no
 | only values that ramp moved | keeps its instance; the values ramp (`SetParam`), no rebuild |
 | new, or changed in a way that cannot ramp | created and prewarmed on the control thread |
 | an input now comes from somewhere else | an internal `nc.xfade` on that input, old driver to new |
-| bypass changed | a `~bypass:<id>` crossfade between its wet and dry signals |
+| bypass changed | alone (with ramps at most): crossfaded in the running plan, no plan built; beside a structural change: a `~bypass:<id>` crossfade between its wet and dry signals |
 | gone | renamed `~old:<id>`, kept running only while a fade still reads it |
 
 Instances are shared (`RenderPlan::instance_of`, a `shared_ptr` with the type's destroy as deleter),
@@ -176,7 +185,8 @@ keeps its sample in a plan buffer, which is copied across at each switch.
 
 Cases, from cheapest:
 
-- **ramps only**: no plan is built and the generation does not advance;
+- **ramps only** (values that ramp, and bypass flags): no plan is built and the generation does not
+  advance;
 - **instant**: no fade is needed and nothing old must keep running (a node that fed nothing was
   dropped, an element renamed): the final plan takes over at the next block;
 - **local**: a transitional plan, then the final one. Its peak is the larger of the two rigs plus the

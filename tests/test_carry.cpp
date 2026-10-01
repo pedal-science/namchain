@@ -216,6 +216,24 @@ Run render_local(const Graph& before, const Graph& after, const std::vector<floa
   for (; at < kEditAt; at += kQuantum)
     running->execute(input.data() + at, run.output.data() + at, kQuantum);
 
+  // Only ramps and bypasses: no new plan, the running one is told, as the render thread does with the
+  // daemon's commands.
+  if (run.plan.ramps_only)
+  {
+    for (const namchain::graph::CarriedRamp& ramp : run.plan.ramps)
+    {
+      std::size_t node = 0;
+      uint32_t param = 0;
+      REQUIRE(running->resolve_param(ramp.node, ramp.param, -1, node, param));
+      REQUIRE(running->set_param(node, param, static_cast<float>(ramp.value)));
+    }
+    for (const namchain::graph::CarriedBypass& bypass : run.plan.bypasses)
+      REQUIRE(running->set_bypass(static_cast<std::size_t>(running->index_of(bypass.node)), bypass.bypass, kFade));
+    for (; at < input.size(); at += kQuantum)
+      running->execute(input.data() + at, run.output.data() + at, kQuantum);
+    return run;
+  }
+
   // Planned and compiled while `running` is still the plan that plays, as on the control thread.
   CarriedPlans plans;
   std::string error;
@@ -345,22 +363,44 @@ TEST_CASE("values that ramp are ramped, with no new plan")
   CHECK(plan.ramps[1].param == "samples");
 }
 
-TEST_CASE("a bypass keeps the block and crossfades between its output and its input")
+TEST_CASE("a bypass alone is a ramp: no plan, the running one crossfades the block")
+{
+  NodeSpec bypassed = biquad("eq", "peaking", 1000.0, 6.0);
+  bypassed.bypass = true;
+  const LocalPlan plan = plan_for(series({biquad("eq", "peaking", 1000.0, 6.0)}), series({bypassed}));
+  CHECK(plan.ramps_only);
+  CHECK(plan.transitional.nodes.empty());
+  REQUIRE(plan.bypasses.size() == 1);
+  CHECK(plan.bypasses[0].node == "eq");
+  CHECK(plan.bypasses[0].bypass);
+
+  SUBCASE("with a value that ramps, both go to the running plan")
+  {
+    NodeSpec moved = gain("g", 0.25);
+    moved.bypass = true;
+    const LocalPlan both = plan_for(series({gain("g", 0.5)}), series({moved}));
+    CHECK(both.ramps_only);
+    CHECK(both.ramps.size() == 1);
+    CHECK(both.bypasses.size() == 1);
+  }
+}
+
+TEST_CASE("a bypass beside a structural edit keeps the block and crossfades between its output and its input")
 {
   NodeSpec bypassed = biquad("eq", "peaking", 1000.0, 6.0);
   bypassed.bypass = true;
   const LocalPlan plan =
-    plan_for(series({biquad("eq", "peaking", 1000.0, 6.0)}), series({bypassed}));
-  CHECK(plan.fades == 1);
-  CHECK(plan.created == 0);
+    plan_for(series({biquad("eq", "peaking", 1000.0, 6.0)}), series({bypassed, gain("g", 0.5)}));
+  CHECK_FALSE(plan.ramps_only);
+  CHECK(plan.bypasses.empty());
+  CHECK(plan.created == 1);
   CHECK(plan.retiring == 0);
   // It renders wet throughout the transition; its crossfade does the switching.
   CHECK_FALSE(find(plan.transitional, "eq")->bypass);
   CHECK(find(plan.final_graph, "eq")->bypass);
-  const std::string fade = driver_of(plan.transitional, "out", 0);
-  CHECK(fade == "~bypass:eq");
-  CHECK(driver_of(plan.transitional, fade, 0) == "eq"); // was wet
-  CHECK(driver_of(plan.transitional, fade, 1) == "in"); // becomes dry
+  REQUIRE(find(plan.transitional, "~bypass:eq") != nullptr);
+  CHECK(driver_of(plan.transitional, "~bypass:eq", 0) == "eq"); // was wet
+  CHECK(driver_of(plan.transitional, "~bypass:eq", 1) == "in"); // becomes dry
 }
 
 TEST_CASE("an element renamed and nothing else is an instant switch")
@@ -497,25 +537,81 @@ TEST_CASE("adding a block plays the old chain, then the crossfade, then the new 
   }
 }
 
-TEST_CASE("a bypass crossfades from the block's output to its input, exactly")
+/// The bypass crossfade RenderPlan::set_bypass plays, from \p from to \p to over kFade frames from
+/// \p start: the same equal-power law as rt::Crossfade, computed rather than read from a table.
+std::vector<float> expected_bypass(const std::vector<float>& from, const std::vector<float>& to, std::size_t start)
+{
+  std::vector<float> out(from.begin(), from.end());
+  for (std::size_t i = start; i < out.size(); ++i)
+  {
+    const std::size_t position = i - start;
+    if (position >= static_cast<std::size_t>(kFade))
+    {
+      out[i] = to[i];
+      continue;
+    }
+    const float t = static_cast<float>(position) / static_cast<float>(kFade - 1);
+    out[i] = from[i] * std::cos(1.57079632679489661923f * t) + to[i] * std::sin(1.57079632679489661923f * t);
+  }
+  return out;
+}
+
+TEST_CASE("a bypass crossfades from the block's output to its input, and back, exactly")
 {
   const std::vector<float> input = tone(kFrames);
-  NodeSpec bypassed = gain("a", 0.5);
-  bypassed.bypass = true;
-  const Run run = render_local(series({gain("a", 0.5)}), series({bypassed}), input);
-
   std::vector<float> wet(input.size());
   for (std::size_t i = 0; i < input.size(); ++i)
     wet[i] = input[i] * 0.5f;
-  const std::vector<float> expected = expected_fade(wet, input, kEditAt);
-  for (std::size_t i = 0; i < input.size(); ++i)
-  {
-    if (run.output[i] != expected[i])
+  NodeSpec bypassed = gain("a", 0.5);
+  bypassed.bypass = true;
+
+  const auto check = [](const std::vector<float>& output, const std::vector<float>& expected) {
+    for (std::size_t i = 0; i < output.size(); ++i)
     {
-      FAIL("sample " << i << ": " << run.output[i] << ", expected " << expected[i]);
-      break;
+      if (std::fabs(output[i] - expected[i]) > 1e-6f)
+      {
+        FAIL("sample " << i << ": " << output[i] << ", expected " << expected[i]);
+        break;
+      }
     }
+  };
+  SUBCASE("bypassed")
+  {
+    const Run run = render_local(series({gain("a", 0.5)}), series({bypassed}), input);
+    CHECK(run.plan.ramps_only);
+    check(run.output, expected_bypass(wet, input, kEditAt));
   }
+  SUBCASE("brought back")
+  {
+    const Run run = render_local(series({bypassed}), series({gain("a", 0.5)}), input);
+    CHECK(run.plan.ramps_only);
+    check(run.output, expected_bypass(input, wet, kEditAt));
+  }
+}
+
+TEST_CASE("a bypass turned around mid-fade carries on from where it is")
+{
+  namchain::rt::Arena arena(1 << 20);
+  std::unique_ptr<RenderPlan> plan = compile(lowered(series({gain("a", 0.5)})), arena);
+  const std::size_t a = static_cast<std::size_t>(plan->index_of("a"));
+  REQUIRE(plan->node_bypassable(a));
+  const std::vector<float> ones(kFade * 2, 1.0f);
+  std::vector<float> out(ones.size(), 0.0f);
+
+  // A quarter of the way to bypassed, then back: the next sample continues from the same weights.
+  REQUIRE(plan->set_bypass(a, true, kFade));
+  const int quarter = kFade / 4;
+  plan->execute(ones.data(), out.data(), quarter);
+  const float last = out[static_cast<std::size_t>(quarter - 1)];
+  REQUIRE(plan->set_bypass(a, false, kFade));
+  for (int at = quarter; at < kFade * 2; at += kQuantum)
+    plan->execute(ones.data() + at, out.data() + at, std::min(kQuantum, kFade * 2 - at));
+  CHECK(std::fabs(out[static_cast<std::size_t>(quarter)] - last) < 0.01f);
+  // ... and lands back on the block's own output, having taken as long as it had gone.
+  CHECK(out[static_cast<std::size_t>(2 * quarter + 1)] == doctest::Approx(0.5f));
+  CHECK(out.back() == doctest::Approx(0.5f));
+  // A node with no dry path is refused.
+  CHECK_FALSE(plan->set_bypass(plan->node_ids().size(), true, kFade));
 }
 
 TEST_CASE("a kept delay keeps playing what it heard before the edit")

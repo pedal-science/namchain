@@ -42,12 +42,21 @@ struct CarriedRamp
   double value = 0.0;
 };
 
+/// A kept node whose bypass flag flipped, in an edit that is otherwise only ramps: crossfaded between its
+/// output and its input on the render thread (RenderPlan::set_bypass), not rebuilt.
+struct CarriedBypass
+{
+  std::string node; ///< lowered node id
+  bool bypass = false;
+};
+
 /// \brief How a chain gets from the graph it is running to the one it was given, keeping what it can.
 ///
 /// Both graphs are *lowered* (every macro expanded), because instances belong to primitive nodes.
 struct LocalPlan
 {
-  /// Nothing changed but values that ramp: no new plan at all, only \ref ramps.
+  /// Nothing changed but values that ramp and bypass flags: no new plan at all, only \ref ramps and
+  /// \ref bypasses.
   bool ramps_only = false;
   /// No fade is needed and nothing old has to keep running (an edit that only renamed an element, or
   /// dropped a node that fed nothing): the final plan takes over from the next block.
@@ -65,6 +74,9 @@ struct LocalPlan
   std::vector<std::pair<std::string, std::string>> buffers_from_running;
   /// Kept nodes whose ramping parameters moved.
   std::vector<CarriedRamp> ramps;
+  /// Kept nodes whose bypass flipped, when \ref ramps_only. In a structural edit a bypass is one of the
+  /// fades of \ref transitional instead.
+  std::vector<CarriedBypass> bypasses;
 
   /// For reports and tests.
   int fades = 0;           ///< crossfades in the transitional graph

@@ -3,9 +3,9 @@
 **Status:** built and tested, M2 in progress. `namchaind` starts an audio backend, compiles a
 **document of up to eight chains** into one plan per chain, runs them on a dedicated real-time
 thread, and serves a Unix-socket control protocol. A parameter edit is ramped inside its node with no
-recompile; a structural change — a reload, a patch that alters the graph, a model swap, a bypass — is
-dual-rendered and equal-power crossfaded, one chain at a time. Bypass keeps the node running so its
-state stays warm. Every node's output is guarded for non-finite samples. The daemon reloads on
+recompile, and so is a bypass, crossfaded inside the running plan; a structural change — a reload, a
+patch that alters the graph, a model swap — fades only what changed, or crossfades the whole chain, one
+chain at a time. Bypass keeps the node running so its state stays warm. Every node's output is guarded for non-finite samples. The daemon reloads on
 `SIGHUP` and survives the interface being unplugged. §"What is built, and what is not" is the honest
 list.
 
@@ -303,7 +303,7 @@ chain quietly playing on channel 0.
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
 `bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`, `record`, `local_transitions`,
-`meta`. It grows as the slices land, and
+`meta`, `bypass_ramp`. It grows as the slices land, and
 absence is how a client degrades rather than guesses.
 
 The error codes a client may have to act on are `bad_json`, `bad_request`, `unknown_method`,
@@ -425,7 +425,10 @@ skipped freezes the model's state and clicks on unmute (plan.md G14).
 `add_node` takes a node object in the rig's own syntax, parsed by the same parser, so a patched node
 and a declared node mean the same thing. `rewire` repoints one input port. `bypass` sets a flag: the
 node **keeps running** so its state stays warm, and its output becomes its dry input — which is why
-un-bypassing does not step (plan.md G14). A patch is **all-or-nothing**: a rejected op or a graph the
+un-bypassing does not step (plan.md G14). A patch that only bypasses (and ramps) answers
+`"kind": "structural"`, because it changes the document, but builds no plan: its `transitions` say
+`ramps`, with a `bypasses` count, the running plan crossfades each node between its output and its
+input over `fade_ms`, and `generation` stays where it was. A patch is **all-or-nothing**: a rejected op or a graph the
 compiler will not accept leaves the running plan rendering exactly as it was, and `generation`
 unchanged. The full op list and semantics are in docs/transitions.md.
 
