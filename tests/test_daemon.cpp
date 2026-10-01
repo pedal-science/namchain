@@ -1577,12 +1577,47 @@ TEST_CASE("rig.apply takes a whole document and rig.get hands it back")
     CHECK(reply["generation"] == 1);
   }
 
+  // A client's own data, at every level: a change to it alone is kept and handed back, and rebuilds
+  // nothing, so the generation stays where it was.
+  {
+    nlohmann::json annotated = got["document"];
+    annotated["meta"] = {{"version", 3}};
+    annotated["chains"][0]["meta"] = {{"colour", "teal"}};
+    annotated["chains"][0]["nodes"][1]["meta"] = {{"label", "Trim"}};
+    nlohmann::json request;
+    request["method"] = "rig.apply";
+    request["document"] = annotated;
+    const auto reply = nlohmann::json::parse(call(config.socket_path, request.dump()));
+    REQUIRE_MESSAGE(reply["ok"] == true, reply.dump());
+    CHECK(reply["generation"] == 1);
+    CHECK(reply["transitions"].empty());
+  }
+
   // And a patch on an applied document works without a chain, because it has one.
   const auto patch = nlohmann::json::parse(call(
     config.socket_path,
     R"({"method":"rig.patch","ops":[{"op":"set_param","node":"blk7/trim","param":"gain","value":0.75}]})"));
   CHECK(patch["ok"] == true);
   CHECK(patch["kind"] == "smooth");
+
+  // The patched document still carries the client's meta.
+  const auto after = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  CHECK(after["document"]["meta"] == nlohmann::json{{"version", 3}});
+  CHECK(after["document"]["chains"][0]["meta"] == nlohmann::json{{"colour", "teal"}});
+  CHECK(after["document"]["chains"][0]["nodes"][1]["meta"] == nlohmann::json{{"label", "Trim"}});
+  CHECK(after["document"]["chains"][0]["nodes"][1]["gain"] == doctest::Approx(0.75));
+
+  // A key the engine does not define is refused, and nothing changes.
+  {
+    nlohmann::json misspelt = after["document"];
+    misspelt["chains"][0]["output_chanel"] = 0;
+    nlohmann::json request;
+    request["method"] = "rig.apply";
+    request["document"] = misspelt;
+    const auto reply = nlohmann::json::parse(call(config.socket_path, request.dump()));
+    CHECK(reply["ok"] == false);
+    CHECK_MESSAGE(reply.dump().find("unknown key 'output_chanel'") != std::string::npos, reply.dump());
+  }
 }
 
 TEST_CASE("an applied document resolves its relative paths against the rigs root")

@@ -58,6 +58,13 @@ struct NodeSpec
   ///
   /// Empty for a node that is its own element, which is every node in a hand-written rig.
   std::string role;
+
+  /// \brief The client's own data about this node: a JSON object, kept as compact JSON text, or empty
+  /// when the document gave none.
+  ///
+  /// Stored as written and handed back by `rig.get`; the engine never reads it, so it never changes what
+  /// compiles, and a change to it alone rebuilds nothing (\ref same_graph ignores it).
+  std::string meta;
 };
 
 /// `from`'s output port \ref from_port feeds `to`'s input port \ref to_port.

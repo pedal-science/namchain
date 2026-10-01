@@ -93,7 +93,7 @@ nlohmann::json protocol_features()
   return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
                                 "structural_crossfade", "smooth_params", "bypass", "guard",
                                 "per_chain_mute", "schema", "tcp_transport", "assets", "record",
-                                "local_transitions"});
+                                "local_transitions", "meta"});
 }
 
 /// The longest recording `engine.record` will make, so a client that forgets to stop one cannot fill

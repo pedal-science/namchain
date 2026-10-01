@@ -32,17 +32,23 @@ struct Chain
   /// Which playback channel it writes. Two chains writing the same one are summed.
   int output_channel = 0;
   Graph graph;
+  /// The client's own data about this chain, as compact JSON text; empty when there is none.
+  /// \see NodeSpec::meta
+  std::string meta;
 };
 
 /// \brief A whole document: zero or more chains, and nothing the engine needs beyond them.
 ///
-/// The name is free text; there is no other rig-level metadata in the IR, because everything else a
-/// client stores (layout, timestamps, presentation) is the client's business and `rig.get` is a
-/// diagnostic rather than a document store.
+/// The name is free text. Everything else a client stores about the document (a version, layout,
+/// timestamps) is the client's business: it goes in `meta`, which the engine keeps and returns without
+/// reading. `rig.get` is still a diagnostic rather than a document store.
 struct Document
 {
   std::string name;
   std::vector<Chain> chains;
+  /// The client's own data about the whole document (a version, say), as compact JSON text; empty
+  /// when there is none. \see NodeSpec::meta
+  std::string meta;
 };
 
 /// \brief Parse a document from JSON text.
@@ -59,11 +65,18 @@ struct Document
 /// }
 /// \endcode
 ///
+/// \par Unknown keys
+/// The document, each chain and each node may carry a `meta` object: the client's own data, kept as
+/// written, returned by `rig.get`, never read, and never a reason to rebuild anything. Any other key the
+/// engine does not know is refused, at every level: a misspelt `output_chanel` is an error rather than
+/// a chain silently playing on channel 0. On a node, every key that is not reserved is a parameter,
+/// and the compiler checks it against the node's schema.
+///
 /// A document that is a bare graph -- top-level `nodes`/`connections`, no `chains` -- is one chain
 /// with id `"main"` on channels 0 and 0. Everything committed before documents existed is in that
 /// shape, so this is the compatibility rule rather than a special case.
 ///
-/// A node's `id`, `type` and `bypass` are reserved, as are `element` and `role`; every other key of a
+/// A node's `id`, `type` and `bypass` are reserved, as are `element`, `role` and `meta`; every other key of a
 /// node object is a parameter. A number or a boolean becomes a numeric param, a string becomes a
 /// string param -- so a model path does not need a separate block. `bypass` is a boolean property of
 /// the node (it keeps running with its dry input substituted), not a parameter, so it does not land

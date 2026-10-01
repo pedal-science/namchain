@@ -396,3 +396,59 @@ TEST_CASE("a document serialises back to something the parser accepts, ids and a
   CHECK(again.chains[0].graph.nodes[2].strings.at("note") == "hand written");
   CHECK(namchain::graph::same_graph(document.chains[0].graph, again.chains[0].graph));
 }
+
+TEST_CASE("meta is the client's own data: kept as written at every level, returned, and never compiled")
+{
+  Document document;
+  std::string error;
+  REQUIRE_MESSAGE(namchain::graph::parse_document_json(R"({
+    "name": "Meta", "meta": { "version": 7, "app": { "layout": [1, 2] } },
+    "chains": [ { "id": "c", "meta": { "colour": "teal" }, "nodes": [
+      { "id": "in", "type": "nc.input" },
+      { "id": "g", "type": "nc.gain", "gain": 0.5, "meta": { "label": "Boost", "pinned": true } },
+      { "id": "out", "type": "nc.output" }
+    ], "connections": [ { "from": "in", "to": "g" }, { "from": "g", "to": "out" } ] } ]
+  })", document, error), error);
+
+  // Not a parameter: a node's meta never reaches the compiler, so it cannot fail a schema check.
+  const NodeSpec& g = document.chains[0].graph.nodes[1];
+  CHECK(g.params.size() == 1u);
+  CHECK(g.strings.empty());
+
+  Document again;
+  REQUIRE_MESSAGE(namchain::graph::parse_document_json(namchain::graph::document_to_json(document), again, error),
+                  error);
+  CHECK(again.meta == R"({"app":{"layout":[1,2]},"version":7})");
+  CHECK(again.chains[0].meta == R"({"colour":"teal"})");
+  CHECK(again.chains[0].graph.nodes[1].meta == R"({"label":"Boost","pinned":true})");
+  CHECK(again.chains[0].graph.nodes[0].meta.empty());
+
+  // A change to meta alone is the same graph, so republishing it rebuilds nothing.
+  Graph relabelled = document.chains[0].graph;
+  relabelled.nodes[1].meta = R"({"label":"Lead"})";
+  CHECK(namchain::graph::same_graph(document.chains[0].graph, relabelled));
+}
+
+TEST_CASE("a key the engine does not define is refused at every level, and says where meta goes")
+{
+  const auto refused = [](const std::string& text, const std::string& expected) {
+    Document document;
+    std::string error;
+    CHECK_FALSE(namchain::graph::parse_document_json(text, document, error));
+    CHECK_MESSAGE(error.find(expected) != std::string::npos, error);
+  };
+  const std::string nodes = R"("nodes": [ { "id": "in", "type": "nc.input" }, { "id": "out", "type": "nc.output" } ])";
+
+  refused(R"({ "version": 2, "chains": [ { "id": "c", )" + nodes + " } ] }",
+          "the rig: unknown key 'version' (a client's own data goes in 'meta')");
+  refused(R"({ "layout": {}, )" + nodes + " }", "the rig: unknown key 'layout'");
+  refused(R"({ "chains": [ { "id": "c", "output_chanel": 1, )" + nodes + " } ] }",
+          "chain 'c': unknown key 'output_chanel'");
+  refused(R"({ "chains": [ { "id": "c", )" + nodes + R"(, "connections": [ { "from": "in", "to": "out", "gain": 2 } ] } ] })",
+          "connection 0: unknown key 'gain'");
+
+  // meta itself has to be an object: anything else is a client bug, not data.
+  refused(R"({ "meta": "v2", )" + nodes + " }", "the rig: 'meta' must be an object");
+  refused(R"({ "chains": [ { "id": "c", "meta": [1], )" + nodes + " } ] }", "chain 'c': 'meta' must be an object");
+  refused(R"({ "nodes": [ { "id": "in", "type": "nc.input", "meta": 3 } ] })", "node 0: 'meta' must be an object");
+}

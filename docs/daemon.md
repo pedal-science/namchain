@@ -290,9 +290,20 @@ It is also a **fixed point**: applying what `rig.get` returned changes nothing, 
 the generation. That is what makes the read-back usable for reconciliation rather than something to
 be careful with.
 
+**A client's own data goes in `meta`.** The document, each chain and each node may carry a `meta`
+object, which the engine keeps exactly as written, returns from `rig.get` (and keeps through a
+`rig.patch`), and never reads. A version, a colour, a layout hint: whatever the client needs to find
+again. A change to `meta` alone compiles to the same plan, so it rebuilds nothing and the generation
+stays where it was. `meta` must be an object. **Every other key is checked**: on a node, any key that
+isn't `id`, `type`, `element`, `role`, `bypass`, `params`, `strings` or `meta` is a parameter, checked
+against the node's schema; on the document, a chain or a connection, a key the engine doesn't define
+is refused (`bad_request`, naming the key), so a misspelt `output_chanel` is an error rather than a
+chain quietly playing on channel 0.
+
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
-`bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`, `local_transitions`. It grows as the slices land, and
+`bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`, `record`, `local_transitions`,
+`meta`. It grows as the slices land, and
 absence is how a client degrades rather than guesses.
 
 The error codes a client may have to act on are `bad_json`, `bad_request`, `unknown_method`,

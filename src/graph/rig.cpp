@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <set>
 #include <sstream>
 #include <system_error>
@@ -53,6 +54,39 @@ std::string optional_string(const nlohmann::json& object, const char* key, const
     return {};
   }
   return object[key].get<std::string>();
+}
+
+/// \brief Read an optional `meta`: the client's own data, which must be an object, kept as compact JSON.
+bool read_meta(const nlohmann::json& object, const std::string& where, std::string& meta, std::string& error)
+{
+  if (!object.contains("meta"))
+    return true;
+  if (!object["meta"].is_object())
+  {
+    error = at(where, "'meta' must be an object");
+    return false;
+  }
+  meta = object["meta"].dump();
+  return true;
+}
+
+/// \brief Refuse a key this level of the document does not define. A client's own data has a place,
+/// `meta`, so an unknown key is a mistake -- `output_chanel` -- rather than something to carry.
+bool known_keys(const nlohmann::json& object, std::initializer_list<const char*> known, const std::string& where,
+                std::string& error)
+{
+  for (const auto& item : object.items())
+  {
+    bool found = false;
+    for (const char* key : known)
+      found = found || item.key() == key;
+    if (!found)
+    {
+      error = at(where, "unknown key '" + item.key() + "' (a client's own data goes in 'meta')");
+      return false;
+    }
+  }
+  return true;
 }
 
 bool parse_nodes(const nlohmann::json& nodes, const std::string& prefix, Graph& graph, std::string& error)
@@ -109,6 +143,8 @@ bool parse_nodes(const nlohmann::json& nodes, const std::string& prefix, Graph& 
       }
       spec.bypass = object["bypass"].get<bool>();
     }
+    if (!read_meta(object, where, spec.meta, error))
+      return false;
 
     // Explicit blocks first, so an inline shorthand key can still override one of them.
     for (const char* block : {"params", "strings"})
@@ -146,7 +182,7 @@ bool parse_nodes(const nlohmann::json& nodes, const std::string& prefix, Graph& 
     for (const auto& [key, value] : object.items())
     {
       if (key == "id" || key == "type" || key == "element" || key == "role" || key == "params" ||
-          key == "strings" || key == "bypass")
+          key == "strings" || key == "bypass" || key == "meta")
         continue;
       if (value.is_number())
         spec.params[key] = value.get<double>();
@@ -178,6 +214,8 @@ bool parse_connections(const nlohmann::json& connections, const std::string& pre
       error = at(where, "needs string 'from' and 'to'");
       return false;
     }
+    if (!known_keys(object, {"from", "from_port", "to", "to_port"}, where, error))
+      return false;
     Connection connection;
     connection.from = object["from"].get<std::string>();
     connection.to = object["to"].get<std::string>();
@@ -241,6 +279,10 @@ bool parse_chain(const nlohmann::json& object, const std::string& where, Chain& 
   }
   chain.id = object["id"].get<std::string>();
   const std::string named = "chain '" + chain.id + "'";
+  if (!known_keys(object, {"id", "name", "input_channel", "output_channel", "nodes", "connections", "meta"}, named,
+                  error) ||
+      !read_meta(object, named, chain.meta, error))
+    return false;
 
   bool ok = true;
   chain.name = optional_string(object, "name", named, ok, error);
@@ -327,6 +369,8 @@ bool parse_document_json(const std::string& text, Document& document, std::strin
       error = "the rig has both 'chains' and top-level 'nodes'/'connections'; it is one or the other";
       return false;
     }
+    if (!known_keys(doc, {"name", "chains", "meta"}, "the rig", error))
+      return false;
     if (!doc["chains"].is_array())
     {
       error = "'chains' must be an array";
@@ -360,12 +404,17 @@ bool parse_document_json(const std::string& text, Document& document, std::strin
       error = "the rig needs a 'nodes' array, or a 'chains' array";
       return false;
     }
+    if (!known_keys(doc, {"name", "nodes", "connections", "meta"}, "the rig", error))
+      return false;
     Chain chain;
     chain.id = "main";
     if (!parse_graph_body(doc, "the rig", "", chain.graph, error))
       return false;
     parsed.chains.push_back(std::move(chain));
   }
+
+  if (!read_meta(doc, "the rig", parsed.meta, error))
+    return false;
 
   document = std::move(parsed);
   return true;
@@ -461,6 +510,8 @@ nlohmann::json graph_json(const Graph& graph)
       object[key] = value;
     for (const auto& [key, value] : node.strings)
       object[key] = value;
+    if (!node.meta.empty())
+      object["meta"] = nlohmann::json::parse(node.meta);
     nodes.push_back(std::move(object));
   }
 
@@ -501,6 +552,8 @@ std::string document_to_json(const Document& document)
     entry["output_channel"] = chain.output_channel;
     entry["nodes"] = graph["nodes"];
     entry["connections"] = graph["connections"];
+    if (!chain.meta.empty())
+      entry["meta"] = nlohmann::json::parse(chain.meta);
     chains.push_back(std::move(entry));
   }
 
@@ -508,6 +561,8 @@ std::string document_to_json(const Document& document)
   if (!document.name.empty())
     object["name"] = document.name;
   object["chains"] = std::move(chains);
+  if (!document.meta.empty())
+    object["meta"] = nlohmann::json::parse(document.meta);
   return object.dump();
 }
 
@@ -518,7 +573,8 @@ bool same_graph(const Graph& a, const Graph& b)
 
   // Everything a compile reads, including the identity fields: `element` and `role` are part of what a
   // client authored, and a document that changed only those is a change worth republishing (an op can
-  // name an element). Node order is compared too -- a reordering is semantically free but it is not
+  // name an element). `meta` is not: the engine never reads it, so a change to it alone compiles to the
+  // same plan and rebuilds nothing. Node order is compared too -- a reordering is semantically free but it is not
   // the *same document*, and treating it as one would silently ignore an edit.
   for (std::size_t i = 0; i < a.nodes.size(); ++i)
   {
