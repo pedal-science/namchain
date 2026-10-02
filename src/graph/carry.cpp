@@ -65,7 +65,8 @@ const render::ParamDesc* declared(const render::NodeType& type, const std::strin
 
 Delta delta_of(const NodeSpec& was, const NodeSpec& now, std::vector<CarriedRamp>& ramps)
 {
-  if (was.type != now.type || was.strings != now.strings)
+  // A slimmed model is a different model, loaded from the same file (NodeSpec::slim).
+  if (was.type != now.type || was.strings != now.strings || was.slim != now.slim)
     return Delta::Replaced;
   const render::NodeType* type = render::find_node_type(now.type);
   if (type == nullptr)

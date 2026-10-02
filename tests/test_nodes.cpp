@@ -623,3 +623,37 @@ TEST_CASE("nc.nam refuses a model trained for a different sample rate")
   CHECK(RenderPlan::compile(one_node(spec), options, arena, error) == nullptr);
   CHECK(error.find("48000") != std::string::npos);
 }
+
+TEST_CASE("nc.nam with slim set runs a container's smallest submodel")
+{
+  // The model budget's NodeSpec::slim. A2.nam is a SlimmableContainer of A2-Lite and A2-Full, and the
+  // generated fixtures are those two submodels extracted, so each side has a reference to agree with.
+  const std::vector<float> input = sine(110.0, 8192, 0.25f);
+  const std::string container = std::string(NAMCHAIN_EXAMPLE_MODELS_DIR) + "/A2.nam";
+
+  const auto run = [&](const std::string& path, bool slim) {
+    NodeSpec spec = node("n", "nc.nam");
+    spec.strings["model"] = path;
+    spec.slim = slim;
+    return render(one_node(spec), input);
+  };
+  const auto max_difference = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double worst = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+      worst = std::max(worst, std::abs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+    return worst;
+  };
+
+  const auto full = run(container, false);
+  const auto slim = run(container, true);
+  const auto lite = run(std::string(NAMCHAIN_TEST_DATA_DIR) + "/A2-Lite.nam", false);
+  const auto extracted_full = run(std::string(NAMCHAIN_TEST_DATA_DIR) + "/A2-Full.nam", false);
+
+  CHECK(max_difference(full, extracted_full) < 1e-5);
+  CHECK(max_difference(slim, lite) < 1e-5);
+  // And the two sizes are audibly different models, so the checks above can tell them apart.
+  CHECK(max_difference(slim, full) > 1e-3);
+
+  // A model with one size ignores it.
+  CHECK(max_difference(run(std::string(NAMCHAIN_TEST_DATA_DIR) + "/A2-Lite.nam", true), lite) == 0.0);
+}

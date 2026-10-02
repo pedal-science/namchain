@@ -38,6 +38,14 @@ struct NodeSpec
   /// connections, so un-bypass is one flag and the original graph is never lost.
   bool bypass = false;
 
+  /// \brief Load the model at its smallest size: an `nc.nam` whose model is slimmable (a
+  /// SlimmableContainer) runs the submodel `SetSlimmableSize(0.0)` selects, instead of the full one.
+  ///
+  /// Set by the daemon's model budget on its resolved copy of a document, never by a document: no rig
+  /// or patch spells it, and `rig.get` never returns it (docs/daemon.md, "Model budget"). It changes
+  /// what compiles, so \ref same_graph compares it and a change to it replaces the node.
+  bool slim = false;
+
   /// \brief The client-owned document element this node belongs to: a block, a lane, a parallel
   /// section, or whatever else the author of the document considers one thing (docs/ui-integration-plan.md
   /// §1.2).

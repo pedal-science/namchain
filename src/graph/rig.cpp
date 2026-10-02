@@ -581,7 +581,7 @@ bool same_graph(const Graph& a, const Graph& b)
     const NodeSpec& x = a.nodes[i];
     const NodeSpec& y = b.nodes[i];
     if (x.id != y.id || x.type != y.type || x.params != y.params || x.strings != y.strings ||
-        x.bypass != y.bypass || x.element != y.element || x.role != y.role)
+        x.bypass != y.bypass || x.slim != y.slim || x.element != y.element || x.role != y.role)
       return false;
   }
   for (std::size_t i = 0; i < a.connections.size(); ++i)

@@ -93,7 +93,7 @@ nlohmann::json protocol_features()
   return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
                                 "structural_crossfade", "smooth_params", "bypass", "guard",
                                 "per_chain_mute", "schema", "tcp_transport", "assets", "record",
-                                "local_transitions", "meta", "bypass_ramp"});
+                                "local_transitions", "meta", "bypass_ramp", "model_budget"});
 }
 
 /// The longest recording `engine.record` will make, so a client that forgets to stop one cannot fill
@@ -683,6 +683,44 @@ std::string first_absolute_path_in_ops(const nlohmann::json& ops)
     }
   }
   return {};
+}
+
+/// A node's string parameter, or an empty string when it has none.
+std::string string_param(const graph::NodeSpec& node, const char* name)
+{
+  const auto found = node.strings.find(name);
+  return found == node.strings.end() ? std::string() : found->second;
+}
+
+/// Whether the model budget slimmed anything.
+bool budget_slimmed(const BudgetOutcome& budget)
+{
+  for (const BudgetedModel& model : budget.models)
+  {
+    if (model.slimmed)
+      return true;
+  }
+  return false;
+}
+
+/// Every model the budget counted, with what it reads per block as published: the part of a message a
+/// person acts on, because it says which block to swap for a smaller model. The chain is named only
+/// when the document has more than one.
+std::string describe_models(const BudgetOutcome& budget, bool name_chains)
+{
+  std::string text;
+  for (const BudgetedModel& model : budget.models)
+  {
+    text += text.empty() ? "" : ", ";
+    text += name_chains ? model.chain + "/" + model.node : model.node;
+    if (!model.estimated)
+      text += " (not estimated: " + model.why + ")";
+    else if (model.slimmed)
+      text += " " + format_kib(model.slim_bytes) + " (slimmed from " + format_kib(model.full_bytes) + ")";
+    else
+      text += " " + format_kib(model.full_bytes) + (model.slimmable ? "" : " (cannot be slimmed)");
+  }
+  return text;
 }
 
 void delete_plan_slot(void* object)
@@ -1342,13 +1380,14 @@ bool Daemon::publish_param(const std::string& chain_id, const std::string& node,
   return true;
 }
 
-bool Daemon::load_rig(const std::string& rig_path, std::string& error, std::string* error_code)
+bool Daemon::load_rig(const std::string& rig_path, std::string& error, std::string* error_code,
+                      bool admit_over_budget)
 {
   graph::Document document;
   if (!graph::load_document_json(rig_path, document, error))
     return false;
   return publish_document(document, rig_path, "file", std::filesystem::path(rig_path).parent_path().string(),
-                          error, error_code);
+                          error, error_code, admit_over_budget);
 }
 
 void Daemon::republish_after_rescan()
@@ -1359,7 +1398,10 @@ void Daemon::republish_after_rescan()
   const graph::Document document = current_document_;
   std::string error;
   std::string code;
-  if (publish_document(document, current_rig_, current_source_, current_base_dir_, error, &code))
+  // Nobody asked for this publish, so nobody can be told "no": a model that has arrived and puts the
+  // document over the model budget plays, and says so, rather than staying stood in for.
+  if (publish_document(document, current_rig_, current_source_, current_base_dir_, error, &code,
+                       /*admit_over_budget=*/true))
   {
     if (config_.verbose)
       std::fprintf(stderr, "[namchaind] library rescanned: %zu asset%s still missing\n", missing_assets_.size(),
@@ -1370,7 +1412,8 @@ void Daemon::republish_after_rescan()
 }
 
 bool Daemon::publish_document(const graph::Document& document, const std::string& path, const std::string& source,
-                              const std::string& base_dir, std::string& error, std::string* error_code)
+                              const std::string& base_dir, std::string& error, std::string* error_code,
+                              bool admit_over_budget)
 {
   const graph::Validation validation = graph::validate(document);
   if (!validation.ok)
@@ -1403,6 +1446,23 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   {
     if (error_code != nullptr)
       *error_code = "asset_missing";
+    return false;
+  }
+
+  // The model budget, on the resolved copy too: what it slims is a different model compiled from the
+  // same reference, so the chains it touches compare as changed below, and the document a client
+  // wrote still names what it named (docs/daemon.md, "Model budget").
+  BudgetOutcome budget = apply_model_budget(resolved, static_cast<std::size_t>(config_.model_budget_kb) * 1024u,
+                                            static_cast<int>(config_.period_size), working_sets_);
+  for (BudgetedModel& model : budget.models)
+    model.reference = string_param(document.chains[model.chain_index].graph.nodes[model.node_index], "model");
+  if (budget.over && !admit_over_budget)
+  {
+    error = "the models in this document read " + format_kib(budget.used_bytes) +
+            " per block together, more than the model budget of " + format_kib(budget.budget_bytes) +
+            ", with every one that can be slimmed slimmed: " + describe_models(budget, document.chains.size() > 1);
+    if (error_code != nullptr)
+      *error_code = "over_budget";
     return false;
   }
 
@@ -1444,6 +1504,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     current_name_ = document.name;
     current_document_ = document;
     missing_assets_ = std::move(missing);
+    model_budget_ = std::move(budget);
     last_transitions_.clear();
     return true;
   }
@@ -1717,6 +1778,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   current_document_ = document;
   current_resolved_ = std::move(resolved);
   missing_assets_ = std::move(missing);
+  model_budget_ = std::move(budget);
   published_slots_ = std::move(raw);
   last_published_ = &current_document_;
   last_transitions_ = std::move(transitions);
@@ -1738,6 +1800,22 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     }
     std::fprintf(stderr, "[namchaind] published %s (generation %llu, %zu chain%s: %s)\n", what.c_str(),
                  static_cast<unsigned long long>(generation_), count, count == 1 ? "" : "s", how.c_str());
+  }
+  // What the budget did is logged whether or not the daemon is verbose: a slimmed model sounds
+  // different from the one the rig names, and a document over the budget may miss deadlines.
+  if (model_budget_.over)
+  {
+    std::fprintf(stderr,
+                 "[namchaind] model budget: the document reads %s per block, over the budget of %s, and plays "
+                 "anyway: %s\n",
+                 format_kib(model_budget_.used_bytes).c_str(), format_kib(model_budget_.budget_bytes).c_str(),
+                 describe_models(model_budget_, count > 1).c_str());
+  }
+  else if (budget_slimmed(model_budget_))
+  {
+    std::fprintf(stderr, "[namchaind] model budget: %s of %s, as slimmed: %s\n",
+                 format_kib(model_budget_.used_bytes).c_str(), format_kib(model_budget_.budget_bytes).c_str(),
+                 describe_models(model_budget_, count > 1).c_str());
   }
   return true;
 }
@@ -1865,7 +1943,10 @@ bool Daemon::start(std::string& error)
   if (!config_.rig.empty())
   {
     std::string path;
-    if (!resolve_startup_rig(config_, config_.rig, path, error) || !load_rig(path, error))
+    // Admitted over the model budget, with a warning: refusing the configured rig would leave a pedal
+    // with no sound at all, which no budget is worth.
+    if (!resolve_startup_rig(config_, config_.rig, path, error) ||
+        !load_rig(path, error, nullptr, /*admit_over_budget=*/true))
     {
       // Both listeners are already up. Leaving them bound would mean the next start() -- the test
       // suite does exactly this -- trips over its own socket, which turns one clear failure into two
@@ -2728,6 +2809,40 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       issue["reference"] = miss.reference;
     }
 
+    // The model budget (docs/daemon.md, "Model budget"). A slimmed block is the budget doing what it
+    // was configured to do -- a two-amp rig on a small core is not a fault -- so it is informational,
+    // but it names the block, because it sounds different from the model the rig names. A document
+    // admitted over the budget, and a model the budget cannot see into, are warnings: either may miss
+    // deadlines.
+    for (const BudgetedModel& model : model_budget_.models)
+    {
+      if (!model.slimmed && model.estimated)
+        continue;
+      if (model.slimmed)
+      {
+        add("model_slimmed", "info",
+            "node '" + model.node + "' plays its smallest model to fit the model budget: " +
+              format_kib(model.slim_bytes) + " per block instead of " + format_kib(model.full_bytes),
+            1, model.chain, model.node);
+      }
+      else
+      {
+        add("model_budget_unknown", "warn",
+            "node '" + model.node + "' is not counted against the model budget: " + model.why, 1, model.chain,
+            model.node);
+      }
+      issues.back()["element"] = model.element;
+      issues.back()["reference"] = model.reference;
+    }
+    if (model_budget_.over)
+    {
+      add("model_budget_exceeded", "warn",
+          "the document's models read " + format_kib(model_budget_.used_bytes) +
+            " per block together, over the model budget of " + format_kib(model_budget_.budget_bytes) +
+            ", so the render may miss deadlines: " + describe_models(model_budget_, current_document_.chains.size() > 1),
+          1);
+    }
+
     // A library root that is configured and not there is worth saying out loud: the palette is empty,
     // and "no amps installed" and "the amps directory moved" look identical from a client otherwise.
     // Informational, not a warning: a device with no IRs is a device with no IRs.
@@ -2777,6 +2892,21 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     return list;
   };
 
+  // The blocks the model budget slimmed, beside the missing assets and for the same reason: the client
+  // that sent the rig learns at once that a block plays a smaller model than it names.
+  auto slimmed_json = [this]() {
+    nlohmann::json list = nlohmann::json::array();
+    for (const BudgetedModel& model : model_budget_.models)
+    {
+      if (!model.slimmed)
+        continue;
+      list.push_back({{"chain", model.chain}, {"node", model.node}, {"element", model.element},
+                      {"reference", model.reference}, {"full_bytes", model.full_bytes},
+                      {"slim_bytes", model.slim_bytes}});
+    }
+    return list;
+  };
+
   // One shape for the per-chain array wherever it appears, so a client can read the same entry from
   // `engine.status` and from `rig.get` and not learn two vocabularies for one thing.
   auto chains_json = [this]() {
@@ -2808,6 +2938,15 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
                            {"kind", assets::kind_name(miss.kind)}, {"reference", miss.reference}});
       }
       entry["missing_assets"] = std::move(missing);
+      // And the blocks the model budget slimmed.
+      nlohmann::json slimmed = nlohmann::json::array();
+      for (const BudgetedModel& model : model_budget_.models)
+      {
+        if (model.slimmed && model.chain == chain.id)
+          slimmed.push_back({{"node", model.node}, {"element", model.element}, {"reference", model.reference},
+                             {"full_bytes", model.full_bytes}, {"slim_bytes", model.slim_bytes}});
+      }
+      entry["slimmed_models"] = std::move(slimmed);
       list.push_back(std::move(entry));
     }
     return list;
@@ -3068,9 +3207,17 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // can read either the whole picture or one chain's.
     status["chains"] = chains_json();
 
+    // The model budget as configured, and what the running document reads against it: 0 throughout when
+    // it is off. `used_bytes` is as published, slimmed models at their slim size; `full_bytes` is what
+    // the same document would read with none of them slimmed.
+    status["model_budget"] = {{"budget_bytes", static_cast<std::size_t>(config_.model_budget_kb) * 1024u},
+                              {"used_bytes", model_budget_.used_bytes},
+                              {"full_bytes", model_budget_.full_bytes},
+                              {"over", model_budget_.over}};
+
     // The library at a glance. The listing is `engine.assets`; this is the size of it, so a client
     // that shows a palette can tell "no models installed" from "not asked yet".
-    status["assets"] = {{"models_root", assets_.models_root()},
+    status["assets"] ={{"models_root", assets_.models_root()},
                         {"irs_root", assets_.irs_root()},
                         {"models", assets_.of_kind(assets::Kind::Model).size()},
                         {"irs", assets_.of_kind(assets::Kind::Ir).size()},
@@ -3258,6 +3405,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["rig"] = path;
     body["generation"] = generation_;
     body["missing_assets"] = missing_json();
+    body["slimmed_models"] = slimmed_json();
     body["transitions"] = transitions_json();
     return ok_response(id, body);
   }
@@ -3296,6 +3444,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["name"] = document.name;
     body["generation"] = generation_;
     body["missing_assets"] = missing_json();
+    body["slimmed_models"] = slimmed_json();
     body["chains"] = document.chains.size();
     body["transitions"] = transitions_json();
     return ok_response(id, body);
@@ -3307,6 +3456,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["source"] = current_source_;
     body["generation"] = generation_;
     body["missing_assets"] = missing_json();
+    body["slimmed_models"] = slimmed_json();
     body["loaded"] = current_document_.chains.empty() ? false : true;
     if (!current_document_.chains.empty())
     {
@@ -3454,6 +3604,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       body["chain"] = chain_id;
       body["generation"] = generation_;
       body["missing_assets"] = missing_json();
+      body["slimmed_models"] = slimmed_json();
       return ok_response(id, body);
     }
 
@@ -3477,6 +3628,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["chain"] = chain_id;
     body["generation"] = generation_;
     body["missing_assets"] = missing_json();
+    body["slimmed_models"] = slimmed_json();
     body["transitions"] = transitions_json();
     return ok_response(id, body);
   }
@@ -3537,8 +3689,9 @@ int Daemon::run()
           assets_.refresh();
           std::string path;
           std::string error;
+          // The configured rig again, under the startup's rule: admitted over the model budget.
           if (!config_.rig.empty() && resolve_startup_rig(config_, config_.rig, path, error) &&
-              load_rig(path, error))
+              load_rig(path, error, nullptr, /*admit_over_budget=*/true))
           {
             if (config_.verbose)
               std::fprintf(stderr, "[namchaind] SIGHUP: reloaded %s\n", path.c_str());

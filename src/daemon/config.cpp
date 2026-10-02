@@ -231,7 +231,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "periods",    "capture_channels", "playback_channels", "rig",
                                       "rigs_root",  "socket",      "socket_mode",     "rt_priority",
                                       "cpu",        "lock_memory",  "output_queue_periods",
-                                      "output_queue_floor_periods", "fade_ms", "device_retry_ms",
+                                      "output_queue_floor_periods", "fade_ms", "model_budget_kb", "device_retry_ms",
                                       "reclamation_timeout_ms", "verbose", "capture_path", "playback_path",
                                       "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
                                       "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
@@ -293,6 +293,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_unsigned(doc, "output_queue_periods", config.output_queue_periods, path, error) ||
       !read_unsigned(doc, "output_queue_floor_periods", config.output_queue_floor_periods, path, error) ||
       !read_unsigned(doc, "device_retry_ms", config.device_retry_ms, path, error) ||
+      !read_unsigned(doc, "model_budget_kb", config.model_budget_kb, path, error) ||
       !read_unsigned(doc, "tcp_port", config.tcp_port, path, error) ||
       !read_unsigned(doc, "tcp_max_connections", config.tcp_max_connections, path, error) ||
       !read_unsigned(doc, "tcp_max_message_bytes", config.tcp_max_message_bytes, path, error) ||
@@ -439,6 +440,8 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
     return parse_unsigned("output-queue-floor-periods", value, config.output_queue_floor_periods, error);
   if (name == "device-retry-ms")
     return parse_unsigned("device-retry-ms", value, config.device_retry_ms, error);
+  if (name == "model-budget-kb")
+    return parse_unsigned("model-budget-kb", value, config.model_budget_kb, error);
   if (name == "tcp-port")
     return parse_unsigned("tcp-port", value, config.tcp_port, error);
   if (name == "tcp-max-connections")

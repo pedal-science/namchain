@@ -116,6 +116,7 @@ endif()
 
 add_library(namchain OBJECT
   src/nam/lookback.cpp
+  src/nam/working_set.cpp
   src/assets/registry.cpp
   src/graph/carry.cpp
   src/graph/macro.cpp
@@ -138,6 +139,7 @@ add_library(namchain OBJECT
   src/graph/patch.cpp
   src/daemon/config.cpp
   src/daemon/daemon.cpp
+  src/daemon/model_budget.cpp
   src/daemon/platform.cpp
   src/daemon/recorder.cpp
   src/render/timeline.cpp
@@ -283,6 +285,8 @@ if(NAMCHAIN_BUILD_TESTS)
 
   add_executable(namchain-tests
     tests/test_lookback.cpp
+    tests/test_working_set.cpp
+    tests/test_model_budget.cpp
     tests/test_a2_planar_parity.cpp
     tests/test_render.cpp
     tests/test_soak.cpp

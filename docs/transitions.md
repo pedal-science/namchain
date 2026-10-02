@@ -313,9 +313,11 @@ full 60 s / 500-edit torture becomes a routine run.
 ## What is next
 
 1. **Admission control and the deferred-commit scheduler** (§5.3, §5.4): `worst_case_block`, the 70 %
-   budget, shorten-fade -> drop-warming -> slim -> reject-with-reason. The cost model it needs does
+   budget, shorten-fade -> drop-warming -> slim -> reject-with-reason. The CPU cost model it needs does
    not exist yet. Today the fade is fixed and an expensive dual-render is admitted — including a
-   bypassed node, which deliberately keeps costing CPU to stay warm.
+   bypassed node, which deliberately keeps costing CPU to stay warm. The **model budget**
+   (docs/daemon.md, "Model budget") is the slim -> reject end of it for one resource, the memory a
+   document's models read per block, and it does not count the fade.
 2. The **tail path**: a `tail_hold` for a bypassed node with a tail, which needs the first tail node
    (reverb, M5) to have anything to hold.
 3. A **structural op in the timeline**, so the offline harness can drive many plan changes in one

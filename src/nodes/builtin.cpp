@@ -21,6 +21,7 @@
 #include "NAM/dsp.h"
 #include "NAM/get_dsp.h"
 #include "NAM/linear.h"
+#include "NAM/slimmable.h"
 #include "dsp/Resample.h" // AudioDSPTools, as the vendored core pins it
 #include "json.hpp"
 
@@ -502,6 +503,23 @@ void* create_nam(const graph::NodeSpec& spec, const CompileOptions& options, std
   {
     error = reject("nc.nam", "cannot load '" + path + "': " + e.what());
     return nullptr;
+  }
+  // The model budget's choice (NodeSpec::slim), made before prepare_dsp() resets the model: a container
+  // resets only its active submodel, so the full one never allocates its history or prewarms.
+  if (spec.slim)
+  {
+    if (auto* slimmable = dynamic_cast<nam::SlimmableModel*>(model.get()))
+    {
+      try
+      {
+        slimmable->SetSlimmableSize(0.0);
+      }
+      catch (const std::exception& e)
+      {
+        error = reject("nc.nam", "cannot slim '" + path + "': " + e.what());
+        return nullptr;
+      }
+    }
   }
   return prepare_dsp(std::move(model), options, "nc.nam", error).release();
 }

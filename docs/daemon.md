@@ -81,6 +81,7 @@ silently ignored.
 | `output_queue_periods` | `0` | output-ring cap in periods; `0` is off |
 | `output_queue_floor_periods` | `0` | queue floor in periods; `0` is off |
 | `fade_ms` | `5.0` | equal-power crossfade for a structural plan transition |
+| `model_budget_kb` | `0` | what a document's models may read per block, together, in KiB; over it, slimmable models are slimmed and a client's publish that still does not fit is refused. `0` is off. See "Model budget" below |
 | `device_retry_ms` | `250` | backoff between attempts to open a lost device |
 | `reclamation_timeout_ms` | `20` | the control `poll` timeout, i.e. the reclamation window |
 | `tcp_listen` | `false` | serve control connections on TCP as well |
@@ -234,7 +235,7 @@ One JSON object per message in each direction, over either transport above. A re
 | `engine.hello` | `{"protocol": 2, "token": "…"?}` | `role`, `version`, `protocol` (what the server speaks), `features`, `transport` (`unix`/`tcp`) and `authenticated`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol`. On TCP the token is required and is checked **before** the version, so a peer without it learns nothing else |
 | `engine.schema` | — | the catalogue: every node type **and every macro** in one array, told apart by `kind` (`primitive`/`macro`), with ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. A macro additionally carries the `roles` it lowers to and, per parameter, the `targets` it drives. A parameter whose choices live in the library carries them, resolved from the same scan `engine.assets` reports. See docs/schema.md and docs/macros.md |
 | `engine.assets` | `{"refresh": true?}` | the model and impulse-response library: an entry per file with its `id`, where it is, its size and mtime, and the rate/architecture/length when the file's own header says so. See docs/assets.md |
-| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, a `queue` object (the output queue's cap and floor, and its `output_drops`, `output_target_drops`, `floor_insertions` and `capture_bursts`), a `record` object (as `engine.record`), a `render` object (each block's time from its capture read to its playback write against the period's deadline: `deadline_us`, `worst_us`, `worst_percent`, `over_90_percent`, `over_deadline`, and `load_histogram` as `[percent, blocks]` pairs for the non-empty 1% buckets, 100 meaning at or past the deadline; all cumulative, so a poller takes deltas), device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), and `health`/`issues` (below) |
+| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, a `queue` object (the output queue's cap and floor, and its `output_drops`, `output_target_drops`, `floor_insertions` and `capture_bursts`), a `record` object (as `engine.record`), a `render` object (each block's time from its capture read to its playback write against the period's deadline: `deadline_us`, `worst_us`, `worst_percent`, `over_90_percent`, `over_deadline`, and `load_histogram` as `[percent, blocks]` pairs for the non-empty 1% buckets, 100 meaning at or past the deadline; all cumulative, so a poller takes deltas), device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), a `model_budget` object ("Model budget", below), and `health`/`issues` (below) |
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `engine.record` | `{"action": "start", "name": "…", "seconds": 600?}`, `{"action": "stop"}`, or `{}` | `record`: whether one is running, its name and path, periods and seconds so far, ring overflows, and the dropped/inserted/xrun totals. See "Recording what the device heard", below |
@@ -303,12 +304,12 @@ chain quietly playing on channel 0.
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
 `bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`, `record`, `local_transitions`,
-`meta`, `bypass_ramp`. It grows as the slices land, and
+`meta`, `bypass_ramp`, `model_budget`. It grows as the slices land, and
 absence is how a client degrades rather than guesses.
 
 The error codes a client may have to act on are `bad_json`, `bad_request`, `unknown_method`,
-`unknown_chain`, `rig_not_found`, `patch_rejected`, `compile_failed`, `asset_missing`, `path_refused`,
-`unauthorized`, `message_too_large`, `too_many_connections` and `unsupported_protocol`. A refusal is a normal answer:
+`unknown_chain`, `rig_not_found`, `patch_rejected`, `compile_failed`, `asset_missing`, `over_budget`,
+`path_refused`, `unauthorized`, `message_too_large`, `too_many_connections` and `unsupported_protocol`. A refusal is a normal answer:
 the connection stays open (except after a framing error, a third failed authentication, or a full
 connection table) and the running plan is untouched.
 
@@ -392,6 +393,9 @@ stops being true disappears, which is the property that makes the light worth ha
 | `not_realtime` | warn | a real-time policy was asked for and is not in force |
 | `memory_not_locked` | warn | `mlockall` was refused while `lock_memory` is on |
 | `asset_missing` | warn | a block's model or IR is not in the library, so it plays as if bypassed. One per block, with `element`, `param`, `kind` and `reference` besides `chain` and `node` (docs/assets.md) |
+| `model_budget_exceeded` | warn | the running document's models read more per block than `model_budget_kb` with everything slimmable slimmed. Only the configured rig gets here (a client's publish is refused instead); it plays, and may miss deadlines |
+| `model_budget_unknown` | warn | the model budget could not estimate a block's model (an architecture it does not know), so it counts as nothing. One per block, with `element` and `reference` |
+| `model_slimmed` | info | a block plays its smallest model to fit the model budget. One per block, with `element` and `reference`: informational, because it is the budget doing its job, but named, because a Lite does not sound like the Full the rig names |
 | `transition` | info | a structural change is being crossfaded (normal, and it does not colour `health`) |
 
 Two things deliberately *not* issues: a daemon asked for no real-time priority that has none, and one
@@ -481,6 +485,68 @@ reference on a node that isn't 1->1 still refuses the document as `asset_missing
 
 docs/assets.md is the reference — ids, the two roots, what is read from a file (a header sniff, never
 a load), and the `engine.assets` response in full.
+
+### Model budget: what a document's models may read per block
+
+Every chain of a document renders on one thread, on one core, so a document's models share that
+core's L2. A model reads its weights and every layer's history each block: an A2-Full **293.8 KiB** at
+q64, an A2-Lite 99.7 KiB (`namchain/working_set.h`, from the model's config). Two Fulls, 587.5 KiB,
+do not fit a Cortex-A76's 512 KiB L2, and the render's worst blocks then follow the shared L3 and
+DRAM: on a Pi 5 a rig with two Fulls reached 107–144 % of the deadline in its worst block, and one
+Full with one Lite stayed under it (pedal.project, `bench-results/2026-10-02-two-amp-tail-vip`). The
+tail comes from what the block reads, not from its arithmetic.
+
+`model_budget_kb` is a ceiling on that, for the whole document. `0`, the default, is off. With it
+set, every publish — `rig.load`, `rig.apply`, `rig.patch`, startup, SIGHUP, a rescan's republish —
+does this on the resolved copy, before anything is compiled:
+
+1. **Estimate every `nc.nam` node** at `period_size`, in document order: chains in order, each chain's
+   nodes as declared. A bypassed node counts, because it keeps running; a block standing in for a
+   missing model counts as nothing. Estimates come from the model's config, never from loading it,
+   and are cached by path, size, mtime and quantum, so a publish does not reparse the library.
+2. **If the total is over, slim** the models that can be slimmed — a `SlimmableContainer`, the
+   `A2.nam` kind with a Full and a Lite in one file — **the last declared first**, until the total
+   fits. A slimmed node runs the submodel `SetSlimmableSize(0.0)` picks, chosen before the model is
+   prepared, so the Full is never allocated or prewarmed.
+3. **If it is still over** with every slimmable model slimmed, a client's publish is refused as
+   `over_budget`, with every model's size in the message, and the running document keeps playing.
+   The configured rig — at startup, on SIGHUP and on a rescan's republish — is **admitted anyway**,
+   with a `model_budget_exceeded` warning: refusing the rig a pedal powers up with would leave it
+   silent, which is worse than a rig that may miss a deadline.
+
+What a client sees: `slimmed_models` in every rig reply (`rig.load`, `rig.apply`, `rig.patch`,
+`rig.get`) and in each chain of `engine.status`, an entry per slimmed node with `chain` (in the
+replies), `node`, `element`, `reference`, `full_bytes` and `slim_bytes`; a `model_slimmed` issue per
+slimmed node; and `model_budget` in `engine.status`, with `budget_bytes`, `used_bytes` (as slimmed),
+`full_bytes` (as written) and `over`. The document `rig.get` returns is the one written: slimming is
+the engine's choice about the copy it compiles, made afresh on every publish, so no document carries
+it and a stale choice never sticks. A model the estimator cannot read counts as nothing and raises
+`model_budget_unknown`.
+
+The figure is the L2 of the render's core less room for everything else the block touches: buffers,
+an IR, the stack. vip runs 448 (pedal.project's `devices/vip/`), which fits a Full and a Lite and
+refuses two Fulls.
+
+What it does not do yet, each with the remedy drafted:
+
+- **Only models are counted.** An IR, a delay line or a mixer reads memory too. Remedy: an estimate
+  per node type, beside its schema, summed the same way.
+- **The dual render is not counted.** During a structural crossfade both plans render, so a
+  transition between two documents that each fit reads up to twice the budget for `fade_ms`. Remedy:
+  the admission control of plan.md §5.3, which costs the fade.
+- **Full or smallest, nothing between.** A container with more than two submodels is never slimmed
+  part-way, and a `SlimmableWaveNet` (one model that slims by channels) counts at full size and is
+  never slimmed. Remedy: estimate each size the model offers and step down one at a time.
+- **The client cannot say which amp gives way.** The last declared is slimmed first, so inserting an
+  amp before an existing one slims the existing one: a sound the player did not touch changes.
+  Remedy: a per-node `size` parameter (`auto`, `full`, `smallest`), or a slim choice that sticks
+  across publishes so the model just added is the one slimmed.
+- **An estimate, not a measurement.** It reads the config; measured breakpoints per model (plan.md
+  §7.7) would replace it.
+- **A macro that lowers to `nc.nam` would not be counted**, because the budget runs before lowering.
+  None exists.
+- **The offline tools do not apply it.** `namchain-render` and the soak render what they are given;
+  the budget is the daemon's.
 
 ## Recording what the device heard
 
@@ -604,7 +670,11 @@ expected.
 
 ## What is built, and what is not
 
-Built: **the macro layer** — seven macros (`fx.eq.bands`, `fx.eq.tilt`, `fx.filter.cut`,
+Built: **the model budget** — a ceiling on what a document's models read per block, estimated from
+each model's config, met by slimming slimmable models last-declared first and enforced by refusing a
+client's publish that still does not fit (`over_budget`), with the configured rig admitted and
+warned about, and `slimmed_models`, `model_budget` and three issue codes to show it ("Model budget",
+above); **the macro layer** — seven macros (`fx.eq.bands`, `fx.eq.tilt`, `fx.filter.cut`,
 `fx.mix.drywet`, `fx.delay.feedback`, `fx.amp.tonestack`, `fx.cab.ir`) lowered per compile into
 biquads, gains, mixes and the existing delay line; a declared param map with a closed transform set,
 so one knob drives as many node parameters as it means to and a macro-level `set_param` writes exactly
@@ -640,9 +710,10 @@ unchanged chains left alone. See docs/transitions.md.
 Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 
 - no `tail_hold` for a bypassed node with a tail (no built-in has one yet);
-- no admission control or cost model, so a plan too expensive to dual-render is not rejected before it
-  runs, and the fade length is fixed rather than shortened under load — the staggered apply is what
-  stands in for it;
+- no admission control or CPU cost model, so a plan too expensive to dual-render is not rejected before
+  it runs, and the fade length is fixed rather than shortened under load — the staggered apply is what
+  stands in for it. The model budget is the one rule that refuses a document for what it costs, and it
+  costs memory read per block, not time;
 - no *document-level* per-port setting: a lane's level, mute and polarity are runtime state addressed
   by port (`rig.patch`), so a rig file expresses them with a gain node in the lane rather than as a
   mixer setting (slice E's lowering is where that belongs);

@@ -220,6 +220,7 @@ TEST_CASE("a config file sets the fields the daemon uses")
     "output_queue_periods": 4,
     "output_queue_floor_periods": 2,
     "fade_ms": 2.5,
+    "model_budget_kb": 448,
     "device_retry_ms": 500,
     "tcp_listen": true,
     "tcp_address": "0.0.0.0",
@@ -251,6 +252,7 @@ TEST_CASE("a config file sets the fields the daemon uses")
   CHECK(config.output_queue_periods == 4u);
   CHECK(config.output_queue_floor_periods == 2u);
   CHECK(config.fade_ms == doctest::Approx(2.5));
+  CHECK(config.model_budget_kb == 448u);
   CHECK(config.device_retry_ms == 500u);
   CHECK(config.tcp_listen);
   CHECK(config.tcp_address == "0.0.0.0");
@@ -322,6 +324,9 @@ TEST_CASE("command-line options parse and reject")
   CHECK(config.cpu == -1);
   CHECK(namchain::daemon::apply_option(config, "no-lock-memory", "", error));
   CHECK_FALSE(config.lock_memory);
+  CHECK(config.model_budget_kb == 0u); // off unless a device asks for it
+  CHECK(namchain::daemon::apply_option(config, "model-budget-kb", "448", error));
+  CHECK(config.model_budget_kb == 448u);
 
   // The TCP transport's flags spell the same fields as the config keys, for the same reason every
   // other flag does: what a unit passes and what an operator types should be one vocabulary.
@@ -349,6 +354,7 @@ TEST_CASE("command-line options parse and reject")
   CHECK_FALSE(namchain::daemon::apply_option(config, "period-size", "-4", error));
   CHECK_FALSE(namchain::daemon::apply_option(config, "socket-mode", "8", error));
   CHECK_FALSE(namchain::daemon::apply_option(config, "rt-priority", "loud", error));
+  CHECK_FALSE(namchain::daemon::apply_option(config, "model-budget-kb", "-1", error));
 }
 
 TEST_CASE("a protocol rig name cannot escape the rigs root")
@@ -2229,6 +2235,208 @@ TEST_CASE("a library root that is not there is an informational issue, not a fai
   CHECK(assets["models"].empty());
   CHECK(assets["roots"]["models"]["readable"] == false);
   CHECK(assets["roots"]["models"]["error"] == "no such directory");
+}
+
+// ---------------------------------------------------------------------------
+// The model budget (docs/daemon.md, "Model budget")
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// A library for the budget: `A2` is the slimmable container (Full and Lite), `A2-Full` the same Full
+/// on its own, which cannot be slimmed. At q64 the Full reads 300808 bytes per block and the Lite
+/// 102068 (test_working_set.cpp).
+void write_budget_library(const std::filesystem::path& models)
+{
+  std::filesystem::create_directories(models);
+  std::filesystem::copy_file(std::string(NAMCHAIN_EXAMPLE_MODELS_DIR) + "/A2.nam", models / "A2.nam");
+  std::filesystem::copy_file(std::string(NAMCHAIN_TEST_DATA_DIR) + "/A2-Full.nam", models / "A2-Full.nam");
+}
+
+std::string two_amp_rig(const char* first, const char* second)
+{
+  return std::string(R"({
+    "nodes": [
+      { "id": "in", "type": "nc.input" },
+      { "id": "a1", "type": "nc.nam", "model": ")") +
+         first + R"(" },
+      { "id": "a2", "type": "nc.nam", "model": ")" +
+         second + R"(" },
+      { "id": "out", "type": "nc.output" }
+    ],
+    "connections": [ { "from": "in", "to": "a1" }, { "from": "a1", "to": "a2" }, { "from": "a2", "to": "out" } ]
+  })";
+}
+
+Config budget_config(const TempDir& dir)
+{
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = (dir.path / "rigs").string();
+  config.models_root = (dir.path / "models").string();
+  config.irs_root = (dir.path / "irs").string();
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.period_size = 64;
+  // vip's: one Full and one Lite fit, two Fulls do not (pedal.project, 2026-10-02).
+  config.model_budget_kb = 448;
+  return config;
+}
+
+} // namespace
+
+TEST_CASE("the model budget slims the last model it can, says so, and refuses what still does not fit")
+{
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "rigs" / "two-amp.json", two_amp_rig("A2", "A2"));
+  const Config config = budget_config(dir);
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const auto hello = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.hello"})"));
+  REQUIRE(hello["ok"] == true);
+  bool advertised = false;
+  for (const auto& feature : hello["features"])
+    advertised = advertised || feature == "model_budget";
+  CHECK(advertised);
+
+  // Two Fulls would not fit; the second amp plays its Lite, and the reply says which and by how much.
+  const auto loaded = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.load","rig":"two-amp.json"})"));
+  REQUIRE_MESSAGE(loaded["ok"] == true, loaded.dump());
+  REQUIRE(loaded["slimmed_models"].size() == 1);
+  CHECK(loaded["slimmed_models"][0]["chain"] == "main");
+  CHECK(loaded["slimmed_models"][0]["node"] == "a2");
+  CHECK(loaded["slimmed_models"][0]["element"] == "a2");
+  CHECK(loaded["slimmed_models"][0]["reference"] == "A2");
+  CHECK(loaded["slimmed_models"][0]["full_bytes"] == 300808);
+  CHECK(loaded["slimmed_models"][0]["slim_bytes"] == 102068);
+  const bool adopted = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["adopted_generation"].get<uint64_t>() >= 1 &&
+           status["blocks"].get<uint64_t>() > 0;
+  });
+  CHECK_MESSAGE(adopted, "the slimmed rig never reached the device");
+
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["model_budget"]["budget_bytes"] == 458752);
+  CHECK(status["model_budget"]["used_bytes"] == 300808 + 102068);
+  CHECK(status["model_budget"]["full_bytes"] == 2 * 300808);
+  CHECK(status["model_budget"]["over"] == false);
+  // The budget doing its job is not a fault: the light stays green, and the issue names the block.
+  CHECK(status["health"] == "ok");
+  bool named = false;
+  for (const auto& issue : status["issues"])
+  {
+    if (issue["code"] != "model_slimmed")
+      continue;
+    named = true;
+    CHECK(issue["severity"] == "info");
+    CHECK(issue["node"] == "a2");
+    CHECK(issue["element"] == "a2");
+    CHECK(issue["reference"] == "A2");
+  }
+  CHECK_MESSAGE(named, "no model_slimmed issue for the slimmed amp");
+  REQUIRE(status["chains"].size() == 1);
+  REQUIRE(status["chains"][0]["slimmed_models"].size() == 1);
+  CHECK(status["chains"][0]["slimmed_models"][0]["node"] == "a2");
+
+  // The document handed back is the one written: slimming is the engine's, never a client's.
+  const auto running = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  REQUIRE(running["ok"] == true);
+  const auto& amp = running["document"]["chains"][0]["nodes"][2];
+  CHECK(amp["model"] == "A2");
+  CHECK_FALSE(amp.contains("slim"));
+  CHECK(running["slimmed_models"].size() == 1);
+
+  // A2 then a Full that cannot be slimmed: the budget passes over the Full and slims the container,
+  // which is the first amp now. The patch reply says so.
+  const auto swapped = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.patch","ops":[{"op":"swap_model","node":"a2","model":"A2-Full"}]})"));
+  REQUIRE_MESSAGE(swapped["ok"] == true, swapped.dump());
+  REQUIRE(swapped["slimmed_models"].size() == 1);
+  CHECK(swapped["slimmed_models"][0]["node"] == "a1");
+
+  // Two Fulls: nothing left to slim, so a client's publish is refused, by name, and nothing changes.
+  const uint64_t before = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"))["generation"];
+  nlohmann::json apply;
+  apply["method"] = "rig.apply";
+  nlohmann::json chain = nlohmann::json::parse(two_amp_rig("A2-Full", "A2-Full"));
+  chain["id"] = "main";
+  apply["document"]["chains"] = nlohmann::json::array({chain});
+  const auto refused = nlohmann::json::parse(call(config.socket_path, apply.dump()));
+  REQUIRE(refused["ok"] == false);
+  CHECK(refused["error"]["code"] == "over_budget");
+  const std::string why = refused["error"]["message"];
+  CHECK_MESSAGE(why.find("587.5 KiB") != std::string::npos, why);
+  CHECK_MESSAGE(why.find("448.0 KiB") != std::string::npos, why);
+  CHECK_MESSAGE(why.find("a2 293.8 KiB (cannot be slimmed)") != std::string::npos, why);
+  const auto after = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  CHECK(after["generation"] == before);
+  CHECK(after["document"]["chains"][0]["nodes"][2]["model"] == "A2-Full");
+  CHECK(after["document"]["chains"][0]["nodes"][1]["model"] == "A2");
+}
+
+TEST_CASE("a configured rig over the model budget still plays, with a warning")
+{
+  // Refusing the rig a pedal powers up with would leave it silent, which is worse than a rig that may
+  // miss a deadline: the configured rig is admitted, and the status says what it costs.
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "rigs" / "two-full.json", two_amp_rig("A2-Full", "A2-Full"));
+  Config config = budget_config(dir);
+  config.rig = (dir.path / "rigs" / "two-full.json").string();
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const bool playing = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["adopted_generation"].get<uint64_t>() >= 1 &&
+           status["blocks"].get<uint64_t>() > 0;
+  });
+  CHECK_MESSAGE(playing, "the configured rig was not admitted");
+
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["model_budget"]["over"] == true);
+  CHECK(status["model_budget"]["used_bytes"] == 2 * 300808);
+  CHECK(status["health"] == "warn");
+  bool warned = false;
+  for (const auto& issue : status["issues"])
+  {
+    if (issue["code"] == "model_budget_exceeded")
+      warned = issue["severity"] == "warn";
+  }
+  CHECK_MESSAGE(warned, "no model_budget_exceeded warning");
 }
 
 // ---------------------------------------------------------------------------

@@ -8,8 +8,9 @@ patch ops, or a non-rampable `set_param` — builds a new graph, compiles it, du
 the old plan for `fade_ms` with an equal-power crossfade at the chain outputs, and retires the old
 after a grace window. Bypass keeps the node running with its output replaced by its dry input, so
 un-bypassing does not step on a frozen state. Every node's output is guarded for non-finite samples.
-What is missing is the cost model and admission control, and a tail-hold for a bypassed node with a
-tail. Control-side awareness is partial: the daemon's socket, protocol, `signalfd` reload and
+What is missing is the CPU cost model and admission control, and a tail-hold for a bypassed node with
+a tail; the daemon's model budget (docs/daemon.md) slims or refuses a document for the memory its
+models read per block, which is the one cost it checks. Control-side awareness is partial: the daemon's socket, protocol, `signalfd` reload and
 device-loss survival exist, and the offline edit timeline now exists; telemetry subscription does not.
 The audio-side command ring is drained at the top of each block and carries plan identity and
 parameter dispatches. The last section says exactly which is which, so nothing here is mistaken for

@@ -22,6 +22,7 @@
 #include "namchain/assets/registry.h"
 #include "namchain/daemon/config.h"
 #include "namchain/daemon/framing.h"
+#include "namchain/daemon/model_budget.h"
 #include "namchain/daemon/recorder.h"
 #include "namchain/graph/plan.h"
 #include "namchain/graph/rig.h"
@@ -281,7 +282,9 @@ private:
   void close_transport();
   bool setup_signals(std::string& error);
   /// Compile \p rig_path and publish it. Called for the startup rig, SIGHUP and `rig.load`.
-  bool load_rig(const std::string& rig_path, std::string& error, std::string* error_code = nullptr);
+  /// \param admit_over_budget passed on to \ref publish_document.
+  bool load_rig(const std::string& rig_path, std::string& error, std::string* error_code = nullptr,
+                bool admit_over_budget = false);
   /// \brief Compile every chain of \p document, prewarm the plans, and publish them together.
   ///
   /// Control thread. All-or-nothing: if any chain fails to compile, or its channels are not available,
@@ -296,10 +299,15 @@ private:
   /// directory for a load, the rigs root for an applied document.
   /// \param error_code the protocol error code a failure should be reported under. `compile_failed`
   /// unless the asset registry refused a model or IR reference, which is `asset_missing` -- a
-  /// different fix for the user (pick another model) from a graph that will not compile.
+  /// different fix for the user (pick another model) from a graph that will not compile -- or the
+  /// document's models do not fit the model budget, which is `over_budget`.
+  /// \param admit_over_budget publish a document that is over the model budget even with every
+  /// slimmable model slimmed, and report it as a `model_budget_exceeded` warning, rather than refuse
+  /// it. For the publishes nobody can be told "no" about: the configured rig at startup and on SIGHUP,
+  /// and the running document again after a library rescan (docs/daemon.md, "Model budget").
   bool publish_document(const graph::Document& document, const std::string& path, const std::string& source,
                         const std::string& base_dir, std::string& error,
-                        std::string* error_code = nullptr);
+                        std::string* error_code = nullptr, bool admit_over_budget = false);
   /// \brief Resolve a `set_param` against a chain's newest published plan and push it on the ring.
   ///
   /// \param chain_id the chain to resolve against, or empty to resolve by node id -- which is an error
@@ -484,6 +492,11 @@ private:
   /// The references in \ref current_document_ that resolved nowhere, each played as a bypass
   /// (assets::resolve_document). Reported as `asset_missing` issues and per chain in `engine.status`.
   std::vector<assets::MissingAsset> missing_assets_;
+  /// What the model budget made of \ref current_document_: every model's estimate, which ones were
+  /// slimmed, and whether the document was admitted over the budget (docs/daemon.md, "Model budget").
+  BudgetOutcome model_budget_;
+  /// The estimates the budget reads, by file. Control thread.
+  WorkingSetCache working_sets_;
   /// \brief What the newest publish did with each chain it changed. Control thread; reported in the
   /// publish's reply and in `engine.status`, so a soak can say which edits faded locally.
   struct ChainTransition
