@@ -16,13 +16,21 @@
 //     after an idle gap rather than in the steady state, and only when that worker is actually
 //     parked (the pool publishes a `parked` flag through which the coordinator decides).
 //
+// **A worker is born on its own core.** It has to be: a thread inherits its creator's affinity mask,
+// and a worker that inherits the coordinator's one core cannot run at all once the coordinator is
+// `SCHED_FIFO` and spinning there -- it would never reach the code that pins it. Each worker is
+// therefore created with its affinity already set, not moved to its core afterwards, which makes
+// `start` safe to call from a thread that is already pinned and already real-time. That is what the
+// daemon does, and getting it wrong is a deadlock rather than a slow start.
+//
 // Everything here is deliberately a fixed-shape function-pointer callback rather than a
 // `std::function`: the contract is a per-block call, and a per-block call may not allocate.
+#include <pthread.h>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "namchain/rt/scheduling.h"
@@ -80,6 +88,18 @@ public:
   /// Stop and join the workers. Idempotent, and called by the destructor.
   void stop() noexcept;
 
+  /// \brief Record the coordinator's own scheduling, once it has been applied.
+  ///
+  /// The pool is started before the render thread promotes itself -- a worker that cannot be born on
+  /// its own core has to be able to run to pin itself -- so participant 0's state is read too early
+  /// and this is where the caller says what it actually got. Nothing else may be called from the
+  /// render path.
+  void note_coordinator(const rt::SchedulingState& state) noexcept
+  {
+    if (!participants_.empty())
+      participants_[0].scheduling = state;
+  }
+
   unsigned threads() const noexcept { return threads_; }
   /// Empty when every requested worker started; otherwise why the pool is smaller than asked for.
   const std::string& degraded_reason() const noexcept { return degraded_reason_; }
@@ -101,9 +121,16 @@ private:
   };
 
   void worker_main(unsigned index);
+  /// What a worker thread is handed at creation; it owns the record for the life of the thread.
+  struct WorkerStart
+  {
+    RenderPool* pool = nullptr;
+    unsigned index = 0;
+  };
+  static void* worker_trampoline(void* arg);
 
   std::vector<std::unique_ptr<Slot>> slots_;
-  std::vector<std::thread> workers_;
+  std::vector<pthread_t> workers_;
   std::vector<RenderParticipant> participants_;
   /// The block's work and its context, published with `go` and stable until every participant has
   /// finished the block.

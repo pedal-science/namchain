@@ -2997,3 +2997,71 @@ TEST_CASE("render_threads needs a CPU to start from, and refuses cores this proc
   CHECK_FALSE(beyond_daemon.start(beyond_error));
   CHECK(beyond_error.find("may not run on") != std::string::npos);
 }
+
+TEST_CASE("the render pool starts from a pinned caller and its worker takes its own core")
+{
+  const std::vector<int> cpus = allowed_cpus();
+  if (cpus.size() < 2)
+  {
+    MESSAGE("fewer than two CPUs are available to this process; the pool arm is skipped");
+    return;
+  }
+
+  // As the render thread is when it dispatches: confined to one CPU. A worker born with that mask
+  // could not run to pin itself once the caller is SCHED_FIFO and spinning there, so the pool gives
+  // each worker its affinity at creation; this is the shape that would deadlock if it did not.
+  cpu_set_t original;
+  CPU_ZERO(&original);
+  REQUIRE(::sched_getaffinity(0, sizeof(original), &original) == 0);
+  cpu_set_t only_first;
+  CPU_ZERO(&only_first);
+  CPU_SET(cpus.front(), &only_first);
+  REQUIRE(::sched_setaffinity(0, sizeof(only_first), &only_first) == 0);
+  struct Restore
+  {
+    cpu_set_t mask;
+    ~Restore() { ::sched_setaffinity(0, sizeof(mask), &mask); }
+  } restore{original};
+
+  namchain::daemon::RenderPool pool;
+  std::string error;
+  REQUIRE_MESSAGE(pool.start(2, cpus.front(), /*priority=*/0, error), error);
+  REQUIRE(pool.threads() == 2u);
+  REQUIRE(pool.participants().size() == 2u);
+  // Read back from the kernel: the worker is on the CPU after the caller's, not on the caller's.
+  CHECK(pool.participants()[0].requested_cpu == cpus.front());
+  CHECK(pool.participants()[1].requested_cpu == cpus[1]);
+  CHECK(pool.participants()[1].scheduling.cpu == cpus[1]);
+  CHECK(pool.degraded_reason().empty());
+
+  struct Counters
+  {
+    std::atomic<int> calls{0};
+    std::atomic<int> worker_calls{0};
+    std::atomic<int> frames_seen{0};
+  } counters;
+
+  const auto work = [](void* context, unsigned participant, unsigned participants, int frames) noexcept {
+    auto* c = static_cast<Counters*>(context);
+    c->calls.fetch_add(1, std::memory_order_relaxed);
+    if (participant == 1)
+      c->worker_calls.fetch_add(1, std::memory_order_relaxed);
+    c->frames_seen.fetch_add(frames, std::memory_order_relaxed);
+  };
+
+  for (int block = 0; block < 200; ++block)
+    pool.run(&counters, work, 64);
+
+  CHECK(counters.calls.load() == 400);
+  CHECK(counters.worker_calls.load() == 200);
+  CHECK(counters.frames_seen.load() == 400 * 64);
+  CHECK(pool.blocks() == 200u);
+
+  pool.stop();
+  CHECK(pool.threads() == 1u);
+  // And the single-participant pool is an inline call, not a dispatch.
+  Counters after_stop;
+  pool.run(&after_stop, work, 32);
+  CHECK(after_stop.calls.load() == 1);
+  CHECK(after_stop.worker_calls.load() == 0);
+}

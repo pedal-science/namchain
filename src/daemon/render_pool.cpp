@@ -1,6 +1,10 @@
 #include "namchain/daemon/render_pool.h"
 
-#include <system_error>
+#include <cstring>
+
+#if defined(__linux__)
+  #include <sched.h>
+#endif
 
 namespace namchain
 {
@@ -90,20 +94,41 @@ bool RenderPool::start(unsigned threads, int first_cpu, int priority, std::strin
   unsigned started = 1;
   for (unsigned i = 1; i < threads_; ++i)
   {
-    try
+    const int worker_cpu = first_cpu_ + static_cast<int>(i);
+    auto start = std::make_unique<WorkerStart>(WorkerStart{this, i});
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+#if defined(__linux__)
+    // Born on its own core, not moved there afterwards: a worker that inherits the coordinator's
+    // single-core mask could never run to pin itself once the coordinator is spinning at SCHED_FIFO
+    // on that core (see the header). On a platform with no affinity call the worker pins itself in
+    // worker_main, which is all that platform can do.
+    if (worker_cpu >= 0 && worker_cpu < CPU_SETSIZE)
     {
-      workers_.emplace_back([this, i] { worker_main(i); });
-      ++started;
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(worker_cpu, &set);
+      pthread_attr_setaffinity_np(&attr, sizeof(set), &set);
     }
-    catch (const std::system_error& e)
+#endif
+    pthread_t handle{};
+    const int created = pthread_create(&handle, &attr, &RenderPool::worker_trampoline, start.get());
+    pthread_attr_destroy(&attr);
+    if (created != 0)
     {
-      // Keep what started. The render path runs on fewer cores and the caller says so; an appliance
-      // that cannot have its extra cores still has to play.
-      degraded_reason_ = std::string("render worker ") + std::to_string(i) + " could not start (" +
-                         e.what() + "); rendering on " + std::to_string(started) + " of " +
+      // `start` still owns the record, and goes out of scope with this iteration: nothing to free by
+      // hand and nothing left dangling.
+      degraded_reason_ = "render worker " + std::to_string(i) + " could not start (" +
+                         std::strerror(created) + "); rendering on " + std::to_string(started) + " of " +
                          std::to_string(threads_) + " cores";
       break;
     }
+    // The trampoline owns the record from here; releasing it is what stops this scope freeing the
+    // memory the new thread is about to read.
+    start.release();
+    workers_.push_back(handle);
+    ++started;
   }
   if (started < threads_)
   {
@@ -127,11 +152,8 @@ void RenderPool::stop() noexcept
     slots_[i]->go.store(++sequence_, std::memory_order_release);
     slots_[i]->go.notify_all();
   }
-  for (std::thread& worker : workers_)
-  {
-    if (worker.joinable())
-      worker.join();
-  }
+  for (pthread_t worker : workers_)
+    pthread_join(worker, nullptr);
   workers_.clear();
   threads_ = 1;
   sequence_ = 0;
@@ -181,6 +203,15 @@ void RenderPool::run(void* context, Work work, int frames) noexcept
     while (slot.done.load(std::memory_order_acquire) != sequence)
       cpu_relax();
   }
+}
+
+void* RenderPool::worker_trampoline(void* arg)
+{
+  // The start record is owned by the trampoline for the life of the thread, so nothing has to be
+  // kept alive on the coordinator's side and nothing is freed on the render path.
+  std::unique_ptr<WorkerStart> start(static_cast<WorkerStart*>(arg));
+  start->pool->worker_main(start->index);
+  return nullptr;
 }
 
 void RenderPool::worker_main(unsigned index)

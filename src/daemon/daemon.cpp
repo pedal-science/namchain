@@ -2559,22 +2559,24 @@ void Daemon::drain_commands()
 
 void Daemon::render_loop()
 {
-  const rt::SchedulingState scheduling = rt::apply_scheduling(config_.rt_priority, config_.cpu);
-  rt_policy_.store(scheduling.policy);
-  rt_priority_.store(scheduling.priority);
-  rt_realtime_.store(scheduling.realtime);
-  if (config_.verbose)
-    std::fprintf(stderr, "[namchaind] render thread: %s\n", rt::describe_scheduling(scheduling).c_str());
-
-  // The workers, before the first block: pinned, counted and warm. A pool that came up smaller than
-  // asked for is reported here, in `engine.status` and in the report of whatever ran, never by
-  // silence.
+  // The workers first, before this thread promotes and pins itself. A worker is born on its own core
+  // (render_pool.h), but on a platform where that cannot be arranged it has to be able to run to pin
+  // itself, and a SCHED_FIFO coordinator spinning on its core would never let it.
   std::string pool_error;
   if (!start_render_pool(pool_error))
   {
     std::fprintf(stderr, "[namchaind] %s\n", pool_error.c_str());
     render_pool_degraded_.store(true);
   }
+
+  const rt::SchedulingState scheduling = rt::apply_scheduling(config_.rt_priority, config_.cpu);
+  render_pool_.note_coordinator(scheduling);
+  publish_render_state();
+  rt_policy_.store(scheduling.policy);
+  rt_priority_.store(scheduling.priority);
+  rt_realtime_.store(scheduling.realtime);
+  if (config_.verbose)
+    std::fprintf(stderr, "[namchaind] render thread: %s\n", rt::describe_scheduling(scheduling).c_str());
 
   std::string error;
   bool memory_locked = false;
@@ -2806,7 +2808,19 @@ bool Daemon::start_render_pool(std::string& error)
     error = pool_error;
     return false;
   }
+  if (!render_pool_.degraded_reason().empty())
+  {
+    // Started, but smaller than asked for. Not a refusal: the render path runs, and every report of
+    // this run has to say it was not the multi-core configuration it was configured to be.
+    error = render_pool_.degraded_reason();
+    std::fprintf(stderr, "[namchaind] %s\n", error.c_str());
+    return false;
+  }
+  return true;
+}
 
+void Daemon::publish_render_state()
+{
   uint64_t mask = 0;
   for (const RenderParticipant& participant : render_pool_.participants())
   {
@@ -2818,15 +2832,6 @@ bool Daemon::start_render_pool(std::string& error)
   }
   render_threads_active_.store(render_pool_.threads());
   render_cores_mask_.store(mask);
-  if (!render_pool_.degraded_reason().empty())
-  {
-    error = render_pool_.degraded_reason();
-    render_pool_degraded_.store(true);
-    std::fprintf(stderr, "[namchaind] %s\n", error.c_str());
-    return false;
-  }
-  render_pool_degraded_.store(false);
-  return true;
 }
 
 void Daemon::run_chains(unsigned participant, unsigned participants, int frames) noexcept

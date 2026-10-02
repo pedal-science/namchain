@@ -373,9 +373,14 @@ private:
   void render_loop();
   /// \brief Start the render pool, if `render_threads` is above one.
   ///
-  /// Called by the render thread before the first block, so the workers are pinned, counted and
-  /// warmed before anything has a deadline. A pool smaller than asked for is reported, never silent.
+  /// Called by the render thread *before* it promotes and pins itself: a worker is born on its own
+  /// core, but on a platform where that cannot be arranged it still has to be able to run to pin
+  /// itself, and a `SCHED_FIFO` coordinator already spinning on its core would never let it.
+  /// A pool smaller than asked for is reported, never silent.
   bool start_render_pool(std::string& error);
+  /// \brief Publish what the pool actually has, for `engine.status`. Render thread, once, after the
+  /// coordinator has taken its own scheduling.
+  void publish_render_state();
   /// \brief One participant's share of a block: every `participants`-th chain, plans only.
   ///
   /// Run on the coordinator and on every worker. It touches chain plans and chain buffers and
