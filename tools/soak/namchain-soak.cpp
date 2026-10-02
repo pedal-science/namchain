@@ -254,15 +254,26 @@ int main(int argc, char** argv)
   // Refused by name rather than ignored on the backends that have no ring to hold a queue in. A run
   // that reports a latency it is not actually carrying is worse than one that will not start -- the
   // whole point of the knob is that the number is a stated trade (plan.md §9.5 item 7). alsa_raw and
-  // coreaudio both have one; `null`, `file` and `pipe` do not.
+  // coreaudio both have an output ring; `null`, `file` and `pipe` do not.
   const bool has_output_ring = options.backend == namchain::BackendKind::AlsaRaw ||
                                options.backend == namchain::BackendKind::CoreAudio;
-  if ((options.output_queue_periods != 0 || options.output_queue_floor_periods != 0) && !has_output_ring)
+  if (options.output_queue_periods != 0 && !has_output_ring)
   {
     std::fprintf(stderr,
-                 "error: the output-queue settings only apply to the backends with an output ring\n"
-                 "       (alsa_raw, coreaudio); the %s backend has none, so they would be reported and\n"
+                 "error: --output-queue-periods only applies to the backends with an output ring\n"
+                 "       (alsa_raw, coreaudio); the %s backend has none, so it would be reported and\n"
                  "       not applied\n",
+                 namchain::backend_kind_name(options.backend));
+    return 2;
+  }
+  // The floor needs a second thing again: a backend that can *insert* a period into its ring, which
+  // only alsa_raw has. coreaudio has the ring the cap acts on and no floor controller at all, so the
+  // floor there would be a number nothing applies.
+  if (options.output_queue_floor_periods != 0 && options.backend != namchain::BackendKind::AlsaRaw)
+  {
+    std::fprintf(stderr,
+                 "error: --output-queue-floor-periods needs a backend with a floor controller\n"
+                 "       (alsa_raw); the %s backend has none, so it would be reported and not applied\n",
                  namchain::backend_kind_name(options.backend));
     return 2;
   }

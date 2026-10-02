@@ -93,6 +93,23 @@ std::string device_name(AudioObjectID device)
   return converted ? std::string(buffer) : ("device " + std::to_string(device));
 }
 
+/// \brief Silence the whole device buffer.
+///
+/// The layout does not matter here: every byte of every buffer is zeroed, and zero float bytes are
+/// zero floats in both an interleaved and a planar buffer. This is what a callback this backend
+/// cannot serve must hand the device -- *not* the buffer as it found it, which the HAL hands back to
+/// the next callback and which therefore plays the previous callback's audio again.
+void zero_output(AudioBufferList* output)
+{
+  if (output == nullptr)
+    return;
+  for (UInt32 b = 0; b < output->mNumberBuffers; ++b)
+  {
+    if (output->mBuffers[b].mData != nullptr)
+      std::memset(output->mBuffers[b].mData, 0, output->mBuffers[b].mDataByteSize);
+  }
+}
+
 /// \brief How many frames this device hands the IOProc, measured rather than asked for.
 ///
 /// `kAudioDevicePropertyBufferFrameSize` is a *request*: on this project's own machine it reads back
@@ -126,8 +143,6 @@ bool measure_device(AudioObjectID device, unsigned& frames, std::string& error)
   {
     std::atomic<unsigned> smallest{0};
     std::atomic<int> seen{0};
-    /// The device's own clock, and the host clock beside it: the pair the rate is derived from.
-
   };
   std::shared_ptr<Probe> probe_state = std::make_shared<Probe>();
 
@@ -329,11 +344,16 @@ struct CoreAudioBackend::Implementation
   std::unique_ptr<SpscRing<std::vector<float>>> capture;
   unsigned playback_channels = 0;
 
-  /// The IOProc's own copy target for the period it pops, so the callback allocates nothing.
-  std::vector<float> period_scratch;
   /// The most periods one callback can carry. A device asking for more is refused rather than
-  /// overrunning this array -- see the guard in `io`.
+  /// overrunning this array -- see the guard in `io`. Declared before the arrays it sizes.
   static constexpr unsigned kMaxPeriodsPerCallback = 16;
+  /// The IOProc's own copy targets, one per period a callback can carry, so the callback allocates
+  /// nothing. **One per period rather than one shared**, because a callback carrying two periods pops
+  /// two and the fill below writes the whole device buffer from them: a single vector left the first
+  /// half of every device buffer holding the second period's audio. That was a real defect here --
+  /// this machine's probe sees 512 frames while the stream's own IOProc is handed 1024, so every
+  /// other half-buffer was a repeat of the one before it.
+  std::vector<float> period_scratch[kMaxPeriodsPerCallback];
   /// Whether each period of the current callback came from the ring. Sized by the constant above.
   bool playback_fresh[kMaxPeriodsPerCallback] = {};
 #if defined(NAMCHAIN_COREAUDIO_CAPTURE)
@@ -401,6 +421,17 @@ struct CoreAudioBackend::Implementation
     lost.store(true, std::memory_order_release);
   }
 
+  /// The one-callback-too-big refusal, which is not the same failure as a callback that is not a
+  /// whole number of periods and must not be reported as if it were.
+  void mark_lost_periods(unsigned frames, unsigned period)
+  {
+    std::snprintf(lost_reason, sizeof(lost_reason),
+                  "the CoreAudio device handed over %u frames at once, which is more than the %u periods of %u "
+                  "this backend carries",
+                  frames, kMaxPeriodsPerCallback, period);
+    lost.store(true, std::memory_order_release);
+  }
+
   /// The device going away is the one failure that cannot be noticed by looking at a buffer: the
   /// HAL simply stops calling, and the engine would sit in `wait_capture` until its timeout and then
   /// call the device lost anyway. This listener makes the state visible immediately, and it is what
@@ -437,7 +468,8 @@ struct CoreAudioBackend::Implementation
     if (frames == 0 || period == 0 || (frames % period) != 0)
     {
       // A callback that is not a whole number of periods cannot be divided without inventing an
-      // offset. Zero the output, record why once, and let the engine's next call report it.
+      // offset. Silence it, record why once, and let the engine's next call report it.
+      zero_output(output);
       mark_lost_rt("asked for", frames, period);
       return;
     }
@@ -448,14 +480,16 @@ struct CoreAudioBackend::Implementation
     const unsigned periods = frames / period;
     if (periods > kMaxPeriodsPerCallback)
     {
-      mark_lost_rt("asked for", frames, period);
+      zero_output(output);
+      mark_lost_periods(frames, period);
       return;
     }
     // One pop per period, before the fill: the fill above must not branch on the ring, and a period
-    // that did not arrive is a period of silence and one underrun.
+    // that did not arrive is a period of silence and one underrun. Each period is popped into its own
+    // scratch, because the fill below needs all of them, not just the last.
     for (unsigned p = 0; p < periods; ++p)
     {
-      playback_fresh[p] = playback->pop(period_scratch);
+      playback_fresh[p] = playback->pop(period_scratch[p]);
       if (!playback_fresh[p])
         playback_underruns.fetch_add(1, std::memory_order_relaxed);
     }
@@ -487,8 +521,11 @@ struct CoreAudioBackend::Implementation
     {
       const unsigned period_index = f / period;          // which period of this callback
       const unsigned frame_in_period = f % period;
-      if (!playback_fresh[period_index])
-        continue;                                        // left zeroed: this period did not arrive
+      // A period that did not arrive is **silence, written rather than skipped**: the HAL hands the
+      // same buffer back to the next callback, so leaving it alone plays whatever was in it last time
+      // round. The comment here used to say the frame was "left zeroed" while nothing zeroed it.
+      const bool fresh = playback_fresh[period_index];
+      const std::vector<float>& source = period_scratch[period_index];
 
       // The channel loop must run once per **device channel**, not once per buffer: an interleaved
       // device has one buffer holding both channels, so `b < mNumberBuffers` visits one channel and
@@ -504,7 +541,7 @@ struct CoreAudioBackend::Implementation
         const unsigned last = std::min(engine_last_channel.load(std::memory_order_relaxed), engine_channels - 1);
         const unsigned source_channel = std::min(c, last);
         const float value =
-          period_scratch[static_cast<std::size_t>(source_channel) * period + frame_in_period];
+          fresh ? source[static_cast<std::size_t>(source_channel) * period + frame_in_period] : 0.0f;
 
         const UInt32 buffer = interleaved ? 0u : c;
         if (buffer >= output->mNumberBuffers)
@@ -574,10 +611,6 @@ struct CoreAudioBackend::Implementation
 #if defined(NAMCHAIN_COREAUDIO_CAPTURE)
   /// What the device was sent, when something asked for it. Empty (and unused) otherwise.
   DeviceRecorder recorder;
-  /// Whether `--capture-device-path` was given but this build cannot honour it: refused by name in
-  /// `create`, the same as any other thing a build does not have.
-  bool capture_requested = false;
-  bool capture_supported = true;
 #endif
 
   /// Periods the device has handed over that the engine has not read yet. The engine's loop is one
@@ -793,9 +826,11 @@ std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& conf
   const unsigned capacity = impl.config.output_queue_periods == 0 ? 8 : impl.config.output_queue_periods;
   impl.playback.reset(new SpscRing<std::vector<float>>(capacity));
   impl.capture.reset(new SpscRing<std::vector<float>>(2));
-  // Zero means "no cap beyond the ring", matching what the field means everywhere else. Otherwise the
-  // requested number is the cap, rounded up by the ring's power-of-two capacity.
-  impl.queue_periods = impl.config.output_queue_periods;
+  // Zero means "no cap beyond the ring", matching what the field means everywhere else. What is
+  // reported is the ring's own capacity rather than the request, because the ring rounds it up to a
+  // power of two and `info.output_queue_periods` is documented as the number that refuses: reporting
+  // the configuration here would state a bound the ring does not have.
+  impl.queue_periods = static_cast<unsigned>(impl.playback->capacity());
   impl.info.output_queue_periods = impl.queue_periods;
   impl.info.output_queue_floor_periods = 0;
   // Sized from the *device's* period, which is the number of frames the IOProc is handed and the
@@ -806,7 +841,8 @@ std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& conf
   for (auto& slice : impl.recorder_slice)
     slice.assign(static_cast<std::size_t>(impl.info.period_size), 0.0f);
 #endif
-  impl.period_scratch.assign(static_cast<std::size_t>(impl.info.period_size) * impl.playback_channels, 0.0f);
+  for (auto& scratch : impl.period_scratch)
+    scratch.assign(static_cast<std::size_t>(impl.info.period_size) * impl.playback_channels, 0.0f);
   impl.playback_planar.assign(static_cast<std::size_t>(impl.info.period_size) * impl.playback_channels, 0.0f);
 
   // 9. The IOProc. A dispatch queue of our own rather than the HAL's IO thread: the callback does not

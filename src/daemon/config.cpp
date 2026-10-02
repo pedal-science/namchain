@@ -262,6 +262,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
 
   if (!read_string(doc, "device", config.device, path, error) ||
       !read_string(doc, "capture_path", config.capture_path, path, error) ||
+      !read_string(doc, "capture_device_path", config.capture_device_path, path, error) ||
       !read_string(doc, "playback_path", config.playback_path, path, error) ||
       !read_string(doc, "rig", config.rig, path, error) ||
       !read_string(doc, "rigs_root", config.rigs_root, path, error) ||
