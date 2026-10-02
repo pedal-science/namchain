@@ -237,7 +237,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
                                       "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
                                       "tcp_auth_timeout_ms", "models_root", "irs_root", "record_dir",
-                                      "capture_device_path"};
+                                      "capture_device_path", "input_device"};
   for (const auto& [key, value] : doc.items())
   {
     bool known = false;
@@ -263,6 +263,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
   if (!read_string(doc, "device", config.device, path, error) ||
       !read_string(doc, "capture_path", config.capture_path, path, error) ||
       !read_string(doc, "capture_device_path", config.capture_device_path, path, error) ||
+      !read_string(doc, "input_device", config.input_device, path, error) ||
       !read_string(doc, "playback_path", config.playback_path, path, error) ||
       !read_string(doc, "rig", config.rig, path, error) ||
       !read_string(doc, "rigs_root", config.rigs_root, path, error) ||
@@ -348,6 +349,11 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
   if (name == "capture-path")
   {
     config.capture_path = value;
+    return true;
+  }
+  if (name == "input-device")
+  {
+    config.input_device = value;
     return true;
   }
   if (name == "capture-device-path")

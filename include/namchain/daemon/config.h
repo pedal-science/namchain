@@ -37,6 +37,17 @@ struct Config
   /// chain, its channel binding and its summing included -- rather than something only the soak tool
   /// could do, and it is how the multi-chain channel tests assert where each chain's audio landed.
   std::string capture_path;
+  /// \brief The device to capture from, where the backend takes one: a CoreAudio input device UID.
+  ///
+  /// The alternative to \ref capture_path rather than a companion to it, and the two together are
+  /// refused by name rather than one silently winning. Empty means "take the capture from
+  /// capture_path", which is what `file` and `pipe` always do. Only `coreaudio` reads it.
+  ///
+  /// This is what makes a rig audible through a real interface on a Mac: the input is the interface's
+  /// own, not a file. It is also the one thing here that makes macOS ask for microphone permission,
+  /// which is a decision for whatever spawns this process and therefore belongs to a flag rather than
+  /// to a default.
+  std::string input_device;
   std::string playback_path;
   /// \brief Where `coreaudio` writes what it is sending the device, or empty for nowhere.
   ///

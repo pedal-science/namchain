@@ -41,8 +41,9 @@ cp build/generated/two-chains.json /tmp/nc/rigs/
 threads, the plan publication and the socket work before a device is in the picture. The default
 backend is `alsa_raw`.
 
-`--backend coreaudio` is the macOS device backend: a WAV looped in and the engine's output to a
-CoreAudio output device, in one process. §"The CoreAudio backend" below has what it promises.
+`--backend coreaudio` is the macOS device backend: the engine's output to a CoreAudio output device
+and its capture from a live CoreAudio input device or a WAV on a loop, in one process.
+§"The CoreAudio backend" below has what it promises.
 
 `--backend file` renders a document offline, start to finish, with the same engine, the same channel
 binding and the same summing as the device path — `--capture-path in.wav --playback-path out.wav`,
@@ -64,13 +65,14 @@ silently ignored.
 | field | default | meaning |
 |---|---|---|
 | `backend` | `alsa_raw` | `alsa_raw`, `coreaudio`, `null`, `file`, `pipe`, or `pipewire` (refused by name) |
-| `device` | *(empty)* | the device to open. On Linux an ALSA spec: `hw:CARD=<id>[,DEV=<d>]`, `hw:<id>,<d>`, `hw:4,0`, `4,0`, or a `/dev/snd` path — prefer an id (the names in `/proc/asound`, e.g. `II` for the SSL 2+ Mk II), because card numbers follow probe order and change across reboots. On macOS a CoreAudio device **UID**, empty asking for the system's default output device |
+| `device` | *(empty)* | the device to open. On Linux an ALSA spec: `hw:CARD=<id>[,DEV=<d>]`, `hw:<id>,<d>`, `hw:4,0`, `4,0`, or a `/dev/snd` path — prefer an id (the names in `/proc/asound`, e.g. `II` for the SSL 2+ Mk II), because card numbers follow probe order and change across reboots. On macOS the **output** CoreAudio device **UID**, empty asking for the system's default output device |
 | `sample_rate` | `48000` | |
 | `period_size` | `64` | quantum in frames. On `coreaudio` it is a **ceiling**, not a request: see "The CoreAudio backend" below |
 | `periods` | `4` | device buffer length in periods |
-| `capture_channels` | `1` | requested; the daemon decodes the channel each chain names |
+| `capture_channels` | `1` | requested; the daemon decodes the channel each chain names. On `coreaudio` with `input_device` this is the width of the capture bus, and the device must offer at least this many input channels |
 | `playback_channels` | `1` | requested; each chain writes the channel it names, and the rest is zeroed |
-| `capture_path` | *(empty)* | `file`, `pipe` and `coreaudio`: the WAV read as input. `pipe` and `coreaudio` loop it |
+| `capture_path` | *(empty)* | `file`, `pipe` and `coreaudio`: the WAV read as input. `pipe` and `coreaudio` loop it. On `coreaudio` it is the alternative to `input_device`, and giving both is refused |
+| `input_device` | *(empty)* | `coreaudio` only: a CoreAudio input device **UID** to capture from live. Empty means the capture comes from `capture_path`. Reading a device is what makes macOS ask for microphone permission, so this happens only when the key is set |
 | `playback_path` | *(empty)* | `file`: the output WAV, written when the input runs out. `pipe`: the FIFO the output is streamed to |
 | `rig` | *(empty)* | startup rig; empty starts silent and waits for `rig.load` |
 | `rigs_root` | `/etc/namchain/rigs` | the directory a `rig.load` **name** resolves under |
@@ -106,12 +108,12 @@ reported with both numbers.
 
 ### The CoreAudio backend
 
-`--backend coreaudio` is the other half of `pipe`, for a Mac with no interface attached: it loops
-`--capture-path` and plays the engine's output through `--device` (a CoreAudio UID, or the default
-output device when empty) — **in one process**, with no FIFO and no external player. The engine's
-render plan is unchanged: the device's IOProc produces capture periods into a lock-free ring and
-drains processed periods from another, so the render thread keeps its `wait_capture → read → DSP →
-write` loop.
+`--backend coreaudio` is the other half of `pipe`, for a Mac with no board attached: it plays the
+engine's output through `--device` (a CoreAudio UID, or the default output device when empty) and
+takes its capture from `--input-device` (a live CoreAudio input) or `--capture-path` (a WAV on a
+loop) — **in one process**, with no FIFO and no external player. The engine's render plan is
+unchanged: the device's IOProc produces capture periods into a lock-free ring and drains processed
+periods from another, so the render thread keeps its `wait_capture → read → DSP → write` loop.
 
 What is worth knowing before quoting a number from it:
 
@@ -178,9 +180,37 @@ What is worth knowing before quoting a number from it:
 - **Block times measured here include the device's buffer**, so a 1024-frame period means a ~21 ms
   block even when the engine's work is a fraction of it. Compare against `file` when the question is
   the engine's own cost.
-- **Capture is a file, never an input device.** The system's default input would need microphone
-  permission, which is a decision for whatever spawns this process rather than a side effect of
-  asking for a monitoring backend.
+- **Capture is a live input device or a file, in that order of preference, and they are alternatives.**
+  `--input-device UID` captures from a CoreAudio input device: a guitar through an interface on the
+  Mac, with no board and no fifth process. `--capture-path FILE` loops a WAV instead, for a machine
+  with no interface attached. Giving both is refused by name, and so is giving neither, because one of
+  them silently winning (or an engine running on silence for ever) is not something the sound would
+  tell you. **The permission is the reason this is a flag and not a default**: opening an input device
+  is what makes macOS ask for microphone access, the grant belongs to the process that *spawns* this
+  one, and a monitoring backend that asked for the microphone because somebody wanted to hear a WAV
+  would be asking on the wrong authority. Whoever spawns `namchaind` therefore needs
+  `NSMicrophoneUsageDescription` and — under the hardened runtime — the
+  `com.apple.security.device.audio-input` entitlement, and the prompt appears on first use. A refused
+  microphone is **silence**, not an error: the HAL hands zeros, which is why `engine.status` cannot
+  say whether the room was quiet or the permission was never granted. When the input and the output
+  are *different* devices the backend makes a **private aggregate** of the two — see below.
+- **Two devices have two clocks, and the answer is an aggregate.** `--input-device` and `--device`
+  naming different HAL devices would mean two independent clocks with no resampler anywhere in this
+  engine: at an ordinary 100 ppm that is a period dropped or inserted every couple of minutes, counted
+  as an xrun and indistinguishable from the engine being late. So the backend asks the HAL for a
+  private aggregate device instead: one clock (the **output**, because the plan is compiled for its
+  period and its callback paces the engine) with the input drift-compensated, which is the HAL
+  resampling it to follow. Private, so it never appears in Audio MIDI Setup, and destroyed when the
+  daemon closes the device. When one device serves both directions — the common case for an interface
+  — no aggregate is made at all. `engine.status.backend_diagnostics` says which happened
+  (`live_input`, `aggregate_device`, `device_period_frames`).
+- **A UID is matched by reading every device's UID, not by `kAudioHardwarePropertyTranslateUIDToDevice`.**
+  That property is the documented way and it refuses every size this code can offer it on macOS 27
+  (`kAudioHardwareBadPropertySizeError`, `!siz`), including the size of `AudioValueTranslation`
+  itself. Nothing noticed for a while because everything opened the *default* output device — an empty
+  UID — and the one refusal test passes a deliberately bogus UID, which fails the same way a working
+  call refuses a bad string. Live input is what made it visible, because there is no "default input"
+  to fall back on.
 - **A device that dies or is unplugged is a device loss**, exactly as it is on ALSA: the daemon
   closes it, reports `lost`, and reopens on its `device_retry_ms` backoff. A change to the *default*
   output device while running does not migrate the stream — the opened device is the one being

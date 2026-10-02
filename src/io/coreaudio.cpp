@@ -21,6 +21,7 @@
   #include <cstring>
   #include <string>
   #include <thread>
+  #include <unistd.h>
   #include <vector>
 
   #include "namchain/io/loop_source.h"
@@ -108,6 +109,276 @@ void zero_output(AudioBufferList* output)
     if (output->mBuffers[b].mData != nullptr)
       std::memset(output->mBuffers[b].mData, 0, output->mBuffers[b].mDataByteSize);
   }
+}
+
+/// The same address with an explicit scope. Only the capture side needs one: a device with both
+/// directions has an input format and an input latency that are not the output's, and asking at
+/// global scope gives whichever of the two the HAL decides to answer with.
+constexpr AudioObjectPropertyAddress scoped_address(AudioObjectPropertySelector selector,
+                                                    AudioObjectPropertyScope scope)
+{
+  return {selector, scope, kAudioObjectPropertyElementMain};
+}
+
+/// \brief A device's UID, or an empty string.
+///
+/// Needed because an aggregate device is built out of **UIDs** and the operator may have named
+/// neither device -- an empty UID means "the system's default", and the aggregate cannot be told
+/// "whatever the default is": it wants the string.
+std::string device_uid(AudioObjectID device)
+{
+  CFStringRef uid = nullptr;
+  const AudioObjectPropertyAddress address = global_address(kAudioDevicePropertyDeviceUID);
+  UInt32 size = sizeof(uid);
+  if (!ca_ok(AudioObjectGetPropertyData(device, &address, 0, nullptr, &size, &uid)) || uid == nullptr)
+    return {};
+  char buffer[256] = {0};
+  const bool converted = CFStringGetCString(uid, buffer, sizeof(buffer), kCFStringEncodingUTF8);
+  CFRelease(uid);
+  return converted ? std::string(buffer) : std::string();
+}
+
+/// \brief The device a UID names, or kAudioObjectUnknown with \p error set.
+///
+/// Matched by reading every device's `kAudioDevicePropertyDeviceUID`, **not** through
+/// `kAudioHardwarePropertyTranslateUIDToDevice`. That property is the documented way to do this and
+/// it does not work here: on macOS 27 it refuses every size this code can offer it with
+/// `kAudioHardwareBadPropertySizeError` (`!siz`), including the size of `AudioValueTranslation`
+/// itself, which is 32 bytes in this SDK. Nothing in the parked work noticed, because the parked
+/// work only ever opened the *default* device -- an empty UID -- and the one refusal test passes a
+/// deliberately bogus UID, which fails the same way a working call would refuse a bad string. It was
+/// found the first time a real UID was given, which is what live input requires.
+///
+/// Enumerating costs a handful of property reads once, at open time, and it reads the very string it
+/// compares against, so the two cannot disagree about what a device's UID is.
+AudioObjectID device_for_uid(const std::string& uid, std::string& error)
+{
+  AudioObjectPropertyAddress address = global_address(kAudioHardwarePropertyDevices);
+  UInt32 size = 0;
+  if (!ca_ok(AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &address, 0, nullptr, &size)) ||
+      size < sizeof(AudioObjectID))
+  {
+    error = "the CoreAudio device list could not be read";
+    return kAudioObjectUnknown;
+  }
+  std::vector<AudioObjectID> devices(size / sizeof(AudioObjectID));
+  if (!ca_ok(AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, nullptr, &size, devices.data())))
+  {
+    error = "the CoreAudio device list could not be read";
+    return kAudioObjectUnknown;
+  }
+  for (AudioObjectID device : devices)
+  {
+    if (device_uid(device) == uid)
+      return device;
+  }
+  error = "no CoreAudio device with UID '" + uid + "'";
+  return kAudioObjectUnknown;
+}
+
+/// A system default device, named in the error so a caller can say which direction is missing.
+AudioObjectID default_device(AudioObjectPropertySelector selector, const char* direction, std::string& error)
+{
+  AudioObjectID device = kAudioObjectUnknown;
+  if (!get_property(kAudioObjectSystemObject, global_address(selector), device) ||
+      device == kAudioObjectUnknown)
+  {
+    error = std::string("there is no default CoreAudio ") + direction + " device";
+    return kAudioObjectUnknown;
+  }
+  return device;
+}
+
+/// \brief How many channels a device's input scope presents, or 0 when it has none.
+///
+/// `kAudioDevicePropertyStreamConfiguration` rather than the stream format: the format describes one
+/// stream, and a device is free to present several (an interface with two stereo pairs is four
+/// channels in two two-channel buffers). The sum over the buffers is the number a chain's
+/// `input_channel` is an index into.
+unsigned input_channel_count(AudioObjectID device)
+{
+  const AudioObjectPropertyAddress address =
+    scoped_address(kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeInput);
+  UInt32 size = 0;
+  if (!ca_ok(AudioObjectGetPropertyDataSize(device, &address, 0, nullptr, &size)) ||
+      size < sizeof(AudioBufferList))
+    return 0;
+  std::vector<unsigned char> storage(size);
+  AudioBufferList* list = reinterpret_cast<AudioBufferList*>(storage.data());
+  if (!ca_ok(AudioObjectGetPropertyData(device, &address, 0, nullptr, &size, list)))
+    return 0;
+  unsigned channels = 0;
+  for (UInt32 b = 0; b < list->mNumberBuffers; ++b)
+    channels += list->mBuffers[b].mNumberChannels;
+  return channels;
+}
+
+/// \brief The CFString keys an aggregate device's description is built from.
+///
+/// The SDK's `kAudioAggregateDevice*Key` names are **C string literals**
+/// (`#define kAudioAggregateDeviceNameKey "name"`), not CFStrings, so each one has to be turned into a
+/// CFString before it can key a CFDictionary. Passing the constants straight in is what crashed the
+/// first aggregate this backend made: `CFDictionarySetValue` retained a `char *` and sent an
+/// Objective-C message to a string. Owning them here is also what makes the releases at the end
+/// impossible to forget.
+struct AggregateKeys
+{
+  CFStringRef name = nullptr;
+  CFStringRef uid = nullptr;
+  CFStringRef is_private = nullptr;
+  CFStringRef is_stacked = nullptr;
+  CFStringRef main_sub_device = nullptr;
+  CFStringRef sub_device_list = nullptr;
+  CFStringRef sub_device_uid = nullptr;
+  CFStringRef drift_compensation = nullptr;
+
+  static CFStringRef make(const char* text)
+  {
+    return CFStringCreateWithCString(kCFAllocatorDefault, text, kCFStringEncodingUTF8);
+  }
+
+  bool make_all()
+  {
+    name = make(kAudioAggregateDeviceNameKey);
+    uid = make(kAudioAggregateDeviceUIDKey);
+    is_private = make(kAudioAggregateDeviceIsPrivateKey);
+    is_stacked = make(kAudioAggregateDeviceIsStackedKey);
+    main_sub_device = make(kAudioAggregateDeviceMainSubDeviceKey);
+    sub_device_list = make(kAudioAggregateDeviceSubDeviceListKey);
+    sub_device_uid = make(kAudioSubDeviceUIDKey);
+    drift_compensation = make(kAudioSubDeviceDriftCompensationKey);
+    return name != nullptr && uid != nullptr && is_private != nullptr && is_stacked != nullptr &&
+           main_sub_device != nullptr && sub_device_list != nullptr && sub_device_uid != nullptr &&
+           drift_compensation != nullptr;
+  }
+
+  void release_all()
+  {
+    for (CFStringRef* key : {&name, &uid, &is_private, &is_stacked, &main_sub_device, &sub_device_list,
+                             &sub_device_uid, &drift_compensation})
+    {
+      if (*key != nullptr)
+        CFRelease(*key);
+      *key = nullptr;
+    }
+  }
+};
+
+/// \brief A private aggregate device whose clock master is \p master and whose other member is
+///        \p follower, or kAudioObjectUnknown with \p error set.
+///
+/// This is the answer to "the input and the output are different devices". Two devices have two
+/// clocks, this engine has no resampler, and running one IOProc on each would therefore drift: at a
+/// hundred parts per million -- ordinary for two nominally-48 kHz devices -- that is a period dropped
+/// or inserted every couple of minutes, counted as an xrun and indistinguishable from the engine
+/// being late. An aggregate device is the HAL's own answer: one clock, the master's, with the other
+/// member drift-compensated, which means resampled by the HAL to follow it. That is exactly the code
+/// this project does not have and does not want.
+///
+/// The **output** is the master, for the same reason the output is the clock everywhere else in this
+/// backend: the engine's plan is compiled for the output device's period and the output's callback is
+/// what `wait_capture` is paced by. The input is the member that gets resampled, which is the cheaper
+/// mistake -- a few parts per million of pitch on a guitar rather than on what the player hears.
+///
+/// The aggregate is **private**: the HAL keeps it out of Audio MIDI Setup, and it belongs to this
+/// process, so it is destroyed in `stop()` rather than left behind on somebody's machine.
+AudioObjectID make_aggregate(AudioObjectID master, AudioObjectID follower, std::string& error)
+{
+  const std::string master_uid = device_uid(master);
+  const std::string follower_uid = device_uid(follower);
+  if (master_uid.empty() || follower_uid.empty())
+  {
+    error = "one of the two CoreAudio devices has no UID, so an aggregate device cannot name it";
+    return kAudioObjectUnknown;
+  }
+
+  // The aggregate needs a UID of its own, unique among the live ones. The process id and a counter
+  // are enough: it is private to this process and goes away with it.
+  static std::atomic<unsigned> counter{0};
+  const std::string aggregate_uid = "cc.hemsley.namchain.aggregate." +
+                                    std::to_string(static_cast<long long>(::getpid())) + "." +
+                                    std::to_string(counter.fetch_add(1, std::memory_order_relaxed));
+
+  AggregateKeys keys;
+  if (!keys.make_all())
+  {
+    keys.release_all();
+    error = "could not build the aggregate device's keys";
+    return kAudioObjectUnknown;
+  }
+
+  CFStringRef master_string =
+    CFStringCreateWithCString(kCFAllocatorDefault, master_uid.c_str(), kCFStringEncodingUTF8);
+  CFStringRef follower_string =
+    CFStringCreateWithCString(kCFAllocatorDefault, follower_uid.c_str(), kCFStringEncodingUTF8);
+  CFStringRef aggregate_string =
+    CFStringCreateWithCString(kCFAllocatorDefault, aggregate_uid.c_str(), kCFStringEncodingUTF8);
+  CFMutableDictionaryRef description =
+    CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  CFMutableArrayRef subdevices = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+  CFMutableDictionaryRef master_entry =
+    CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  CFMutableDictionaryRef follower_entry =
+    CFDictionaryCreateMutable(kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  if (master_string == nullptr || follower_string == nullptr || aggregate_string == nullptr ||
+      description == nullptr || subdevices == nullptr || master_entry == nullptr || follower_entry == nullptr)
+  {
+    if (master_string != nullptr)
+      CFRelease(master_string);
+    if (follower_string != nullptr)
+      CFRelease(follower_string);
+    if (aggregate_string != nullptr)
+      CFRelease(aggregate_string);
+    if (description != nullptr)
+      CFRelease(description);
+    if (subdevices != nullptr)
+      CFRelease(subdevices);
+    if (master_entry != nullptr)
+      CFRelease(master_entry);
+    if (follower_entry != nullptr)
+      CFRelease(follower_entry);
+    keys.release_all();
+    error = "could not build the aggregate device's description";
+    return kAudioObjectUnknown;
+  }
+
+  CFDictionarySetValue(description, keys.name, CFSTR("namchain (private)"));
+  CFDictionarySetValue(description, keys.uid, aggregate_string);
+  CFDictionarySetValue(description, keys.is_private, kCFBooleanTrue);
+  CFDictionarySetValue(description, keys.is_stacked, kCFBooleanFalse);
+  // Named as well as ordered first: "the master is the first sub-device" is the documented rule, and
+  // saying which one it is costs nothing and survives a reordering.
+  CFDictionarySetValue(description, keys.main_sub_device, master_string);
+
+  CFDictionarySetValue(master_entry, keys.sub_device_uid, master_string);
+  CFDictionarySetValue(master_entry, keys.drift_compensation, kCFBooleanFalse);
+  CFDictionarySetValue(follower_entry, keys.sub_device_uid, follower_string);
+  CFDictionarySetValue(follower_entry, keys.drift_compensation, kCFBooleanTrue);
+  CFArrayAppendValue(subdevices, master_entry);
+  CFArrayAppendValue(subdevices, follower_entry);
+  CFDictionarySetValue(description, keys.sub_device_list, subdevices);
+
+  AudioObjectID aggregate = kAudioObjectUnknown;
+  const OSStatus status = AudioHardwareCreateAggregateDevice(description, &aggregate);
+
+  // Released here: the HAL has copied what it needs, and from now on the aggregate is addressed by
+  // its object id (and destroyed by it).
+  CFRelease(master_entry);
+  CFRelease(follower_entry);
+  CFRelease(subdevices);
+  CFRelease(description);
+  CFRelease(master_string);
+  CFRelease(follower_string);
+  CFRelease(aggregate_string);
+  keys.release_all();
+
+  if (!ca_ok(status) || aggregate == kAudioObjectUnknown)
+  {
+    error = "could not make a private aggregate device of the output and input devices: " +
+            os_status_text(status);
+    return kAudioObjectUnknown;
+  }
+  return aggregate;
 }
 
 /// \brief How many frames this device hands the IOProc, measured rather than asked for.
@@ -325,10 +596,26 @@ struct CoreAudioBackend::Implementation
   BackendInfo info;
   LoopSource loop;
 
+  /// The stream's device: the one the output goes to, or the private aggregate when the input and
+  /// the output are different devices. The IOProc and the unplug listener belong to it.
   AudioObjectID device = kAudioObjectUnknown;
+  /// The private aggregate this backend made, and must destroy. kAudioObjectUnknown when the input
+  /// and output are one device -- the common case, and the one that needs no HAL object at all.
+  AudioObjectID aggregate = kAudioObjectUnknown;
+  /// \brief Whether the capture comes from a device rather than from `loop`.
+  ///
+  /// The one branch in the callback that matters: it decides whether the capture side reads the
+  /// device's own buffers or the file. It is fixed at open time and never changes for the life of the
+  /// backend.
+  bool live_input = false;
   AudioDeviceIOProcID io_proc = nullptr;
   dispatch_queue_t queue = nullptr;
   bool started = false;
+
+  /// The two devices as the operator named them, for `info` and for the error messages: the
+  /// aggregate's own name ("namchain (private)") names neither of them.
+  std::string input_device_name;
+  std::string output_device_name;
 
   /// One captured period, preallocated. Filled by the IOProc and pushed to the ring as a whole.
   std::vector<float> capture_scratch;
@@ -347,6 +634,23 @@ struct CoreAudioBackend::Implementation
   /// The most periods one callback can carry. A device asking for more is refused rather than
   /// overrunning this array -- see the guard in `io`. Declared before the arrays it sizes.
   static constexpr unsigned kMaxPeriodsPerCallback = 16;
+  /// The most capture channels this backend carries. A device with more is asked for the first this
+  /// many; the engine's own bus is far narrower (a document is at most eight chains).
+  static constexpr unsigned kMaxCaptureChannels = 32;
+
+  /// \brief Where one of the device's input channels is in the callback's buffer list.
+  ///
+  /// A device may present one interleaved buffer of N channels, N buffers of one channel, or -- an
+  /// interface with two stereo pairs -- two buffers of two. Flattening that here, once per callback,
+  /// is what lets the copy below index "capture channel c" without caring which of the three the
+  /// device chose.
+  struct ChannelSource
+  {
+    const float* data = nullptr;
+    unsigned stride = 1;  ///< Floats between consecutive frames of this channel.
+    unsigned offset = 0;  ///< Floats from the start of a frame to this channel.
+  };
+  ChannelSource capture_source[kMaxCaptureChannels] = {};
   /// The IOProc's own copy targets, one per period a callback can carry, so the callback allocates
   /// nothing. **One per period rather than one shared**, because a callback carrying two periods pops
   /// two and the fill below writes the whole device buffer from them: a single vector left the first
@@ -432,6 +736,28 @@ struct CoreAudioBackend::Implementation
     lost.store(true, std::memory_order_release);
   }
 
+  /// The input direction's version of the same two failures. Kept apart from the output's because the
+  /// fix for each is different and a message that does not say which side failed sends the reader to
+  /// the wrong device.
+  void mark_lost_input_frames(unsigned got, unsigned expected)
+  {
+    std::snprintf(lost_reason, sizeof(lost_reason),
+                  "the CoreAudio input device handed over %u frames, and the engine's period is %u",
+                  got, expected);
+    lost.store(true, std::memory_order_release);
+  }
+
+  /// No input buffers at all: the IOProc was created without the input streams, or the device has
+  /// stopped presenting them. **A refused microphone is not this** -- macOS hands silence rather than
+  /// nothing, so a Mac that has not granted permission records silence and this message would be a
+  /// lie; docs/daemon.md says what the spawner has to arrange.
+  void mark_lost_no_input()
+  {
+    std::snprintf(lost_reason, sizeof(lost_reason),
+                  "the CoreAudio device handed the callback no input buffers, so there is nothing to capture");
+    lost.store(true, std::memory_order_release);
+  }
+
   /// The device going away is the one failure that cannot be noticed by looking at a buffer: the
   /// HAL simply stops calling, and the engine would sit in `wait_capture` until its timeout and then
   /// call the device lost anyway. This listener makes the state visible immediately, and it is what
@@ -457,7 +783,7 @@ struct CoreAudioBackend::Implementation
   /// Both directions are quantised to the engine's period, and over a second the frame count the
   /// device consumes and the frame count the engine produces are the same number -- which is the only
   /// property that matters, and the one a frame-count equality check here was getting wrong.
-  void io(const AudioTimeStamp* /*now*/, const AudioBufferList* /*input*/, const AudioTimeStamp* /*input_time*/,
+  void io(const AudioTimeStamp* /*now*/, const AudioBufferList* input, const AudioTimeStamp* /*input_time*/,
           AudioBufferList* output, const AudioTimeStamp* /*output_time*/)
   {
     const unsigned channels = output->mNumberBuffers > 0 ? output->mBuffers[0].mNumberChannels : 0;
@@ -586,26 +912,109 @@ struct CoreAudioBackend::Implementation
       }
     }
 #endif
-    // And the same number of periods back in. Each one is read from the loop and pushed, so the
-    // engine's `read_capture` finds exactly what it was credited for.
+    // And the same number of periods back in. Each one comes from the device when the capture is
+    // live and from the loop when it is not, and each is pushed as a whole, so the engine's
+    // `read_capture` finds exactly what it was credited for.
+    if (live_input)
+    {
+      capture_from_input(input, frames, periods);
+    }
+    else
+    {
+      for (unsigned p = 0; p < periods; ++p)
+      {
+        loop.read(capture_scratch.data(), period);
+        if (capture->push(capture_scratch))
+        {
+          capture_credits.fetch_add(1, std::memory_order_release);
+        }
+        else
+        {
+          // The engine had not read the last two periods yet. Dropping is the only real-time-safe
+          // answer, and `capture_overruns` is the honest name for it -- it is the engine being late,
+          // not the device.
+          capture_overruns.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
+    // One wake per callback, not one per period: the engine spends credits itself, and a second
+    // signal would leave a token in the semaphore with nothing behind it. Signalled even when the
+    // capture side has just marked the device lost, so the engine sees that now rather than after
+    // its own timeout.
+    dispatch_semaphore_signal(capture_ready);
+  }
+
+  /// \brief One callback's worth of a live input device's capture, into the ring.
+  ///
+  /// The device's *input* layout is decided the same way its output layout is, and for the same
+  /// reason: a device may present one interleaved buffer holding every channel, or one buffer per
+  /// channel, and assuming the wrong one reads every sample twice. That mistake was made here once --
+  /// a 1 kHz tone came out as 500 Hz with every value repeated -- and it was in the measurement, not
+  /// in the engine.
+  void capture_from_input(const AudioBufferList* input, unsigned frames, unsigned periods)
+  {
+    if (input == nullptr || input->mNumberBuffers == 0)
+    {
+      mark_lost_no_input();
+      return;
+    }
+
+    // The engine's period and the device's callback are the same length here -- one IOProc is handed
+    // one list covering both directions, on one device or on an aggregate -- but a short input buffer
+    // would be read past its end below, so it is checked rather than assumed.
+    const UInt32 first_channels = input->mBuffers[0].mNumberChannels;
+    const unsigned input_frames = static_cast<unsigned>(
+      input->mBuffers[0].mDataByteSize / (sizeof(float) * (first_channels == 0 ? 1 : first_channels)));
+    if (input_frames < frames)
+    {
+      mark_lost_input_frames(input_frames, frames);
+      return;
+    }
+
+    // Flatten the list once: engine channel `c` is `data[frame * stride + offset]`, whatever the
+    // device's buffer layout is.
+    const unsigned capture_channels = info.capture_channels;
+    unsigned flat = 0;
+    for (UInt32 b = 0; b < input->mNumberBuffers && flat < capture_channels; ++b)
+    {
+      const unsigned in_buffer = std::max(1u, input->mBuffers[b].mNumberChannels);
+      const float* data = static_cast<const float*>(input->mBuffers[b].mData);
+      for (unsigned k = 0; k < in_buffer && flat < capture_channels; ++k, ++flat)
+      {
+        capture_source[flat].data = data;
+        capture_source[flat].stride = in_buffer;
+        capture_source[flat].offset = k;
+      }
+    }
+    // Fewer channels in the list than the engine's bus. `create` checked the device's *stream
+    // configuration* against the bus width, so this is the callback disagreeing with the property:
+    // silence for the rest rather than reading past the list.
+    for (unsigned c = flat; c < capture_channels; ++c)
+      capture_source[c] = ChannelSource{};
+
     for (unsigned p = 0; p < periods; ++p)
     {
-      loop.read(capture_scratch.data(), period);
+      for (unsigned i = 0; i < info.period_size; ++i)
+      {
+        const unsigned frame = p * info.period_size + i;
+        for (unsigned c = 0; c < capture_channels; ++c)
+        {
+          const ChannelSource& source = capture_source[c];
+          const float value =
+            source.data == nullptr ? 0.0f : source.data[static_cast<std::size_t>(frame) * source.stride + source.offset];
+          capture_scratch[static_cast<std::size_t>(i) * capture_channels + c] = value;
+        }
+      }
       if (capture->push(capture_scratch))
       {
         capture_credits.fetch_add(1, std::memory_order_release);
       }
       else
       {
-        // The engine had not read the last two periods yet. Dropping is the only real-time-safe
-        // answer, and `capture_overruns` is the honest name for it -- it is the engine being late,
-        // not the device.
+        // The same answer as the loop case: the engine had not read the last two periods yet.
         capture_overruns.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    // One wake per callback, not one per period: the engine spends credits itself, and a second
-    // signal would leave a token in the semaphore with nothing behind it.
-    dispatch_semaphore_signal(capture_ready);
   }
 
 #if defined(NAMCHAIN_COREAUDIO_CAPTURE)
@@ -638,9 +1047,27 @@ const BackendInfo& CoreAudioBackend::info() const { return self_->info; }
 
 std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& config, std::string& error)
 {
-  if (config.input_path.empty())
+  // 0. Where the capture comes from. A device to capture from and a WAV to loop are alternatives
+  //    rather than layers, so a configuration that gives both -- or neither -- is refused by name
+  //    rather than one of them quietly winning. Neither would be an engine running on silence for
+  //    ever, which looks like a working device.
+  const bool live_input = !config.input_device.empty();
+  if (live_input && !config.input_path.empty())
   {
-    error = "the coreaudio backend needs --capture-path: the WAV to loop as its input";
+    error = "the coreaudio backend takes --input-device or --capture-path, not both: a CoreAudio input "
+            "device to capture from and a WAV to loop are alternatives";
+    return nullptr;
+  }
+  if (!live_input && config.input_path.empty())
+  {
+    error = "the coreaudio backend needs --input-device (a CoreAudio input device UID to capture from) "
+            "or --capture-path (a WAV to loop as its input)";
+    return nullptr;
+  }
+  if (live_input && config.capture_channels > Implementation::kMaxCaptureChannels)
+  {
+    error = "the coreaudio backend carries at most " + std::to_string(Implementation::kMaxCaptureChannels) +
+            " capture channels, configured for " + std::to_string(config.capture_channels);
     return nullptr;
   }
 
@@ -648,6 +1075,7 @@ std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& conf
   Implementation& impl = *self->self_;
 
   impl.config.input_path = config.input_path;
+  impl.config.input_device_uid = config.input_device;
   impl.config.device_uid = config.device;
   impl.config.sample_rate = config.sample_rate;
   impl.config.period_size = config.period_size;
@@ -655,70 +1083,95 @@ std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& conf
   impl.config.capture_channels = config.capture_channels;
   impl.config.playback_channels = config.playback_channels;
   impl.config.output_queue_periods = config.output_queue_periods;
+  impl.live_input = live_input;
 
-  // 1. The signal. Loaded whole, before anything is opened: the IOProc reads it on the device's
-  //    thread, and a file read there would be a dropout.
-  if (!LoopSource::load(impl.config.input_path, impl.config.sample_rate, impl.loop, error))
+  // 1. The signal, when the signal is a file. Loaded whole, before anything is opened: the IOProc
+  //    reads it on the device's thread, and a file read there would be a dropout.
+  if (!live_input &&
+      !LoopSource::load(impl.config.input_path, impl.config.sample_rate, impl.loop, error))
     return nullptr;
 
-  // 2. The device: the operator's UID, or the system's default. A UID rather than an index, because
-  //    indices move when something is unplugged.
+  // 2. The output device: the operator's UID, or the system's default. A UID rather than an index,
+  //    because indices move when something is unplugged.
+  AudioObjectID output = kAudioObjectUnknown;
   if (impl.config.device_uid.empty())
   {
-    AudioObjectID default_device = kAudioObjectUnknown;
-    if (!get_property(kAudioObjectSystemObject, global_address(kAudioHardwarePropertyDefaultOutputDevice),
-                      default_device) ||
-        default_device == kAudioObjectUnknown)
-    {
-      error = "there is no default CoreAudio output device";
+    output = default_device(kAudioHardwarePropertyDefaultOutputDevice, "output", error);
+    if (output == kAudioObjectUnknown)
       return nullptr;
-    }
-    impl.device = default_device;
   }
   else
   {
-    CFStringRef uid = CFStringCreateWithCString(kCFAllocatorDefault, impl.config.device_uid.c_str(),
-                                                kCFStringEncodingUTF8);
-    if (uid == nullptr)
+    output = device_for_uid(impl.config.device_uid, error);
+    if (output == kAudioObjectUnknown)
+      return nullptr;
+  }
+  impl.output_device_name = device_name(output);
+
+  // 2b. The input device, when the capture is live. There is deliberately no "default input": reading
+  //     a microphone is a decision, so it is only ever made because a UID was given.
+  AudioObjectID input = kAudioObjectUnknown;
+  if (live_input)
+  {
+    input = device_for_uid(impl.config.input_device_uid, error);
+    if (input == kAudioObjectUnknown)
+      return nullptr;
+    impl.input_device_name = device_name(input);
+
+    // Checked here, before any aggregate is made, so that a device with no inputs at all is refused
+    // by the name the operator used rather than as an aggregate with a silent input scope.
+    const unsigned available = input_channel_count(input);
+    if (available == 0)
     {
-      error = "the CoreAudio device UID '" + impl.config.device_uid + "' is not valid UTF-8";
+      error = "the CoreAudio input device '" + impl.config.input_device_uid + "' has no input channels";
       return nullptr;
     }
-    AudioValueTranslation translation;
-    translation.mInputData = &uid;
-    translation.mInputDataSize = sizeof(uid);
-    AudioObjectID found = kAudioObjectUnknown;
-    translation.mOutputData = &found;
-    translation.mOutputDataSize = sizeof(found);
-    UInt32 size = sizeof(translation);
-    // A copy: the HAL takes a mutable address even for a read.
-    AudioObjectPropertyAddress address = global_address(kAudioHardwarePropertyTranslateUIDToDevice);
-    const OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, nullptr, &size, &translation);
-    CFRelease(uid);
-    if (!ca_ok(status) || found == kAudioObjectUnknown)
+    if (available < impl.config.capture_channels)
     {
-      error = "no CoreAudio device with UID '" + impl.config.device_uid + "'";
+      error = "the CoreAudio input device '" + impl.config.input_device_uid + "' has " +
+              std::to_string(available) + " input channels, configured for " +
+              std::to_string(impl.config.capture_channels);
       return nullptr;
     }
-    impl.device = found;
+  }
+
+  // 2c. One stream device. The same device serves both directions when it has both; two *different*
+  //     devices need an aggregate, because they have two clocks and this engine has no resampler --
+  //     see make_aggregate for why the aggregate is the answer rather than two IOProcs. The aggregate
+  //     is the stream device from here on, and this object owns it until stop().
+  if (live_input && input != output)
+  {
+    impl.aggregate = make_aggregate(output, input, error);
+    if (impl.aggregate == kAudioObjectUnknown)
+      return nullptr;
+    impl.device = impl.aggregate;
+  }
+  else
+  {
+    impl.device = output;
   }
 
   // 3. It has to be there now. A device that is alive at open and dies later is the daemon's lost
-  //    device path; a device that was never there is a configuration error.
+  //    device path; a device that was never there is a configuration error. The name used is the
+  //    operator's -- the output device's, or the aggregate's when there is one -- because that is
+  //    what they can act on.
   UInt32 alive = 0;
   if (!get_property(impl.device, global_address(kAudioDevicePropertyDeviceIsAlive), alive))
   {
-    error = "the CoreAudio device '" + impl.config.device_uid + "' has no IsAlive property";
+    error = "the CoreAudio device '" + impl.output_device_name + "' has no IsAlive property";
     return nullptr;
   }
   if (alive == 0)
   {
-    error = "the CoreAudio device '" + impl.config.device_uid + "' is not alive";
+    error = "the CoreAudio device '" + impl.output_device_name + "' is not alive";
     return nullptr;
   }
 
   // 4. The rate. The engine has no resampler, so a device at another rate is refused rather than
-  //    asked to change: changing it would be the app editing a system-wide setting.
+  //    asked to change: changing it would be the app editing a system-wide setting. On an aggregate
+  //    the master's rate is the aggregate's, and an input at a different rate would need the HAL to
+  //    convert it -- which is a thing aggregates do, but only within what the two devices share, so
+  //    both are checked before the aggregate is allowed near them.
   Float64 nominal_rate = 0.0;
   if (!get_property(impl.device, global_address(kAudioDevicePropertyNominalSampleRate), nominal_rate))
   {
@@ -733,20 +1186,22 @@ std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& conf
     return nullptr;
   }
 
-  // 5. The format: float32, native endian, the device's own channel count. A device that presents
-  //    something else is refused rather than converted -- this backend has no format conversion, and
-  //    a silent one would be worse than a refusal.
+  // 5. The formats: float32, native endian, the device's own channel count, read per *scope*. A
+  //    device that presents something else is refused rather than converted -- this backend has no
+  //    format conversion, and a silent one would be worse than a refusal.
   AudioStreamBasicDescription format{};
-  if (!get_property(impl.device, global_address(kAudioDevicePropertyStreamFormat), format))
+  if (!get_property(impl.device, scoped_address(kAudioDevicePropertyStreamFormat, kAudioObjectPropertyScopeOutput),
+                    format))
   {
-    error = "the CoreAudio device's stream format could not be read";
+    error = "the CoreAudio device's playback stream format could not be read";
     return nullptr;
   }
   const bool is_float = (format.mFormatFlags & kAudioFormatFlagIsFloat) != 0 &&
                         (format.mFormatFlags & kAudioFormatFlagIsBigEndian) == 0;
   if (format.mFormatID != kAudioFormatLinearPCM || !is_float || format.mBitsPerChannel != 32)
   {
-    error = "the CoreAudio device does not present 32-bit float linear PCM, so this backend cannot drive it";
+    error = "the CoreAudio device does not present 32-bit float linear PCM for playback, so this backend "
+            "cannot drive it";
     return nullptr;
   }
   if (format.mChannelsPerFrame < impl.config.playback_channels)
@@ -754,6 +1209,33 @@ std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& conf
     error = "the CoreAudio device has " + std::to_string(format.mChannelsPerFrame) +
             " playback channels, configured for " + std::to_string(impl.config.playback_channels);
     return nullptr;
+  }
+  impl.playback_channels = format.mChannelsPerFrame;
+
+  // 5b. The same for the capture, when it is live. The input scope's format is the one the callback's
+  //     input buffers will be in, and the engine's capture bus is as wide as `--capture-channels`
+  //     says. The channel count comes from the stream configuration rather than the format, because a
+  //     device may present several streams and the format describes only one of them.
+  unsigned capture_channels = impl.loop.channels();
+  if (live_input)
+  {
+    AudioStreamBasicDescription input_format{};
+    if (!get_property(impl.device,
+                      scoped_address(kAudioDevicePropertyStreamFormat, kAudioObjectPropertyScopeInput),
+                      input_format))
+    {
+      error = "the CoreAudio input device's stream format could not be read";
+      return nullptr;
+    }
+    const bool input_is_float = (input_format.mFormatFlags & kAudioFormatFlagIsFloat) != 0 &&
+                                (input_format.mFormatFlags & kAudioFormatFlagIsBigEndian) == 0;
+    if (input_format.mFormatID != kAudioFormatLinearPCM || !input_is_float || input_format.mBitsPerChannel != 32)
+    {
+      error = "the CoreAudio input device does not present 32-bit float linear PCM, so this backend cannot "
+              "capture from it";
+      return nullptr;
+    }
+    capture_channels = impl.config.capture_channels;
   }
 
   // 6. The quantum, which is the device's to choose. The engine compiles its plan for one period
@@ -772,8 +1254,6 @@ std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& conf
             "; restart with --period-size " + std::to_string(device_frames);
     return nullptr;
   }
-
-  impl.playback_channels = format.mChannelsPerFrame;
 
 #if defined(NAMCHAIN_COREAUDIO_CAPTURE)
   // A measurement instrument, asked for by name. When this build has it, it opens here -- before the
@@ -794,33 +1274,50 @@ std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& conf
 #endif
 
 
-  // 7. The info the engine reads. `capture_channels` is the file's, as it is for `file` and `pipe`:
-  //    the daemon refuses a device that gives fewer than the configuration promised.
+  // 7. The info the engine reads. `capture_channels` is the device's when the capture is live and
+  //    the file's otherwise -- as it is for `file` and `pipe`, the daemon refuses a backend that
+  //    gives fewer than the configuration promised.
   impl.info.period_size = device_frames;
   impl.info.buffer_size = device_frames * impl.config.periods;
   impl.info.sample_rate = impl.config.sample_rate;
-  impl.info.capture_channels = impl.loop.channels();
+  impl.info.capture_channels = capture_channels;
   impl.info.playback_channels = impl.playback_channels;
   impl.info.format = PcmFormat::F32_LE;
   impl.info.bytes_per_sample = 4;
   impl.info.capture_bytes_per_frame = impl.info.capture_channels * impl.info.bytes_per_sample;
   impl.info.playback_bytes_per_frame = impl.info.playback_channels * impl.info.bytes_per_sample;
   impl.info.period_exact = true;
-  impl.info.capture_name = impl.config.input_path + " (looped)";
-  impl.info.playback_name = device_name(impl.device);
+  // Both name the device the operator chose rather than the aggregate: "namchain (private)" is what
+  // this backend called it, and it is what a status page would otherwise show.
+  impl.info.capture_name = live_input ? (impl.input_device_name + " (input)")
+                                      : (impl.config.input_path + " (looped)");
+  impl.info.playback_name = impl.output_device_name;
   // The rings plus whatever the device adds in front of them. Read, not guessed, because this is the
-  // number a latency report is built on.
+  // number a latency report is built on. Both directions are read on their own scope: a device's
+  // input latency is not its output latency.
   uint64_t device_latency_frames = 0;
   UInt32 safety = 0;
   UInt32 device_latency = 0;
-  if (get_property(impl.device, global_address(kAudioDevicePropertySafetyOffset), safety))
+  if (get_property(impl.device,
+                   scoped_address(kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeOutput), safety))
     device_latency_frames += safety;
-  if (get_property(impl.device, global_address(kAudioDevicePropertyLatency), device_latency))
+  if (get_property(impl.device,
+                   scoped_address(kAudioDevicePropertyLatency, kAudioObjectPropertyScopeOutput), device_latency))
     device_latency_frames += device_latency;
+  if (live_input)
+  {
+    if (get_property(impl.device,
+                     scoped_address(kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeInput), safety))
+      device_latency_frames += safety;
+    if (get_property(impl.device,
+                     scoped_address(kAudioDevicePropertyLatency, kAudioObjectPropertyScopeInput), device_latency))
+      device_latency_frames += device_latency;
+  }
   impl.info.buffer_floor_frames = static_cast<uint64_t>(impl.info.buffer_size) + device_latency_frames;
-  // The callback produces input from its first invocation, so the first period is not an artefact of
-  // a ring filling -- unlike a capture device, where it is.
-  impl.info.needs_bringup_cycle = false;
+  // A file has something to give from the callback's first invocation; a capture device's first
+  // period is an artefact of its own ring filling, which is what this flag exists to say (`alsa_raw`
+  // sets it for the same reason). The daemon uses it to discard that period rather than to render it.
+  impl.info.needs_bringup_cycle = live_input;
 
   // 8. The rings. Sized here, so neither the IOProc nor the engine's read allocates.
   const unsigned capacity = impl.config.output_queue_periods == 0 ? 8 : impl.config.output_queue_periods;
@@ -1001,6 +1498,15 @@ void CoreAudioBackend::stop()
     dispatch_release(impl.queue);
     impl.queue = nullptr;
   }
+  // Last, and after the stream is stopped: the aggregate is this process's own object, so destroying
+  // it takes it off the system as well as out of here. A private aggregate does not survive the
+  // process that made it, but leaving it to that would leave it alive for as long as the daemon keeps
+  // the device open after a `coreaudio` open that failed.
+  if (impl.aggregate != kAudioObjectUnknown)
+  {
+    AudioHardwareDestroyAggregateDevice(impl.aggregate);
+    impl.aggregate = kAudioObjectUnknown;
+  }
   impl.device = kAudioObjectUnknown;
 }
 
@@ -1158,11 +1664,15 @@ bool CoreAudioBackend::ring_occupancy(long long& capture_frames, long long& play
 std::vector<std::pair<std::string, long long>> CoreAudioBackend::diagnostics() const
 {
   const Implementation& impl = *self_;
-  // `loop_wraps` is the one that matters: each wrap is exactly one pass of the file, so a client can
-  // divide the file's frame count by the wrap rate and see the rate the engine is really consuming
-  // capture at. It is how "the loop plays at the right speed" became checkable from outside.
+  // `loop_wraps` is the one that matters when the capture is a file: each wrap is exactly one pass of
+  // it, so a client can divide the file's frame count by the wrap rate and see the rate the engine is
+  // really consuming capture at. It is how "the loop plays at the right speed" became checkable from
+  // outside. It stays zero for a live input, and `live_input` is what says so rather than leaving a
+  // reader to wonder.
   return {{"loop_wraps", static_cast<long long>(impl.loop.wraps())},
-          {"device_period_frames", static_cast<long long>(impl.info.period_size)}};
+          {"device_period_frames", static_cast<long long>(impl.info.period_size)},
+          {"live_input", impl.live_input ? 1 : 0},
+          {"aggregate_device", impl.aggregate != kAudioObjectUnknown ? 1 : 0}};
 }
 
 void CoreAudioBackend::interrupt()

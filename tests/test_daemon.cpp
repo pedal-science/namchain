@@ -212,6 +212,8 @@ TEST_CASE("a config file sets the fields the daemon uses")
     "periods": 6,
     "capture_channels": 2,
     "playback_channels": 2,
+    "input_device": "AppleUSBAudioEngine:Some Interface:140000:1,2",
+    "capture_device_path": "/tmp/what-the-device-was-sent.wav",
     "rigs_root": "/srv/rigs",
     "socket": "/tmp/example.sock",
     "socket_mode": "0600",
@@ -244,6 +246,10 @@ TEST_CASE("a config file sets the fields the daemon uses")
   CHECK(config.periods == 6u);
   CHECK(config.capture_channels == 2u);
   CHECK(config.playback_channels == 2u);
+  CHECK(config.input_device == "AppleUSBAudioEngine:Some Interface:140000:1,2");
+  // The other side of the same lesson: `capture_device_path` was a known key with no reader, so a
+  // file that set it was accepted and silently ignored. Both are read now.
+  CHECK(config.capture_device_path == "/tmp/what-the-device-was-sent.wav");
   CHECK(config.rigs_root == "/srv/rigs");
   CHECK(config.socket_path == "/tmp/example.sock");
   CHECK(config.socket_mode == 0600u);

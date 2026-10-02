@@ -1,18 +1,29 @@
 #pragma once
 
-// The CoreAudio backend: a WAV looped in, the engine's output to a CoreAudio device, both in one
-// process with one clock.
+// The CoreAudio backend: the engine's output to a CoreAudio device, and its capture from a live
+// CoreAudio input device or a WAV on a loop, in one process with one clock.
 //
 // It exists for the machine this project is developed on. `pipe` can already get audio out of a Mac
 // (a FIFO and `ffplay`), but it needs a second process and an external player, and the player's
 // buffering is both the monitoring latency and the only clock -- which is why its block times are
-// explicitly not a measurement of the engine. Here the device's IO thread is the clock, the file is
-// read in that same callback, and the engine is a producer/consumer against two lock-free rings.
+// explicitly not a measurement of the engine. Here the device's IO thread is the clock, the capture
+// is read in that same callback, and the engine is a producer/consumer against two lock-free rings.
 //
-// It is deliberately **capture-from-file only**. The system's default *input* device is the other
-// half of the same idea and is not in this slice: reading it would make macOS ask for microphone
-// permission, which is a decision for whoever spawns this process, not a side effect of asking for a
-// monitoring backend.
+// Capture has two sources and they are alternatives, not layers:
+//
+//  * **A live input device** (`CoreAudioConfig::input_device_uid`), which is what makes a guitar
+//    through an interface audible on a Mac with no board attached. This is the one thing in this
+//    backend that makes macOS ask for microphone permission -- deliberately, and only when the flag
+//    is given: permission is a decision for whoever spawns this process, and a monitoring backend
+//    that asked for the microphone because someone wanted to hear a WAV would be asking on the wrong
+//    authority. See docs/daemon.md for what the spawner has to arrange.
+//  * **A WAV on a loop** (`input_path`), for a machine with no interface attached at all.
+//
+// When the chosen input and output are *different* HAL devices the backend makes a private aggregate
+// device from the two, because two devices have two clocks and this engine has no resampler: the
+// output is the aggregate's master (the plan is compiled for its period, and its callback is what
+// paces the engine) and the HAL resamples the input to follow it. Private, so it never appears in
+// Audio MIDI Setup and goes away with the process.
 //
 // The CoreAudio framework is not mentioned in this header: it is behind a pimpl so that nothing that
 // includes it has to link the framework, and so the file compiles to nothing on Linux. The body of
@@ -29,20 +40,32 @@
 namespace namchain
 {
 
-/// \brief The `coreaudio` backend's configuration: a file to loop and a device to play it on.
+/// \brief The `coreaudio` backend's configuration: where the capture comes from and where the
+///        engine's output goes.
 struct CoreAudioConfig
 {
-  /// The WAV read as capture, looped for the life of the stream. Required: there is no input device
-  /// path yet, so an empty path is a refusal rather than a silence.
+  /// The WAV read as capture, looped for the life of the stream. Required when \ref input_device_uid
+  /// is empty; giving both is refused, because a device to capture from and a file to loop are
+  /// alternatives rather than layers.
   std::string input_path;
+  /// \brief A live CoreAudio input device UID to capture from, or empty to loop \ref input_path.
+  ///
+  /// A UID rather than an index, for the same reason \ref device_uid is one. Reading a device is what
+  /// makes macOS ask for microphone permission, so this is only ever set because somebody asked for
+  /// it by name.
+  std::string input_device_uid;
   /// A CoreAudio device UID, or empty for the system's default output device. A UID rather than an
   /// index: indices are not stable across a replug, and this is the string `Audio MIDI Setup` and
   /// `system_profiler` both show.
   std::string device_uid;
   unsigned sample_rate = 48000;
-  /// The engine quantum. The device is asked for exactly this and the backend refuses to open if it
-  /// cannot have it: the render plan is compiled for one quantum (§9.2), so a device that rounds it
-  /// silently would run frames past every node's buffers.
+  /// \brief The engine's quantum, as a *ceiling* rather than a request.
+  ///
+  /// A device's own period is what its callback is actually handed, and on this project's machine
+  /// that is not the number `kAudioDevicePropertyBufferFrameSize` reads back as. So the backend
+  /// measures the smallest callback the device gives it, reports that as `info.period_size`, and
+  /// refuses a device that wants *more* than this: a plan compiled for the daemon's `period_size`
+  /// carries any smaller period, and a larger one has nowhere to go.
   unsigned period_size = 64;
   unsigned periods = 4;
   unsigned capture_channels = 1;

@@ -51,6 +51,12 @@ struct BackendConfig
   /// `file` and `pipe`: the WAV read as capture. `file` also writes \ref output_path as a WAV;
   /// `pipe` writes raw interleaved frames to it, and it is expected to be a FIFO.
   std::string input_path;
+  /// \brief The device to capture from, where the backend takes one: a CoreAudio input device UID.
+  ///
+  /// `coreaudio` only, and the alternative to \ref input_path rather than a companion to it: with a
+  /// device to capture from there is nothing to loop, and a configuration that gives both is refused
+  /// by name. Empty means the capture comes from `input_path`.
+  std::string input_device;
   std::string output_path;
   /// `coreaudio` only, and only when built with `NAMCHAIN_COREAUDIO_CAPTURE`: a WAV path to write
   /// what the backend hands the device. Empty -- the default, and the only value in a normal build --

@@ -1940,6 +1940,15 @@ bool Daemon::start(std::string& error)
     error = "fade_ms must be >= 0";
     return false;
   }
+  if (!config_.input_device.empty() && config_.backend != BackendKind::CoreAudio)
+  {
+    // Refused by name rather than ignored: a run that says "capture from device X" and then captures
+    // from a file (or from nothing) is a claim nobody could check, which is the rule `pipewire`
+    // already follows for the backend itself.
+    error = std::string("--input-device is a coreaudio setting: ") +
+            backend_kind_name(config_.backend) + " captures from --capture-path (or has no capture at all)";
+    return false;
+  }
   if (config_.output_queue_floor_periods > config_.output_queue_periods)
   {
     error = "output_queue_floor_periods cannot exceed output_queue_periods";
@@ -2098,6 +2107,7 @@ bool Daemon::open_device(std::string& error)
   backend.output_queue_periods = config_.output_queue_periods;
   backend.output_queue_floor_periods = config_.output_queue_floor_periods;
   backend.input_path = config_.capture_path;
+  backend.input_device = config_.input_device;
   backend.output_path = config_.playback_path;
   backend.capture_device_path = config_.capture_device_path;
 
