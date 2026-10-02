@@ -1453,15 +1453,33 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   // The model budget, on the resolved copy too: what it slims is a different model compiled from the
   // same reference, so the chains it touches compare as changed below, and the document a client
   // wrote still names what it named (docs/daemon.md, "Model budget").
-  BudgetOutcome budget = apply_model_budget(resolved, static_cast<std::size_t>(config_.model_budget_kb) * 1024u,
+  //
+  // Two ceilings, because the render path has two (docs/daemon.md, "Render threads"): one core's for
+  // any single chain, since a chain is executed by one thread and cannot be split, and one core's per
+  // core the chains can actually be spread over for the document. The spread is bounded by the chain
+  // count: an idle core has no L2 to lend, so a four-core engine rendering a one-chain document still
+  // has one core's budget.
+  const std::size_t per_core_bytes = static_cast<std::size_t>(config_.model_budget_kb) * 1024u;
+  const std::size_t spread =
+    std::min<std::size_t>(std::max(1u, config_.render_threads), std::max<std::size_t>(1, resolved.chains.size()));
+  BudgetOutcome budget = apply_model_budget(resolved, per_core_bytes, per_core_bytes * spread,
                                             static_cast<int>(config_.period_size), working_sets_);
   for (BudgetedModel& model : budget.models)
     model.reference = string_param(document.chains[model.chain_index].graph.nodes[model.node_index], "model");
   if (budget.over && !admit_over_budget)
   {
+    // Which ceiling was hit decides what the user has to do about it, so the message names it: a chain
+    // that is too heavy is one model to replace, a document that is too heavy is one chain too many.
+    const bool chain_over = budget.heaviest_chain_bytes > budget.per_chain_bytes;
     error = "the models in this document read " + format_kib(budget.used_bytes) +
-            " per block together, more than the model budget of " + format_kib(budget.budget_bytes) +
-            ", with every one that can be slimmed slimmed: " + describe_models(budget, document.chains.size() > 1);
+            " per block together, more than the model budget of " + format_kib(budget.budget_bytes);
+    if (chain_over)
+    {
+      error += ", and chain '" + resolved.chains[budget.heaviest_chain].id + "' alone reads " +
+               format_kib(budget.heaviest_chain_bytes) + " against " +
+               format_kib(budget.per_chain_bytes) + " for one core";
+    }
+    error += ", with every one that can be slimmed slimmed: " + describe_models(budget, document.chains.size() > 1);
     if (error_code != nullptr)
       *error_code = "over_budget";
     return false;
@@ -3338,7 +3356,11 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // The model budget as configured, and what the running document reads against it: 0 throughout when
     // it is off. `used_bytes` is as published, slimmed models at their slim size; `full_bytes` is what
     // the same document would read with none of them slimmed.
-    status["model_budget"] = {{"budget_bytes", static_cast<std::size_t>(config_.model_budget_kb) * 1024u},
+    status["model_budget"] = {{"budget_bytes", model_budget_.budget_bytes},
+                              {"per_chain_bytes", model_budget_.per_chain_bytes},
+                              {"configured_per_core_bytes", static_cast<std::size_t>(config_.model_budget_kb) * 1024u},
+                              {"heaviest_chain", model_budget_.heaviest_chain},
+                              {"heaviest_chain_bytes", model_budget_.heaviest_chain_bytes},
                               {"used_bytes", model_budget_.used_bytes},
                               {"full_bytes", model_budget_.full_bytes},
                               {"over", model_budget_.over}};

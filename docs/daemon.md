@@ -525,24 +525,36 @@ Every chain of a document renders on one thread, on one core, so a document's mo
 core's L2. A model reads its weights and every layer's history each block: an A2-Full **293.8 KiB** at
 q64, an A2-Lite 99.7 KiB (`namchain/working_set.h`, from the model's config). Two Fulls, 587.5 KiB,
 do not fit a Cortex-A76's 512 KiB L2, and the render's worst blocks then follow the shared L3 and
-DRAM: on a Pi 5 a rig with two Fulls reached 107–144 % of the deadline in its worst block, and one
-Full with one Lite stayed under it (pedal.project, `bench-results/2026-10-02-two-amp-tail-vip`). The
-tail comes from what the block reads, not from its arithmetic.
+DRAM. The tail comes from what the block reads, not from its arithmetic.
 
-`model_budget_kb` is a ceiling on that, for the whole document. `0`, the default, is off. With it
-set, every publish — `rig.load`, `rig.apply`, `rig.patch`, startup, SIGHUP, a rescan's republish —
-does this on the resolved copy, before anything is compiled:
+> **Re-measured 2026-10-02, and the earlier figure is withdrawn.** The run that first showed this —
+> `pedal.project/bench-results/2026-10-02-two-amp-tail-vip`, whose two-amp rig reached 107–144 % of the
+> deadline in its worst block — was taken while that host was busy with other work. The same rig
+> re-measured on a verified-quiet piv (null backend, q64, 60 s, eight runs across cores 0, 2 and 3)
+> gives p50 11.6 %, p99 13.9–18.5 %, worst 22.8–43.0 % and **0 blocks past the deadline**, flat out and
+> paced alike. Two Fulls still do not fit one core's L2 and the capacity cliff is still real in
+> principle; the magnitude claimed here was not. The correction, the method and the live re-measurement
+> are in `pedal.project/docs/multi-core.md`.
+
+`model_budget_kb` is a ceiling on that, **per core**. `0`, the default, is off. With it set, every
+publish — `rig.load`, `rig.apply`, `rig.patch`, startup, SIGHUP, a rescan's republish — does this on
+the resolved copy, before anything is compiled:
 
 1. **Estimate every `nc.nam` node** at `period_size`, in document order: chains in order, each chain's
    nodes as declared. A bypassed node counts, because it keeps running; a block standing in for a
    missing model counts as nothing. Estimates come from the model's config, never from loading it,
    and are cached by path, size, mtime and quantum, so a publish does not reparse the library.
-2. **If the total is over, slim** the models that can be slimmed — a `SlimmableContainer`, the
-   `A2.nam` kind with a Full and a Lite in one file — **the last declared first**, until the total
-   fits. A slimmed node runs the submodel `SetSlimmableSize(0.0)` picks, chosen before the model is
-   prepared, so the Full is never allocated or prewarmed.
-3. **If it is still over** with every slimmable model slimmed, a client's publish is refused as
-   `over_budget`, with every model's size in the message, and the running document keeps playing.
+2. **Any chain over one core's ceiling is slimmed first**, last declared first within that chain,
+   until it fits. A chain is executed by one thread and cannot be split, so this binds whatever the
+   document as a whole is allowed; a second core cannot lend its L2 to a chain it is not running.
+3. **Then the document total is brought under `model_budget_kb × cores`**, last declared first, the
+   way it always has been. The cores are `render_threads` bounded by the number of chains: an idle
+   core has no L2 to lend, so a four-thread engine rendering a one-chain document still has one
+   core's budget. A slimmed node runs the submodel `SetSlimmableSize(0.0)` picks, chosen before the
+   model is prepared, so the Full is never allocated or prewarmed.
+4. **If it is still over** with every slimmable model slimmed, a client's publish is refused as
+   `over_budget`, with every model's size in the message and, when it is one chain that is too heavy,
+   that chain named with its own figure. The running document keeps playing.
    The configured rig — at startup, on SIGHUP and on a rescan's republish — is **admitted anyway**,
    with a `model_budget_exceeded` warning: refusing the rig a pedal powers up with would leave it
    silent, which is worse than a rig that may miss a deadline.
@@ -550,11 +562,12 @@ does this on the resolved copy, before anything is compiled:
 What a client sees: `slimmed_models` in every rig reply (`rig.load`, `rig.apply`, `rig.patch`,
 `rig.get`) and in each chain of `engine.status`, an entry per slimmed node with `chain` (in the
 replies), `node`, `element`, `reference`, `full_bytes` and `slim_bytes`; a `model_slimmed` issue per
-slimmed node; and `model_budget` in `engine.status`, with `budget_bytes`, `used_bytes` (as slimmed),
-`full_bytes` (as written) and `over`. The document `rig.get` returns is the one written: slimming is
-the engine's choice about the copy it compiles, made afresh on every publish, so no document carries
-it and a stale choice never sticks. A model the estimator cannot read counts as nothing and raises
-`model_budget_unknown`.
+slimmed node; and `model_budget` in `engine.status`, with `budget_bytes` (the document's ceiling),
+`per_chain_bytes` (one core's), `configured_per_core_bytes` (what the operator wrote),
+`heaviest_chain`/`heaviest_chain_bytes`, `used_bytes` (as slimmed), `full_bytes` (as written) and
+`over`. The document `rig.get` returns is the one written: slimming is the engine's choice about the
+copy it compiles, made afresh on every publish, so no document carries it and a stale choice never
+sticks. A model the estimator cannot read counts as nothing and raises `model_budget_unknown`.
 
 The figure is the L2 of the render's core less room for everything else the block touches: buffers,
 an IR, the stack. vip runs 448 (pedal.project's `devices/vip/`), which fits a Full and a Lite and

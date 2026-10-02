@@ -38,12 +38,13 @@ WorkingSet WorkingSetCache::get(const std::string& path, int max_quantum)
   return estimate;
 }
 
-BudgetOutcome apply_model_budget(graph::Document& resolved, std::size_t budget_bytes, int max_quantum,
-                                 WorkingSetCache& cache)
+BudgetOutcome apply_model_budget(graph::Document& resolved, std::size_t per_chain_bytes,
+                                 std::size_t document_bytes, int max_quantum, WorkingSetCache& cache)
 {
   BudgetOutcome outcome;
-  outcome.budget_bytes = budget_bytes;
-  if (budget_bytes == 0)
+  outcome.per_chain_bytes = per_chain_bytes;
+  outcome.budget_bytes = document_bytes;
+  if (per_chain_bytes == 0 || document_bytes == 0)
     return outcome;
 
   for (std::size_t c = 0; c < resolved.chains.size(); ++c)
@@ -84,19 +85,54 @@ BudgetOutcome apply_model_budget(graph::Document& resolved, std::size_t budget_b
     }
   }
 
+  // A chain is executed by one thread on one core, so no chain may exceed the per-core ceiling --
+  // whatever the document as a whole is allowed. Slim that chain's own models first, last declared
+  // first within it, and only then look at the document.
+  for (std::size_t c = 0; c < resolved.chains.size(); ++c)
+  {
+    std::size_t chain_bytes = 0;
+    for (const BudgetedModel& model : outcome.models)
+    {
+      if (model.chain_index == c)
+        chain_bytes += model.bytes();
+    }
+    for (auto it = outcome.models.rbegin(); it != outcome.models.rend() && chain_bytes > per_chain_bytes; ++it)
+    {
+      if (it->chain_index != c || !it->slimmable || it->slimmed)
+        continue;
+      it->slimmed = true;
+      chain_bytes -= it->full_bytes - it->slim_bytes;
+      resolved.chains[it->chain_index].graph.nodes[it->node_index].slim = true;
+    }
+    if (chain_bytes > outcome.heaviest_chain_bytes)
+    {
+      outcome.heaviest_chain_bytes = chain_bytes;
+      outcome.heaviest_chain = c;
+    }
+  }
+
   // The last declared first. Nothing about the order is measured -- slimming either of two equal
   // amps saves the same -- but it is predictable, and it leaves the first amp of a chain as written.
-  outcome.used_bytes = outcome.full_bytes;
-  for (auto it = outcome.models.rbegin(); it != outcome.models.rend() && outcome.used_bytes > budget_bytes; ++it)
+  outcome.used_bytes = 0;
+  for (const BudgetedModel& model : outcome.models)
+    outcome.used_bytes += model.bytes();
+  for (auto it = outcome.models.rbegin(); it != outcome.models.rend() && outcome.used_bytes > document_bytes;
+       ++it)
   {
-    if (!it->slimmable)
+    if (!it->slimmable || it->slimmed)
       continue;
     it->slimmed = true;
     outcome.used_bytes -= it->full_bytes - it->slim_bytes;
     resolved.chains[it->chain_index].graph.nodes[it->node_index].slim = true;
   }
-  outcome.over = outcome.used_bytes > budget_bytes;
+  outcome.over = outcome.used_bytes > document_bytes || outcome.heaviest_chain_bytes > per_chain_bytes;
   return outcome;
+}
+
+BudgetOutcome apply_model_budget(graph::Document& resolved, std::size_t budget_bytes, int max_quantum,
+                                 WorkingSetCache& cache)
+{
+  return apply_model_budget(resolved, budget_bytes, budget_bytes, max_quantum, cache);
 }
 
 std::string format_kib(std::size_t bytes)

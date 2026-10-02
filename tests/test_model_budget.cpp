@@ -236,3 +236,59 @@ TEST_CASE("model budget: the cache rereads a file that has changed")
   CHECK(cache.get(model.string(), 64).full_bytes == kFull);
   CHECK(cache.parses() == 3);
 }
+
+TEST_CASE("model budget: a chain is capped on its own, whatever the document is allowed")
+{
+  // A chain runs on one core, so its models have to fit one core's L2 even when the document as a
+  // whole is allowed more than that (docs/daemon.md, "Render threads"). One Full and one Lite fit a
+  // core; two Fulls do not.
+  const auto two_chains = [] {
+    Document document;
+    document.chains.push_back(chain_of("a", {example("A2.nam"), example("A2.nam")}));
+    document.chains.push_back(chain_of("b", {example("A2.nam")}));
+    return document;
+  };
+
+  // With one ceiling for everything -- the single-core rule -- three Fulls inside 3 * kFull are left
+  // exactly as written, because nothing is over the only budget there is.
+  {
+    Document document = two_chains();
+    WorkingSetCache cache;
+    const BudgetOutcome flat = apply_model_budget(document, 3 * kFull, 64, cache);
+    CHECK_FALSE(flat.over);
+    CHECK(flat.budget_bytes == flat.per_chain_bytes);
+    CHECK_FALSE(node(document, 0, "amp1").slim);
+    CHECK_FALSE(node(document, 0, "amp2").slim);
+    CHECK_FALSE(node(document, 1, "amp1").slim);
+  }
+
+  // With one core's ceiling for a chain and two cores' worth for the document, chain "a" is over its
+  // own ceiling and is slimmed until it fits -- and no further -- while the document stays inside its.
+  {
+    Document document = two_chains();
+    WorkingSetCache cache;
+    const BudgetOutcome outcome = apply_model_budget(document, kVipBudget, 2 * kVipBudget, 64, cache);
+    CHECK_FALSE(outcome.over);
+    CHECK(outcome.per_chain_bytes == kVipBudget);
+    CHECK(outcome.budget_bytes == 2 * kVipBudget);
+    CHECK(outcome.heaviest_chain == 0u);
+    CHECK(outcome.heaviest_chain_bytes == kFull + kLite);
+    // Last declared first within the chain that is over, and only that chain.
+    CHECK_FALSE(node(document, 0, "amp1").slim);
+    CHECK(node(document, 0, "amp2").slim);
+    CHECK_FALSE(node(document, 1, "amp1").slim);
+    CHECK(outcome.used_bytes == kFull + kLite + kFull);
+  }
+
+  // A single chain that cannot be brought under one core's ceiling is over, however much room the
+  // document has: the second engine cannot lend its L2 to a chain it is not running.
+  {
+    Document document;
+    document.chains.push_back(chain_of("a", {generated("A2-Full.nam"), generated("A2-Full.nam")}));
+    WorkingSetCache cache;
+    const BudgetOutcome outcome = apply_model_budget(document, kVipBudget, 8 * kVipBudget, 64, cache);
+    CHECK(outcome.over);
+    CHECK(outcome.heaviest_chain_bytes == 2 * kFull);
+    CHECK(outcome.heaviest_chain == 0u);
+  }
+}

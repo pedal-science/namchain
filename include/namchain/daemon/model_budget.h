@@ -81,29 +81,49 @@ struct BudgetedModel
 /// What the budget made of one document.
 struct BudgetOutcome
 {
-  /// The budget in bytes; 0 when it is off, and then nothing else is filled in.
+  /// The document's ceiling in bytes; 0 when it is off, and then nothing else is filled in.
   std::size_t budget_bytes = 0;
+  /// The ceiling for any one chain, which is the *per core* figure the operator configured. A chain
+  /// is executed by one thread on one core, so this binds whatever the document total is allowed.
+  std::size_t per_chain_bytes = 0;
+  /// The chain that came out heaviest, and what it reads. Reported because with more than one render
+  /// thread a document can be inside its total and still have a chain that does not fit one core.
+  std::size_t heaviest_chain_bytes = 0;
+  std::size_t heaviest_chain = 0;
   /// What the document's models read per block as published, and what they would read unslimmed.
   std::size_t used_bytes = 0;
   std::size_t full_bytes = 0;
-  /// Still over the budget with every slimmable model slimmed. The caller decides what that means:
-  /// a client's publish is refused, the configured rig is admitted with a warning.
+  /// Still over a ceiling with every slimmable model slimmed: either one chain is over
+  /// \ref per_chain_bytes, or the document is over \ref budget_bytes. The caller decides what that
+  /// means: a client's publish is refused, the configured rig is admitted with a warning.
   bool over = false;
   /// Every `nc.nam` node, in document order: chains in order, each chain's nodes as declared.
   std::vector<BudgetedModel> models;
 };
 
-/// \brief Estimate every `nc.nam` node of \p resolved, and if together they read more than
-/// \p budget_bytes per block, slim the slimmable ones -- the last declared first -- until they fit or
-/// nothing slimmable is left.
+/// \brief Estimate every `nc.nam` node of \p resolved, and slim what has to be slimmed so that no
+/// chain reads more than \p per_chain_bytes and the document reads no more than \p document_bytes.
+///
+/// Two ceilings rather than one, because the render path has two (docs/daemon.md, "Render threads"):
+/// a chain is executed by one thread on one core, so the chain's own models have to fit one core's
+/// L2 however many cores the document is spread over. A chain over its ceiling is slimmed first, last
+/// declared first within the chain; then the document total is brought under its ceiling the way it
+/// always has been, last declared first. With one render thread -- or one chain -- the two ceilings
+/// are the same and the result is the rule this engine has always had.
 ///
 /// Slimming sets graph::NodeSpec::slim on \p resolved, which must be the resolved copy of a document
-/// (model references already turned into paths), never the document a client wrote. A budget of 0 is
-/// off: nothing is estimated, nothing is slimmed, and the outcome is empty. Never refuses anything:
-/// \ref BudgetOutcome::over is for the caller to act on.
+/// (model references already turned into paths), never the document a client wrote. A
+/// \p per_chain_bytes of 0 is off: nothing is estimated, nothing is slimmed, the outcome is empty.
+/// Never refuses anything: \ref BudgetOutcome::over is for the caller to act on.
 ///
 /// Only `nc.nam` nodes are counted. A missing model's stand-in is an `nc.bypass` by now and counts
 /// as nothing; a bypassed `nc.nam` still renders (graph::NodeSpec::bypass) and counts in full.
+BudgetOutcome apply_model_budget(graph::Document& resolved, std::size_t per_chain_bytes,
+                                 std::size_t document_bytes, int max_quantum, WorkingSetCache& cache);
+
+/// \brief The single-ceiling form: \p budget_bytes for the document and for every chain.
+///
+/// What a one-core engine means by "the model budget", and what most callers want.
 BudgetOutcome apply_model_budget(graph::Document& resolved, std::size_t budget_bytes, int max_quantum,
                                  WorkingSetCache& cache);
 
