@@ -16,6 +16,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -1876,6 +1877,36 @@ bool Daemon::start(std::string& error)
     error = "rt_priority must be in [0, 99]";
     return false;
   }
+  if (config_.render_threads > 1)
+  {
+    // Refused here rather than discovered by a worker that cannot pin itself: a pool that runs on
+    // fewer cores than it was asked for is a different claim from one that runs on the cores the
+    // configuration names, and the timing of the two is not comparable (docs/multi-core.md).
+    if (config_.cpu < 0)
+    {
+      error = "render_threads above 1 needs cpu: the workers take the cores above it";
+      return false;
+    }
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (::sched_getaffinity(0, sizeof(allowed), &allowed) == 0)
+    {
+      std::string missing;
+      for (unsigned i = 0; i < config_.render_threads; ++i)
+      {
+        const int cpu = config_.cpu + static_cast<int>(i);
+        if (cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &allowed))
+          missing += (missing.empty() ? "" : ", ") + std::to_string(cpu);
+      }
+      if (!missing.empty())
+      {
+        error = "render_threads " + std::to_string(config_.render_threads) + " from cpu " +
+                std::to_string(config_.cpu) + " needs cpus this process may not run on: " + missing +
+                " (cgroup cpuset, or a cpu the kernel does not have)";
+        return false;
+      }
+    }
+  }
   if (!(config_.fade_ms >= 0.0))
   {
     error = "fade_ms must be >= 0";
@@ -2517,6 +2548,16 @@ void Daemon::render_loop()
   if (config_.verbose)
     std::fprintf(stderr, "[namchaind] render thread: %s\n", rt::describe_scheduling(scheduling).c_str());
 
+  // The workers, before the first block: pinned, counted and warm. A pool that came up smaller than
+  // asked for is reported here, in `engine.status` and in the report of whatever ran, never by
+  // silence.
+  std::string pool_error;
+  if (!start_render_pool(pool_error))
+  {
+    std::fprintf(stderr, "[namchaind] %s\n", pool_error.c_str());
+    render_pool_degraded_.store(true);
+  }
+
   std::string error;
   bool memory_locked = false;
   constexpr int kDeviceWaitMs = 1000;
@@ -2598,6 +2639,8 @@ void Daemon::render_loop()
       const int frames = static_cast<int>(info.period_size);
       std::fill(bus_.begin(), bus_.end(), 0.0f);
 
+      // 1. Every chain's input, on the coordinator. The decode is a per-sample conversion and a
+      //    chain's plan cannot start before its input exists, so this is not worth sharing out.
       for (int c = 0; c < chain_count_; ++c)
       {
         ChainRuntime& chain = chains_[c];
@@ -2613,31 +2656,38 @@ void Daemon::render_loop()
           chain.in[i] = pcm_decode(capture_buffer_.data() +
                                      (static_cast<std::size_t>(i) * info.capture_channels + channel) * width,
                                    info.format);
+      }
+
+      // 2. The plans, on the pool: one participant per core, each taking every `participants`-th
+      //    chain. With `render_threads` at 1 this is the same call it has always been, made inline.
+      render_pool_.run(this, &Daemon::run_chains_entry, frames);
+
+      // 3. Everything that must keep one owner, in the order it has always run: the crossfade mixes,
+      //    the transition bookkeeping and the output bus. This is what makes a parallel render
+      //    identical to a serial one rather than merely similar.
+      for (int c = 0; c < chain_count_; ++c)
+      {
+        ChainRuntime& chain = chains_[c];
+        if (chain.current == nullptr)
+          continue;
+        const PlanSlot* source = chain.next != nullptr ? chain.next : chain.current;
 
         if (chain.next != nullptr)
         {
-          // Dual-render: both plans run on the same input, and their chain outputs are equal-power
-          // crossfaded. Both keep running for the whole fade (a chain that stops mid-transition
-          // freezes its state and would step on the way out).
-          chain.current->plan->execute(chain.in.data(), chain.old.data(), frames);
-          chain.next->plan->execute(chain.in.data(), chain.incoming.data(), frames);
+          // Dual-render: both plans ran on the same participant, and their chain outputs are
+          // equal-power crossfaded here. mix() has finished reading old, so the outgoing plan can be
+          // retired; the control thread frees it after the reclaimer's grace window.
           chain.crossfade.mix(chain.old.data(), chain.incoming.data(), chain.out.data(), frames);
-          // mix() has finished reading old, so the outgoing plan can be retired here; the control
-          // thread frees it after the reclaimer's grace window.
           if (!chain.crossfade.active())
             finish_transition(c);
         }
-        else
+        else if (chain.local_remaining > 0)
         {
           // One plan, also during a local transition: its crossfades sit inside it, at the inputs the
           // edit changed, and everything the edit did not touch runs once.
-          chain.current->plan->execute(chain.in.data(), chain.out.data(), frames);
-          if (chain.local_remaining > 0)
-          {
-            chain.local_remaining -= frames;
-            if (chain.local_remaining <= 0)
-              finish_local_transition(c);
-          }
+          chain.local_remaining -= frames;
+          if (chain.local_remaining <= 0)
+            finish_local_transition(c);
         }
 
         // Mute is a zeroing of the *emitted* copy, applied after execute so the chain keeps running:
@@ -2719,6 +2769,76 @@ void Daemon::render_loop()
   // the object is destroyed. A device backend has nothing to finish, and says so by doing nothing.
   finish_device(error);
   close_device();
+  render_pool_.stop();
+  render_threads_active_.store(1);
+}
+
+bool Daemon::start_render_pool(std::string& error)
+{
+  error.clear();
+  render_threads_active_.store(1);
+  render_cores_mask_.store(0);
+
+  if (config_.render_threads <= 1)
+    return true; // one participant: `run` calls the work inline, and nothing is started
+
+  std::string pool_error;
+  if (!render_pool_.start(config_.render_threads, config_.cpu, config_.rt_priority, pool_error))
+  {
+    error = pool_error;
+    return false;
+  }
+
+  uint64_t mask = 0;
+  for (const RenderParticipant& participant : render_pool_.participants())
+  {
+    if (config_.verbose)
+      std::fprintf(stderr, "[namchaind] render participant %u: %s\n", participant.index,
+                   rt::describe_scheduling(participant.scheduling).c_str());
+    if (participant.scheduling.cpu >= 0 && participant.scheduling.cpu < 64)
+      mask |= (uint64_t{1} << participant.scheduling.cpu);
+  }
+  render_threads_active_.store(render_pool_.threads());
+  render_cores_mask_.store(mask);
+  if (!render_pool_.degraded_reason().empty())
+  {
+    error = render_pool_.degraded_reason();
+    render_pool_degraded_.store(true);
+    std::fprintf(stderr, "[namchaind] %s\n", error.c_str());
+    return false;
+  }
+  render_pool_degraded_.store(false);
+  return true;
+}
+
+void Daemon::run_chains(unsigned participant, unsigned participants, int frames) noexcept
+{
+  // Every `participants`-th chain. Nothing here may touch another participant's chain, and nothing
+  // here may touch the transition bookkeeping: `current` and `next` are read, never written, and the
+  // coordinator does not move them until every participant has finished this block.
+  for (int c = static_cast<int>(participant); c < chain_count_; c += static_cast<int>(participants))
+  {
+    ChainRuntime& chain = chains_[c];
+    if (chain.current == nullptr)
+      continue;
+
+    if (chain.next != nullptr)
+    {
+      // Dual-render: both plans run on the same input, in the order they always have (the outgoing
+      // one first), and their chain outputs are equal-power crossfaded later on the coordinator.
+      chain.current->plan->execute(chain.in.data(), chain.old.data(), frames);
+      chain.next->plan->execute(chain.in.data(), chain.incoming.data(), frames);
+    }
+    else
+    {
+      chain.current->plan->execute(chain.in.data(), chain.out.data(), frames);
+    }
+  }
+}
+
+void Daemon::run_chains_entry(void* context, unsigned participant, unsigned participants, int frames) noexcept
+{
+  static_cast<Daemon*>(context)->run_chains(participant, participants, frames);
 }
 
 // ---------------------------------------------------------------------------
@@ -3148,6 +3268,14 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["realtime"] = rt_realtime_.load();
     status["rt_policy"] = rt_policy_.load();
     status["rt_priority"] = rt_priority_.load();
+    // How many cores the render path is actually using, which core each participant was confined to
+    // (a bit per CPU, read back from the kernel rather than remembered), and whether the pool fell
+    // short of what was configured. A run whose `render_threads` is below `render_threads_configured`
+    // is not a multi-core measurement.
+    status["render_threads"] = render_threads_active_.load();
+    status["render_threads_configured"] = config_.render_threads;
+    status["render_cores"] = render_cores_mask_.load();
+    status["render_degraded"] = render_pool_degraded_.load();
     status["retired_pending"] = static_cast<std::uint64_t>(reclaimer_.pending());
     status["params_applied"] = params_applied_.load();
     status["params_stale"] = params_stale_.load();

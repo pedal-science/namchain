@@ -92,7 +92,24 @@ struct Config
   /// the unit (a systemd service does not get pam_limits).
   int rt_priority = 80;
   /// CPU the render thread is pinned to, or -1 to leave the affinity alone.
+  ///
+  /// With \ref render_threads above 1 this is the *first* core of the render set: the coordinator
+  /// takes this one and the workers take the ones above it.
   int cpu = -1;
+  /// \brief How many cores the render path uses: one coordinator plus this many minus one workers.
+  ///
+  /// 1 is the single-threaded engine that has always run here, and it stays bit-identical to it
+  /// (docs/multi-core.md). Above 1, the document's chains are shared out across threads pinned to
+  /// `cpu` and the cores above it: the coordinator keeps the device, the input decode, the
+  /// crossfades, the output bus and every piece of transition bookkeeping, and each worker runs its
+  /// own chains' plans. A chain is never split, so every chain still executes on one thread in its
+  /// original node order, which is what keeps the output identical to the single-threaded run.
+  ///
+  /// It only pays where there is more than one chain's worth of work to run at once; a rig whose
+  /// weight is one long chain gets nothing from it (docs/multi-core.md, "What it does not help").
+  /// A value larger than the cores this process may run on is refused at startup, because a worker
+  /// that cannot be pinned is a worker whose timing cannot be reported.
+  unsigned render_threads = 1;
   /// mlockall(MCL_CURRENT) once the plan and the stream buffers exist (never MCL_FUTURE, §14.10).
   bool lock_memory = true;
   /// Output-queue cap and floor, in periods; see BackendConfig. 0 disables each.

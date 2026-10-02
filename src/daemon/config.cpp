@@ -232,6 +232,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "rigs_root",  "socket",      "socket_mode",     "rt_priority",
                                       "cpu",        "lock_memory",  "output_queue_periods",
                                       "output_queue_floor_periods", "fade_ms", "model_budget_kb", "device_retry_ms",
+                                      "render_threads",
                                       "reclamation_timeout_ms", "verbose", "capture_path", "playback_path",
                                       "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
                                       "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
@@ -294,6 +295,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_unsigned(doc, "output_queue_floor_periods", config.output_queue_floor_periods, path, error) ||
       !read_unsigned(doc, "device_retry_ms", config.device_retry_ms, path, error) ||
       !read_unsigned(doc, "model_budget_kb", config.model_budget_kb, path, error) ||
+      !read_unsigned(doc, "render_threads", config.render_threads, path, error) ||
       !read_unsigned(doc, "tcp_port", config.tcp_port, path, error) ||
       !read_unsigned(doc, "tcp_max_connections", config.tcp_max_connections, path, error) ||
       !read_unsigned(doc, "tcp_max_message_bytes", config.tcp_max_message_bytes, path, error) ||
@@ -458,6 +460,8 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
     return parse_int("rt-priority", value, config.rt_priority, error);
   if (name == "cpu")
     return parse_int("cpu", value, config.cpu, error);
+  if (name == "render-threads")
+    return parse_unsigned("render-threads", value, config.render_threads, error);
 
   error = "unknown option '--" + name + "'";
   return false;

@@ -24,6 +24,7 @@
 #include "namchain/daemon/framing.h"
 #include "namchain/daemon/model_budget.h"
 #include "namchain/daemon/recorder.h"
+#include "namchain/daemon/render_pool.h"
 #include "namchain/graph/plan.h"
 #include "namchain/graph/rig.h"
 #include "namchain/io/backend.h"
@@ -370,6 +371,20 @@ private:
 
   // --- render thread only --------------------------------------------------
   void render_loop();
+  /// \brief Start the render pool, if `render_threads` is above one.
+  ///
+  /// Called by the render thread before the first block, so the workers are pinned, counted and
+  /// warmed before anything has a deadline. A pool smaller than asked for is reported, never silent.
+  bool start_render_pool(std::string& error);
+  /// \brief One participant's share of a block: every `participants`-th chain, plans only.
+  ///
+  /// Run on the coordinator and on every worker. It touches chain plans and chain buffers and
+  /// nothing else: no crossfade mix, no transition bookkeeping and no output bus, all of which stay
+  /// on the coordinator so that a chain still has exactly one owner for state (docs/multi-core.md).
+  void run_chains(unsigned participant, unsigned participants, int frames) noexcept;
+  /// The pool's callback: `context` is the Daemon.
+  static void run_chains_entry(void* context, unsigned participant, unsigned participants,
+                               int frames) noexcept;
   bool open_device(std::string& error);
   /// Give the backend its chance to flush what it accumulated, before the object is destroyed: a
   /// `file` backend writes its output WAV here, and a device backend has nothing to do.
@@ -540,6 +555,9 @@ private:
   std::atomic<bool> stop_requested_{false};
   std::atomic<bool> mute_{false};
   std::thread render_thread_;
+  /// The worker threads behind `Config::render_threads`. Idle (one participant, no threads) unless
+  /// the configuration asks for more; stopped with the render thread.
+  RenderPool render_pool_;
 
   // Render-thread-owned state. Only the render thread touches these.
   std::unique_ptr<AudioBackend> device_;
@@ -619,6 +637,17 @@ private:
   std::atomic<int> rt_policy_{0};
   std::atomic<int> rt_priority_{0};
   std::atomic<bool> rt_realtime_{false};
+  /// \brief The render pool as it actually is, for `engine.status`.
+  ///
+  /// Written by the render thread when the pool starts and read by the control thread, so these are
+  /// atomics rather than the pool itself: the pool's own state is the render thread's, and a status
+  /// request may not walk a vector another thread is rebuilding. `render_cores_mask_` is a bit per
+  /// CPU the participants were actually confined to, read back from the kernel.
+  std::atomic<unsigned> render_threads_active_{1};
+  std::atomic<uint64_t> render_cores_mask_{0};
+  /// True when the pool is smaller than the configuration asked for, or could not start at all. The
+  /// status reports it and the run is not a multi-core result.
+  std::atomic<bool> render_pool_degraded_{false};
   std::atomic<int> active_format_{static_cast<int>(PcmFormat::Unknown)};
 
   /// The backend's output-queue counters (StreamQueueStats), published per block. A dropped or an

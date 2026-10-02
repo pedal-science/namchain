@@ -142,6 +142,7 @@ add_library(namchain OBJECT
   src/daemon/model_budget.cpp
   src/daemon/platform.cpp
   src/daemon/recorder.cpp
+  src/daemon/render_pool.cpp
   src/render/timeline.cpp
   src/latency/latency.cpp
   src/glitch/glitch.cpp

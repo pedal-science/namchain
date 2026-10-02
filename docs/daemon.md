@@ -76,7 +76,8 @@ silently ignored.
 | `socket` | `/run/namchain/namchaind.sock` | Unix `SOCK_SEQPACKET` control socket |
 | `socket_mode` | `"0660"` | octal string |
 | `rt_priority` | `80` | `SCHED_FIFO` for the render thread; `0` leaves the policy alone |
-| `cpu` | `-1` | pin the render thread to one CPU; `-1` leaves the affinity alone |
+| `cpu` | `-1` | pin the render thread to one CPU; `-1` leaves the affinity alone. With `render_threads` above 1 this is the first core of the render set |
+| `render_threads` | `1` | cores the render path uses: one coordinator plus this many minus one workers; `1` is the single-threaded engine. See "Render threads" below |
 | `lock_memory` | `true` | `mlockall(MCL_CURRENT)`, never `MCL_FUTURE` (plan.md §14.10) |
 | `output_queue_periods` | `0` | output-ring cap in periods; `0` is off |
 | `output_queue_floor_periods` | `0` | queue floor in periods; `0` is off |
@@ -485,6 +486,38 @@ reference on a node that isn't 1->1 still refuses the document as `asset_missing
 
 docs/assets.md is the reference — ids, the two roots, what is read from a file (a header sniff, never
 a load), and the `engine.assets` response in full.
+
+### Render threads: how many cores the render path uses
+
+`render_threads` is how many cores `namchaind` renders on. `1`, the default, is the engine that has
+always run here: one render thread that reads the device, decodes each chain's input, executes every
+chain's plan, crossfades, sums the output bus and writes the device. Above one, the chains are shared
+out over that many threads pinned to `cpu` and the cores above it, and a block becomes:
+
+1. **the coordinator** (the render thread, on `cpu`) reads the device and decodes every chain's input;
+2. **every participant** executes its share of the chains — participant `p` takes chain `p`, `p+N`,
+   `p+2N`, ... — including *both* plans of a chain that is mid-transition;
+3. **the coordinator** mixes the crossfades, retires the plan that has faded out, skips muted chains,
+   sums the output bus and writes the device.
+
+What does not change: a chain is executed by exactly one thread, in its original node order, and only
+the coordinator touches the transition bookkeeping, the reclaimer or the output bus. A document
+rendered with `render_threads: 2` is therefore **bit-identical** to the same document rendered with
+`1`, and `tests/test_daemon.cpp` asserts that sample by sample rather than approximately.
+
+**What it does not help.** A chain cannot be split, so this shares out *chains* and nothing else. A
+document whose weight is one long chain — an amp into an amp into a cabinet, which is what the pedal's
+heaviest rig is — gets nothing from it, and the second half of a chain cannot start before the first
+half has finished. The gain is for documents with more than one chain's worth of work: dual-mono rigs,
+a guitar and a bass, a parallel path that exists for its own sake. The measurement and the trade-offs
+are in `pedal.project/docs/multi-core.md` and its report.
+
+`engine.status` reports `render_threads` (what the pool actually has), `render_threads_configured`
+(what was asked for), `render_cores` (a bit per CPU the participants were confined to, read back from
+the kernel rather than remembered) and `render_degraded`. A run whose `render_threads` is below its
+configured value is not a multi-core measurement; a worker that cannot be created is reported rather
+than silently dropped, and a configuration naming cores this process may not run on is refused at
+startup, by name.
 
 ### Model budget: what a document's models may read per block
 

@@ -7,6 +7,7 @@
 // state that never leaves "closed".
 #include <doctest.h>
 
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -2777,4 +2778,222 @@ TEST_CASE("a recent-trouble bucket reaches zero in bounded time")
   // And it is still a decay: a big count takes longer than a small one, and never grows.
   CHECK(decay_recent_trouble(1000) < 1000);
   CHECK(decay_recent_trouble(1000) > decay_recent_trouble(18));
+}
+
+// ---------------------------------------------------------------------------
+// The render pool (`render_threads`, pedal.project docs/multi-core.md)
+// ---------------------------------------------------------------------------
+namespace
+{
+
+/// The CPUs this process may run on, lowest first. A pool needs one per participant.
+std::vector<int> allowed_cpus()
+{
+  std::vector<int> cpus;
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  if (::sched_getaffinity(0, sizeof(mask), &mask) != 0)
+    return cpus;
+  for (int i = 0; i < CPU_SETSIZE; ++i)
+  {
+    if (CPU_ISSET(i, &mask))
+      cpus.push_back(i);
+  }
+  return cpus;
+}
+
+/// A document of `count` chains, each a gain from channel `i % 2` to the same channel. The gain
+/// depends on the chain, so a chain rendered twice, not at all, or on the wrong input cannot pass
+/// unnoticed; two chains share each channel, so the sum order is visible too.
+std::string n_chain_document(int count)
+{
+  nlohmann::json chains = nlohmann::json::array();
+  for (int i = 0; i < count; ++i)
+  {
+    const int channel = i % 2;
+    nlohmann::json chain;
+    chain["id"] = "c" + std::to_string(i);
+    chain["input_channel"] = channel;
+    chain["output_channel"] = channel;
+    chain["nodes"] = nlohmann::json::array({
+      {{"id", "in"}, {"type", "nc.input"}},
+      {{"id", "g"}, {"type", "nc.gain"}, {"gain", 0.1 * (i + 1)}},
+      {{"id", "out"}, {"type", "nc.output"}},
+    });
+    chain["connections"] =
+      nlohmann::json::array({{{"from", "in"}, {"to", "g"}}, {{"from", "g"}, {"to", "out"}}});
+    chains.push_back(chain);
+  }
+  nlohmann::json document;
+  document["name"] = "N chains";
+  document["chains"] = chains;
+  return document.dump();
+}
+
+/// Render `document` off a file and hand back the output samples. `threads` > 1 pins the pool at the
+/// first allowed CPU, which is what the appliance does with `cpu`.
+std::vector<float> render_document(const std::string& document, unsigned threads)
+{
+  const std::vector<int> cpus = allowed_cpus();
+  REQUIRE(cpus.size() >= threads);
+
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "doc.json", document);
+  write_stereo_wav(dir.path / "in.wav", 512, /*left=*/0.75f, /*right=*/-0.5f);
+
+  Config config = file_backend_config(dir, 2, 2);
+  config.rigs_root = root.string();
+  config.rig = (root / "doc.json").string();
+  config.render_threads = threads;
+  if (threads > 1)
+    config.cpu = cpus.front();
+
+  Daemon daemon(config);
+  run_to_end(daemon);
+
+  unsigned channels = 0;
+  return read_wav(dir.path / "out.wav", channels);
+}
+
+} // namespace
+
+TEST_CASE("two render threads produce, bit for bit, what one does")
+{
+  if (allowed_cpus().size() < 2)
+  {
+    MESSAGE("fewer than two CPUs are available to this process; the parallel arm is skipped");
+    return;
+  }
+  const std::string document = two_chain_document(0.5, 0.25, 0, 1);
+  const std::vector<float> serial = render_document(document, 1);
+  const std::vector<float> parallel = render_document(document, 2);
+
+  REQUIRE(serial.size() == 512u * 2u);
+  REQUIRE(parallel.size() == serial.size());
+  // Not `Approx`: a chain is executed by one thread in its original node order either way, so the
+  // two runs have to agree to the last bit. Anything less would mean the pool changed the audio.
+  for (std::size_t i = 0; i < serial.size(); ++i)
+    CHECK(serial[i] == parallel[i]);
+}
+
+TEST_CASE("a participant takes every participants-th chain, and the sum keeps its order")
+{
+  if (allowed_cpus().size() < 3)
+  {
+    MESSAGE("fewer than three CPUs are available to this process; the three-way arm is skipped");
+    return;
+  }
+  // Five chains over two channels: two participants take two chains each and one takes one, and the
+  // chains that share a channel are summed in chain order whatever the split.
+  const std::string document = n_chain_document(5);
+  const std::vector<float> serial = render_document(document, 1);
+  const std::vector<float> parallel = render_document(document, 3);
+
+  REQUIRE(serial.size() == 512u * 2u);
+  REQUIRE(parallel.size() == serial.size());
+  for (std::size_t i = 0; i < serial.size(); ++i)
+    CHECK(serial[i] == parallel[i]);
+
+  // And the sum is what the document says: channel 0 takes chains 0, 2, 4 at 0.1/0.3/0.5 of 0.75,
+  // channel 1 takes chains 1, 3 at 0.2/0.4 of -0.5.
+  CHECK(serial[0] == doctest::Approx(0.75f * 0.9f).epsilon(1e-5));
+  CHECK(serial[1] == doctest::Approx(-0.5f * 0.6f).epsilon(1e-5));
+}
+
+TEST_CASE("a transition under two render threads keeps one owner for its bookkeeping")
+{
+  if (allowed_cpus().size() < 2)
+  {
+    MESSAGE("fewer than two CPUs are available to this process; the parallel arm is skipped");
+    return;
+  }
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "a.json", two_chain_document(0.5, 0.5, 0, 1));
+  // A structural change to both chains, so both plans are rendered together for the fade.
+  write_file(root / "b.json", two_chain_document(0.25, 0.25, 0, 1, /*second_stage=*/true));
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "a.json").string();
+  config.capture_channels = 2;
+  config.playback_channels = 2;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  config.fade_ms = 20.0;
+  config.render_threads = 2;
+  config.cpu = allowed_cpus().front();
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() == 1;
+  }));
+
+  // The status says what the pool actually did, not what was configured.
+  {
+    const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+    CHECK(reply["status"]["render_threads"].get<unsigned>() == 2u);
+    CHECK(reply["status"]["render_threads_configured"].get<unsigned>() == 2u);
+    CHECK(reply["status"]["render_degraded"].get<bool>() == false);
+  }
+
+  const auto loaded =
+    nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"rig.load","rig":"b.json"})"));
+  REQUIRE(loaded["ok"] == true);
+
+  // Dual-render puts both plans of a chain on the same participant, so the fade has to close and the
+  // chain has to change hands with no mismatch and no guard trip. `local_base_mismatches` is the one
+  // counter that would move if two participants ever touched one chain's state.
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["audible_generation"].get<uint64_t>() == 2 && status["transition_active"] == false;
+  }));
+  const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  CHECK(reply["status"]["local_base_mismatches"].get<uint64_t>() == 0u);
+  CHECK(reply["status"]["guard_trips"].get<uint64_t>() == 0u);
+  CHECK(reply["status"]["failed_nodes"].get<unsigned>() == 0u);
+  CHECK(reply["status"]["max_concurrent_transitions"].get<unsigned>() == 1u);
+}
+
+TEST_CASE("render_threads needs a CPU to start from, and refuses cores this process may not use")
+{
+  Config config;
+  config.backend = BackendKind::Null;
+  config.render_threads = 2;
+  config.cpu = -1;
+  std::string error;
+  Daemon daemon(config);
+  CHECK_FALSE(daemon.start(error));
+  CHECK(error.find("render_threads") != std::string::npos);
+
+  // A CPU beyond the process's affinity mask is refused by name rather than discovered by a worker
+  // that cannot pin itself.
+  const std::vector<int> cpus = allowed_cpus();
+  Config beyond;
+  beyond.backend = BackendKind::Null;
+  beyond.render_threads = 2;
+  beyond.cpu = cpus.back() + 1;
+  std::string beyond_error;
+  Daemon beyond_daemon(beyond);
+  CHECK_FALSE(beyond_daemon.start(beyond_error));
+  CHECK(beyond_error.find("may not run on") != std::string::npos);
 }

@@ -54,6 +54,8 @@ void print_usage(std::FILE* stream)
                "      --tcp-auth-timeout-ms N  how long a connection may stay unauthenticated, default 10000\n"
                "      --rt-priority N          render-thread SCHED_FIFO priority, default 80; 0 leaves it\n"
                "      --cpu N                  pin the render thread to one CPU; -1 leaves it (default)\n"
+               "      --render-threads N       cores the render path uses, from --cpu upwards; 1 = one\n"
+               "                               thread (default), N > 1 shares the chains out over N\n"
                "      --lock-memory            mlockall(MCL_CURRENT) (default)\n"
                "      --no-lock-memory         do not lock memory\n"
                "      --output-queue-periods N output ring cap in periods; 0 = none (default)\n"
