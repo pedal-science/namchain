@@ -48,6 +48,13 @@ struct Config
   /// which is a decision for whatever spawns this process and therefore belongs to a flag rather than
   /// to a default.
   std::string input_device;
+  /// \brief The device's own buffer, in frames, to ask for where the backend can set it; 0 leaves it.
+  ///
+  /// Not the engine's quantum: `period_size` is the plan's ceiling and the backend measures what the
+  /// device actually hands over. This is the *device's* buffer, which is most of the monitoring
+  /// latency, and a backend that sets it must put back what it found when it stops. Only `coreaudio`
+  /// reads it today.
+  unsigned device_buffer_frames = 0;
   std::string playback_path;
   /// \brief Where `coreaudio` writes what it is sending the device, or empty for nowhere.
   ///

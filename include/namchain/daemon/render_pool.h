@@ -78,7 +78,10 @@ public:
   ///        workers it has and reports it in \ref degraded_reason, because an appliance that cannot
   ///        have its extra cores still has to play.
   /// \return false only when \p error says the request was refused.
-  bool start(unsigned threads, int first_cpu, int priority, std::string& error);
+  /// \param period_seconds The audio period the workers have to finish inside, or 0 when the caller
+  ///        does not know it. Only platforms whose real-time facility is made of it use it (macOS's
+  ///        time-constraint policy); Linux pins and promotes and ignores it.
+  bool start(unsigned threads, int first_cpu, int priority, std::string& error, double period_seconds = 0.0);
 
   /// \brief Run one block on every participant and return when all have finished.
   ///
@@ -140,6 +143,7 @@ private:
   unsigned threads_ = 1; ///< Participants, coordinator included. 1 means "no workers".
   int first_cpu_ = -1;
   int priority_ = 0;
+  double period_seconds_ = 0.0; ///< The window a platform whose real-time facility needs one is given.
   uint64_t sequence_ = 0;
   std::string degraded_reason_;
 };

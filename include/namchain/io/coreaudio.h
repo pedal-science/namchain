@@ -73,6 +73,14 @@ struct CoreAudioConfig
   /// Periods of processed audio the output ring may hold before a period is dropped. 0 is "no cap",
   /// in which case the ring's own capacity (the next power of two at or above 8) is the cap.
   unsigned output_queue_periods = 0;
+  /// \brief The device's own buffer, in frames, to ask for; 0 leaves it as it is found.
+  ///
+  /// This is the device's IO buffer, not the engine's quantum, and it is most of the monitoring
+  /// latency: 512 frames is 10.67 ms at 48 kHz, and a USB interface will usually take a great deal
+  /// less. Applied with `kAudioDevicePropertyBufferFrameSize` after the stream device is chosen and
+  /// *before* the period is measured, because the measurement is of what the callback is handed and
+  /// that is exactly what this changes. What the device was set to before is put back in `stop()`.
+  unsigned device_buffer_frames = 0;
 };
 
 /// \brief A looped WAV into a CoreAudio output device, in one process.

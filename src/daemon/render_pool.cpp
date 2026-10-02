@@ -52,7 +52,7 @@ RenderPool::~RenderPool()
   stop();
 }
 
-bool RenderPool::start(unsigned threads, int first_cpu, int priority, std::string& error)
+bool RenderPool::start(unsigned threads, int first_cpu, int priority, std::string& error, double period_seconds)
 {
   stop();
 
@@ -73,6 +73,7 @@ bool RenderPool::start(unsigned threads, int first_cpu, int priority, std::strin
   threads_ = threads;
   first_cpu_ = first_cpu;
   priority_ = priority;
+  period_seconds_ = period_seconds;
   sequence_ = 0;
   degraded_reason_.clear();
   participants_.clear();
@@ -229,7 +230,7 @@ void RenderPool::worker_main(unsigned index)
   Slot& slot = *slots_[index];
 
   const int cpu = first_cpu_ >= 0 ? first_cpu_ + static_cast<int>(index) : -1;
-  participants_[index].scheduling = rt::apply_scheduling(priority_, cpu);
+  participants_[index].scheduling = rt::apply_scheduling(priority_, cpu, period_seconds_);
 
   // Touch the stack this thread will run on, so the first block does not take a page fault on the
   // render path. mlockall(MCL_CURRENT) runs after the pool starts and covers what is faulted here.

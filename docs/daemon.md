@@ -73,6 +73,7 @@ silently ignored.
 | `playback_channels` | `1` | requested; each chain writes the channel it names, and the rest is zeroed |
 | `capture_path` | *(empty)* | `file`, `pipe` and `coreaudio`: the WAV read as input. `pipe` and `coreaudio` loop it. On `coreaudio` it is the alternative to `input_device`, and giving both is refused |
 | `input_device` | *(empty)* | `coreaudio` only: a CoreAudio input device **UID** to capture from live. Empty means the capture comes from `capture_path`. Reading a device is what makes macOS ask for microphone permission, so this happens only when the key is set |
+| `device_buffer_frames` | `0` | `coreaudio` only: the device's own IO buffer to ask it for, in frames; 0 leaves it as it is found. This is where most of the monitoring latency lives — 512 frames is 10.67 ms at 48 kHz — and the daemon **puts the previous value back** when it stops |
 | `playback_path` | *(empty)* | `file`: the output WAV, written when the input runs out. `pipe`: the FIFO the output is streamed to |
 | `rig` | *(empty)* | startup rig; empty starts silent and waits for `rig.load` |
 | `rigs_root` | `/etc/namchain/rigs` | the directory a `rig.load` **name** resolves under |
@@ -204,6 +205,27 @@ What is worth knowing before quoting a number from it:
   daemon closes the device. When one device serves both directions — the common case for an interface
   — no aggregate is made at all. `engine.status.backend_diagnostics` says which happened
   (`live_input`, `aggregate_device`, `device_period_frames`).
+- **The device's buffer is the latency knob, and it is put back.** `--device-buffer-frames 32` asks the
+  device for a 32-frame IO buffer (0.67 ms at 48 kHz) instead of whatever it had, which is most of the
+  monitoring latency; the request is checked against the device's own range and read back, so
+  `engine.status.backend_diagnostics.device_buffer_frames` reports what the device actually took. The
+  value it had before is restored in `stop()`, because a monitoring tool that leaves somebody's
+  interface — and every other application that opens it — at 32 frames has taken a decision that was
+  not its to take. A crash between the write and the restore leaves it set; that is the price of
+  writing a device property at all, and Audio MIDI Setup is where it is put right.
+- **The render thread asks macOS for real-time scheduling, and it gets it.** There is no settable
+  `SCHED_FIFO` for an unprivileged process the way Linux has one — but `pthread_setschedparam` with
+  `SCHED_FIFO` *does* work here, and it is **read back** (`engine.status.realtime`, `rt_policy 4`).
+  On top of that the thread is given a `THREAD_TIME_CONSTRAINT_POLICY` window sized to the audio
+  period (the configured ceiling at start-up, then the device's measured period as soon as it is
+  known), which is the facility CoreAudio's own IO threads use; macOS accepts it and then reports it
+  back as the default, so the report says "accepted, and these are the numbers asked for" rather than
+  pretending to have read it. Two things about it are not obvious and were measured on macOS 27:
+  a further `pthread_setschedparam` **fails with `EINVAL`** once a window is in force (so the daemon
+  skips the call when the thread is already what was asked for — it re-applies scheduling on every
+  device open), and the window's period must be converted with the mach timebase **the other way round
+  from the way it reads** (`ticks = ns * denom / numer`), or the `uint32_t` overflows and the kernel
+  answers `KERN_INVALID_ARGUMENT`.
 - **A UID is matched by reading every device's UID, not by `kAudioHardwarePropertyTranslateUIDToDevice`.**
   That property is the documented way and it refuses every size this code can offer it on macOS 27
   (`kAudioHardwareBadPropertySizeError`, `!siz`), including the size of `AudioValueTranslation`

@@ -58,6 +58,13 @@ struct BackendConfig
   /// by name. Empty means the capture comes from `input_path`.
   std::string input_device;
   std::string output_path;
+  /// \brief The device's own buffer, in frames, to ask for; 0 leaves it as it is found.
+  ///
+  /// `coreaudio` only, and not the engine's quantum: this is the device's IO buffer, which is where
+  /// most of the monitoring latency lives (512 frames is 10.67 ms at 48 kHz). A backend that honours
+  /// it saves the value it found and puts it back in `stop()`, so a tool that borrows the interface
+  /// does not leave somebody's DAW configured for 32 frames.
+  unsigned device_buffer_frames = 0;
   /// `coreaudio` only, and only when built with `NAMCHAIN_COREAUDIO_CAPTURE`: a WAV path to write
   /// what the backend hands the device. Empty -- the default, and the only value in a normal build --
   /// means nothing is recorded. It exists so the live device path can be null-tested.

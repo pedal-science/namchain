@@ -381,6 +381,10 @@ private:
   /// \brief Publish what the pool actually has, for `engine.status`. Render thread, once, after the
   /// coordinator has taken its own scheduling.
   void publish_render_state();
+  /// \brief Ask for real-time scheduling with a window sized to \p period_seconds, and publish what
+  /// resulted. Called at start-up (the configured period as an estimate) and again after a device
+  /// opens, when the period it actually hands over is known.
+  void promote_render_thread(double period_seconds);
   /// \brief One participant's share of a block: every `participants`-th chain, plans only.
   ///
   /// Run on the coordinator and on every worker. It touches chain plans and chain buffers and

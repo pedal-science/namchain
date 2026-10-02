@@ -617,6 +617,13 @@ struct CoreAudioBackend::Implementation
   std::string input_device_name;
   std::string output_device_name;
 
+  /// The device's buffer as it was found, and whether this open changed it. `stop()` puts it back, so
+  /// borrowing somebody's interface at 32 frames does not leave their DAW configured that way.
+  unsigned previous_buffer_frames = 0;
+  bool buffer_frames_set = false;
+  /// What the device's buffer actually is after the request, for `diagnostics`.
+  unsigned device_buffer_frames = 0;
+
   /// One captured period, preallocated. Filled by the IOProc and pushed to the ring as a whole.
   std::vector<float> capture_scratch;
   /// One period of silence, written when the output ring is empty.
@@ -704,6 +711,11 @@ struct CoreAudioBackend::Implementation
   char lost_reason[256] = {0};
   std::atomic<uint64_t> playback_underruns{0};
   std::atomic<uint64_t> capture_overruns{0};
+  /// The most periods one callback has carried, and the most a period has been late by. Both are for
+  /// `diagnostics`: "the engine is being starved" and "the device is handing over more than one
+  /// quantum at a time" are the same symptom from outside and different faults inside, and a
+  /// recording of the sound cannot tell them apart.
+  std::atomic<unsigned> max_periods_per_callback{0};
 
   void mark_lost(const std::string& reason)
   {
@@ -810,6 +822,11 @@ struct CoreAudioBackend::Implementation
       mark_lost_periods(frames, period);
       return;
     }
+    // What the device is actually asking for, in engine periods. Recorded rather than assumed: the
+    // probe's smallest callback is what the engine runs at, and a *stream* callback may be larger --
+    // on this machine the probe sees 512 frames and the stream is handed 1024, which is two periods.
+    if (periods > max_periods_per_callback.load(std::memory_order_relaxed))
+      max_periods_per_callback.store(periods, std::memory_order_relaxed);
     // One pop per period, before the fill: the fill above must not branch on the ring, and a period
     // that did not arrive is a period of silence and one underrun. Each period is popped into its own
     // scratch, because the fill below needs all of them, not just the last.
@@ -1081,6 +1098,7 @@ std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& conf
   impl.config.period_size = config.period_size;
   impl.config.periods = config.periods == 0 ? 4 : config.periods;
   impl.config.capture_channels = config.capture_channels;
+  impl.config.device_buffer_frames = config.device_buffer_frames;
   impl.config.playback_channels = config.playback_channels;
   impl.config.output_queue_periods = config.output_queue_periods;
   impl.live_input = live_input;
@@ -1165,6 +1183,36 @@ std::unique_ptr<AudioBackend> CoreAudioBackend::create(const BackendConfig& conf
   {
     error = "the CoreAudio device '" + impl.output_device_name + "' is not alive";
     return nullptr;
+  }
+
+  // 3b. The device's own buffer, when the caller asked for one. This is the first thing that should
+  //     happen to the device, because everything after it -- the format checks, and above all the
+  //     probe -- is about the stream this buffer defines. A request is checked against the device's
+  //     own range and read back; the read-back is what `diagnostics` reports, because a device that
+  //     silently clamps to 512 must not be described as running at 32.
+  if (impl.config.device_buffer_frames > 0)
+  {
+    AudioValueRange range{};
+    if (get_property(impl.device, global_address(kAudioDevicePropertyBufferFrameSizeRange), range) &&
+        (impl.config.device_buffer_frames < static_cast<unsigned>(range.mMinimum) ||
+         impl.config.device_buffer_frames > static_cast<unsigned>(range.mMaximum)))
+    {
+      error = "the CoreAudio device takes a buffer of " + std::to_string(static_cast<unsigned>(range.mMinimum)) +
+              " to " + std::to_string(static_cast<unsigned>(range.mMaximum)) + " frames, and " +
+              std::to_string(impl.config.device_buffer_frames) + " was asked for";
+      return nullptr;
+    }
+    if (get_property(impl.device, global_address(kAudioDevicePropertyBufferFrameSize), impl.previous_buffer_frames))
+      impl.buffer_frames_set = true;
+    const UInt32 wanted = impl.config.device_buffer_frames;
+    if (!set_property(impl.device, global_address(kAudioDevicePropertyBufferFrameSize), wanted))
+    {
+      error = "the CoreAudio device would not take a buffer of " + std::to_string(wanted) + " frames";
+      return nullptr;
+    }
+    UInt32 actual = 0;
+    if (get_property(impl.device, global_address(kAudioDevicePropertyBufferFrameSize), actual))
+      impl.device_buffer_frames = actual;
   }
 
   // 4. The rate. The engine has no resampler, so a device at another rate is refused rather than
@@ -1498,6 +1546,17 @@ void CoreAudioBackend::stop()
     dispatch_release(impl.queue);
     impl.queue = nullptr;
   }
+  // The device's buffer goes back to what it was found as. This is the one property this backend
+  // writes, and writing it without putting it back would leave somebody's interface -- and every other
+  // application that opens it -- at 32 frames because a monitoring tool was tried once. A crash
+  // between the write and this line leaves it set, which is the price of touching it at all; the same
+  // value is in Audio MIDI Setup for whoever has to put it right.
+  if (impl.buffer_frames_set && impl.device != kAudioObjectUnknown && impl.previous_buffer_frames > 0)
+  {
+    const UInt32 previous = impl.previous_buffer_frames;
+    set_property(impl.device, global_address(kAudioDevicePropertyBufferFrameSize), previous);
+    impl.buffer_frames_set = false;
+  }
   // Last, and after the stream is stopped: the aggregate is this process's own object, so destroying
   // it takes it off the system as well as out of here. A private aggregate does not survive the
   // process that made it, but leaving it to that would leave it alive for as long as the daemon keeps
@@ -1672,7 +1731,17 @@ std::vector<std::pair<std::string, long long>> CoreAudioBackend::diagnostics() c
   return {{"loop_wraps", static_cast<long long>(impl.loop.wraps())},
           {"device_period_frames", static_cast<long long>(impl.info.period_size)},
           {"live_input", impl.live_input ? 1 : 0},
-          {"aggregate_device", impl.aggregate != kAudioObjectUnknown ? 1 : 0}};
+          {"aggregate_device", impl.aggregate != kAudioObjectUnknown ? 1 : 0},
+          // The two halves of `xruns`, which the summary number cannot tell apart: a capture overrun
+          // is the engine not having read the last one or two periods before the device produced
+          // more, and a playback underrun is the device having run out of processed audio.
+          {"capture_overruns", static_cast<long long>(impl.capture_overruns.load(std::memory_order_relaxed))},
+          {"playback_underruns", static_cast<long long>(impl.playback_underruns.load(std::memory_order_relaxed))},
+          {"periods_per_callback", static_cast<long long>(impl.max_periods_per_callback.load(std::memory_order_relaxed))},
+          // What the device's buffer actually is, which is the number `--device-buffer-frames` is
+          // about and which `period_size` only shows as a frame count per callback. 0 means it was
+          // never asked for.
+          {"device_buffer_frames", static_cast<long long>(impl.device_buffer_frames)}};
 }
 
 void CoreAudioBackend::interrupt()

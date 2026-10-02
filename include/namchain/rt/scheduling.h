@@ -32,20 +32,41 @@ struct SchedulingState
   bool affinity_applied = false; ///< False when the requested CPU was refused.
   std::string detail;          ///< Why either failed, empty when both did what was asked.
 
+  /// \brief macOS: the thread carries a `THREAD_TIME_CONSTRAINT_POLICY`.
+  ///
+  /// There is no `SCHED_FIFO` an unprivileged macOS process can set, and this policy is what the
+  /// platform offers instead: the kernel schedules the thread inside a period/computation window it
+  /// promises to meet. It is the same facility CoreAudio's own IO threads use, and it is what makes a
+  /// 32-frame period (0.67 ms) survivable. False everywhere else, and false on macOS until a caller
+  /// asks for it with a priority above zero.
+  bool time_constraint = false;
+  /// macOS only: the window that policy is set to, in microseconds. 0 when it is not in force.
+  unsigned constraint_period_us = 0;
+  unsigned constraint_computation_us = 0;
+
   /// The CPUs, in ascending order, when a caller wants to show a mask rather than a single choice.
   std::string affinity_text() const;
 };
 
-/// \brief Ask for SCHED_FIFO at \p priority and confinement to \p cpu, then report what resulted.
+/// \brief Ask for real-time scheduling, and confinement to \p cpu, then report what resulted.
 ///
-/// \param priority Requested SCHED_FIFO priority; 0 means "leave the policy alone".
-/// \param cpu Requested CPU, or -1 for "leave the affinity alone".
+/// \param priority Requested priority; 0 means "leave the scheduling policy alone". On Linux this is
+///        a `SCHED_FIFO` priority. On macOS there are no priorities to name: any value above zero asks
+///        for the time-constraint policy, and the number itself is not used.
+/// \param cpu Requested CPU, or -1 for "leave the affinity alone". macOS has no per-thread affinity
+///        and reports that as a refusal rather than pretending otherwise.
+/// \param period_seconds The audio period this thread has to finish inside, or 0 when the caller does
+///        not know it yet. Linux's `SCHED_FIFO` has no such parameter and ignores it; macOS's
+///        time-constraint policy is *made* of it, so a caller that knows the period should say so — a
+///        window sized for a 1024-frame period gives a thread working to a 32-frame deadline a great
+///        deal more rope than it should have.
 /// \return the state *after* the attempt, with `detail` saying what was refused and why.
 ///
 /// Never throws and never aborts: refusing to be real-time is not a reason to fail a run, it is a
-/// reason for the run to say it was not real-time. Unprivileged callers get EPERM on the priority and
-/// a successful affinity change, which is exactly the case a unit test can exercise in CI.
-SchedulingState apply_scheduling(int priority, int cpu);
+/// reason for the run to say it was not real-time. Unprivileged callers get EPERM on the Linux
+/// priority and a successful affinity change, which is exactly the case a unit test can exercise in
+/// CI; on macOS the time-constraint policy needs no privilege at all, so the same test gets it.
+SchedulingState apply_scheduling(int priority, int cpu, double period_seconds = 0.0);
 
 /// Read the current policy, priority and affinity without changing any of them.
 SchedulingState current_scheduling();

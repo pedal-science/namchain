@@ -361,3 +361,63 @@ TEST_CASE("scheduling state can be read back, and a refusal is reported rather t
   else
     CHECK_FALSE(rt.detail.empty());
 }
+
+#if defined(__APPLE__)
+// ---------------------------------------------------------------------------
+TEST_CASE("macOS gets real-time scheduling without privilege, and re-asking does not fail")
+{
+  // macOS has no `SCHED_FIFO` an unprivileged process can reach by the Linux route, and this project
+  // reported "not real-time" for months because of it. `pthread_setschedparam` does work here, and the
+  // time-constraint window is what makes a short period survivable, so this test asserts the thing
+  // that used to be untrue: the policy is set, and the kernel reads it back.
+  //
+  // In a thread of its own, because scheduling is per-thread and this is exactly the daemon's
+  // situation: a fresh render thread that asks once at start-up and again on every device open. (The
+  // test above has already promoted the thread it runs on, and a thread that holds a window cannot
+  // have its priority changed again -- see the last block here, which pins that down.)
+  const double period = 32.0 / 48000.0; // 0.67 ms, the period this app runs at
+  namchain::rt::SchedulingState asked;
+  namchain::rt::SchedulingState again;
+  namchain::rt::SchedulingState changed;
+  namchain::rt::SchedulingState untouched;
+  std::thread worker([&] {
+    asked = namchain::rt::apply_scheduling(60, -1, period);
+    again = namchain::rt::apply_scheduling(60, -1, 512.0 / 48000.0);
+    changed = namchain::rt::apply_scheduling(70, -1, period);
+    untouched = namchain::rt::apply_scheduling(0, -1);
+  });
+  worker.join();
+
+  CHECK(asked.realtime);
+  CHECK(asked.policy == SCHED_FIFO);
+  CHECK(asked.priority == 60);
+  CHECK(asked.priority_applied);
+  CHECK(asked.time_constraint);
+  CHECK(asked.constraint_period_us > 0);
+  // The window is the period asked for, not the 10 ms a caller that does not know its period gets.
+  CHECK(asked.constraint_period_us <= 1000);
+  CHECK(asked.constraint_computation_us < asked.constraint_period_us);
+
+  // Asking again is what the daemon does on every device open, and it must not report a failure: once
+  // a window is in force, a further `pthread_setschedparam` answers EINVAL (measured on macOS 27), so
+  // the implementation skips the call when the thread already holds what was asked for.
+  CHECK(again.priority_applied);
+  CHECK(again.detail.find("EINVAL") == std::string::npos);
+  CHECK(again.detail.find("Invalid argument") == std::string::npos);
+  CHECK(again.constraint_period_us > asked.constraint_period_us); // revised, not refused
+
+  // Changing the priority *after* a window is in force cannot be done at all on this macOS: the call
+  // answers EINVAL whatever the new priority is. What matters is that the refusal is reported instead
+  // of the run claiming a priority it does not hold -- and the thread stays real-time either way.
+  const bool refused_by_name = changed.detail.find("EINVAL") != std::string::npos ||
+                               changed.detail.find("Invalid argument") != std::string::npos;
+  CHECK_FALSE(changed.priority_applied);
+  CHECK(refused_by_name);
+  CHECK(changed.realtime);
+  CHECK(changed.priority == 60); // the priority it does hold
+
+  // And zero still means "leave the policy alone", which is not the same as asking for SCHED_OTHER.
+  CHECK(untouched.realtime); // the policy set above is still in force
+  CHECK_FALSE(untouched.priority_applied);
+}
+#endif

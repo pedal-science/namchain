@@ -130,11 +130,18 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
   set(_sched_expected "scheduling:[^\n]*cpu 0")
   set(_sched_wanted "say the thread was confined to cpu 0")
 else()
-  set(_sched_expected "scheduling:[^\n]*only implemented on Linux")
-  set(_sched_wanted "say that it could not confine the thread on this platform")
+  # macOS has a real policy to report since 2026-10-02 (`SCHED_FIFO` plus a time-constraint window,
+  # neither of which needs a privilege there), and still no affinity API. So the honest report names
+  # the policy it holds and says the confinement was not applied -- and must not print a cpu number,
+  # which is what a claim of confinement would look like.
+  set(_sched_expected "scheduling:[^\n]*SCHED_FIFO[^\n]*time-constraint window[^\n]*no per-thread cpu affinity")
+  set(_sched_wanted "name the real-time policy it holds and say that it could not confine the thread")
 endif()
 if(NOT _sched_out MATCHES "${_sched_expected}")
   message(FATAL_ERROR "the report did not ${_sched_wanted}:\n--- stdout ---\n${_sched_out}")
+endif()
+if(NOT CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND _sched_out MATCHES "scheduling:[^\n]*cpu 0")
+  message(FATAL_ERROR "the report claimed a cpu confinement this platform cannot give it:\n--- stdout ---\n${_sched_out}")
 endif()
 
 # --- 7. the output-queue target is applied or refused, never silently ignored --------------------

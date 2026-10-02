@@ -237,7 +237,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
                                       "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
                                       "tcp_auth_timeout_ms", "models_root", "irs_root", "record_dir",
-                                      "capture_device_path", "input_device"};
+                                      "capture_device_path", "input_device", "device_buffer_frames"};
   for (const auto& [key, value] : doc.items())
   {
     bool known = false;
@@ -275,6 +275,16 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_string(doc, "tcp_token", config.tcp_token, path, error) ||
       !read_string(doc, "tcp_token_file", config.tcp_token_file, path, error))
     return false;
+
+  if (doc.contains("device_buffer_frames"))
+  {
+    if (!doc["device_buffer_frames"].is_number_unsigned())
+    {
+      error = path + ": device_buffer_frames must be a non-negative integer";
+      return false;
+    }
+    config.device_buffer_frames = doc["device_buffer_frames"].get<unsigned>();
+  }
 
   if (doc.contains("socket_mode"))
   {
@@ -354,6 +364,21 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
   if (name == "input-device")
   {
     config.input_device = value;
+    return true;
+  }
+  if (name == "device-buffer-frames")
+  {
+    // Refused rather than silently ignored when it is not a number: this option's whole point is the
+    // number, and a typo that leaves the device at 512 frames is a latency claim nobody made.
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long frames = std::strtoul(value.c_str(), &end, 10);
+    if (value.empty() || end == value.c_str() || *end != '\0' || errno != 0 || frames == 0 || frames > 65536)
+    {
+      error = "--device-buffer-frames needs a frame count between 1 and 65536, not '" + value + "'";
+      return false;
+    }
+    config.device_buffer_frames = static_cast<unsigned>(frames);
     return true;
   }
   if (name == "capture-device-path")

@@ -214,6 +214,7 @@ TEST_CASE("a config file sets the fields the daemon uses")
     "playback_channels": 2,
     "input_device": "AppleUSBAudioEngine:Some Interface:140000:1,2",
     "capture_device_path": "/tmp/what-the-device-was-sent.wav",
+    "device_buffer_frames": 32,
     "rigs_root": "/srv/rigs",
     "socket": "/tmp/example.sock",
     "socket_mode": "0600",
@@ -250,6 +251,9 @@ TEST_CASE("a config file sets the fields the daemon uses")
   // The other side of the same lesson: `capture_device_path` was a known key with no reader, so a
   // file that set it was accepted and silently ignored. Both are read now.
   CHECK(config.capture_device_path == "/tmp/what-the-device-was-sent.wav");
+  // The device's own IO buffer, which is where the monitoring latency lives, is a setting and not a
+  // constant: 32 frames is 0.67 ms at 48 kHz against 10.67 ms for the 512 most interfaces arrive with.
+  CHECK(config.device_buffer_frames == 32u);
   CHECK(config.rigs_root == "/srv/rigs");
   CHECK(config.socket_path == "/tmp/example.sock");
   CHECK(config.socket_mode == 0600u);
@@ -334,6 +338,18 @@ TEST_CASE("command-line options parse and reject")
   CHECK(config.model_budget_kb == 0u); // off unless a device asks for it
   CHECK(namchain::daemon::apply_option(config, "model-budget-kb", "448", error));
   CHECK(config.model_budget_kb == 448u);
+
+  // The device's buffer, and the two ways of asking for it wrongly. A typo must be a refusal rather
+  // than a silently ignored latency claim: an operator who typed `--device-buffer-frames 3two` and got
+  // 512 frames of latency would have no way to tell that nothing had happened.
+  CHECK(namchain::daemon::apply_option(config, "device-buffer-frames", "32", error));
+  CHECK(config.device_buffer_frames == 32u);
+  error.clear();
+  CHECK_FALSE(namchain::daemon::apply_option(config, "device-buffer-frames", "3two", error));
+  CHECK_FALSE(error.empty());
+  error.clear();
+  CHECK_FALSE(namchain::daemon::apply_option(config, "device-buffer-frames", "0", error));
+  CHECK(config.device_buffer_frames == 32u); // refused, not reset: the last good value stands
 
   // The TCP transport's flags spell the same fields as the config keys, for the same reason every
   // other flag does: what a unit passes and what an operator types should be one vocabulary.

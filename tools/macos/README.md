@@ -61,6 +61,8 @@ ffmpeg -i your-guitar-di.wav -c:a pcm_f32le -ar 48000 -ac 1 /tmp/nc/input-f32.wa
   --tcp-listen --tcp-address 127.0.0.1 --tcp-port 47810 --tcp-token-file /tmp/nc/token
 ```
 
+`--device-buffer-frames 32` is the latency knob: the interface is asked for a 32-frame IO buffer
+(0.67 ms at 48 kHz) and the value it had before is put back when the daemon stops.
 `--period-size 1024` is a ceiling rather than a request: the backend measures the device's own period
 and compiles for that. 1024 is above anything a Mac's default output delivers. Omit `--device` for
 the default output device, or give a CoreAudio UID to pick one. A control client connects to
@@ -75,7 +77,7 @@ for the microphone:
 ./build/namchaind --backend coreaudio \
   --input-device 'AppleUSBAudioEngine:Solid State Logic:SSL 2+ Mk II:140000:1,2' \
   --device       'AppleUSBAudioEngine:Solid State Logic:SSL 2+ Mk II:140000:1,2' \
-  --capture-channels 2 --period-size 1024 \
+  --capture-channels 2 --period-size 1024 --device-buffer-frames 32 \
   --rigs-root /tmp/nc/rigs --models-root /tmp/nc/models --irs-root /tmp/nc/irs \
   --socket /tmp/nc/d.sock --no-lock-memory --rt-priority 0 \
   --tcp-listen --tcp-address 127.0.0.1 --tcp-port 47810 --tcp-token-file /tmp/nc/token

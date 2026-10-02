@@ -2108,6 +2108,7 @@ bool Daemon::open_device(std::string& error)
   backend.output_queue_floor_periods = config_.output_queue_floor_periods;
   backend.input_path = config_.capture_path;
   backend.input_device = config_.input_device;
+  backend.device_buffer_frames = config_.device_buffer_frames;
   backend.output_path = config_.playback_path;
   backend.capture_device_path = config_.capture_device_path;
 
@@ -2179,7 +2180,31 @@ bool Daemon::open_device(std::string& error)
   active_format_.store(static_cast<int>(info.format));
   // A new backend counts from zero, as its xruns do.
   last_queue_ = StreamQueueStats{};
+
+  // Re-ask for real-time scheduling now that the device's own period is known. The start-up request
+  // used the configured ceiling, which is an upper bound on the period and can be an order of
+  // magnitude off it: at `--period-size 1024` with a device handing over 32 frames, a window sized
+  // from the ceiling would give this thread thirty times the rope it needs. Nothing happens when no
+  // priority was asked for or the platform ignores the period (Linux).
+  if (config_.rt_priority > 0)
+    promote_render_thread(static_cast<double>(info.period_size) / static_cast<double>(info.sample_rate));
   return true;
+}
+
+/// \brief Ask for real-time scheduling with a window for \p period_seconds, and publish what happened.
+///
+/// Called twice for a device that opens: once at start-up with the configured period as the estimate,
+/// and again from `open_device` with the period the device actually hands over.
+void Daemon::promote_render_thread(double period_seconds)
+{
+  const rt::SchedulingState scheduling = rt::apply_scheduling(config_.rt_priority, config_.cpu, period_seconds);
+  render_pool_.note_coordinator(scheduling);
+  publish_render_state();
+  rt_policy_.store(scheduling.policy);
+  rt_priority_.store(scheduling.priority);
+  rt_realtime_.store(scheduling.realtime);
+  if (config_.verbose)
+    std::fprintf(stderr, "[namchaind] render thread: %s\n", rt::describe_scheduling(scheduling).c_str());
 }
 
 void Daemon::account_period()
@@ -2608,14 +2633,9 @@ void Daemon::render_loop()
     render_pool_degraded_.store(true);
   }
 
-  const rt::SchedulingState scheduling = rt::apply_scheduling(config_.rt_priority, config_.cpu);
-  render_pool_.note_coordinator(scheduling);
-  publish_render_state();
-  rt_policy_.store(scheduling.policy);
-  rt_priority_.store(scheduling.priority);
-  rt_realtime_.store(scheduling.realtime);
-  if (config_.verbose)
-    std::fprintf(stderr, "[namchaind] render thread: %s\n", rt::describe_scheduling(scheduling).c_str());
+  // The window's period is the configured ceiling here, because the device has not been opened yet
+  // and the period it will hand over is not known. `open_device` asks again with the real one.
+  promote_render_thread(static_cast<double>(config_.period_size) / static_cast<double>(config_.sample_rate > 0 ? config_.sample_rate : 1));
 
   std::string error;
   bool memory_locked = false;
@@ -2849,7 +2869,12 @@ bool Daemon::start_render_pool(std::string& error)
     return true; // one participant: `run` calls the work inline, and nothing is started
 
   std::string pool_error;
-  if (!render_pool_.start(config_.render_threads, config_.cpu, config_.rt_priority, pool_error))
+  // The period the workers are asked to finish inside: the configured ceiling, because the device has
+  // not been opened yet. A worker's window is set when it is created and is not revised afterwards
+  // (the coordinator's is, in `open_device`), which is why the estimate is conservative.
+  const double estimate = static_cast<double>(config_.period_size) /
+                          static_cast<double>(config_.sample_rate > 0 ? config_.sample_rate : 1);
+  if (!render_pool_.start(config_.render_threads, config_.cpu, config_.rt_priority, pool_error, estimate))
   {
     error = pool_error;
     return false;
