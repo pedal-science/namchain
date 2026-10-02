@@ -105,3 +105,26 @@ rig.apply p50 17.0 ms / max 19.7 ms, rig.patch p50 0.19 ms; the replay kept up (
 The two arms match because that session's rig is the single serial chain -- the one rig parallelism
 cannot help. What the soak establishes is the other half: transitions and edits under a parallel render
 are clean, single-owner (0 local_base_mismatches) and no worse than under one thread.
+
+The thermal soak (1, 2 and 3 render cores), piv bare, governor pinned at performance
+------------------------------------------------------------------------------------
+15 minutes per audio arm, 5 minutes for the stress-ng reference, 10 for the last; temperature from
+/sys/class/thermal/thermal_zone0, throttle from vcgencmd, per-core busy from /proc/stat across the arm.
+Every audio arm: 0 deadline overruns, 0 xruns, clock flat at 2.4 GHz.
+
+arm        threads cores  rig                      temp first/max/steady  throttle  per-core busy
+reference  -       1-3    stress-ng --cpu 3        37.5 / 40.8 / 38.9     0x0       (no audio)
+n1         1       3      two heavy chains         38.0 / 38.0 / 36.8     0x0       0:1 1:1 2:0 3:13
+n2         2       2,3    two heavy chains         37.0 / 39.7 / 37.3     0x0       0:1 1:1 2:7 3:26
+n3         3       1,2,3  three heavy chains       38.0 / 40.8 / 39.0     0x0       0:1 1:12 2:27 3:27
+n3-idle    3       1,2,3  one heavy + vocal chain  38.0 / 40.2 / 38.5     0x0       0:1 1:20 2:19 3:19
+
+- Thermally a non-event: the pedal workload on three cores peaks at the same 40.8 C that three cores
+  at FULL load reach on this board, and throttling never came within thirty degrees of mattering.
+- The finding is CPU, not heat. Total across all cores: n1 13%, n2 33% (7+26), n3 66% (12+27+27),
+  n3-idle 58% (20+19+19) -- for the same work. n3-idle is the clean case: its third participant has no
+  chain at all and is still 19% busy. That is the pool's spin before parking: a participant whose share
+  is small waits by spinning, so an idle participant costs about a fifth of a core each.
+- Left as it is, deliberately: the spin is what keeps a worker's wake off the critical path and ~0.2 W
+  does not move this board's temperature. The constant (kSpinRounds) now records the measurement and
+  names the condition for lowering it: the enclosure soak, or a power budget.

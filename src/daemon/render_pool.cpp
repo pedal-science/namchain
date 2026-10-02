@@ -22,6 +22,15 @@ constexpr unsigned kMaxRenderThreads = 16;
 /// a two-chain document is a few hundred microseconds, so a spin of this order keeps the common case
 /// syscall-free -- the worker is still spinning when the next block is published -- while an idle
 /// pool (a closed device, a paused daemon) sleeps instead of burning a core.
+///
+/// **Measured cost of the spin, 2026-10-02 (pedal.project, bench-results/2026-10-02-multi-core-piv.md,
+/// "The thermal soak").** A participant whose share of the block is small spends most of the block
+/// spinning: a worker rendering one A2-Full chain (about 7% of the deadline) reads back at 27% of its
+/// core busy, and a participant with *no chain at all* still reads 19%. Three participants rendering a
+/// one-chain document cost 58% of three cores to do what one core does in 13%. Thermally it was free
+/// on that host (40.8 C peak with throttling never set), so this was left as it is: the spin is what
+/// keeps a worker's wake off the critical path, and parking sooner trades it for one futex wake per
+/// block. Lower this constant when something cares about the watts or the last few degrees.
 constexpr unsigned kSpinRounds = 200000;
 
 /// The CPU's own "I am spinning" hint: aarch64 `yield`, x86 `pause`.
