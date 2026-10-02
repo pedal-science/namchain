@@ -1,0 +1,77 @@
+render_threads on piv: what sharing a document's chains over two cores does
+================================================================================
+
+Date      2026-10-02
+Host      piv (Raspberry Pi 500, BCM2712, 4 x Cortex-A76), kernel 7.0.0-1017-raspi-realtime
+          cores 2-3 isolated and tickless, nothing else running (namchaind stopped, no build)
+namchain  cf7aa84 (render_threads), 6ca4324 (per-core budget), 69b5b54 (the pool)
+NAM core  rikkus/OptimisationWorkOnNeuralAmpModelerCore d0339874, branch all-optimisations
+Plan      pedal.project docs/multi-core.md; report pedal.project/bench-results/2026-10-02-multi-core-piv.md
+
+Method
+------
+namchaind with the null backend (paced to the wall clock, so the numbers are real-time; silent input,
+which the 2026-10-02 two-amp work found indistinguishable from played audio), q64, 60 s per arm, one
+arm at a time, `engine.status` read at the end. Percentiles are from the daemon's own block-time
+histogram, so they carry its 1% bucket resolution; "over90" is blocks at or past 90% of the 1333.33 us
+deadline and "over" is blocks past it. The live arms use the kernel loopback card (the SSL 2+ was not
+attached to piv): a real full-duplex PCM, 20 s, period 64, 6 periods.
+
+The arms
+--------
+c2  two heavy chains: an A2-Full + cab per channel, one chain each   (the case the feature is for)
+c1  one heavy chain                                                  (the control)
+c4  four light chains: an A2-Full each, no cab
+s2  the Ambient Wash: two A2-Full amps IN SERIES on one chain, + cab + delay, + the vocal chain
+s1  that same serial guitar chain alone
+
+Results
+-------
+arm                          p50   p99   worst   over90   over   blocks   threads/cores   xruns
+c2-t1 (two chains, 1 core)   11%   15%   37.8%      0      0     45107   1 [-]           0
+c2-t2 (two chains, 2 cores)   6%    8%   23.1%      0      0     45104   2 [2,3]         0
+c1-t1 (one chain, 1 core)     5%    7%   13.0%      0      0     45118   1 [-]           0
+c1-t2 (one chain, 2 cores)    5%    7%   16.8%      0      0     45118   2 [2,3]         0
+c4-t1 (four chains, 1 core)  22%   25%   74.5%      0      0     45083   1 [-]           0
+c4-t2 (four chains, 2 cores) 11%   15%   39.0%      0      0     45087   2 [2,3]         0
+s2-t1 (series rig, 1 core)   11%   13%   26.4%      0      0     45106   1 [-]           0
+s2-t2 (series rig, 2 cores)  11%   14%   34.2%      0      0     45106   2 [2,3]         0
+s1-t1 (serial chain, 1 core) 11%   13%   35.9%      0      0     45107   1 [-]           0
+s1-t2 (serial chain, 2 cores)11%   14%   31.5%      0      0     45107   2 [2,3]         0
+
+Interference on the housekeeping cores 0-1, two heavy chains:
+c2-t2-cpu     stress-ng --cpu 2                       6%    9%   22.6%      0      0     45070   2 [2,3]   0
+c2-t2-vm      stress-ng --vm 1 --vm-bytes 128M       10%   37%   52.2%      0      0     45156   2 [2,3]   0
+c2-t2-vmkeep  the same with --vm-keep                 9%   37%   53.6%      0      0     45101   2 [2,3]   0
+c2-t1-vmkeep  the same load, ONE core                14%   64%  119.6%     13      4     45165   1 [-]     0
+
+Live, against the loopback PCM (20 s):
+live-t1 (two chains, 1 core) 12%   16%   33.2%      0      0     15102   1 [-]           1
+live-t2 (two chains, 2 cores) 6%    9%   25.0%      0      0     15104   2 [2,3]         1
+live-t2b(series rig, 2 cores)11%   14%   31.5%      0      0     15105   2 [2,3]         1
+
+Reading it
+----------
+- Where there are chains to share, the load roughly halves: c2 11/15 -> 6/8, c4 22/25 -> 11/15. That is
+  the feature, and it is what it was built for.
+- A one-chain document gains nothing (c1 5/7 -> 5/7; s2 11/13 -> 11/14). The Ambient Wash's two amps
+  are in series on one chain, so there is nothing to overlap. The differences in the worst block are
+  single blocks in 45,000, not a signal.
+- Under memory pressure the two-core render is the one that holds the deadline: same load, same rig,
+  one core misses it 4 times a minute (worst 119.6%), two cores never do (worst 53.6%). Each chain
+  keeps its working set in its own private L2 instead of sharing one. The magnitudes of a memory-load
+  arm are not reproducible (docs/tuning.md: the same flags gave 0 and 562 xruns 3.5 h apart); the
+  ordering is the result, not the numbers.
+- Pure CPU load on the housekeeping cores costs nothing (6/8 -> 6/9), which is the isolation working.
+- The live arms replicate all of it on a real device. The single driver xrun appears in every live arm
+  including the single-threaded one, so it belongs to the loopback card, not to the pool.
+- Every arm: mlockall granted, every participant SCHED_FIFO 80, and the cores each participant got are
+  read back from the kernel (the `render_cores` bitmask) rather than taken from the configuration.
+
+What is not established here
+----------------------------
+- No thermal measurement: these arms are 60 s. A multi-core hour at temperature is outstanding.
+- No edit-storm soak under render_threads 2.
+- No audio-IRQ-placement arm: the SSL 2+ was not attached to piv, so there was no audio interrupt to
+  move off a render core.
+- The `dd` interference arms produced no status and are missing from the interference table.
