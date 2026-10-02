@@ -236,7 +236,8 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "reclamation_timeout_ms", "verbose", "capture_path", "playback_path",
                                       "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
                                       "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
-                                      "tcp_auth_timeout_ms", "models_root", "irs_root", "record_dir"};
+                                      "tcp_auth_timeout_ms", "models_root", "irs_root", "record_dir",
+                                      "capture_device_path"};
   for (const auto& [key, value] : doc.items())
   {
     bool known = false;
@@ -346,6 +347,11 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
   if (name == "capture-path")
   {
     config.capture_path = value;
+    return true;
+  }
+  if (name == "capture-device-path")
+  {
+    config.capture_device_path = value;
     return true;
   }
   if (name == "playback-path")

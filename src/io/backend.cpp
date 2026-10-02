@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "namchain/io/loop_source.h"
 #include "namchain/wav.h"
 
 #include <csignal>
@@ -17,6 +18,10 @@
 #if defined(__linux__)
   #include "namchain/io/alsa_params.h"
   #include "namchain/io/alsa_raw.h"
+#endif
+
+#if defined(__APPLE__)
+  #include "namchain/io/coreaudio.h"
 #endif
 
 namespace namchain
@@ -285,26 +290,11 @@ public:
 
     std::unique_ptr<PipeBackend> self(new PipeBackend());
 
-    std::vector<float> interleaved;
-    unsigned channels = 0;
-    double rate = 0.0;
-    if (!load_wav(config.input_path, interleaved, channels, rate, error))
+    // The loop is not this backend's business: the wrap rule is shared with the CoreAudio backend's
+    // file capture and tested on its own (tests/test_loop_source.cpp).
+    if (!LoopSource::load(config.input_path, config.sample_rate, self->loop_, error))
       return nullptr;
-    if (static_cast<unsigned>(rate + 0.5) != config.sample_rate)
-    {
-      error = "input '" + config.input_path + "' is " + std::to_string(static_cast<long long>(rate)) +
-              " Hz but the engine runs at " + std::to_string(config.sample_rate) + " Hz";
-      return nullptr;
-    }
-    if (interleaved.empty() || channels == 0)
-    {
-      // A loop over nothing is an infinite silence that looks like a working device.
-      error = "input '" + config.input_path + "' has no frames to loop";
-      return nullptr;
-    }
-
-    self->input_ = std::move(interleaved);
-    self->input_frames_ = self->input_.size() / channels;
+    const unsigned channels = self->loop_.channels();
 
     self->info_.period_size = config.period_size;
     self->info_.buffer_size = config.period_size * (config.periods == 0 ? 4 : config.periods);
@@ -322,6 +312,9 @@ public:
     // a smaller lie than a number nobody measured.
     self->info_.buffer_floor_frames = 0;
     self->output_path_ = config.output_path;
+    // One period of interleaved scratch for read_capture, allocated here so the audio thread's copy
+    // out of the loop never touches the allocator.
+    self->scratch_.assign(static_cast<std::size_t>(config.period_size) * channels, 0.0f);
     return self;
   }
 
@@ -331,7 +324,7 @@ public:
 
   bool start(std::string& error) override
   {
-    read_frames_ = 0;
+    loop_.reset();
     info_.capture_exhausted = false;
 
     // O_NONBLOCK first: opening a FIFO for writing blocks until a reader arrives, and blocking
@@ -385,18 +378,15 @@ public:
   int read_capture(void* dst, unsigned frames, int /*timeout_ms*/, std::string& /*error*/) override
   {
     const size_t stride = info_.capture_bytes_per_frame;
+    // The loop wraps per frame inside LoopSource, so a file whose length is not a whole number of
+    // periods still plays end to end instead of losing its tail to a short read every time round.
+    // `scratch_` was sized in create(): read_capture runs on the audio thread and must not allocate.
+    loop_.read(scratch_.data(), frames);
     for (unsigned i = 0; i < frames; ++i)
-    {
-      // Wrapped per frame rather than per period, so a file whose length is not a whole number of
-      // periods still plays end to end instead of losing its tail to a short read every time round.
-      if (read_frames_ >= input_frames_)
-        read_frames_ = 0;
       for (unsigned c = 0; c < info_.capture_channels; ++c)
         pcm_encode(static_cast<unsigned char*>(dst) + static_cast<size_t>(i) * stride +
                      static_cast<size_t>(c) * info_.bytes_per_sample,
-                   PcmFormat::F32_LE, input_[read_frames_ * info_.capture_channels + c]);
-      ++read_frames_;
-    }
+                   PcmFormat::F32_LE, scratch_[static_cast<size_t>(i) * info_.capture_channels + c]);
     return static_cast<int>(frames);
   }
 
@@ -449,9 +439,8 @@ private:
   }
 
   BackendInfo info_;
-  std::vector<float> input_; ///< interleaved, capture_channels wide
-  size_t input_frames_ = 0;
-  size_t read_frames_ = 0;
+  LoopSource loop_;             ///< the file, looped; the wrap rule lives in LoopSource
+  std::vector<float> scratch_;  ///< one period of interleaved capture, allocated in create()
   std::string output_path_;
   int fd_ = -1;
 #if !defined(F_SETNOSIGPIPE)
@@ -606,6 +595,7 @@ const char* backend_kind_name(BackendKind kind)
   case BackendKind::Null: return "null";
   case BackendKind::Pipe: return "pipe";
   case BackendKind::AlsaRaw: return "alsa_raw";
+  case BackendKind::CoreAudio: return "coreaudio";
   case BackendKind::PipeWire: return "pipewire";
   }
   return "unknown";
@@ -631,6 +621,11 @@ bool parse_backend_kind(const std::string& text, BackendKind& kind)
   if (text == "alsa" || text == "alsa_raw")
   {
     kind = BackendKind::AlsaRaw;
+    return true;
+  }
+  if (text == "coreaudio")
+  {
+    kind = BackendKind::CoreAudio;
     return true;
   }
   if (text == "pipewire")
@@ -674,6 +669,13 @@ std::unique_ptr<AudioBackend> open_backend(const BackendConfig& config, BackendK
     return AlsaBackend::create(config, error);
 #else
     error = "the alsa_raw backend is Linux-only; this build has no /dev/snd";
+    return nullptr;
+#endif
+  case BackendKind::CoreAudio:
+#if defined(__APPLE__)
+    return CoreAudioBackend::create(config, error);
+#else
+    error = "the coreaudio backend is macOS-only; this build has no CoreAudio framework";
     return nullptr;
 #endif
   case BackendKind::PipeWire:

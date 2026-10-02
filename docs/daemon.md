@@ -41,6 +41,9 @@ cp build/generated/two-chains.json /tmp/nc/rigs/
 threads, the plan publication and the socket work before a device is in the picture. The default
 backend is `alsa_raw`.
 
+`--backend coreaudio` is the macOS device backend: a WAV looped in and the engine's output to a
+CoreAudio output device, in one process. §"The CoreAudio backend" below has what it promises.
+
 `--backend file` renders a document offline, start to finish, with the same engine, the same channel
 binding and the same summing as the device path — `--capture-path in.wav --playback-path out.wav`,
 with `--capture-channels 2 --playback-channels 2` for a two-chain rig. It stops when the input runs
@@ -60,15 +63,15 @@ silently ignored.
 
 | field | default | meaning |
 |---|---|---|
-| `backend` | `alsa_raw` | `alsa_raw`, `null`, `file`, or `pipewire` (refused by name) |
-| `device` | *(empty)* | ALSA spec: `hw:CARD=<id>[,DEV=<d>]`, `hw:<id>,<d>`, `hw:4,0`, `4,0`, or a `/dev/snd` path. Prefer an id (the names in `/proc/asound`, e.g. `II` for the SSL 2+ Mk II): card numbers follow probe order and change across reboots |
+| `backend` | `alsa_raw` | `alsa_raw`, `coreaudio`, `null`, `file`, `pipe`, or `pipewire` (refused by name) |
+| `device` | *(empty)* | the device to open. On Linux an ALSA spec: `hw:CARD=<id>[,DEV=<d>]`, `hw:<id>,<d>`, `hw:4,0`, `4,0`, or a `/dev/snd` path — prefer an id (the names in `/proc/asound`, e.g. `II` for the SSL 2+ Mk II), because card numbers follow probe order and change across reboots. On macOS a CoreAudio device **UID**, empty asking for the system's default output device |
 | `sample_rate` | `48000` | |
-| `period_size` | `64` | quantum in frames |
+| `period_size` | `64` | quantum in frames. On `coreaudio` it is a **ceiling**, not a request: see "The CoreAudio backend" below |
 | `periods` | `4` | device buffer length in periods |
 | `capture_channels` | `1` | requested; the daemon decodes the channel each chain names |
 | `playback_channels` | `1` | requested; each chain writes the channel it names, and the rest is zeroed |
-| `capture_path` | *(empty)* | `file` backend only: the input WAV |
-| `playback_path` | *(empty)* | `file` backend only: the output WAV, written when the input runs out |
+| `capture_path` | *(empty)* | `file`, `pipe` and `coreaudio`: the WAV read as input. `pipe` and `coreaudio` loop it |
+| `playback_path` | *(empty)* | `file`: the output WAV, written when the input runs out. `pipe`: the FIFO the output is streamed to |
 | `rig` | *(empty)* | startup rig; empty starts silent and waits for `rig.load` |
 | `rigs_root` | `/etc/namchain/rigs` | the directory a `rig.load` **name** resolves under |
 | `models_root` | `/etc/namchain/models` | the device's `.nam` model library; a document names a model by id (docs/assets.md) |
@@ -100,6 +103,88 @@ The daemon refuses a device that does not give the configured quantum and rate e
 (`require_exact_period`): a plan is compiled for one quantum, and running it at another would read
 past every node's buffers. That refusal is a configuration error, not a device failure, and it is
 reported with both numbers.
+
+### The CoreAudio backend
+
+`--backend coreaudio` is the other half of `pipe`, for a Mac with no interface attached: it loops
+`--capture-path` and plays the engine's output through `--device` (a CoreAudio UID, or the default
+output device when empty) — **in one process**, with no FIFO and no external player. The engine's
+render plan is unchanged: the device's IOProc produces capture periods into a lock-free ring and
+drains processed periods from another, so the render thread keeps its `wait_capture → read → DSP →
+write` loop.
+
+What is worth knowing before quoting a number from it:
+
+- **The device's own period is the engine's quantum, and it is measured, not requested.**
+  `kAudioDevicePropertyBufferFrameSize` reads back as whatever was written to it while the callback
+  is handed something else entirely. So the backend runs a short probe IOProc at open time and takes
+  the *smallest* callback it sees; that number is what `engine.status` reports as `period_size`, and
+  on this machine it is 512 while `--period-size 1024` is the configured ceiling.
+- **`--period-size` is therefore a ceiling here.** A plan compiled for 1024 carries a device that
+  runs at 512: `RenderPlan::execute` takes a frame count and every node's buffers were sized for the
+  maximum, so a smaller period runs the plan inside its own limit. A device that wants *more* than
+  the plan was built for is refused, because there is genuinely nowhere for those frames to go. This
+  is a deliberate departure from §9.2's "quantum = device period, clamped to [32, 256]", and it is
+  bounded: the configured value is the plan's buffer size, so nothing overflows.
+- **The device's buffer layout decides the indexing, and the two are not the same thing.** This
+  machine presents **one interleaved buffer** holding both channels (`mNumberBuffers == 1`,
+  `mNumberChannels == 2`), so channel `c` of frame `f` is `mData[f * channels + c]`. The callback
+  originally advanced by `period` floats per period and addressed `mBuffers[b]` as though each
+  channel had its own buffer. On an interleaved device that writes the source's sample *k* at index
+  `2k`: the left channel hears samples 0, 2, 4 …, the right channel is never written at all and stays
+  silent, the pitch doubles, and there is a one-sample offset between the channels. Reported as
+  "harsh, metallic, digital", and the gating at the device period comes from the buffer never being
+  filled past its first half.
+- **A channel the engine never wrote is silence, and repeating it is the backend's job.** A document
+  with one chain fills output channel 0 and leaves the rest of the bus at zero — correctly, because
+  no chain having that channel means silence. A device with more channels than the document uses must
+  be sent the *last channel the engine actually wrote*, repeated, rather than that zero. The backend
+  remembers which channel that was, from the engine's own bytes.
+- **The capture instrument has to read the buffer in the layout the callback wrote it in.** The
+  recorder takes planar slices; handed an interleaved buffer as though it were one channel it reads
+  both channels as consecutive frames, which duplicates every sample — a 1 kHz tone recorded as
+  500 Hz with every value repeated. That misreading accused the engine of a bug for a while before
+  the instrument was fixed, which is worth remembering: a measurement that cannot be wrong in the
+  direction the bug would take it is not a measurement.
+- **A callback is not always one period, and the backend does not assume it is.** A device is free to
+  present a larger IO buffer than the engine's quantum: on this project's machine the probe sees 512
+  frames per callback and the stream's own IOProc is then handed 1024. So the callback converts frames
+  into *periods* — one callback carrying two periods' worth hands the engine two and asks for two back
+  — and both directions are quantised to the engine's period. What must agree over a second is the
+  frame count the device consumes and the frame count the engine produces, and that is what is
+  checked. An equality test on the frame count, which is what this used to do, refuses a device that
+  is working perfectly.
+- **Frames, not samples.** `mBuffers[0].mDataByteSize` counts every channel: 4096 bytes at 2 channels
+  of float is 1024 samples and **512 frames**. Dividing by the sample size alone doubles every figure
+  derived from it, and that mistake was made here — it produced a "the device delivers 96,000 frames a
+  second" reading that led to a rate check refusing perfectly good hardware. The channel count is read
+  from the buffer and is not optional.
+- **The live device path can be null-tested, when the build allows it.** An empty chain
+  (`nc.input` → `nc.output`) is bit-exact end to end: offline through `--backend file`, through
+  `--backend pipe` against the looping source, and through `coreaudio` itself when built with
+  `-DNAMCHAIN_COREAUDIO_CAPTURE=ON`, which adds `--capture-device-path FILE` and records what the
+  callback hands the device. Measured on the file used for it — 5 whole passes, 960,000 frames, every
+  frame compared, `max|a-b| = 0` — with the two output channels identical, as a mono signal into a
+  stereo device should be.
+
+  The recording is not real-time safe (it can block on a slow disk) and is off by default for that
+  reason; a build without it refuses `--capture-device-path` by name rather than running unrecorded.
+  What the recording starts with is one period of silence: the backend primes the output ring before
+  starting the device, so the first thing the device is handed is that priming period.
+
+- **The probe runs the device for a few callback periods before the stream's own IOProc is created.**
+  That is the only way to know the number, it writes no device property and changes no setting, and
+  the device is returned to the system between the two.
+- **Block times measured here include the device's buffer**, so a 1024-frame period means a ~21 ms
+  block even when the engine's work is a fraction of it. Compare against `file` when the question is
+  the engine's own cost.
+- **Capture is a file, never an input device.** The system's default input would need microphone
+  permission, which is a decision for whatever spawns this process rather than a side effect of
+  asking for a monitoring backend.
+- **A device that dies or is unplugged is a device loss**, exactly as it is on ALSA: the daemon
+  closes it, reports `lost`, and reopens on its `device_retry_ms` backoff. A change to the *default*
+  output device while running does not migrate the stream — the opened device is the one being
+  driven until it goes away.
 
 ## Two transports
 

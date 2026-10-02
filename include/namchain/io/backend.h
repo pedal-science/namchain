@@ -11,6 +11,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "namchain/pcm.h"
 
@@ -19,11 +21,12 @@ namespace namchain
 
 enum class BackendKind
 {
-  File,    ///< WAV in, WAV out, as fast as the disk allows. The offline instance of the interface.
-  Null,    ///< Real-time paced against the wall clock, with no device: silence in, discarded out.
-  Pipe,    ///< A WAV looped in, raw frames out to a FIFO: the monitoring instance (§9.1, see below).
-  AlsaRaw, ///< /dev/snd PCM ioctls, no libasound (Linux only, §4.3).
-  PipeWire ///< Not implemented; refused by name rather than silently falling back.
+  File,      ///< WAV in, WAV out, as fast as the disk allows. The offline instance of the interface.
+  Null,      ///< Real-time paced against the wall clock, with no device: silence in, discarded out.
+  Pipe,      ///< A WAV looped in, raw frames out to a FIFO: the monitoring instance (§9.1, see below).
+  AlsaRaw,   ///< /dev/snd PCM ioctls, no libasound (Linux only, §4.3).
+  CoreAudio, ///< A WAV looped in, the engine's output to a CoreAudio device (macOS only).
+  PipeWire   ///< Not implemented; refused by name rather than silently falling back.
 };
 
 const char* backend_kind_name(BackendKind kind);
@@ -41,12 +44,18 @@ struct BackendConfig
   unsigned periods = 4;
   unsigned capture_channels = 1;
   unsigned playback_channels = 1;
-  /// Device spec for the device backends: "hw:CARD=<id>", "hw:<id>,<d>", "hw:4,0", "4,0", or a /dev/snd path.
+  /// Device spec for the device backends. On Linux an ALSA spec: "hw:CARD=<id>", "hw:<id>,<d>",
+  /// "hw:4,0", "4,0", or a /dev/snd path. On macOS a CoreAudio device UID, empty asking for the
+  /// system's default output device.
   std::string device;
   /// `file` and `pipe`: the WAV read as capture. `file` also writes \ref output_path as a WAV;
   /// `pipe` writes raw interleaved frames to it, and it is expected to be a FIFO.
   std::string input_path;
   std::string output_path;
+  /// `coreaudio` only, and only when built with `NAMCHAIN_COREAUDIO_CAPTURE`: a WAV path to write
+  /// what the backend hands the device. Empty -- the default, and the only value in a normal build --
+  /// means nothing is recorded. It exists so the live device path can be null-tested.
+  std::string capture_device_path;
   /// `null` only: pace against the wall clock the way a device would. False runs flat out, which is
   /// what a throughput measurement wants and a lateness measurement cannot use.
   bool realtime_paced = true;
@@ -281,6 +290,18 @@ public:
   /// own delay field disagreed with the pointer pair behind this figure.
   virtual bool ring_occupancy(long long& /*capture_frames*/, long long& /*playback_frames*/) const { return false; }
 
+  /// \brief Backend-specific counters for `engine.status`, as name/value pairs.
+  ///
+  /// A diagnostic surface, and deliberately a small one: it exists so that a question about a
+  /// backend's *behaviour* can be answered from a running daemon rather than by reading its source.
+  /// The one that earned it is `loop_wraps` — the number of times a looping capture source has
+  /// started over — which is what makes "this file is being consumed at the rate the engine's rate
+  /// implies" a measurement instead of an assumption. A case where that was not true turned out to be
+  /// a backend whose IOProc was invoked twice per device period.
+  ///
+  /// Empty for every backend that has nothing to say.
+  virtual std::vector<std::pair<std::string, long long>> diagnostics() const { return {}; }
+
   /// Flush anything buffered. A no-op for every backend that is not `file`, where it writes the
   /// output WAV.
   virtual bool finish(std::string& error)
@@ -288,6 +309,15 @@ public:
     (void)error;
     return true;
   }
+
+  /// \brief Make a blocked `wait_capture` return as soon as possible. Called from another thread
+  /// while the audio thread is inside the wait, on the way to stopping a daemon.
+  ///
+  /// A no-op for the backends whose wait is a poll or a short sleep: they notice the caller's own
+  /// running flag within a period anyway. A device backend whose wait blocks until the device
+  /// produces a period needs it, because that is the one wait that is as long as the device's buffer
+  /// -- and a daemon that takes its own period size to answer a Ctrl-C feels broken.
+  virtual void interrupt() {}
 
 protected:
   /// Protected and defaulted: declaring the copy operations deleted above would otherwise suppress

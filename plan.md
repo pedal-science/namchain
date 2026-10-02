@@ -877,9 +877,9 @@ name** rather than falling back — otherwise "I measured it on PipeWire" would 
 | `alsa_raw` | **done** | adapter over `AlsaRawDuplex`; converts at the boundary and holds nothing, so the code measured on hardware (§9.5) is the code the soak drives |
 | `file` | **done** | WAV in, WAV out; the offline instance of the same interface. Bit-identical to `namchain-render` on the A2-Lite fixture, and checked by a CTest |
 | `null` | **done** | real-time paced against the wall clock, silence in and discarded out. Clocks off an absolute deadline, so a late period does not make every later one late |
+| `coreaudio` | **done** (rest of M6 open) | a WAV looped in, the engine's output to a CoreAudio output device, one process and one clock: the IOProc produces capture periods into an SPSC ring and drains processed ones from another, so the render loop is unchanged. Deliberately capture-from-file only -- the system's default *input* device is the microphone-permission slice. §9.2's "quantum = device period, clamped" is deliberately departed from: the device's period is measured with a probe IOProc and is the engine's quantum, and `period_size` is a ceiling for it. Workgroups, `QOS_CLASS_USER_INTERACTIVE` and `.measurement` remain M6, and they are what the iOS target needs |
 | `pipewire` | refused by name | MIT, so no licensing question; the work is the graph/stream plumbing, not the licence (see §4.3 for why JACK is the deferred one) |
 | `jack` | deferred | LGPL client library deliberately; the reason is architectural, not legal (§4.3) |
-| `coreaudio` | M6 | RemoteIO/AUHAL, workgroups, `QOS_CLASS_USER_INTERACTIVE`, `.measurement` session mode |
 
 Two consequences worth naming. First, the soak harness's stream path is now written once and runs
 against a device, a paced clock with no device, or a WAV file — which is what lets CI exercise the

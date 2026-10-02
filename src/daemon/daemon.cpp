@@ -1926,9 +1926,9 @@ bool Daemon::start(std::string& error)
       }
     }
 #else
-    // macOS has no process affinity to ask about: `sched_getaffinity` is Linux's, and so is the call
-    // the pool pins its workers with at creation (`pthread_attr_setaffinity_np`). A CPU this process
-    // may not run on therefore cannot be named here, and the pool reports what it actually got
+    // macOS has no process affinity to ask about: `sched_getaffinity` is Linux's, and the call the
+    // pool pins its workers with at creation (`pthread_attr_setaffinity_np`) is Linux's too. So a CPU
+    // this process may not run on cannot be named here, and the pool reports what it actually got
     // (`affinity_applied`, `render_degraded`) rather than this refusing a configuration it has no way
     // to check. Calibrating `render_threads` is a Linux-host activity either way; on a Mac the pool
     // runs its workers wherever the scheduler puts them and says so.
@@ -2026,7 +2026,16 @@ void Daemon::stop()
   stop_requested_.store(true);
   running_.store(false);
   if (render_thread_.joinable())
+  {
+    // The render thread may be inside the backend's wait for the device's next period, which for a
+    // device paced at a large buffer is as long as that buffer. Asked to cut it short, so a daemon
+    // answers a signal in its own quantum rather than in a second. Read without a lock: `device_` is
+    // only ever replaced by the render thread, which is the thread being joined, and never by this
+    // one -- so this can either see the backend or a null, and both are safe.
+    if (device_ != nullptr)
+      device_->interrupt();
     render_thread_.join();
+  }
   // After the join, so nothing can be pushing; the files are closed properly on a clean shutdown.
   end_recording();
 
@@ -2090,6 +2099,7 @@ bool Daemon::open_device(std::string& error)
   backend.output_queue_floor_periods = config_.output_queue_floor_periods;
   backend.input_path = config_.capture_path;
   backend.output_path = config_.playback_path;
+  backend.capture_device_path = config_.capture_device_path;
 
   device_ = open_backend(backend, config_.backend, error);
   if (device_ == nullptr)
@@ -2098,7 +2108,16 @@ bool Daemon::open_device(std::string& error)
   const BackendInfo& info = device_->info();
   // The plan was compiled for the configured quantum and rate. A backend that got something else
   // would run frames past every node's buffer, so refuse it rather than adopt it.
-  if (info.period_size != config_.period_size || info.sample_rate != config_.sample_rate)
+  //
+  // *Smaller* is not "something else", and this is where that distinction is drawn. A plan compiled
+  // for N frames carries any period up to N -- `RenderPlan::execute` takes a frame count and every
+  // node's buffers were sized for the maximum -- so a device that hands over fewer frames than
+  // configured is running the plan inside its own limit. The `coreaudio` backend measures the device's
+  // real period and reports it, and the machine this was written on gives 512 frames for a configured
+  // 1024; refusing that would refuse every device that does not happen to match the default. A device
+  // that wants *more* than the plan was built for is still refused, because there is genuinely nowhere
+  // for those frames to go.
+  if (info.period_size > config_.period_size || info.sample_rate != config_.sample_rate)
   {
     error = "device gave " + std::to_string(info.period_size) + " frames at " +
             std::to_string(info.sample_rate) + " Hz, configured for " + std::to_string(config_.period_size) +
@@ -2598,12 +2617,19 @@ void Daemon::render_loop()
     {
       if (!open_device(error))
       {
+        // Said out loud, once per attempt at the configured backoff. A device that will not open is
+        // the failure an operator most needs the reason for, and "the device is not open" in
+        // `engine.status` cannot say whether it is missing, busy, or refusing its rate.
+        if (config_.verbose)
+          std::fprintf(stderr, "[namchaind] device: %s\n", error.c_str());
         set_device_state(DeviceState::Lost);
         std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1u, config_.device_retry_ms)));
         continue;
       }
       if (!device_->start(error))
       {
+        if (config_.verbose)
+          std::fprintf(stderr, "[namchaind] device start: %s\n", error.c_str());
         close_device();
         set_device_state(DeviceState::Lost);
         std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1u, config_.device_retry_ms)));
@@ -3293,6 +3319,16 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["adopted_generation"] = adopted_generation_.load();
     status["blocks"] = blocks_.load();
     status["xruns"] = xruns_.load();
+    // Whatever the backend can say about itself, in its own words. Empty for most, and additive, so
+    // a client that has never heard of a key keeps working — the same rule every response follows.
+    if (device_ != nullptr)
+    {
+      nlohmann::json backend_diagnostics = nlohmann::json::object();
+      for (const auto& [name, value] : device_->diagnostics())
+        backend_diagnostics[name] = value;
+      if (!backend_diagnostics.empty())
+        status["backend_diagnostics"] = std::move(backend_diagnostics);
+    }
     status["device_lost"] = device_lost_.load();
     status["device_restored"] = device_restored_.load();
     status["render_errors"] = render_errors_.load();

@@ -4,15 +4,22 @@ The engine runs on a Linux single-board computer. This directory is about the ot
 laptop with no audio interface attached, where you want to drive the engine from a control client
 and hear what it does.
 
-There is no hardware in this picture. The input is a WAV on a loop and the output is a pipe, which
-is what `--backend pipe` means. That is enough to answer the two questions a front end needs
-answered — *does the engine pass a signal through unchanged, and does it hear what I send it* —
-without a guitar, an interface, or the board.
+There is no hardware in this picture. The input is a WAV on a loop, and there are two ways to hear it:
+
+- **`--backend coreaudio`** (preferred): one process. The loop is read inside the device's own IO
+  callback and the engine's output goes straight to a CoreAudio device. One clock, no external
+  player, and `engine.status` reports the device's real period.
+- **`--backend pipe`**: the looped WAV is written to a FIFO as raw floats and `listen.sh` plays it.
+  Useful when the thing you want to hear it through is not a CoreAudio device, or when you want the
+  engine's output to be a stream another tool can read.
+
+Both answer the two questions a front end needs answered — *does the engine pass a signal through
+unchanged, and does it hear what I send it* — without a guitar, an interface, or the board.
 
 ## What builds here
 
-`namchaind` and `namchainctl` build on macOS as of this branch. The four Linux spellings the control
-transport used go through `include/namchain/daemon/platform.h`:
+`namchaind` and `namchainctl` build on macOS. The four Linux spellings the control transport used go
+through `include/namchain/daemon/platform.h`:
 
 | Linux | macOS |
 | --- | --- |
@@ -26,29 +33,42 @@ The last is the only one that changes anything observable, and it changes less t
 so the two were always the same bytes in different envelopes. `PF_LOCAL` has no `SOCK_SEQPACKET` on
 macOS, so there the local socket uses the envelope that survives everywhere.
 
-There is no CoreAudio backend. `alsa_raw` stays Linux-only, and asking for it here is refused by
-name rather than quietly given something else.
+`alsa_raw` stays Linux-only and asking for it here is refused by name rather than quietly given
+something else. `coreaudio` is the reverse: `src/io/coreaudio.cpp` compiles to an empty translation
+unit anywhere but macOS, and `docs/daemon.md` has the details of what it does and does not promise.
 
 ## Running it
+
+With the device backend — no FIFO, no listener, and the daemon can start before anything is playing:
 
 ```sh
 cmake -S . -B build -G Ninja && cmake --build build
 ffmpeg -i your-guitar-di.wav -c:a pcm_f32le -ar 48000 -ac 1 /tmp/nc/input-f32.wav
 
-tools/macos/listen.sh          # first: the daemon waits for a listener
-tools/macos/run-namchaind.sh   # then, in another shell
+./build/namchaind --backend coreaudio \
+  --capture-path /tmp/nc/input-f32.wav \
+  --period-size 1024 \
+  --rigs-root /tmp/nc/rigs --models-root /tmp/nc/models --irs-root /tmp/nc/irs \
+  --socket /tmp/nc/d.sock --no-lock-memory --rt-priority 0 \
+  --tcp-listen --tcp-address 127.0.0.1 --tcp-port 47810 --tcp-token-file /tmp/nc/token
 ```
 
-`run-namchaind.sh` prints the token. A control client connects to `127.0.0.1:47810` and presents it.
+`--period-size 1024` is a ceiling rather than a request: the backend measures the device's own period
+and compiles for that. 1024 is above anything a Mac's default output delivers. Omit `--device` for
+the default output device, or give a CoreAudio UID to pick one. A control client connects to
+`127.0.0.1:47810` and presents the token.
 
-Start `listen.sh` first. The daemon opens the FIFO for writing, which needs a reader, and reports a
-lost device and retries until one appears — the same thing it does when an interface is unplugged.
-Detaching and reattaching a player works for the same reason.
+`run-namchaind.sh` is the `pipe` form of the same thing, and it prints its token. Start `listen.sh`
+first: the daemon opens the FIFO for writing, which needs a reader, and reports a lost device and
+retries until one appears — the same thing it does when an interface is unplugged. Detaching and
+reattaching a player works for the same reason.
 
 **Whatever is reading the FIFO is the engine's clock.** The `pipe` backend paces nothing itself; the
 write blocks when the pipe is full and the listener's device clock does the rest. That is what keeps
 a long session from drifting, and it is also why a `namchain-soak` figure taken against this backend
-measures the listener's scheduling rather than the engine's work. Don't publish one.
+measures the listener's scheduling rather than the engine's work. Don't publish one. The `coreaudio`
+backend has no such caveat — its block time is the engine's work plus the device's buffer, and
+`engine.status` says what that buffer is.
 
 ## Proving it is clean
 

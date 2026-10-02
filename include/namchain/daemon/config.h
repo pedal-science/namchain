@@ -20,21 +20,31 @@ namespace daemon
 struct Config
 {
   BackendKind backend = BackendKind::AlsaRaw;
-  /// Device spec for the device backends: "hw:CARD=<id>", "hw:<id>,<d>", "hw:4,0", "4,0", or a /dev/snd path. Empty = platform
-  /// default. Ignored by `null` and `file`.
+  /// Device spec for the device backends. On Linux an ALSA spec: "hw:CARD=<id>", "hw:<id>,<d>",
+  /// "hw:4,0", "4,0", or a /dev/snd path. On macOS a CoreAudio device UID, empty asking for the
+  /// system's default output device. Ignored by `null`, `file` and `pipe`.
   std::string device;
   unsigned sample_rate = 48000;
   unsigned period_size = 64;
   unsigned periods = 4;
   unsigned capture_channels = 1;
   unsigned playback_channels = 1;
-  /// The `file` backend's input and output WAVs. Empty for the device backends, which use \ref device.
+  /// The WAV read as input by `file`, `pipe` and `coreaudio`. Empty for the device backends, which
+  /// use \ref device. `file` stops at the end of it; `pipe` and `coreaudio` loop it, because their
+  /// whole purpose is to feed a rig with no instrument plugged in.
   ///
   /// This is what makes `namchaind --backend file` an offline render of a whole document -- every
   /// chain, its channel binding and its summing included -- rather than something only the soak tool
   /// could do, and it is how the multi-chain channel tests assert where each chain's audio landed.
   std::string capture_path;
   std::string playback_path;
+  /// \brief Where `coreaudio` writes what it is sending the device, or empty for nowhere.
+  ///
+  /// A measurement instrument, not a feature: it exists so the live device path can be null-tested
+  /// the way `--backend file` already can. Only compiled in with `NAMCHAIN_COREAUDIO_CAPTURE`, and
+  /// refused by name when this build does not have it — the same rule every other unavailable thing
+  /// in here follows.
+  std::string capture_device_path;
   /// The startup rig, read synchronously before the clock starts (rig-pipeline.md §5.1 item 2). An
   /// absolute path is taken as written; a bare name resolves under \ref rigs_root. Empty means the
   /// daemon starts silent and waits for a `rig.load`.
