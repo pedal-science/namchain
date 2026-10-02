@@ -1,0 +1,62 @@
+Phase 0: the vendored NAM core moves to rikkus/OptimisationWorkOnNeuralAmpModelerCore@all-optimisations
+=====================================================================================================
+
+Date      2026-10-02
+Host      piv (Raspberry Pi 500 Rev 1.0, BCM2712, 4 x Cortex-A76), kernel 7.0.0-1017-raspi-realtime
+namchain  66f8dda + the commit this file lands with
+Core      rikkus/OptimisationWorkOnNeuralAmpModelerCore d0339874 ("Merge branch
+          'ir-optimisation' into all-optimisations"), branch all-optimisations
+          previously: sdatkinson/NeuralAmpModelerCore 2563c0f + vendor/patches/0001-a2-planar-neon-kernels.patch
+
+Why
+---
+pedal.project docs/multi-core.md develops and tests the multi-core work against this core, so that
+the A2 planar kernels and the IR optimisations are both in the tree. The fork's base is exactly the
+commit namchain pinned (2563c0f), so the move is additive.
+
+What changed
+------------
+- .gitmodules: vendor/NeuralAmpModelerCore -> the rikkus fork, branch all-optimisations.
+- vendor/patches/0001-a2-planar-neon-kernels.patch removed: the branch contains the planar work (the
+  NAM/ portion of that patch reverse-applies cleanly to it). It failed to apply verbatim only
+  because tools/CMakeLists.txt moved upstream, and namchain does not build the core's tools.
+- CMakeLists.txt: the A2 planar summary gate no longer depends on NAMCHAIN_APPLY_VENDOR_PATCHES; the
+  kernels are in the core now, not in a patch. (Leaving it would have reported "OFF" for a build
+  that has them, the same class of bug plan.md §9.4 records for armv7.)
+- AGENTS.md: records the core branch and which Linear implementation nc.cab.ir gets.
+
+What came along with the branch: upstream after 2563c0f (v0.6.0, #333 variable sample rate, #335
+1-to-n/n-to-1 Linear, #337 WAV-instantiated Linear). Linear's constructor is source-compatible (the
+new `implementation` parameter defaults to Auto) and the dependency pins are unchanged
+(AudioDSPTools 0827c6c, Eigen bc3b398), so no other namchain change was needed.
+
+Evidence
+--------
+Configure (Release, Ninja, GCC 15.2.0, natively on piv):
+  A2 planar parity gate: enabled (-O3 build)
+  A2 fast path: ON    A2 planar NEON: ON
+
+ctest --test-dir build-mc:
+  1/5 unit ........... Passed    7.03 sec
+  2/5 soak_cli ....... Passed    0.25 sec
+  3/5 ctl_cli ........ Passed    0.92 sec
+  4/5 golden_setup ... Passed   88.33 sec
+  5/5 golden_a2_lite . Passed    0.10 sec
+  100% tests passed, 0 tests failed out of 5
+
+namchain-tests: 309 cases | 309 passed | 0 failed | 0 skipped
+                269,229 assertions | 269,229 passed | 0 failed
+  --test-case="*planar*,*parity*,*A2*"   7 cases,    188 assertions, 0 failed  (bit-identical)
+  --test-case="*cab*,*ir*,*Linear*"     22 cases, 200,608 assertions, 0 failed
+     including "nc.cab.ir agrees with direct convolution on both the direct and the FFT path":
+     2/512/513/2048/8192 taps at quantum 32/64/37, bar < -110 dB against direct convolution. That
+     is the tolerance test for the new partitioned-FFT Linear, which `Auto` selects above 512 taps.
+
+namchain-soak --backend null --seconds 5 --instances 2 --model A2-Full.nam: PASS
+  p99/deadline 19.74% (gate <= 50%), 0 deadline overruns, 0 render-path allocations, 0 frees.
+
+What this does not establish
+----------------------------
+- No device was attached: the soak used the null backend. The cab's cost with the IR optimisation
+  is not measured here. That is Phase A, on piv with the SSL 2+ and a verified-quiet box.
+- Nothing about multi-core: render_threads does not exist yet.

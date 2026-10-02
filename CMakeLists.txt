@@ -433,8 +433,11 @@ endif()
 # ---------------------------------------------------------------------------
 # Mirror the preprocessor gate in NAM/wavenet/a2_planar.h rather than guessing from the
 # processor name: armv7 builds get the planar kernels only with NEON and FMA enabled.
+#
+# The kernels come from the vendored core itself (rikkus/OptimisationWorkOnNeuralAmpModelerCore,
+# branch all-optimisations), not from a vendor patch, so this is gated on NAMCHAIN_A2_FAST alone.
 set(NAMCHAIN_A2_PLANAR_ACTIVE OFF)
-if(NAMCHAIN_A2_FAST AND NAMCHAIN_APPLY_VENDOR_PATCHES)
+if(NAMCHAIN_A2_FAST)
   include(CheckCXXSourceCompiles)
   check_cxx_source_compiles("
 #if defined(__aarch64__)

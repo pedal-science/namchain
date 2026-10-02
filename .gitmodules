@@ -1,4 +1,5 @@
 [submodule "vendor/NeuralAmpModelerCore"]
 	path = vendor/NeuralAmpModelerCore
-	url = https://github.com/sdatkinson/NeuralAmpModelerCore
+	url = https://github.com/rikkus/OptimisationWorkOnNeuralAmpModelerCore
 	ignore = dirty
+	branch = all-optimisations

@@ -28,10 +28,13 @@ Run cross-built tests with `qemu-arm-static -cpu cortex-a15 -L /usr/arm-linux-gn
 
 - **Nothing on the render path allocates, locks or blocks.** `NAMCHAIN_RT_CHECK` interposes the
   allocator to catch it, and there are RTSan and TSan builds (`NAMCHAIN_RTSAN`, `NAMCHAIN_TSAN`).
-- **The vendored NAM core is patched** from `vendor/patches/` at configure time. Change the
-  patches, not the vendored files.
-- **`nc.cab.ir` convolves with the core's `nam::Linear`**, and resamples with the AudioDSPTools the
-  core vendors (sdatkinson's). rikkus's AudioDSPTools fork is deprecated; don't bring it back.
+- **The vendored NAM core is `rikkus/OptimisationWorkOnNeuralAmpModelerCore`, branch
+  `all-optimisations`** (`vendor/NeuralAmpModelerCore`, a submodule): it carries the A2 planar
+  kernels and the IR optimisations in `NAM/linear.*`. `vendor/patches/` remains the mechanism for
+  upstream-PR-shaped changes and is empty today; change patches, not vendored files.
+- **`nc.cab.ir` convolves with the core's `nam::Linear`** (the `Auto` implementation from that
+  branch: direct to 512 taps, partitioned FFT above), and resamples with the AudioDSPTools the core
+  vendors (sdatkinson's). rikkus's AudioDSPTools fork is deprecated; don't bring it back.
 - **The A2 planar parity test only means something in Release.** At -O0 it self-skips;
   `-DNAMCHAIN_REQUIRE_A2_PARITY=ON` turns the skip into a failure.
 - **`tib` is armv7 with no compiler.** Build for it on piv with the NEON toolchain file.
