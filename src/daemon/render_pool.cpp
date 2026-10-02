@@ -103,7 +103,6 @@ bool RenderPool::start(unsigned threads, int first_cpu, int priority, std::strin
   unsigned started = 1;
   for (unsigned i = 1; i < threads_; ++i)
   {
-    const int worker_cpu = first_cpu_ + static_cast<int>(i);
     auto start = std::make_unique<WorkerStart>(WorkerStart{this, i});
 
     pthread_attr_t attr;
@@ -111,8 +110,10 @@ bool RenderPool::start(unsigned threads, int first_cpu, int priority, std::strin
 #if defined(__linux__)
     // Born on its own core, not moved there afterwards: a worker that inherits the coordinator's
     // single-core mask could never run to pin itself once the coordinator is spinning at SCHED_FIFO
-    // on that core (see the header). On a platform with no affinity call the worker pins itself in
-    // worker_main, which is all that platform can do.
+    // on that core (see the header). On a platform with no affinity call the worker asks for its core
+    // in worker_main, which is all that platform can do -- and there is no attribute to set here, so
+    // the variable lives inside this branch rather than above it.
+    const int worker_cpu = first_cpu_ + static_cast<int>(i);
     if (worker_cpu >= 0 && worker_cpu < CPU_SETSIZE)
     {
       cpu_set_t set;

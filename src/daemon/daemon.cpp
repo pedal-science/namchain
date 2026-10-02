@@ -1905,6 +1905,7 @@ bool Daemon::start(std::string& error)
       error = "render_threads above 1 needs cpu: the workers take the cores above it";
       return false;
     }
+#if defined(__linux__)
     cpu_set_t allowed;
     CPU_ZERO(&allowed);
     if (::sched_getaffinity(0, sizeof(allowed), &allowed) == 0)
@@ -1924,6 +1925,15 @@ bool Daemon::start(std::string& error)
         return false;
       }
     }
+#else
+    // macOS has no process affinity to ask about: `sched_getaffinity` is Linux's, and so is the call
+    // the pool pins its workers with at creation (`pthread_attr_setaffinity_np`). A CPU this process
+    // may not run on therefore cannot be named here, and the pool reports what it actually got
+    // (`affinity_applied`, `render_degraded`) rather than this refusing a configuration it has no way
+    // to check. Calibrating `render_threads` is a Linux-host activity either way; on a Mac the pool
+    // runs its workers wherever the scheduler puts them and says so.
+    (void)0;
+#endif
   }
   if (!(config_.fade_ms >= 0.0))
   {

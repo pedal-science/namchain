@@ -2787,9 +2787,13 @@ namespace
 {
 
 /// The CPUs this process may run on, lowest first. A pool needs one per participant.
+///
+/// Linux-only for the same reason the daemon's own check is: process affinity is a Linux call. An
+/// empty result on any other platform makes the pool cases below skip themselves rather than fail.
 std::vector<int> allowed_cpus()
 {
   std::vector<int> cpus;
+#if defined(__linux__)
   cpu_set_t mask;
   CPU_ZERO(&mask);
   if (::sched_getaffinity(0, sizeof(mask), &mask) != 0)
@@ -2799,6 +2803,7 @@ std::vector<int> allowed_cpus()
     if (CPU_ISSET(i, &mask))
       cpus.push_back(i);
   }
+#endif
   return cpus;
 }
 
@@ -2986,7 +2991,8 @@ TEST_CASE("render_threads needs a CPU to start from, and refuses cores this proc
   CHECK(error.find("render_threads") != std::string::npos);
 
   // A CPU beyond the process's affinity mask is refused by name rather than discovered by a worker
-  // that cannot pin itself.
+  // that cannot pin itself. Linux-only, because the mask is: see `allowed_cpus`.
+#if defined(__linux__)
   const std::vector<int> cpus = allowed_cpus();
   Config beyond;
   beyond.backend = BackendKind::Null;
@@ -2996,6 +3002,9 @@ TEST_CASE("render_threads needs a CPU to start from, and refuses cores this proc
   Daemon beyond_daemon(beyond);
   CHECK_FALSE(beyond_daemon.start(beyond_error));
   CHECK(beyond_error.find("may not run on") != std::string::npos);
+#else
+  MESSAGE("process affinity is a Linux call; the mask case is skipped here");
+#endif
 }
 
 TEST_CASE("the render pool starts from a pinned caller and its worker takes its own core")
@@ -3010,6 +3019,11 @@ TEST_CASE("the render pool starts from a pinned caller and its worker takes its 
   // As the render thread is when it dispatches: confined to one CPU. A worker born with that mask
   // could not run to pin itself once the caller is SCHED_FIFO and spinning there, so the pool gives
   // each worker its affinity at creation; this is the shape that would deadlock if it did not.
+  //
+  // Linux-only in full, and not just for the calls below: the assertions read the worker's CPU back
+  // from the kernel, and on a platform with no affinity there is no CPU to read back. The pool's
+  // dispatch itself is covered on every platform by the daemon cases above.
+#if defined(__linux__)
   cpu_set_t original;
   CPU_ZERO(&original);
   REQUIRE(::sched_getaffinity(0, sizeof(original), &original) == 0);
@@ -3064,4 +3078,5 @@ TEST_CASE("the render pool starts from a pinned caller and its worker takes its 
   pool.run(&after_stop, work, 32);
   CHECK(after_stop.calls.load() == 1);
   CHECK(after_stop.worker_calls.load() == 0);
+#endif // __linux__
 }
