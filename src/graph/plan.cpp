@@ -117,6 +117,11 @@ constexpr float kHalfPi = 1.57079632679489661923f;
 /// closes, a bypassed node's remaining frames are its input.
 void fade_bypass(PlanNode& node, int frames) noexcept
 {
+  // A node with no output port has no signal to fade: it is a measurement sink (`nc.meter`, were it
+  // built) or a node the graph validated away. Nothing to do, and `node.outputs[0]` would be the
+  // terminator.
+  if (node.outputs.size() <= 1)
+    return;
   const float* dry = node.inputs.size() > 1 ? node.inputs[0] : nullptr;
   float* out = node.outputs[0];
   const int length = node.bypass_fade;
@@ -153,6 +158,25 @@ bool outputs_finite(const PlanNode& node, int frames) noexcept
         return false;
   }
   return true;
+}
+
+/// The level probe's scan, for a node whose output is the one downstream nodes will read.
+///
+/// One probe per node, over the node's first output port -- the ports are separate signals, but a
+/// meter answers "how loud is this node", and a node with several outputs (a split) is measured on
+/// the one its consumers take first. Reading every port would report a sum that never existed in
+/// the signal path.
+///
+/// **After** a bypass substitution, not before: what a downstream node reads is the dry signal
+/// while a node is bypassed, so the level a client sees is the level that is actually there. The
+/// scan is a compare and an add per sample on a buffer just written, which is the cheapest a probe
+/// can be, and it is the same walk `outputs_finite` already makes -- kept separate rather than
+/// fused so the guard stays a guard (it can return early; this cannot).
+void measure_node(const PlanNode& node, level::Probe* probe, int frames) noexcept
+{
+  if (probe == nullptr || node.outputs.size() <= 1)
+    return;
+  probe->accumulate(node.outputs[0], frames);
 }
 
 /// Every node's resolved type and port counts, keyed by id, plus its position in `graph.nodes`.
@@ -785,6 +809,9 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   plan->failed_ = std::vector<std::atomic<bool>>(lowered_graph.nodes.size());
   for (std::atomic<bool>& flag : plan->failed_)
     flag.store(false, std::memory_order_relaxed);
+  // Reserved here and filled beside `nodes_`, so the two stay parallel by construction: a probe
+  // with no node, or a node with no probe, would be a meter reading somebody else's signal.
+  plan->levels_.reserve(lowered_graph.nodes.size());
   plan->buffers_.reserve(static_cast<std::size_t>(total_buffers));
   for (int i = 0; i < total_buffers; ++i)
   {
@@ -852,6 +879,9 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
 
     plan->nodes_.push_back(std::move(plan_node));
     plan->node_ids_.push_back(spec.id);
+    // One level probe per node, made here so it is parallel to `nodes_` by construction. `emplace`
+    // rather than `push_back`: a Probe holds atomics and is not movable.
+    plan->levels_.emplace_back();
   }
 
   // Bind inputs now that every output buffer is known.
@@ -964,6 +994,10 @@ void RenderPlan::execute(const float* input, float* output, int frames) noexcept
       fade_bypass(node, frames);
     else if (node.bypass)
       substitute_dry(node, frames);
+
+    // Last, so the probe measures what the next node in the chain will read rather than what this
+    // one computed on the way there.
+    measure_node(node, i < levels_.size() ? &levels_[i] : nullptr, frames);
   }
 
   if (output_buffer_ >= 0 && output != nullptr)

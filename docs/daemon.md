@@ -373,7 +373,8 @@ One JSON object per message in each direction, over either transport above. A re
 | `engine.hello` | `{"protocol": 2, "token": "…"?}` | `role`, `version`, `protocol` (what the server speaks), `features`, `transport` (`unix`/`tcp`) and `authenticated`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol`. On TCP the token is required and is checked **before** the version, so a peer without it learns nothing else |
 | `engine.schema` | — | the catalogue: every node type **and every macro** in one array, told apart by `kind` (`primitive`/`macro`), with ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. A macro additionally carries the `roles` it lowers to and, per parameter, the `targets` it drives. A parameter whose choices live in the library carries them, resolved from the same scan `engine.assets` reports. See docs/schema.md and docs/macros.md |
 | `engine.assets` | `{"refresh": true?}` | the model and impulse-response library: an entry per file with its `id`, where it is, its size and mtime, and the rate/architecture/length when the file's own header says so. See docs/assets.md |
-| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, a `queue` object (the output queue's cap and floor, and its `output_drops`, `output_target_drops`, `floor_insertions` and `capture_bursts`), a `record` object (as `engine.record`), a `render` object (each block's time from its capture read to its playback write against the period's deadline: `deadline_us`, `worst_us`, `worst_percent`, `over_90_percent`, `over_deadline`, and `load_histogram` as `[percent, blocks]` pairs for the non-empty 1% buckets, 100 meaning at or past the deadline; all cumulative, so a poller takes deltas), device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), a `model_budget` object ("Model budget", below), and `health`/`issues` (below) |
+| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, a `queue` object (the output queue's cap and floor, and its `output_drops`, `output_target_drops`, `floor_insertions` and `capture_bursts`), a `record` object (as `engine.record`), a `render` object (each block's time from its capture read to its playback write against the period's deadline: `deadline_us`, `worst_us`, `worst_percent`, `over_90_percent`, `over_deadline`, and `load_histogram` as `[percent, blocks]` pairs for the non-empty 1% buckets, 100 meaning at or past the deadline; all cumulative, so a poller takes deltas), device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), a `model_budget` object ("Model budget", below), `health`/`issues` (below), the PCM `format` the device was opened with, the audio `levels` ("Levels", below, with the same shape `engine.levels` returns), and — for ALSA — a `backend_diagnostics` object that splits the one `xruns` number into `capture_overruns` and `playback_underruns` beside `recoveries`, `gate_capture_xruns`, `floor_inserted_frames`, `settle_discarded_frames`, `occupancy_mismatches` and `period_exact` |
+| `engine.levels` | — | the audio levels, and only them: `state`, `blocks`, `generation`/`audible_generation`, `sample_rate`, `period_size`, `input` and `output` (per device channel: a `peak` in dBFS, an `rms`, and a `clipped` count), and a `chains` array of `{id, name, output_channel, muted, out: {peak, rms, frames, clipped}, nodes: [{node, element, role, peak, rms, frames}]}`. **Read-only and small**, which is why it is a method of its own: a meter polls this rather than building the whole of `engine.status` twenty times a second. Each read *takes* its window (see "Levels", below) |
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `engine.record` | `{"action": "start", "name": "…", "seconds": 600?}`, `{"action": "stop"}`, or `{}` | `record`: whether one is running, its name and path, periods and seconds so far, ring overflows, and the dropped/inserted/xrun totals. See "Recording what the device heard", below |
@@ -442,8 +443,9 @@ chain quietly playing on channel 0.
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
 `bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`, `record`, `local_transitions`,
-`meta`, `bypass_ramp`, `model_budget`. It grows as the slices land, and
-absence is how a client degrades rather than guesses.
+`meta`, `bypass_ramp`, `model_budget`, `levels`. It grows as the slices land, and
+absence is how a client degrades rather than guesses: a client that does not see `levels` hides its
+meters rather than drawing a floor.
 
 The error codes a client may have to act on are `bad_json`, `bad_request`, `unknown_method`,
 `unknown_chain`, `rig_not_found`, `patch_rejected`, `compile_failed`, `asset_missing`, `over_budget`,
@@ -731,6 +733,65 @@ What it does not do yet, each with the remedy drafted:
 - **The offline tools do not apply it.** `namchain-render` and the soak render what they are given;
   the budget is the daemon's.
 
+## Levels
+
+Every other number this protocol reports is about *timing* — how long a block took, how close it came
+to its deadline, how many xruns there were. None of them can say what the audio is doing. A client
+that wants a level meter, and a person asking "is the input dead or is the level just low", need a
+different question answered: **how loud is the signal here, now** — at the device's input, at its
+output, at each chain, and at every node inside each chain.
+
+`engine.levels` answers it, and `engine.status.levels` carries the same object for a client that only
+polls status. The answer is in **dBFS, one decimal**, with **-200.0 as the floor** — a number rather
+than `-inf`, because the wire is JSON and a client doing arithmetic on a sentinel is a client that
+works.
+
+### What is measured, and where
+
+| Place | Reported as | Why there |
+|---|---|---|
+| The device's input | `input.peak[c]`, `input.rms[c]`, `input.clipped[c]` per capture channel | The ADC's own level, before any chain routing or mute: a meter has to show what the device handed over, or a routing mistake reads as a dead input |
+| The device's output | `output.peak[c]` … per playback channel | The sum of every chain on that channel, and `clipped` is the encode's own clamps — the saturation a listener hears |
+| Each chain | `chains[].out` | What this chain contributed to the bus |
+| Each node | `chains[].nodes[]` | Every primitive of every block, labelled with `node` (its id), `element` (what the client named — its own block, or the macro it was lowered from) and `role` (which primitive of that macro it is) |
+
+A **macro has no runtime existence** — it is lowered into primitives that keep the client's
+`element` — so "the level of every block in the rig" is a grouping by `element`, and the parts are
+there for a client that wants to know which half of a cabinet block is hot. A node's float output is
+*allowed* past 1.0 and routinely is, so a node's entry carries no `clipped`: full scale is the
+device's limit, not the graph's.
+
+### Read and reset, and why
+
+Every read **takes** its window: the accumulators are emptied as they are read, so two reads describe
+disjoint windows and a poller's numbers add up over a long run. The alternative — a peak that holds
+until it is cleared — makes "the peak since this client connected" the answer, which is not a meter.
+
+The cost of that choice is one thing to know: **two reads in quick succession each get a window**, so
+a client polling faster than the engine renders blocks will see empty (`frames: 0`) windows between
+populated ones. A level with `frames: 0` is not a level; it is a window in which nothing was measured,
+and a client should hold its display rather than draw the floor. (A test that reads `engine.status`
+and then immediately reads `engine.levels` sees exactly this: the status call emptied the probes on its
+way through.)
+
+### What it costs the audio thread
+
+The probes are **relaxed atomics written once per period**, in the loop the engine already walks:
+`outputs_finite` scans every output sample for the non-finite guard, so a peak and a sum over the same
+samples is a compare and an add on buffers that are already hot in cache. Amplitude is accumulated as
+`|x| * 4096` in a `uint64_t` — exact, order-independent, and no floating-point accumulator shared
+between threads. There is **no logarithm on the audio thread**: the dB conversion happens on the
+control thread, where the JSON is built.
+
+A node's probe lives in the plan, not in the daemon, because a plan is executed by whichever pool
+worker owns its chain and it dies with the plan — a level from a plan nobody is running is not a
+level. `render_threads` is 1 on the pedal today, and this is correct when it is not.
+
+The probe is measuring **what the next node reads**: it runs after a bypass substitution, so a
+bypassed node reports its dry level, which is what is actually there. A node the guard has failed is
+left out of the answer entirely (its output is substituted dry, and reporting it as silence would send
+somebody after the wrong thing) — the `node_failed` issue is what names it.
+
 ## Recording what the device heard
 
 `engine.record` (`namchainctl record start NAME [--seconds S]`, `record stop`, `record`) answers "where
@@ -911,5 +972,7 @@ Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 - no write path to the library and no `model.load`/`model.unload`/`model.list`: it is what the
   operator put on the device, listed by `engine.assets` (docs/assets.md §"What is not here");
 - no presets, tags or favourites, and no amp/cab metadata beyond the directory tree;
-- no telemetry subscription and no `scene.*`, `model.*`, `bench.run` methods;
+- no *telemetry subscription* and no `scene.*`, `model.*`, `bench.run` methods. Levels are the one
+  thing a client polls rather than subscribes to (`engine.levels`, at whatever rate it likes; see
+  "Levels"), which is enough for a meter and is deliberately not the beginning of an event stream;
 - no state-accurate NAM warm start (M3), so `swap_model` crossfades rather than replaying history.

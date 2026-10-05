@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "namchain/graph/graph.h"
+#include "namchain/level.h"
 #include "namchain/rt/arena.h"
 
 namespace namchain
@@ -469,6 +470,18 @@ public:
   /// second trip on an already-failed node is not a second failure.
   uint64_t guard_trips() const noexcept { return guard_trips_.load(std::memory_order_relaxed); }
 
+  /// \brief The level probe for a node's output, or null when there is no such node.
+  ///
+  /// One probe per node rather than one per place the wire asks about: a node's `element` is what a
+  /// client named (its own id, or the macro an element was lowered from), so aggregating a macro's
+  /// level is a sum over the nodes that share its element (\ref Daemon::levels_json), and a node
+  /// that stands alone needs no special case. Control thread; returns null rather than throwing,
+  /// because a status request may name a node from an older plan.
+  level::Probe* level_of(std::size_t node_index) noexcept
+  {
+    return node_index < levels_.size() ? &levels_[node_index] : nullptr;
+  }
+
   /// Debug/inspection: the buffer index each node output was coloured onto.
   const std::vector<int>& output_buffer_of(std::size_t node_index) const;
 
@@ -482,6 +495,13 @@ private:
   /// report; an atomic per node rather than a `PlanNode` field because `PlanNode` lives in a vector
   /// and `std::atomic` is not movable.
   std::vector<std::atomic<bool>> failed_;
+  /// \brief One level probe per node, parallel to \ref nodes_ (\ref level_of).
+  ///
+  /// In the plan rather than in the daemon because a plan is executed by whichever pool worker owns
+  /// its chain: with more than one render thread a shared probe would be written by several
+  /// threads, and only the plan knows which nodes are its own. It also dies with the plan, which is
+  /// right -- a level from a plan nobody is running is not a level.
+  std::vector<level::Probe> levels_;
   std::atomic<uint64_t> guard_trips_{0};
   int input_node_ = -1;            // index in nodes_ whose block input is sampled from the graph
   int output_buffer_ = -1;         // buffer the graph output is read from

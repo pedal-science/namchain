@@ -576,6 +576,36 @@ public:
     return true;
   }
 
+  /// \brief What this backend knows about itself and does not otherwise say.
+  ///
+  /// Every number here has existed in \ref AlsaRawDuplex since it was measured; only four of them
+  /// reached `engine.status` (through `queue`), and the two that matter most were not among them:
+  ///
+  ///  - **`capture_overruns` against `playback_underruns`.** The one `xruns` number is their sum, and
+  ///    the two have almost nothing in common: a capture overrun is the loop not reading promptly, a
+  ///    playback underrun is the output ring running dry. "92 xruns and no idea which" is exactly the
+  ///    question the split was measured for; a diagnostic that can only see the sum cannot ask it.
+  ///  - **`period_exact`.** The engine refuses to open a device that cannot give the period it asked
+  ///    for, so a client ("why will it not open?") needs the fact, not the refusal.
+  ///
+  /// The ring occupancy is deliberately NOT here: it is one ioctl per call and this is called from a
+  /// status path, so it stays where it belongs, in \ref ring_occupancy, for a caller that wants it.
+  std::vector<std::pair<std::string, long long>> diagnostics() const override
+  {
+    const AlsaRawInfo& source = device_->info();
+    return {{"capture_overruns", static_cast<long long>(device_->capture_overruns())},
+            {"playback_underruns", static_cast<long long>(device_->playback_underruns())},
+            {"recoveries", static_cast<long long>(device_->recoveries())},
+            {"gate_capture_xruns", static_cast<long long>(device_->gate_capture_xruns())},
+            {"output_target_drops", static_cast<long long>(device_->output_target_drops())},
+            {"floor_inserted_frames", static_cast<long long>(device_->floor_inserted_frames())},
+            {"settle_discarded_frames", static_cast<long long>(device_->settle_discarded_frames())},
+            {"occupancy_mismatches", static_cast<long long>(device_->occupancy_mismatches())},
+            {"period_exact", source.period_exact ? 1 : 0},
+            {"buffer_size", static_cast<long long>(source.buffer_size)},
+            {"bytes_per_sample", static_cast<long long>(source.bytes_per_sample)}};
+  }
+
 private:
   AlsaBackend() = default;
 

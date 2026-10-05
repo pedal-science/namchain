@@ -266,6 +266,76 @@ TEST_CASE("a rig loads from a file and renders through the compiler")
   CHECK(error.find("cannot open") != std::string::npos);
 }
 
+TEST_CASE("a plan's level probes measure each node's output where the next node reads it")
+{
+  // A DC signal at half scale through a gain of 0.5: the input node sees 0.5, the gain node's
+  // output is 0.25, and the numbers are asserted in dBFS because that is what the wire carries.
+  Graph graph;
+  std::string error;
+  REQUIRE_MESSAGE(namchain::graph::parse_graph_json(R"({
+      "nodes": [
+        { "id": "in", "type": "nc.input" },
+        { "id": "g", "type": "nc.gain", "gain": 0.5 },
+        { "id": "out", "type": "nc.output" }
+      ],
+      "connections": [
+        { "from": "in", "to": "g" },
+        { "from": "g", "to": "out" }
+      ]
+    })", graph, error), error);
+
+  namchain::rt::Arena arena(1u << 16);
+  auto plan = RenderPlan::compile(graph, options_for(), arena, error);
+  REQUIRE_MESSAGE(plan != nullptr, error);
+  REQUIRE(plan->nodes().size() == 3);
+
+  std::vector<float> input(kQuantum, 0.5f);
+  std::vector<float> output(kQuantum, 0.0f);
+  plan->execute(input.data(), output.data(), kQuantum);
+
+  // The input node's output is the block's input; the gain node halves it; the output node's is
+  // the chain's result. Read by index, which is what the daemon does.
+  const auto in = plan->level_of(0)->take();
+  const auto mid = plan->level_of(1)->take();
+  plan->level_of(2)->take();   // the output node: see below
+  CHECK(in.frames == static_cast<uint64_t>(kQuantum));
+  CHECK(namchain::level::db_of_peak(in.peak) == doctest::Approx(-6.0206).epsilon(0.01));
+  CHECK(namchain::level::db_of_peak(mid.peak) == doctest::Approx(-12.0412).epsilon(0.01));
+  CHECK(mid.rms == doctest::Approx(0.25).epsilon(0.001));
+  // A node's output is *allowed* past full scale in the float domain, so the probe does not call
+  // that clipping: the device's encode is where full scale means something.
+  CHECK(mid.clipped == 0);
+  CHECK(plan->level_of(99) == nullptr);
+
+  // Read and reset is what makes a poller's windows disjoint: two reads of the same block give one
+  // reading and then an empty window, never the same block twice.
+  CHECK(plan->level_of(0)->take().frames == 0);
+
+  // The chain's output node has NO output port, so its probe stays empty: what a meter wants there
+  // is the chain's output, which the device's own output probe measures. Reporting the node's dry
+  // input instead would double-count the last block in the signal path.
+  CHECK(plan->level_of(2)->peek().frames == 0);
+
+  // Bypass measures what the next node reads, and bypass is a fade: the window that contains the
+  // fade is somewhere between the wet level and the dry one, and it settles on the dry level. This
+  // is a claim about the *probe*, not about the fade -- the fade's own behaviour is tested where it
+  // belongs (the transition tests) -- so it only asserts that the probe followed the signal.
+  REQUIRE(plan->set_bypass(1, true, kQuantum / 2));
+  plan->level_of(1)->take();
+  bool settled = false;
+  for (int block = 0; block < 8 && !settled; ++block)
+  {
+    plan->execute(input.data(), output.data(), kQuantum);
+    const auto r = plan->level_of(1)->take();
+    CHECK(r.frames == static_cast<uint64_t>(kQuantum));
+    if (namchain::level::db_of_peak(r.peak) == doctest::Approx(-6.0206).epsilon(0.01))
+      settled = true;
+    else
+      CHECK(r.peak > 0.5f);   // still fading from the wet level up to the dry one
+  }
+  CHECK_MESSAGE(settled, "a bypassed node's probe never settled at its dry input's level");
+}
+
 // ---------------------------------------------------------------------------
 // The reference interpreter as the compiler's oracle
 // ---------------------------------------------------------------------------

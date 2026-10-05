@@ -66,6 +66,7 @@ void print_usage(std::FILE* stream)
     "commands:\n"
     "  hello                  negotiate the protocol and print what the daemon offers\n"
     "  status                 the device, the document, the chains, and engine health\n"
+    "  levels                 the audio levels: the device's in and out, each chain's, every node's\n"
     "  schema                 the node and parameter catalogue (see docs/schema.md)\n"
     "  assets [--refresh]     the model and impulse-response library as ids, optionally rescanning it\n"
     "                         first (the scan is cached by size and mtime, so this is cheap)\n"
@@ -285,6 +286,8 @@ const char* method_for(const std::string& command)
     return "engine.hello";
   if (command == "status")
     return "engine.status";
+  if (command == "levels")
+    return "engine.levels";
   if (command == "schema")
     return "engine.schema";
   if (command == "assets")
@@ -494,7 +497,8 @@ int main(int argc, char** argv)
   };
 
   if (options.command == "hello" || options.command == "status" || options.command == "schema" ||
-      options.command == "get" || options.command == "panic" || options.command == "assets")
+      options.command == "get" || options.command == "panic" || options.command == "assets" ||
+      options.command == "levels")
   {
     // No arguments; the method is the whole request, except for `assets --refresh`, which asks the
     // daemon to look at the disk again rather than answer from its scan.

@@ -94,7 +94,8 @@ nlohmann::json protocol_features()
   return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
                                 "structural_crossfade", "smooth_params", "bypass", "guard",
                                 "per_chain_mute", "schema", "tcp_transport", "assets", "record",
-                                "local_transitions", "meta", "bypass_ramp", "model_budget"});
+                                "local_transitions", "meta", "bypass_ramp", "model_budget",
+                                "levels"});
 }
 
 /// The longest recording `engine.record` will make, so a client that forgets to stop one cannot fill
@@ -2235,6 +2236,147 @@ void Daemon::account_period()
   last_queue_ = queue;
 }
 
+nlohmann::json Daemon::levels_json()
+{
+  // One reading per place, *taken* rather than peeked: two callers in a row then describe disjoint
+  // windows instead of counting the same samples twice, which is what a meter wants and what makes
+  // the numbers add up over a long run. A node's probe belongs to whatever plan is audible, so a
+  // node in a plan fading *out* is still reported -- it is still playing.
+
+  const auto stats = [](const level::Probe::Reading& r) {
+    return nlohmann::json{{"peak", std::round(level::db_of_peak(r.peak) * 10.0) / 10.0},
+                          {"rms", std::round(level::db_of_rms(r.rms) * 10.0) / 10.0},
+                          {"frames", r.frames},
+                          {"clipped", r.clipped}};
+  };
+  const auto peaks = [](const std::array<level::Probe, kMaxLevelChannels>& probes,
+                        unsigned channels) {
+    nlohmann::json out = nlohmann::json::array();
+    for (unsigned c = 0; c < channels && c < probes.size(); ++c)
+    {
+      const level::Probe::Reading r = const_cast<level::Probe&>(probes[c]).take();
+      out.push_back(std::round(level::db_of_peak(r.peak) * 10.0) / 10.0);
+    }
+    return out;
+  };
+
+  nlohmann::json levels;
+  levels["blocks"] = blocks_.load();
+  levels["generation"] = adopted_generation_.load();
+  levels["audible_generation"] = audible_generation_.load();
+  levels["sample_rate"] = active_rate_.load() == 0 ? config_.sample_rate : active_rate_.load();
+  levels["period_size"] = active_period_.load() == 0 ? config_.period_size : active_period_.load();
+  levels["state"] = device_state_name(device_state());
+
+  // The device's own channels, per channel: which channel is silent is a wiring question, and a
+  // summed level could not answer it.
+  const unsigned capture = active_capture_channels_.load();
+  const unsigned playback = active_playback_channels_.load();
+  nlohmann::json input;
+  input["peak"] = peaks(input_levels_, capture ? capture : 0);
+  {
+    // RMS and clipping are per channel too, but the wire's shape for them is one number per
+    // channel as well, so the same loop is written once more rather than a second helper.
+    nlohmann::json rms = nlohmann::json::array();
+    nlohmann::json clipped = nlohmann::json::array();
+    for (unsigned c = 0; c < capture && c < kMaxLevelChannels; ++c)
+    {
+      const level::Probe::Reading r = input_levels_[c].peek();
+      rms.push_back(std::round(level::db_of_rms(r.rms) * 10.0) / 10.0);
+      clipped.push_back(r.clipped);
+    }
+    input["rms"] = rms;
+    input["clipped"] = clipped;
+  }
+  nlohmann::json output;
+  output["peak"] = peaks(output_levels_, playback ? playback : 0);
+  {
+    nlohmann::json rms = nlohmann::json::array();
+    nlohmann::json clipped = nlohmann::json::array();
+    for (unsigned c = 0; c < playback && c < kMaxLevelChannels; ++c)
+    {
+      const level::Probe::Reading r = output_levels_[c].peek();
+      rms.push_back(std::round(level::db_of_rms(r.rms) * 10.0) / 10.0);
+      clipped.push_back(r.clipped);
+    }
+    output["rms"] = rms;
+    output["clipped"] = clipped;
+  }
+  levels["input"] = input;
+  levels["output"] = output;
+
+  /// Each chain: its own output level and the level of every node in the plan it is playing.
+  ///
+  /// A node is labelled with `node` (its id), `element` (what the client named -- its own block, or
+  /// the macro it was lowered from) and `role` (which primitive of that macro). A client that wants
+  /// "the level of every block in the rig" groups by `element`; one that wants the primitive behind
+  /// a block has the parts. Both are the same answer to two questions, and the alternative -- only
+  /// elements -- would hide which half of a macro is hot.
+  nlohmann::json chains = nlohmann::json::array();
+  std::size_t node_count = 0;
+  // The Unix transport's reply is one datagram of about 200 KiB: an eight-chain document of
+  // pathological size is capped rather than sent and truncated by the kernel. The cap is on nodes,
+  // and the answer says when it bit.
+  constexpr std::size_t kMaxLevelNodes = 2000;
+  bool truncated = false;
+  for (int c = 0; c < chain_count_ && c < kMaxChains; ++c)
+  {
+    const ChainRuntime& chain = chains_[c];
+    if (chain.current == nullptr)
+      continue;
+    const graph::RenderPlan& plan = *chain.current->plan;
+    nlohmann::json entry;
+    entry["id"] = current_document_.chains.size() > static_cast<std::size_t>(c)
+                    ? current_document_.chains[static_cast<std::size_t>(c)].id : std::string();
+    entry["name"] = current_document_.chains.size() > static_cast<std::size_t>(c)
+                      ? current_document_.chains[static_cast<std::size_t>(c)].name : std::string();
+    entry["output_channel"] = chain.current->output_channel;
+    entry["muted"] = chain.mute.load(std::memory_order_relaxed);
+    {
+      const level::Probe::Reading r = chain_levels_[c].take();
+      entry["out"] = stats(r);
+    }
+    nlohmann::json nodes = nlohmann::json::array();
+    for (std::size_t i = 0; i < plan.nodes().size(); ++i)
+    {
+      if (node_count >= kMaxLevelNodes)
+      {
+        // Past the cap the window is emptied anyway, so the next read is not a stale sum of
+        // samples nobody reported. A truncated answer that also lies about the next one would be
+        // two faults.
+        if (level::Probe* dropped = const_cast<graph::RenderPlan&>(plan).level_of(i))
+          dropped->take();
+        truncated = true;
+        continue;
+      }
+      level::Probe* probe = const_cast<graph::RenderPlan&>(plan).level_of(i);
+      if (probe == nullptr)
+        continue;
+      const level::Probe::Reading r = probe->take();
+      // A node the guard has failed is out of the signal path and its probe is empty: reporting it
+      // as -200 dBFS would read as "this block is silent" and send somebody after the wrong thing,
+      // so it is left out and the `node_failed` issue is what names it.
+      if (plan.node_failed(i))
+        continue;
+      nodes.push_back(nlohmann::json{{"node", plan.nodes()[i].element.empty()
+                                                ? std::string("?") : plan.nodes()[i].element},
+                                     {"element", plan.nodes()[i].element},
+                                     {"role", plan.nodes()[i].role},
+                                     {"peak", std::round(level::db_of_peak(r.peak) * 10.0) / 10.0},
+                                     {"rms", std::round(level::db_of_rms(r.rms) * 10.0) / 10.0},
+                                     {"frames", r.frames}});
+      ++node_count;
+    }
+    entry["nodes"] = std::move(nodes);
+    chains.push_back(std::move(entry));
+  }
+  levels["chains"] = std::move(chains);
+
+  levels["nodes"] = node_count;
+  levels["truncated"] = truncated;
+  return levels;
+}
+
 void Daemon::account_render_time(std::chrono::steady_clock::duration elapsed, const BackendInfo& info) noexcept
 {
   if (info.sample_rate == 0)
@@ -2282,6 +2424,15 @@ void Daemon::close_device()
 {
   if (device_ == nullptr)
     return;
+  // A level window that spans a device restart is a window of two different streams: the peaks are
+  // the peak of both and the RMS is a mean of neither. Cleared here rather than in open_device so a
+  // closed device reports silence, which is what it is.
+  for (level::Probe& probe : input_levels_)
+    probe.take();
+  for (level::Probe& probe : output_levels_)
+    probe.take();
+  for (level::Probe& probe : chain_levels_)
+    probe.take();
   if (device_started_)
   {
     device_->stop();
@@ -2744,6 +2895,19 @@ void Daemon::render_loop()
                                    info.format);
       }
 
+      // 1b. What the device actually handed over, per channel and before any routing or mute: the
+      //     input level a meter shows has to be the ADC's, not the chain's, or a routing mistake
+      //     reads as a dead input. The decode above walks the same buffer, so the extra work is one
+      //     decode per channel the chains do not use.
+      for (unsigned c = 0; c < info.capture_channels && c < input_levels_.size(); ++c)
+      {
+        level::Probe& probe = input_levels_[c];
+        for (unsigned i = 0; i < info.period_size; ++i)
+          probe.accumulate(pcm_decode(capture_buffer_.data() +
+                                        (static_cast<std::size_t>(i) * info.capture_channels + c) * width,
+                                      info.format));
+      }
+
       // 2. The plans, on the pool: one participant per core, each taking every `participants`-th
       //    chain. With `render_threads` at 1 this is the same call it has always been, made inline.
       render_pool_.run(this, &Daemon::run_chains_entry, frames);
@@ -2783,8 +2947,13 @@ void Daemon::render_loop()
           continue;
 
         float* destination = bus_.data() + static_cast<std::size_t>(source->output_channel) * info.period_size;
+        level::Probe* out_level = c < static_cast<int>(chain_levels_.size()) ? &chain_levels_[c] : nullptr;
         for (int i = 0; i < frames; ++i)
+        {
           destination[i] += chain.out[static_cast<std::size_t>(i)];
+          if (out_level != nullptr)
+            out_level->accumulate(chain.out[static_cast<std::size_t>(i)]);
+        }
       }
 
       // Global mute, after every chain has run, for the same reason a per-chain mute is a skip.
@@ -2798,9 +2967,12 @@ void Daemon::render_loop()
       {
         for (unsigned c = 0; c < info.playback_channels; ++c)
         {
+          const float sample = bus_[static_cast<std::size_t>(c) * info.period_size + i];
+          if (c < output_levels_.size())
+            output_levels_[c].accumulate(sample);
           pcm_encode(playback_buffer_.data() +
                        (static_cast<std::size_t>(i) * info.playback_channels + c) * width,
-                     info.format, bus_[static_cast<std::size_t>(c) * info.period_size + i]);
+                     info.format, sample);
         }
       }
     }
@@ -3347,6 +3519,10 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["period_size"] = active_period_.load() == 0 ? config_.period_size : active_period_.load();
     status["capture_channels"] = active_capture_channels_.load();
     status["playback_channels"] = active_playback_channels_.load();
+    // The sample format the device was actually opened with, as ALSA's own name for it ("S32_LE").
+    // It has always been known -- it is what the decode and encode loops switch on -- and it was
+    // never reported, which left a diagnostic reading /proc to find it out.
+    status["format"] = pcm_format_name(static_cast<PcmFormat>(active_format_.load()));
     status["rig"] = current_rig_;
     status["rig_source"] = current_source_;
     status["rig_name"] = current_name_;
@@ -3385,6 +3561,10 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["params_stale"] = params_stale_.load();
     status["failed_nodes"] = failed_nodes_.load();
     status["guard_trips"] = guard_trips_.load();
+    // The audio levels, as their own object. Embedded here AND a method of its own, because the two
+    // callers want different shapes: a status poll is a snapshot of everything every second, and a
+    // meter wants only these numbers, often, without building the rest of this JSON.
+    status["levels"] = levels_json();
     // Two honest labels: parameter edits are ramped inside the node (no recompile, no step); a
     // structural change is equal-power crossfaded for fade_ms -- where the edit is, when what it did not
     // touch can be kept (`local_transitions`), and across the whole chain when it cannot.
@@ -3499,6 +3679,14 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
   }
 
   // --- engine.record -------------------------------------------------------
+  if (method == "engine.levels")
+  {
+    // The meter's method. Read-only and deliberately small: a client that polls this at 20 Hz must
+    // not be building the whole of `engine.status` -- chains, issues, model budget, transitions --
+    // twenty times a second, on the thread that compiles rigs. Everything here is an atomic read and
+    // a string the plan already holds.
+    return ok_response(id, {{"levels", levels_json()}});
+  }
   if (method == "engine.record")
   {
     std::string action = "status";

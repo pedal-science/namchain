@@ -28,7 +28,11 @@
 #include "namchain/graph/plan.h"
 #include "namchain/graph/rig.h"
 #include "namchain/io/backend.h"
+#include "namchain/level.h"
 #include "namchain/rt/arena.h"
+
+#include <json.hpp>
+
 #include "namchain/rt/crossfade.h"
 #include "namchain/rt/reclaimer.h"
 #include "namchain/rt/spsc_ring.h"
@@ -169,6 +173,11 @@ struct PlanSlot
 /// would be exactly that. The limit is published to clients as part of the engine's limits.
 inline constexpr int kMaxChains = 8;
 
+/// The widest device whose levels are measured, per direction. Eight is the pedal's stereo interface
+/// with room to spare, and it is a bound rather than a guess: the render thread accumulates into a
+/// fixed array, because the audio thread allocates nothing (namchain/rt_check.h).
+inline constexpr std::size_t kMaxLevelChannels = 8;
+
 /// Control thread -> render thread: the identity of prepared work that is already finished.
 ///
 /// One tagged record rather than one ring per op: the render thread drains it in order at the top of
@@ -270,6 +279,23 @@ public:
   /// How many control connections are open on one transport. Control thread; the status reports it,
   /// and a test uses it to see a vanished client released.
   std::size_t connection_count(PeerKind peer) const;
+
+  /// \brief The audio levels: the device's input and output, each chain's, and every node's.
+  ///
+  /// `engine.levels` builds its whole answer from this and `engine.status` embeds it under `levels`,
+  /// so the two can never disagree about what a level is. Each reading *takes* its window: two
+  /// callers in a row then describe disjoint windows instead of counting the same samples twice,
+  /// which is what a meter wants and what makes the numbers add up over a long run.
+  ///
+  /// A node is labelled with `node` (its id), `element` (what the client named — its own block, or
+  /// the macro it was lowered from) and `role` (which primitive of that macro), so a client that
+  /// wants "the level of every block in the rig" groups by `element` and one that wants the part
+  /// behind a block has the parts.
+  ///
+  /// Control thread; public because it is the unit-testable half of the feature, like
+  /// \ref handle_request.
+  nlohmann::json levels_json();
+
 
 private:
   // --- control thread only -------------------------------------------------
@@ -658,6 +684,17 @@ private:
   /// status reports it and the run is not a multi-core result.
   std::atomic<bool> render_pool_degraded_{false};
   std::atomic<int> active_format_{static_cast<int>(PcmFormat::Unknown)};
+
+  /// \brief The device's input and output levels, and each chain's contribution to the bus.
+  ///
+  /// Written by the render thread as it walks the samples it already has, read by
+  /// \ref levels_json. Fixed-size arrays rather than vectors: the channel count a device will be
+  /// opened with is bounded (\ref kMaxLevelChannels), and the render path may not grow anything.
+  /// A chain's probe is indexed by chain, not by id, because the id is a string and this is the
+  /// audio thread.
+  std::array<level::Probe, kMaxLevelChannels> input_levels_;
+  std::array<level::Probe, kMaxLevelChannels> output_levels_;
+  std::array<level::Probe, kMaxChains> chain_levels_;
 
   /// The backend's output-queue counters (StreamQueueStats), published per block. A dropped or an
   /// inserted period is a click that is not an xrun, so these belong in `engine.status` beside it.

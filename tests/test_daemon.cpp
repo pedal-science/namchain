@@ -3102,3 +3102,206 @@ TEST_CASE("the render pool starts from a pinned caller and its worker takes its 
   CHECK(after_stop.worker_calls.load() == 0);
 #endif // __linux__
 }
+
+// ---------------------------------------------------------------------------
+// Levels: the device's in and out, a chain's, and every node's (docs/daemon.md, "Levels")
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a level probe measures a window and starts a new one when it is read")
+{
+  namchain::level::Probe probe;
+
+  // A DC signal at half scale: peak -6 dBFS, RMS the same, because every sample is equal.
+  for (int i = 0; i < 64; ++i)
+    probe.accumulate(0.5f);
+  auto r = probe.take();
+  CHECK(r.frames == 64);
+  CHECK(r.peak == doctest::Approx(0.5f));
+  CHECK(r.rms == doctest::Approx(0.5).epsilon(0.001));
+  CHECK(r.clipped == 0);
+  CHECK(namchain::level::db_of_peak(r.peak) == doctest::Approx(-6.0206).epsilon(0.01));
+  CHECK(namchain::level::db_of_rms(r.rms) == doctest::Approx(-6.0206).epsilon(0.01));
+
+  // Read and reset: the next window is its own, not a longer version of the first.
+  r = probe.take();
+  CHECK(r.frames == 0);
+  CHECK(namchain::level::db_of_peak(r.peak) == namchain::level::kFloorDb);
+
+  for (int i = 0; i < 32; ++i)
+    probe.accumulate(0.25f);
+  r = probe.take();
+  CHECK(r.frames == 32);
+  CHECK(r.peak == doctest::Approx(0.25f));
+
+  // Peek reads the same window without emptying it.
+  for (int i = 0; i < 8; ++i)
+    probe.accumulate(1.0f);
+  CHECK(probe.peek().frames == 8);
+  CHECK(probe.peek().frames == 8);
+  CHECK(probe.peek().clipped == 8);
+}
+
+TEST_CASE("a level probe's fixed point is exact enough for a meter and a peak holds the loudest sample")
+{
+  namchain::level::Probe probe;
+  // A sine-like alternation and one spike: the peak is the spike, the RMS is the mean magnitude.
+  const float samples[] = {0.1f, -0.1f, 0.1f, -0.1f, 0.9f, -0.1f, 0.1f, -0.1f};
+  for (float s : samples)
+    probe.accumulate(s);
+  const auto r = probe.take();
+  CHECK(r.peak == doctest::Approx(0.9f));
+  // mean of the eight magnitudes: (0.1*7 + 0.9)/8 = 0.2
+  CHECK(r.rms == doctest::Approx(0.2).epsilon(0.001));
+  // Full scale counts as clipped; a negative peak at full scale does too (it is |x| that is tested).
+  namchain::level::Probe second;
+  second.accumulate(-1.0f);
+  second.accumulate(1.2f);
+  second.accumulate(0.99f);
+  const auto r2 = second.take();
+  CHECK(r2.clipped == 2);
+  CHECK(r2.peak == doctest::Approx(1.2f));
+}
+
+TEST_CASE("engine.levels reports the device, the chain and every node, and carries the plan's identity")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "gain.json", kGainRig);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "gain.json").string();
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["blocks"].get<uint64_t>() > 4;
+  }));
+
+  // The method exists, is read-only, and answers with a `levels` object rather than a `status` one:
+  // it is the small answer a meter polls, not a second status.
+  //
+  // **Read until a window is non-empty**, which is what a meter does: every read empties the probes
+  // (that is the design -- see level.h), so a single read taken at a random moment can legitimately
+  // land between two blocks and be empty. A test that read once and demanded samples would be
+  // asserting a race, not the feature.
+  nlohmann::json levels;
+  bool have_window = false;
+  for (int attempt = 0; attempt < 200 && !have_window; ++attempt)
+  {
+    const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"engine.levels"})"));
+    REQUIRE(reply["ok"] == true);
+    REQUIRE(reply.contains("levels"));
+    levels = reply["levels"];
+    const auto& nodes = levels["chains"][0]["nodes"];
+    have_window = !nodes.empty() && nodes[0]["frames"].get<uint64_t>() > 0;
+    if (!have_window)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  REQUIRE_MESSAGE(have_window, "no level window ever contained samples");
+
+  CHECK(levels["state"] == "running");
+  CHECK(levels["sample_rate"] == 48000);
+  CHECK(levels["period_size"] == 64);
+  CHECK(levels["blocks"].get<uint64_t>() > 0);
+  CHECK(levels["truncated"] == false);
+
+  // Read the status FIRST, before the checks that look at a window's contents: `engine.status`
+  // carries its own `levels` and empties every probe on its way through, so a status call after a
+  // levels read leaves that read's frame counts as the stale zeros of a drained window.
+  const auto reported = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+  CHECK(reported["status"].contains("levels"));
+  CHECK(reported["status"]["levels"]["chains"].size() == 1);
+  const auto capture_channels = reported["status"]["capture_channels"].get<unsigned>();
+  CHECK(capture_channels >= 1);
+
+  // Now a fresh window to inspect: the same poll-until-there-is-one rule as above.
+  have_window = false;
+  for (int attempt = 0; attempt < 200 && !have_window; ++attempt)
+  {
+    const auto again = nlohmann::json::parse(call(config.socket_path, R"({"id":"l3","method":"engine.levels"})"));
+    levels = again["levels"];
+    const auto& fresh_nodes = levels["chains"][0]["nodes"];
+    have_window = !fresh_nodes.empty() && fresh_nodes[0]["frames"].get<uint64_t>() > 0;
+    if (!have_window)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  REQUIRE_MESSAGE(have_window, "no second level window ever contained samples");
+  CHECK(levels["input"]["peak"].size() == capture_channels);
+  CHECK(levels["output"]["peak"].size() == reported["status"]["playback_channels"].get<unsigned>());
+  CHECK(levels["input"]["rms"].size() == capture_channels);
+  CHECK(levels["output"]["clipped"].size() == levels["output"]["peak"].size());
+
+  // The chain, with its document identity and its own output level.
+  REQUIRE(levels["chains"].size() == 1);
+  const auto& chain = levels["chains"][0];
+  CHECK(chain["id"] == "main");
+  CHECK(chain["output_channel"] == 0);
+  CHECK(chain["muted"] == false);
+  CHECK(chain.contains("out"));
+
+  // Every node of the plan, labelled so a client can find its block: `element` is what the client
+  // named and `role` is which primitive of a macro it was lowered from.
+  const auto& nodes = chain["nodes"];
+  CHECK(nodes.size() == 3);
+  bool saw_gain = false;
+  for (const auto& node : nodes)
+  {
+    CHECK(node.contains("element"));
+    CHECK(node.contains("role"));
+    CHECK(node.contains("peak"));
+    CHECK(node.contains("rms"));
+    if (node["element"] == "out")
+    {
+      // The chain's output node has NO output port, so nothing is measured at it: what a client
+      // wants there is the chain's output, which the chain's own probe reports. A node-level
+      // reading of its dry input would count the last block of the signal path twice.
+      CHECK(node["frames"].get<uint64_t>() == 0);
+    }
+    else
+    {
+      // A window that measured nothing is not a level: every node that has an output must have
+      // samples behind its number, or it is stale from a plan that has stopped.
+      CHECK(node["frames"].get<uint64_t>() > 0);
+    }
+    if (node["element"] == "g")
+    {
+      saw_gain = true;
+      // The null backend hands over silence, so every node is at the floor -- and the floor is a
+      // number, not a missing field or an infinity that would not survive JSON.
+      CHECK(node["peak"].get<double>() == namchain::level::kFloorDb);
+    }
+  }
+  CHECK(saw_gain);
+
+  // The format the device was opened with, which used to be known and never reported.
+  CHECK(reported["status"].contains("format"));
+
+  // The feature is advertised, because a client that does not see it must degrade rather than guess.
+  const auto hello = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.hello"})"));
+  bool advertises = false;
+  for (const auto& feature : hello["features"])
+    if (feature == "levels")
+      advertises = true;
+  CHECK(advertises);
+}
