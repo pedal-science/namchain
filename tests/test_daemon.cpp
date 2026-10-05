@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -3144,14 +3145,15 @@ TEST_CASE("a level probe measures a window and starts a new one when it is read"
 TEST_CASE("a level probe's fixed point is exact enough for a meter and a peak holds the loudest sample")
 {
   namchain::level::Probe probe;
-  // A sine-like alternation and one spike: the peak is the spike, the RMS is the mean magnitude.
+  // A sine-like alternation and one spike: the peak is the spike, the RMS is the root of the mean
+  // square -- not the mean magnitude, which for these eight samples would be 0.2.
   const float samples[] = {0.1f, -0.1f, 0.1f, -0.1f, 0.9f, -0.1f, 0.1f, -0.1f};
   for (float s : samples)
     probe.accumulate(s);
   const auto r = probe.take();
   CHECK(r.peak == doctest::Approx(0.9f));
-  // mean of the eight magnitudes: (0.1*7 + 0.9)/8 = 0.2
-  CHECK(r.rms == doctest::Approx(0.2).epsilon(0.001));
+  // root of the mean square: sqrt((0.1^2 * 7 + 0.9^2) / 8) = sqrt(0.11)
+  CHECK(r.rms == doctest::Approx(std::sqrt(0.11)).epsilon(0.001));
   // Full scale counts as clipped; a negative peak at full scale does too (it is |x| that is tested).
   namchain::level::Probe second;
   second.accumulate(-1.0f);
@@ -3160,6 +3162,42 @@ TEST_CASE("a level probe's fixed point is exact enough for a meter and a peak ho
   const auto r2 = second.take();
   CHECK(r2.clipped == 2);
   CHECK(r2.peak == doctest::Approx(1.2f));
+}
+
+TEST_CASE("a level probe reports the root of the mean square, which a sine tells apart from the mean magnitude")
+{
+  namchain::level::Probe probe;
+  // One cycle of a sine sampled at sixteen points: mean square 0.5 exactly, so RMS 1/sqrt(2). The mean
+  // magnitude of the same samples is 0.628, which is what a rectified average would report -- 1.05 dB
+  // lower, and a different quantity. A client showing crest factor needs the RMS.
+  constexpr double kTwoPi = 6.283185307179586;
+  for (int i = 0; i < 16; ++i)
+    probe.accumulate(static_cast<float>(std::sin(kTwoPi * i / 16.0)));
+  const auto r = probe.take();
+  CHECK(r.peak == doctest::Approx(1.0f).epsilon(0.001));
+  CHECK(r.rms == doctest::Approx(std::sqrt(0.5)).epsilon(0.005));
+  CHECK(r.rms > 0.65); // the mean magnitude of these samples would be 0.628
+  CHECK(namchain::level::db_of_rms(r.rms) == doctest::Approx(-3.0103).epsilon(0.01));
+}
+
+TEST_CASE("a probe read twice reports the second read from the next window, which one take prevents")
+{
+  namchain::level::Probe probe;
+  for (int i = 0; i < 64; ++i)
+    probe.accumulate(1.0f);
+
+  const auto taken = probe.take();
+  CHECK(taken.frames == 64);
+  CHECK(taken.clipped == 64);
+
+  // A `take` empties the window it returns, so a `peek` after it describes the *next* window -- and
+  // the render thread has usually not filled that one yet. This is the shape that reported a device
+  // channel's `rms` as the floor and its `clipped` as zero beside a `peak` that was real: one entry's
+  // fields have to come from one `take` (Daemon::levels_json).
+  const auto peeked = probe.peek();
+  CHECK(peeked.frames == 0);
+  CHECK(peeked.clipped == 0);
+  CHECK(namchain::level::db_of_rms(peeked.rms) == namchain::level::kFloorDb);
 }
 
 TEST_CASE("engine.levels reports the device, the chain and every node, and carries the plan's identity")
@@ -3251,6 +3289,13 @@ TEST_CASE("engine.levels reports the device, the chain and every node, and carri
   CHECK(levels["output"]["peak"].size() == reported["status"]["playback_channels"].get<unsigned>());
   CHECK(levels["input"]["rms"].size() == capture_channels);
   CHECK(levels["output"]["clipped"].size() == levels["output"]["peak"].size());
+  // The device carries a frame count too, and it is the same window as its peak: this reply was
+  // polled until a node's window had samples in it, and the device probes are accumulated on those
+  // same periods, so an empty device window here would mean the two were read separately.
+  CHECK(levels["input"]["frames"].size() == capture_channels);
+  CHECK(levels["output"]["frames"].size() == levels["output"]["peak"].size());
+  CHECK(levels["input"]["frames"][0].get<uint64_t>() > 0);
+  CHECK(levels["output"]["frames"][0].get<uint64_t>() > 0);
 
   // The chain, with its document identity and its own output level.
   REQUIRE(levels["chains"].size() == 1);
@@ -3304,4 +3349,140 @@ TEST_CASE("engine.levels reports the device, the chain and every node, and carri
     if (feature == "levels")
       advertises = true;
   CHECK(advertises);
+}
+
+TEST_CASE("a device level entry is one window: its peak, rms, clipped and frames agree")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "gain.json", kGainRig);
+
+  // Twenty seconds of full-scale DC on the `file` backend, which is unpaced: the whole run is a few
+  // tens of milliseconds and the test polls `engine.levels` while it happens. DC rather than a tone
+  // so that every sample of every window is at full scale, which is what makes `clipped == frames` a
+  // statement about one window rather than about four numbers that merely look plausible. 960000
+  // frames is an exact multiple of the 64-frame period, so the backend never pads a short final
+  // period with silence and *every* window is full scale, whichever one the poll catches.
+  {
+    const std::vector<float> samples(20u * 48000u, 1.0f);
+    std::string error;
+    REQUIRE_MESSAGE(namchain::save_wav_float32((dir.path / "in.wav").string(), samples.data(),
+                                               samples.size(), 1, 48000.0, error),
+                    error);
+  }
+
+  Config config = file_backend_config(dir, 1, 1);
+  config.rigs_root = root.string();
+  config.rig = (root / "gain.json").string();
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+
+  // Poll until a window with samples in it turns up. A read is what empties a window, so the tail
+  // after the last block is still there for the poll that follows it: this cannot miss every window
+  // the way a single read at a random moment can.
+  //
+  // The device's channel arrays are **empty** until it opens, so the poll has to tolerate that, and
+  // `closed` alone is not the end -- it is also the state before the device is opened at all. A block
+  // count is what tells a device that has been and gone from one that has not arrived yet.
+  nlohmann::json window;
+  for (int attempt = 0; attempt < 4000 && window.is_null(); ++attempt)
+  {
+    const auto reply = nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.levels"})"));
+    REQUIRE(reply["ok"] == true);
+    const nlohmann::json& levels = reply["levels"];
+    REQUIRE(levels["input"].contains("frames"));
+    const nlohmann::json& frames = levels["input"]["frames"];
+    if (!frames.empty() && frames[0].get<uint64_t>() > 0)
+      window = levels;
+    else if (levels["state"] == "closed" && levels["blocks"].get<uint64_t>() > 0)
+      break;
+    else
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE_MESSAGE(!window.is_null(), "no device window ever contained samples");
+
+  // Full scale in through a gain of 0.5: the input is at 0 dBFS and every sampled frame of it is
+  // clipped, the output is at -6 dBFS and clips nothing. Both are constant signals, so peak and rms
+  // are the same number however the mean is defined -- this asserts the window, not the definition.
+  const uint64_t in_frames = window["input"]["frames"][0].get<uint64_t>();
+  CHECK(in_frames > 0);
+  CHECK(window["input"]["peak"][0].get<double>() == 0.0);
+  CHECK(window["input"]["rms"][0].get<double>() == 0.0);
+  CHECK(window["input"]["clipped"][0].get<uint64_t>() == in_frames);
+  CHECK(window["output"]["frames"][0].get<uint64_t>() > 0);
+  CHECK(window["output"]["peak"][0].get<double>() == -6.0);
+  CHECK(window["output"]["rms"][0].get<double>() == -6.0);
+  CHECK(window["output"]["clipped"][0].get<uint64_t>() == 0);
+}
+
+TEST_CASE("a plan's prewarm is not part of the first window a level meter sees")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "gain.json", kGainRig);
+
+  // Eight periods of half-scale DC. Short enough that the whole run fits in a window nobody has read
+  // yet, long enough to have samples in it, and an exact multiple of the period so no padded tail
+  // muddies the frame count.
+  {
+    const std::vector<float> samples(8u * 64u, 0.5f);
+    std::string error;
+    REQUIRE_MESSAGE(namchain::save_wav_float32((dir.path / "in.wav").string(), samples.data(),
+                                               samples.size(), 1, 48000.0, error),
+                    error);
+  }
+
+  Config config = file_backend_config(dir, 1, 1);
+  config.rigs_root = root.string();
+  config.rig = (root / "gain.json").string();
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+
+  // Wait for the run to finish *without* reading the probes until it has: `engine.status` and
+  // `engine.levels` both carry levels and empty them, and this test is about what one unread window
+  // holds. A read taken while nothing has been rendered returns an empty window and costs nothing, so
+  // polling is safe; a block count is what tells a device that has been and gone from one that has
+  // not opened yet.
+  nlohmann::json levels;
+  for (int attempt = 0; attempt < 4000; ++attempt)
+  {
+    if (daemon.device_state() == namchain::daemon::DeviceState::Closed)
+    {
+      levels = nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.levels"})"))["levels"];
+      if (levels["blocks"].get<uint64_t>() > 0)
+        break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  REQUIRE(levels["blocks"].get<uint64_t>() == 8u);
+
+  // Every node measured the eight periods and nothing else. The prewarm's quantum of silence used to
+  // sit in each node's probe and nowhere else: one period longer than the audio, with the mean diluted
+  // by a signal that never reached the device -- -6.5 dBFS for the input node rather than the -6.0 it
+  // is at.
+  //
+  // The device's and the chain's own probes are compared against the period count rather than each
+  // other because `Daemon::close_device` empties those on purpose: a window spanning a device restart
+  // is a mean of neither stream, so a closed device reports silence. A node's probe outlives the
+  // device with its plan, which is exactly what makes it the one that can carry a stale first window.
+  bool saw_input = false;
+  for (const auto& node : levels["chains"][0]["nodes"])
+  {
+    if (node["element"] == "out") // no output port: nothing is measured there
+      continue;
+    CHECK(node["frames"].get<uint64_t>() == 8u * 64u);
+    if (node["element"] == "in")
+    {
+      saw_input = true;
+      CHECK(node["peak"].get<double>() == -6.0);
+      CHECK(node["rms"].get<double>() == -6.0);
+    }
+    else if (node["element"] == "g")
+      CHECK(node["rms"].get<double>() == -12.0);
+  }
+  CHECK(saw_input);
 }

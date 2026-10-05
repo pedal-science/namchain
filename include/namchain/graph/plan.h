@@ -423,6 +423,11 @@ public:
   /// work that has nothing to do with steady-state cost -- and a stall that long can drain the
   /// device ring on its own. Call this on the control thread before publishing the plan (§3.3).
   /// It is not part of `execute` because it mutates node state: the oracle has to be warmed too.
+  ///
+  /// Every node's level probe is emptied on the way out. Those blocks are silence, rendered before
+  /// the plan is visible to anything, so nothing can have read them; left in, they would give a node
+  /// a first window one quantum longer than the chain's, its mean diluted by audio that never reached
+  /// the device.
   void prewarm() noexcept;
 
   /// \brief Prewarm only the nodes this plan created, leaving carried ones alone.

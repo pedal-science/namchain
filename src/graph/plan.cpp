@@ -1007,8 +1007,15 @@ void RenderPlan::execute(const float* input, float* output, int frames) noexcept
 
 void RenderPlan::prewarm() noexcept
 {
-  if (max_quantum_ > 0)
-    execute(nullptr, nullptr, max_quantum_);
+  if (max_quantum_ <= 0)
+    return;
+  execute(nullptr, nullptr, max_quantum_);
+  // The prewarm's block is silence that no client could have read -- the plan is not published until
+  // this returns -- so it is dropped rather than left to dilute a node's first window. `take` is the
+  // only way to empty a probe, and on the control thread before publication there is no reader to
+  // race. (`prewarm_fresh` calls `process` directly and measures nothing, so it has nothing to drop.)
+  for (level::Probe& probe : levels_)
+    probe.take();
 }
 
 void RenderPlan::prewarm_fresh() noexcept

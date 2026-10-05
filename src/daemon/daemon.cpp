@@ -2249,15 +2249,30 @@ nlohmann::json Daemon::levels_json()
                           {"frames", r.frames},
                           {"clipped", r.clipped}};
   };
-  const auto peaks = [](const std::array<level::Probe, kMaxLevelChannels>& probes,
-                        unsigned channels) {
-    nlohmann::json out = nlohmann::json::array();
+  /// One device channel's window, taken **once**: `peak`, `rms`, `clipped` and `frames` all come
+  /// from the same `Reading`.
+  ///
+  /// Splitting them over two reads is the bug this shape exists to make impossible: `take` empties
+  /// the window as it reads, so a second read -- even a `peek` -- describes the *next* window, which
+  /// the render thread has usually not filled yet. Read that way, the device's `rms` was always the
+  /// floor and its `clipped` always zero, beside a `peak` from a window that did have samples in it.
+  const auto device_channel_stats = [](const std::array<level::Probe, kMaxLevelChannels>& probes,
+                                       unsigned channels) {
+    nlohmann::json peak = nlohmann::json::array();
+    nlohmann::json rms = nlohmann::json::array();
+    nlohmann::json clipped = nlohmann::json::array();
+    nlohmann::json frames = nlohmann::json::array();
     for (unsigned c = 0; c < channels && c < probes.size(); ++c)
     {
       const level::Probe::Reading r = const_cast<level::Probe&>(probes[c]).take();
-      out.push_back(std::round(level::db_of_peak(r.peak) * 10.0) / 10.0);
+      peak.push_back(std::round(level::db_of_peak(r.peak) * 10.0) / 10.0);
+      rms.push_back(std::round(level::db_of_rms(r.rms) * 10.0) / 10.0);
+      clipped.push_back(r.clipped);
+      // Reported for the device too, so a client can apply the same rule it applies to a chain or a
+      // node: a window with no samples in it is not a level, hold the display.
+      frames.push_back(r.frames);
     }
-    return out;
+    return nlohmann::json{{"peak", peak}, {"rms", rms}, {"clipped", clipped}, {"frames", frames}};
   };
 
   nlohmann::json levels;
@@ -2272,38 +2287,8 @@ nlohmann::json Daemon::levels_json()
   // summed level could not answer it.
   const unsigned capture = active_capture_channels_.load();
   const unsigned playback = active_playback_channels_.load();
-  nlohmann::json input;
-  input["peak"] = peaks(input_levels_, capture ? capture : 0);
-  {
-    // RMS and clipping are per channel too, but the wire's shape for them is one number per
-    // channel as well, so the same loop is written once more rather than a second helper.
-    nlohmann::json rms = nlohmann::json::array();
-    nlohmann::json clipped = nlohmann::json::array();
-    for (unsigned c = 0; c < capture && c < kMaxLevelChannels; ++c)
-    {
-      const level::Probe::Reading r = input_levels_[c].peek();
-      rms.push_back(std::round(level::db_of_rms(r.rms) * 10.0) / 10.0);
-      clipped.push_back(r.clipped);
-    }
-    input["rms"] = rms;
-    input["clipped"] = clipped;
-  }
-  nlohmann::json output;
-  output["peak"] = peaks(output_levels_, playback ? playback : 0);
-  {
-    nlohmann::json rms = nlohmann::json::array();
-    nlohmann::json clipped = nlohmann::json::array();
-    for (unsigned c = 0; c < playback && c < kMaxLevelChannels; ++c)
-    {
-      const level::Probe::Reading r = output_levels_[c].peek();
-      rms.push_back(std::round(level::db_of_rms(r.rms) * 10.0) / 10.0);
-      clipped.push_back(r.clipped);
-    }
-    output["rms"] = rms;
-    output["clipped"] = clipped;
-  }
-  levels["input"] = input;
-  levels["output"] = output;
+  levels["input"] = device_channel_stats(input_levels_, capture ? capture : 0);
+  levels["output"] = device_channel_stats(output_levels_, playback ? playback : 0);
 
   /// Each chain: its own output level and the level of every node in the plan it is playing.
   ///
