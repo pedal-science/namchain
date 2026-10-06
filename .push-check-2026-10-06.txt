@@ -1,0 +1,15 @@
+Push check, 2026-10-06.
+
+This file is deliberate, and it exists only to be a harmless commit: it exercises the commit and
+push path in all five of the pedal's repositories at once, from a single session opened on the
+workspace root (~/code.local/pedal).
+
+It checks four things:
+  * a session opened on the workspace root can write in every repository (the point of the move
+    recorded in pedal.project/docs/workspace.md)
+  * the workspace guard installed through ~/.gitconfig at pedal.project/tools/git-hooks accepts
+    an ordinary commit and push
+  * each repository's remote is reachable and accepts a push
+  * the five repositories end up level with their origin/main
+
+Delete this file once it has served that purpose. It is not part of the pedal.
