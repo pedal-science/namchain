@@ -227,6 +227,7 @@ TEST_CASE("a config file sets the fields the daemon uses")
     "fade_ms": 2.5,
     "model_budget_kb": 448,
     "device_retry_ms": 500,
+    "levels": false,
     "tcp_listen": true,
     "tcp_address": "0.0.0.0",
     "tcp_port": 47811,
@@ -266,6 +267,9 @@ TEST_CASE("a config file sets the fields the daemon uses")
   CHECK(config.fade_ms == doctest::Approx(2.5));
   CHECK(config.model_budget_kb == 448u);
   CHECK(config.device_retry_ms == 500u);
+  // Measuring is on unless it is turned off, and the key that turns it off is the flag's own name
+  // (config.h: "keys are the long flag names without the dashes").
+  CHECK_FALSE(config.levels);
   CHECK(config.tcp_listen);
   CHECK(config.tcp_address == "0.0.0.0");
   CHECK(config.tcp_port == 47811u);
@@ -339,6 +343,15 @@ TEST_CASE("command-line options parse and reject")
   CHECK(config.model_budget_kb == 0u); // off unless a device asks for it
   CHECK(namchain::daemon::apply_option(config, "model-budget-kb", "448", error));
   CHECK(config.model_budget_kb == 448u);
+
+  // Level measuring: on unless it is turned off, so an appliance that wants the per-sample cost back
+  // has to say so. Both spellings are accepted from the start, because a flag that can only be
+  // turned off (or only on) is one an operator has to read the help for.
+  CHECK(config.levels);
+  CHECK(namchain::daemon::apply_option(config, "no-levels", "", error));
+  CHECK_FALSE(config.levels);
+  CHECK(namchain::daemon::apply_option(config, "levels", "", error));
+  CHECK(config.levels);
 
   // The device's buffer, and the two ways of asking for it wrongly. A typo must be a refusal rather
   // than a silently ignored latency claim: an operator who typed `--device-buffer-frames 3two` and got
@@ -3349,6 +3362,65 @@ TEST_CASE("engine.levels reports the device, the chain and every node, and carri
     if (feature == "levels")
       advertises = true;
   CHECK(advertises);
+}
+
+TEST_CASE("levels off: the feature is not advertised, the method is refused, and status omits the field")
+{
+  // The switch (Config::levels, --no-levels) exists so the per-sample cost of measuring can be
+  // turned off on an appliance nobody polls -- and so a measurement can separate the engine's own
+  // cost from the cost of watching it. What it must never do is answer -200 dBFS, which would say
+  // "silence" where the truth is "nobody is measuring": the three assertions below are the three
+  // ways a client could be misled, and each has to be an absence instead.
+  TempDir dir;
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.levels = false;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running";
+  }));
+
+  // 1. Not advertised. A client that does not see "levels" builds no meters, which is the truth
+  //    about this engine -- and is why the client's own feature-detection is enough.
+  const auto hello = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.hello"})"));
+  for (const auto& feature : hello["features"])
+    CHECK(feature != "levels");
+
+  // 2. Refused by name, so a client can tell "this engine does not measure" from a transport
+  //    failure or a mistyped method.
+  const auto refused = nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"engine.levels"})"));
+  CHECK(refused["ok"] == false);
+  CHECK(refused["error"]["code"] == "levels_disabled");
+
+  // 3. Absent from status, rather than present and full of floors.
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"id":"s","method":"engine.status"})"));
+  CHECK(status["ok"] == true);
+  CHECK_FALSE(status["status"].contains("levels"));
+
+  // Everything else is untouched: the switch turns off measuring, not the engine.
+  CHECK(status["status"]["state"] == "running");
+  CHECK(status["status"]["sample_rate"] == 48000);
 }
 
 TEST_CASE("a device level entry is one window: its peak, rms, clipped and frames agree")

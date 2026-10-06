@@ -811,6 +811,36 @@ bypassed node reports its dry level, which is what is actually there. A node the
 left out of the answer entirely (its output is substituted dry, and reporting it as silence would send
 somebody after the wrong thing) — the `node_failed` issue is what names it.
 
+### Turning it off: `--levels` / `--no-levels`
+
+Measuring is **on** by default, and the switch exists for the two cases where its per-sample cost is
+not wanted: an appliance with no client polling levels at all, and a measurement that has to separate
+the engine's own cost from the cost of watching it.
+
+`--no-levels` (config key `"levels": false`) turns it off **at the source**, rather than answering
+with floors:
+
+| | measuring (default) | `--no-levels` |
+|---|---|---|
+| A node's probe | one per node, in the plan | none built — `CompileOptions::levels` |
+| The render path | peak, sum, frames and clip per sample | no level work at all |
+| `engine.levels` | the levels object | refused, `levels_disabled` |
+| `engine.status.levels` | present | absent |
+| `features` | includes `"levels"` | omits it |
+
+It is **decided once**, when the daemon is constructed and when each plan is compiled, and it cannot
+change while the daemon runs. That is not a limitation to work around: a plan is compiled on the
+render path by a local transition, so a value that could change under it would be a probe that some
+plans write and others do not — a meter reading a mixture of two engines.
+
+The three absences are the point, and they are what the tests assert: a client that does not see
+`"levels"` in `features` builds no meters, one that calls the method anyway is told why by name, and
+`engine.status` does not carry a levels object full of `-200 dBFS`, which would say "silence" where
+the truth is "nobody is measuring".
+
+This is a switch for **cost**, not for safety: with it off, `engine.levels` is the only thing that
+stops working. Nothing else in this document changes.
+
 ## Recording what the device heard
 
 `engine.record` (`namchainctl record start NAME [--seconds S]`, `record stop`, `record`) answers "where

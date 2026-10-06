@@ -162,6 +162,20 @@ struct Config
   /// A client names a recording, never a path: the name is one plain directory component under this,
   /// so a control connection can create files here and nowhere else.
   std::string record_dir = "/var/lib/namchain/recordings";
+  /// \brief Whether the engine measures audio levels at all (`level.h`, docs/daemon.md "Levels").
+  ///
+  /// On by default, because a meter and a diagnostic both need it and a feature that has to be asked
+  /// for is one nobody finds. Off is for the two cases where the per-sample cost is not wanted: an
+  /// appliance with no client polling levels at all, and a measurement that has to separate the
+  /// engine's own cost from the cost of watching it.
+  ///
+  /// Off means the probes are never built, the render path skips every accumulation, `engine.levels`
+  /// is refused with `levels_disabled`, and `features` does not advertise "levels" -- so a client
+  /// degrades to having no meters rather than polling a method that cannot answer. It is read once,
+  /// when the daemon is constructed: a plan's probes are made as the plan is compiled, and a local
+  /// transition compiles a plan on the render path, so a value that could change under it would be a
+  /// probe that some plans write and others do not.
+  bool levels = true;
   /// How long the render thread waits before retrying a device that failed or is not present.
   unsigned device_retry_ms = 250;
   /// How long the control loop's poll sleeps when nothing is pending. This is the reclamation

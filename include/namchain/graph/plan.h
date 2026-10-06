@@ -27,6 +27,15 @@ struct CompileOptions
   int max_quantum = 64;
   /// The engine's rate. 48 kHz is the M1 target; models are loaded at whatever this says (§7.1).
   double sample_rate = 48000.0;
+  /// \brief Whether this plan measures its nodes' levels (`level.h`).
+  ///
+  /// False leaves `levels_` empty, which is what makes a plan with the feature off cost *nothing* on
+  /// the render path rather than a branch per node per quantum: `execute` already passes a null probe
+  /// for a node it has no probe for, and `measure_node` returns on a null probe. Decided at compile
+  /// time for the same reason the daemon reads Config::levels once: a local transition compiles a plan
+  /// on the render path, and probes that appeared or vanished with a flag read mid-flight would be
+  /// probes that some plans write and others do not.
+  bool levels = true;
 };
 
 /// The kind of value a parameter holds, which is what a client shows a control for

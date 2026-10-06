@@ -810,8 +810,11 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   for (std::atomic<bool>& flag : plan->failed_)
     flag.store(false, std::memory_order_relaxed);
   // Reserved here and filled beside `nodes_`, so the two stay parallel by construction: a probe
-  // with no node, or a node with no probe, would be a meter reading somebody else's signal.
-  plan->levels_.reserve(lowered_graph.nodes.size());
+  // with no node, or a node with no probe, would be a meter reading somebody else's signal. Left
+  // empty when the engine is not measuring levels: `measure_node` returns on a null probe, so the
+  // render path then does no per-sample level work at all (CompileOptions::levels).
+  if (options.levels)
+    plan->levels_.reserve(lowered_graph.nodes.size());
   plan->buffers_.reserve(static_cast<std::size_t>(total_buffers));
   for (int i = 0; i < total_buffers; ++i)
   {
@@ -880,8 +883,10 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
     plan->nodes_.push_back(std::move(plan_node));
     plan->node_ids_.push_back(spec.id);
     // One level probe per node, made here so it is parallel to `nodes_` by construction. `emplace`
-    // rather than `push_back`: a Probe holds atomics and is not movable.
-    plan->levels_.emplace_back();
+    // rather than `push_back`: a Probe holds atomics and is not movable. Nothing is made when the
+    // engine is not measuring, which is what leaves this vector empty and `measure_node` idle.
+    if (options.levels)
+      plan->levels_.emplace_back();
   }
 
   // Bind inputs now that every output buffer is known.

@@ -336,6 +336,61 @@ TEST_CASE("a plan's level probes measure each node's output where the next node 
   CHECK_MESSAGE(settled, "a bypassed node's probe never settled at its dry input's level");
 }
 
+TEST_CASE("a plan built without levels has no probes, and still renders the same audio")
+{
+  // What makes `--no-levels` free rather than cheap: the probes are not made, so `execute` passes a
+  // null probe for every node and `measure_node` returns immediately. This test is the *structural*
+  // half of that claim -- the per-sample half is measured, not asserted -- and the audio comparison
+  // is here so that "no probes" cannot quietly become "no signal".
+  Graph graph;
+  std::string error;
+  REQUIRE_MESSAGE(namchain::graph::parse_graph_json(R"({
+      "nodes": [
+        { "id": "in",  "type": "nc.input" },
+        { "id": "g",   "type": "nc.gain", "gain": 0.5 },
+        { "id": "out", "type": "nc.output" }
+      ],
+      "connections": [
+        { "from": "in", "to": "g" },
+        { "from": "g", "to": "out" }
+      ]
+    })",
+                                                  graph, error),
+                  error);
+
+  namchain::render::CompileOptions measuring = options_for();
+  namchain::render::CompileOptions quiet = options_for();
+  quiet.levels = false;
+
+  namchain::rt::Arena arena_a(1u << 16);
+  namchain::rt::Arena arena_b(1u << 16);
+  auto with_levels = RenderPlan::compile(graph, measuring, arena_a, error);
+  REQUIRE_MESSAGE(with_levels != nullptr, error);
+  auto without_levels = RenderPlan::compile(graph, quiet, arena_b, error);
+  REQUIRE_MESSAGE(without_levels != nullptr, error);
+
+  // The plan is still a plan: same nodes, same count.
+  CHECK(without_levels->nodes().size() == with_levels->nodes().size());
+
+  // Every node has a probe when measuring, and none when not. A node index out of range is already
+  // a nullptr, so the loops below use the node count rather than a magic index.
+  for (std::size_t i = 0; i < with_levels->nodes().size(); ++i)
+    CHECK(with_levels->level_of(i) != nullptr);
+  for (std::size_t i = 0; i < without_levels->nodes().size(); ++i)
+    CHECK(without_levels->level_of(i) == nullptr);
+
+  // And the audio is the same, which is the part that matters: the measurement is a reader of the
+  // signal, never an input to it.
+  std::vector<float> input(kQuantum);
+  for (int i = 0; i < kQuantum; ++i)
+    input[static_cast<std::size_t>(i)] = 0.5f * std::sin(0.1f * static_cast<float>(i));
+  std::vector<float> rendered_a(kQuantum, 0.0f);
+  std::vector<float> rendered_b(kQuantum, 0.0f);
+  with_levels->execute(input.data(), rendered_a.data(), kQuantum);
+  without_levels->execute(input.data(), rendered_b.data(), kQuantum);
+  CHECK(rendered_a == rendered_b);
+}
+
 // ---------------------------------------------------------------------------
 // The reference interpreter as the compiler's oracle
 // ---------------------------------------------------------------------------

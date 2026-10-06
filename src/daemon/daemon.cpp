@@ -89,13 +89,22 @@ constexpr int kOldestProtocolVersion = 1;
 /// What this daemon can be relied on to do, so a client degrades rather than guesses. Grows as the
 /// slices land (docs/ui-integration-plan.md §1.4): a client that does not see "stereo" does not offer
 /// a pan control, and one that sees "schema" knows to build its inspector from `engine.schema`.
-nlohmann::json protocol_features()
+///
+/// `measure_levels` is whether this daemon was started measuring (`Config::levels`). It is a
+/// parameter rather than a constant because with the feature off the honest answer is that this
+/// daemon does not do it: a client that sees "levels" polls a method that will refuse it, and a
+/// client that does not see it has no meters, which is the truth.
+nlohmann::json protocol_features(bool measure_levels)
 {
-  return nlohmann::json::array({"multi_chain", "documents", "rig_apply", "rig_get_document",
-                                "structural_crossfade", "smooth_params", "bypass", "guard",
-                                "per_chain_mute", "schema", "tcp_transport", "assets", "record",
-                                "local_transitions", "meta", "bypass_ramp", "model_budget",
-                                "levels"});
+  nlohmann::json features = nlohmann::json::array({"multi_chain", "documents", "rig_apply",
+                                                   "rig_get_document", "structural_crossfade",
+                                                   "smooth_params", "bypass", "guard",
+                                                   "per_chain_mute", "schema", "tcp_transport",
+                                                   "assets", "record", "local_transitions", "meta",
+                                                   "bypass_ramp", "model_budget"});
+  if (measure_levels)
+    features.push_back("levels");
+  return features;
 }
 
 /// The longest recording `engine.record` will make, so a client that forgets to stop one cannot fill
@@ -778,7 +787,10 @@ const char* device_state_name(DeviceState state)
   return "unknown";
 }
 
-Daemon::Daemon(Config config) : config_(std::move(config)) {}
+Daemon::Daemon(Config config)
+  : config_(std::move(config)), levels_enabled_(config_.levels)
+{
+}
 
 Daemon::~Daemon()
 {
@@ -1489,6 +1501,9 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   render::CompileOptions options;
   options.max_quantum = static_cast<int>(config_.period_size);
   options.sample_rate = static_cast<double>(config_.sample_rate);
+  // A plan built with the feature off has no probes at all, which is what makes `levels` cost
+  // nothing per sample rather than a branch per node per quantum (CompileOptions::levels).
+  options.levels = config_.levels;
 
   // Which chains actually changed. An unchanged chain keeps the plan it has: republishing it would
   // recompile it -- reloading every model on this thread -- and crossfade it, for an edit somebody
@@ -2883,8 +2898,9 @@ void Daemon::render_loop()
       // 1b. What the device actually handed over, per channel and before any routing or mute: the
       //     input level a meter shows has to be the ADC's, not the chain's, or a routing mistake
       //     reads as a dead input. The decode above walks the same buffer, so the extra work is one
-      //     decode per channel the chains do not use.
-      for (unsigned c = 0; c < info.capture_channels && c < input_levels_.size(); ++c)
+      //     decode per channel the chains do not use. Skipped entirely when this daemon does not
+      //     measure levels (Config::levels).
+      for (unsigned c = 0; levels_enabled_ && c < info.capture_channels && c < input_levels_.size(); ++c)
       {
         level::Probe& probe = input_levels_[c];
         for (unsigned i = 0; i < info.period_size; ++i)
@@ -2932,7 +2948,9 @@ void Daemon::render_loop()
           continue;
 
         float* destination = bus_.data() + static_cast<std::size_t>(source->output_channel) * info.period_size;
-        level::Probe* out_level = c < static_cast<int>(chain_levels_.size()) ? &chain_levels_[c] : nullptr;
+        level::Probe* out_level = levels_enabled_ && c < static_cast<int>(chain_levels_.size())
+                                    ? &chain_levels_[c]
+                                    : nullptr;
         for (int i = 0; i < frames; ++i)
         {
           destination[i] += chain.out[static_cast<std::size_t>(i)];
@@ -2953,7 +2971,7 @@ void Daemon::render_loop()
         for (unsigned c = 0; c < info.playback_channels; ++c)
         {
           const float sample = bus_[static_cast<std::size_t>(c) * info.period_size + i];
-          if (c < output_levels_.size())
+          if (levels_enabled_ && c < output_levels_.size())
             output_levels_[c].accumulate(sample);
           pcm_encode(playback_buffer_.data() +
                        (static_cast<std::size_t>(i) * info.playback_channels + c) * width,
@@ -3427,7 +3445,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["protocol"] = kProtocolVersion;
     body["role"] = "namchaind";
     body["version"] = NAMCHAIN_VERSION_STRING;
-    body["features"] = protocol_features();
+    body["features"] = protocol_features(config_.levels);
     // Which transport answered, and whether this session is authenticated. On the local transport the
     // second is always true (filesystem permissions decided it); on TCP it becomes true here and
     // nowhere else, which is what makes a client able to tell "wrong token" from "wrong method".
@@ -3549,7 +3567,11 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // The audio levels, as their own object. Embedded here AND a method of its own, because the two
     // callers want different shapes: a status poll is a snapshot of everything every second, and a
     // meter wants only these numbers, often, without building the rest of this JSON.
-    status["levels"] = levels_json();
+    // Absent rather than all-floor when this daemon does not measure levels: `-200 dBFS` would say
+    // "silence" where the truth is "nobody is measuring", and absence is how a client degrades
+    // (docs/daemon.md, "Absence is the feature flag").
+    if (levels_enabled_)
+      status["levels"] = levels_json();
     // Two honest labels: parameter edits are ramped inside the node (no recompile, no step); a
     // structural change is equal-power crossfaded for fade_ms -- where the edit is, when what it did not
     // touch can be kept (`local_transitions`), and across the whole chain when it cannot.
@@ -3657,7 +3679,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["health"] = health;
     status["issues"] = std::move(issues);
     status["max_chains"] = kMaxChains;
-    status["features"] = protocol_features();
+    status["features"] = protocol_features(config_.levels);
     nlohmann::json body;
     body["status"] = status;
     return ok_response(id, body);
@@ -3670,6 +3692,14 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // not be building the whole of `engine.status` -- chains, issues, model budget, transitions --
     // twenty times a second, on the thread that compiles rigs. Everything here is an atomic read and
     // a string the plan already holds.
+    //
+    // Refused rather than answered with the floor when the daemon was started without measuring
+    // (Config::levels): there are no probes to read, and a reply of -200 dBFS all round would say
+    // "silence" where the truth is "nobody is measuring". A named code is what lets a client tell
+    // that from a transport failure.
+    if (!levels_enabled_)
+      return error_response(id, "levels_disabled",
+                            "this daemon was started with --no-levels and measures no levels");
     return ok_response(id, {{"levels", levels_json()}});
   }
   if (method == "engine.record")

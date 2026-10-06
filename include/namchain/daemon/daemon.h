@@ -696,6 +696,14 @@ private:
   std::array<level::Probe, kMaxLevelChannels> output_levels_;
   std::array<level::Probe, kMaxChains> chain_levels_;
 
+  /// \brief Whether this daemon measures levels at all (`Config::levels`, `level.h`).
+  ///
+  /// Const after construction, because it decides two things that cannot change while plans are
+  /// running: whether a compiled plan has probes at all (they are made as the plan is built, and a
+  /// local transition builds one on the render path), and whether `engine.levels` answers. A render
+  /// thread reading it per block is reading a value that never changes.
+  const bool levels_enabled_;
+
   /// The backend's output-queue counters (StreamQueueStats), published per block. A dropped or an
   /// inserted period is a click that is not an xrun, so these belong in `engine.status` beside it.
   std::atomic<uint64_t> output_drops_{0};

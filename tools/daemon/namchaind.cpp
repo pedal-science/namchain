@@ -72,6 +72,11 @@ void print_usage(std::FILE* stream)
                "      --fade-ms X              structural crossfade length, default 5\n"
                "      --model-budget-kb N      what a document's models may read per block, together;\n"
                "                               over it, slimmable models are slimmed. 0 = off (default)\n"
+               "      --levels                 measure audio levels for engine.levels and the meters\n"
+               "                               (default). --no-levels builds no probes at all: the\n"
+               "                               render path then folds nothing per sample, engine.levels\n"
+               "                               is refused, and `features` omits \"levels\"\n"
+               "      --no-levels              do not measure audio levels\n"
                "      --device-retry-ms N      retry backoff after a lost device, default 250\n"
                "      --reclamation-timeout-ms N  control poll timeout, default 20\n"
                "  -v, --verbose                log lifecycle events to stderr\n"
@@ -169,7 +174,7 @@ int main(int argc, char** argv)
     std::string name = argument == "-v" ? "verbose" : argument.substr(2);
     std::string value;
     const bool takes_no_value = name == "verbose" || name == "lock-memory" || name == "no-lock-memory" ||
-                                name == "tcp-listen";
+                                name == "tcp-listen" || name == "levels" || name == "no-levels";
     if (!takes_no_value)
     {
       if (i + 1 >= argc)
