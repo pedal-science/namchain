@@ -390,6 +390,14 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
     }
     return true;
   }
+  if (name == "no-levels-rate-hz")
+  {
+    // Spelled without a value because the alternative is `--levels-rate-hz 0`, and a flag whose
+    // off-switch is "pass a zero" is one an operator has to be told about. There is a default rate
+    // now, so there has to be a way to say "no limit" that reads like it.
+    config.levels_rate_hz = 0.0;
+    return true;
+  }
   if (name == "backend")
   {
     if (!parse_backend_kind(value, config.backend))

@@ -353,6 +353,23 @@ TEST_CASE("command-line options parse and reject")
   CHECK(namchain::daemon::apply_option(config, "levels", "", error));
   CHECK(config.levels);
 
+  // The two defaults that changed on 2026-10-06, so that a change of mind has to be deliberate:
+  // publishing per period (which recovers 55% of what measuring costs, while measuring every sample)
+  // and an 8 Hz drain rate (half what a 20 Hz meter can show, and a fraction of the conversion work).
+  // Each has an off-switch, because a default somebody cannot turn off is one they work around.
+  CHECK(config.levels_publish_period);
+  CHECK(config.levels_rate_hz == doctest::Approx(8.0));
+  CHECK(namchain::daemon::apply_option(config, "no-levels-publish-period", "", error));
+  CHECK_FALSE(config.levels_publish_period);
+  CHECK(namchain::daemon::apply_option(config, "levels-publish-period", "", error));
+  CHECK(config.levels_publish_period);
+  // `--no-levels-rate-hz` is the readable spelling of "no limit": the alternative is passing a zero,
+  // and a flag whose off-switch is a magic value is one an operator has to be told about.
+  CHECK(namchain::daemon::apply_option(config, "no-levels-rate-hz", "", error));
+  CHECK(config.levels_rate_hz == doctest::Approx(0.0));
+  CHECK(namchain::daemon::apply_option(config, "levels-rate-hz", "8", error));
+  CHECK(config.levels_rate_hz == doctest::Approx(8.0));
+
   // The device's buffer, and the two ways of asking for it wrongly. A typo must be a refusal rather
   // than a silently ignored latency claim: an operator who typed `--device-buffer-frames 3two` and got
   // 512 frames of latency would have no way to tell that nothing had happened.
@@ -3714,6 +3731,10 @@ TEST_CASE("a device level entry is one window: its peak, rms, clipped and frames
   Config config = file_backend_config(dir, 1, 1);
   config.rigs_root = root.string();
   config.rig = (root / "gain.json").string();
+  // A high rate rather than the default: this test is about what a window *contains*, and at
+  // the default 8 Hz a poll every few milliseconds reads the same window over and over. That is
+  // the rate limit doing its job -- it is just not what is under test here.
+  config.levels_rate_hz = 200.0;
 
   Daemon daemon(config);
   std::string error;
@@ -3726,8 +3747,14 @@ TEST_CASE("a device level entry is one window: its peak, rms, clipped and frames
   // The device's channel arrays are **empty** until it opens, so the poll has to tolerate that, and
   // `closed` alone is not the end -- it is also the state before the device is opened at all. A block
   // count is what tells a device that has been and gone from one that has not arrived yet.
+  //
+  // The rate limit is set high for this test rather than left at its default, and the sleep is what
+  // makes a *new* window arrive: at the default 8 Hz, a poll every millisecond is answered from the
+  // cache and reads the same window 125 times. That is the feature working -- it is just not what
+  // this test is about, which is what a window contains.
   nlohmann::json window;
-  for (int attempt = 0; attempt < 4000 && window.is_null(); ++attempt)
+  const auto window_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (window.is_null() && std::chrono::steady_clock::now() < window_deadline)
   {
     const auto reply = nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.levels"})"));
     REQUIRE(reply["ok"] == true);
@@ -3739,7 +3766,7 @@ TEST_CASE("a device level entry is one window: its peak, rms, clipped and frames
     else if (levels["state"] == "closed" && levels["blocks"].get<uint64_t>() > 0)
       break;
     else
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   REQUIRE_MESSAGE(!window.is_null(), "no device window ever contained samples");
 

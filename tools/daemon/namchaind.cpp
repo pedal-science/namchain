@@ -79,17 +79,21 @@ void print_usage(std::FILE* stream)
                "      --no-levels              do not measure audio levels\n"
                "      --levels-rate-hz X       drain the level probes at most X times a second and answer\n"
                "                               a read in between from the held value; 0 = every read is a\n"
-               "                               real measurement (default). Lower it to make a meter cost\n"
-               "                               the control thread less, at the price of freshness\n"
+               "                               real measurement. Default 8, which is half what a 20 Hz\n"
+               "                               meter can show and keeps the conversions off the control\n"
+               "                               thread's critical path; lower it for freshness, raise it\n"
+               "                               for a client that wants every window\n"
+               "      --no-levels-rate-hz      no limit: every read is a real measurement\n"
                "      --levels-first-frame     measure one frame per period instead of every frame. An\n"
                "                               experiment switch: it cuts the per-sample cost by the\n"
                "                               period length and makes a meter miss transients\n"
                "      --no-levels-first-frame  measure every frame (default)\n"
                "      --levels-publish-period  fold samples into private memory and add the window to\n"
                "                               the probe once per period, instead of writing the probe's\n"
-               "                               atomics per sample. The meter reads the same thing; the\n"
-               "                               render thread stops sharing cache lines with it\n"
-               "      --no-levels-publish-period  write the probe per sample (default)\n"
+               "                               atomics per sample (default). The meter reads the same\n"
+               "                               thing; the render thread stops sharing cache lines with it\n"
+               "      --no-levels-publish-period  write the probe per sample: what every build before\n"
+               "                               2026-10-06 did\n"
                "      --device-retry-ms N      retry backoff after a lost device, default 250\n"
                "      --reclamation-timeout-ms N  control poll timeout, default 20\n"
                "  -v, --verbose                log lifecycle events to stderr\n"
@@ -189,7 +193,8 @@ int main(int argc, char** argv)
     const bool takes_no_value = name == "verbose" || name == "lock-memory" || name == "no-lock-memory" ||
                                 name == "tcp-listen" || name == "levels" || name == "no-levels" ||
                                 name == "levels-first-frame" || name == "no-levels-first-frame" ||
-                                name == "levels-publish-period" || name == "no-levels-publish-period";
+                                name == "levels-publish-period" || name == "no-levels-publish-period" ||
+                                name == "no-levels-rate-hz";
     if (!takes_no_value)
     {
       if (i + 1 >= argc)

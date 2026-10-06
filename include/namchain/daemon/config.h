@@ -203,22 +203,34 @@ struct Config
   /// anybody is reading. A rate at or above the client's own that changes nothing is the point: a
   /// 20 Hz meter against a 20 Hz rate costs exactly what it costs today.
   ///
-  /// The trade is freshness: at 1 Hz a meter shows a value up to a second old, which is legible for a
-  /// level and not for an edit. Off by default for that reason. `engine.levels` reports the cache's
-  /// hit and miss counts, so a client can tell which it got.
-  double levels_rate_hz = 0.0;
-  /// \brief When the render thread writes a probe's atomic fields: per sample, or once per period.
+  /// **8 Hz is the default** (2026-10-06), on the argument of the measurement in
+  /// bench-results/2026-10-06-levels-switch.md: the conversion is the one part of this feature that
+  /// buys nothing on the render core, and 8 Hz is half what a meter can show. ljoss polls at 20 Hz,
+  /// so five reads in six are answered from the held value and a level can be up to 125 ms old --
+  /// below the ~100 ms at which a decaying bar's motion stops reading as smooth, and levels are the
+  /// one thing on that canvas that does not need to be interactive. `0` restores a real measurement
+  /// per read for anything that wants one (a diagnostic counting windows, a measurement campaign).
   ///
-  /// `Period` folds samples into plain private memory and adds the window to the atomics once a
-  /// period, which is the same thing the meter reads -- a publish adds rather than sets, so the
-  /// read-and-reset contract is unchanged -- at a fraction of the cache-coherency traffic between the
-  /// render thread and the control thread that reads it. `Sample` is the behaviour every build before
-  /// this one had, and stays the default until the measurement says otherwise:
-  /// bench-results/2026-10-06-levels-switch.md, "Part 4".
+  /// The trade is freshness, and it is the reason this is a default rather than a constant: at 1 Hz a
+  /// meter shows a value up to a second old, which is legible for a level and not for an edit.
+  /// `engine.levels` reports the cache's hit and miss counts, so a client can tell which it got.
+  double levels_rate_hz = 8.0;
+  /// \brief When the render thread writes a probe's atomic fields: once per period, or per sample.
   ///
-  /// One period of latency is the price, and only when the reader arrives after a period was rendered
-  /// and before the next one is: 1.33 ms at 64 frames and 48 kHz.
-  bool levels_publish_period = false;
+  /// `true` (the default, 2026-10-06) folds samples into plain private memory and adds the window to
+  /// the probe's atomics once a period. That is the same thing a meter reads -- a publish adds rather
+  /// than sets, so the read-and-reset contract is unchanged -- at a fraction of the cache-coherency
+  /// traffic between the render thread and the control thread that reads it. It measures every
+  /// sample: the saving is in *when* the atomics are written, not in how much is looked at.
+  ///
+  /// Measured on vip at 1 Hz with a 34-node rig: 5.40% of one core with per-sample publishing, 3.66%
+  /// with per-period, against 2.22% for not measuring at all -- so it recovers 55% of the cost of
+  /// having meters (bench-results/2026-10-06-levels-switch.md, "Part 4").
+  ///
+  /// The price is latency: a reader can see a window that closed up to one period ago, 1.33 ms at 64
+  /// frames and 48 kHz. `--no-levels-publish-period` restores the per-sample path, which is what
+  /// every build before this one did.
+  bool levels_publish_period = true;
   /// How long the render thread waits before retrying a device that failed or is not present.
   unsigned device_retry_ms = 250;
   /// How long the control loop's poll sleeps when nothing is pending. This is the reclamation

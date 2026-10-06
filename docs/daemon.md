@@ -841,31 +841,46 @@ the truth is "nobody is measuring".
 This is a switch for **cost**, not for safety: with it off, `engine.levels` is the only thing that
 stops working. Nothing else in this document changes.
 
-### Two finer switches, for measurement rather than for the pedal
+### When a probe is written, and how often it is read
 
-Both are **off by default** and both exist to answer "what is the per-sample cost worth", which is a
-question the meter cannot answer from the outside. They were added for the campaign in
-`bench-results/` on the pedal side, and they are documented because a switch nobody can find is a
-switch nobody can reproduce a number with.
+Two knobs that decide what measuring costs. The first is **on by default** (2026-10-06); the second
+defaults to **8 Hz**. Both came out of the campaign in the pedal repo's `bench-results/`, and are
+documented because a knob nobody can find is a knob nobody can reproduce a number with.
 
-| Option | What it does | What it costs |
-|---|---|---|
-| `--levels-rate-hz X` | Drains the probes at most X times a second; a read in between is answered from the held reply. `0` (the default) means every read is a real measurement | Freshness. At 1 Hz a meter shows a value up to a second old — legible for a level, not for an edit |
-| `--levels-first-frame` | A probe folds the period's **first** frame and skips the rest, on the device's input, each chain's output, the playback bus and every node | What the meter reads. One sample per period misses nearly every transient the peak exists to catch, and `rms` is that sample's magnitude rather than a mean over the window |
+| Option | Default | What it does | What it costs |
+|---|---|---|---|
+| `--levels-publish-period` / `--no-levels-publish-period` | **on** | A probe folds samples into `level::Window` — plain private memory — and adds that window to its atomics **once per period**, instead of writing them per sample | Latency: a reader can see a window that closed up to one period ago (1.33 ms at q=64). Nothing else: **every sample is still measured** |
+| `--levels-rate-hz X` / `--no-levels-rate-hz` | **8** | Drains the probes at most X times a second; a read in between is answered from the held reply. `--no-levels-rate-hz` (or `0`) means every read is a real measurement | Freshness. At 8 Hz a level is up to 125 ms old — half what a 20 Hz meter can show, and below the point where a decaying bar reads as sluggish |
+| `--levels-first-frame` / `--no-levels-first-frame` | off | A probe folds the period's **first** frame and skips the rest, on the device's input, each chain's output, the playback bus and every node | What the meter reads. One sample per period misses nearly every transient the peak exists to catch, and `rms` is that sample's magnitude rather than a mean over the window |
 
-Four things worth knowing about them:
+**Why publishing per period is the default.** A probe is four unpadded atomics, so probes share cache
+lines; writing them per sample means the render thread loses those lines to its reader on every
+sample. Folding into private memory and publishing once a period recovers **55% of the whole cost of
+having meters** (5.40% → 3.66% of one core on a 34-node rig) *while measuring every sample* — unlike
+`--levels-first-frame`, which buys a similar saving by not looking at 63 samples in 64. The meter
+reads the same thing either way, because a publish **adds** rather than sets: add and max against the
+zeroed reset a reader performs are order-independent, so no sample is lost or counted twice.
 
-- **`--levels-rate-hz` does not change the render path at all.** The per-sample fold is the render
-  thread's and it runs whoever is polling; only the *reading* is rate-limited, and reading happens on
-  the control thread. If the question is render headroom, `--no-levels` is the switch and this is not.
-- **The reply says which it gave you.** `cache.hits`, `cache.misses`, `cache.rate_hz` and
-  `cache.first_frame` ride in the levels object, so a client — or a campaign measuring what a poll
-  costs — can check that the rate it asked for is the rate it got instead of assuming it.
+**Why 8 Hz.** The conversion — the square root, the logarithms, the JSON — is the one part of this
+feature that buys nothing on the render core, and 8 Hz is half what a 20 Hz meter can show. ljoss
+polls at 20 Hz, so five reads in six are answered from the held value. Raise it (or pass
+`--no-levels-rate-hz`) for a client that wants a real window per read: a diagnostic counting windows,
+or a measurement campaign, both of which want every one.
+
+Four things worth knowing about the read path:
+
+- **`--levels-rate-hz` does not change the render path at all.** The fold is the render thread's and
+  it runs whoever is polling; only the *reading* is rate-limited, and reading happens on the control
+  thread. If the question is render headroom, the publish mode is the knob and this is not.
+- **The reply says which it gave you.** `cache.hits`, `cache.misses`, `cache.drains`, `cache.rate_hz`,
+  `cache.first_frame` and `cache.publish` ride in the levels object, so a client — or a campaign
+  measuring what a poll costs — can check that the configuration it asked for is the one it got
+  instead of assuming it.
 - **`frames` stays honest under first-frame.** It reports 1 per period rather than the period's
   length, because that is how many samples the level is a mean of. A client that reads `frames` (and
   ljoss does, to tell an empty window from a silent one) is told a sparse window from a full one.
 - **A rate at or above the client's own changes nothing**, which is the point of choosing it rather
-  than a fixed cap: a 20 Hz meter against a 20 Hz rate costs exactly what it costs today.
+  than a fixed cap: a 20 Hz meter against a 20 Hz rate costs exactly what it costs with no limit.
 
 Neither switch changes the audio. `--levels` alone decides whether the render path folds anything,
 and the audio it renders is identical either way — pinned by a test that compares two plans compiled
