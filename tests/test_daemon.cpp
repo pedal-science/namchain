@@ -3155,6 +3155,80 @@ TEST_CASE("a level probe measures a window and starts a new one when it is read"
   CHECK(probe.peek().clipped == 8);
 }
 
+TEST_CASE("publishing per period adds to the window rather than setting it")
+{
+  // The contract that lets a probe fold into private memory and publish once a period: a reader zeroes
+  // the fields as it reads them, so a publish must *add* and *raise* rather than store. If it stored,
+  // a publish landing after a read would wipe the reader's next window, and one landing before would
+  // wipe what had not been read yet. This test is the one that fails if that ever changes.
+  namchain::level::Probe probe(namchain::level::Probe::Publish::Period);
+  probe.accumulate(0.5f);
+  probe.publish_window();
+
+  auto first = probe.take();
+  CHECK(first.frames == 1);
+  CHECK(first.peak == doctest::Approx(0.5f));
+
+  // Read again: nothing has been published since, so the window is empty -- not the one just read.
+  CHECK(probe.take().frames == 0);
+
+  // A publish *after* a read starts the next window: the reader must see it, not lose it.
+  probe.accumulate(0.25f);
+  probe.publish_window();
+  auto second = probe.take();
+  CHECK(second.frames == 1);
+  CHECK(second.peak == doctest::Approx(0.25f));
+
+  // A publish *before* a read joins whatever was already there: two periods read once is two
+  // periods' worth of frames, and the peak is the louder of the two.
+  probe.accumulate(0.1f);
+  probe.publish_window();
+  probe.accumulate(0.9f);
+  probe.publish_window();
+  auto third = probe.take();
+  CHECK(third.frames == 2);
+  CHECK(third.peak == doctest::Approx(0.9f));
+
+  // Publishing with nothing folded in is a no-op: an idle period must not invent frames.
+  probe.publish_window();
+  CHECK(probe.take().frames == 0);
+}
+
+TEST_CASE("a probe publishes the same window whichever mode it is in")
+{
+  // Equivalence, not merely agreement: with one publish per fold-group the two modes are the same
+  // arithmetic on the same samples, so the readings must be identical -- same peak, same frames, same
+  // sum and therefore the same rms, same clip count. Anything else is a bug in one of the paths.
+  namchain::level::Probe by_sample(namchain::level::Probe::Publish::Sample);
+  namchain::level::Probe by_period(namchain::level::Probe::Publish::Period);
+
+  constexpr int kPeriods = 4;
+  constexpr int kFrames = 64;
+  for (int period = 0; period < kPeriods; ++period)
+  {
+    for (int i = 0; i < kFrames; ++i)
+    {
+      // A signal with a spike, a clip and a sign change in it, so a mode that lost or reordered a
+      // sample would show up in the peak, the sum or the clip count.
+      const float x = (i == 7) ? 1.5f : (i == 9) ? -1.0f : 0.3f * ((i % 2) ? -1.0f : 1.0f);
+      by_sample.accumulate(x);
+      by_period.accumulate(x);
+    }
+    by_period.publish_window();
+
+    const auto a = by_sample.take();
+    const auto b = by_period.take();
+    CHECK(a.frames == b.frames);
+    CHECK(a.peak == doctest::Approx(b.peak));
+    CHECK(a.rms == doctest::Approx(b.rms).epsilon(1e-12));
+    CHECK(a.clipped == b.clipped);
+  }
+
+  // Both empty at the end, and in step rather than one having drifted.
+  CHECK(by_sample.take().frames == 0);
+  CHECK(by_period.take().frames == 0);
+}
+
 TEST_CASE("a level probe's fixed point is exact enough for a meter and a peak holds the loudest sample")
 {
   namchain::level::Probe probe;
@@ -3340,7 +3414,27 @@ TEST_CASE("engine.levels reports the device, the chain and every node, and carri
 
   // Every node of the plan, labelled so a client can find its block: `element` is what the client
   // named and `role` is which primitive of a macro it was lowered from.
-  const auto& nodes = chain["nodes"];
+  //
+  // The assertions below are about one reply, and a reply is one drain of every probe at once -- so
+  // the read that produced it is the one that had *every* measured node populated, not merely the
+  // first. Asserting a node had samples after polling only for some other node's is the same race
+  // that produced the two flakes above, one level further down.
+  have_window = false;
+  const auto all_nodes_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!have_window && std::chrono::steady_clock::now() < all_nodes_deadline)
+  {
+    const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"id":"l4","method":"engine.levels"})"));
+    levels = reply["levels"];
+    have_window = true;
+    for (const auto& node : levels["chains"][0]["nodes"])
+      if (node["element"] != "out" && node["frames"].get<uint64_t>() == 0)
+        have_window = false;
+    if (!have_window)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  REQUIRE_MESSAGE(have_window, "no window had samples for every measured node at once");
+
+  const auto& nodes = levels["chains"][0]["nodes"];
   CHECK(nodes.size() == 3);
   bool saw_gain = false;
   for (const auto& node : nodes)

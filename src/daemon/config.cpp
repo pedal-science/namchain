@@ -233,6 +233,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "cpu",        "lock_memory",  "output_queue_periods",
                                       "output_queue_floor_periods", "fade_ms", "model_budget_kb", "device_retry_ms",
                                       "render_threads", "levels", "levels_rate_hz", "levels_first_frame",
+                                      "levels_publish_period",
                                       "reclamation_timeout_ms", "verbose", "capture_path", "playback_path",
                                       "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
                                       "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
@@ -320,6 +321,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_bool(doc, "lock_memory", config.lock_memory, path, error) ||
       !read_bool(doc, "levels", config.levels, path, error) ||
       !read_bool(doc, "levels_first_frame", config.levels_first_frame, path, error) ||
+      !read_bool(doc, "levels_publish_period", config.levels_publish_period, path, error) ||
       !read_double(doc, "levels_rate_hz", config.levels_rate_hz, path, error) ||
       !read_bool(doc, "tcp_listen", config.tcp_listen, path, error) ||
       !read_bool(doc, "verbose", config.verbose, path, error))
@@ -363,6 +365,16 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
   if (name == "no-levels-first-frame")
   {
     config.levels_first_frame = false;
+    return true;
+  }
+  if (name == "levels-publish-period")
+  {
+    config.levels_publish_period = true;
+    return true;
+  }
+  if (name == "no-levels-publish-period")
+  {
+    config.levels_publish_period = false;
     return true;
   }
   if (name == "levels-rate-hz")

@@ -42,6 +42,11 @@ struct CompileOptions
   /// the period length and makes a meter miss most transients, which is a trade to be measured rather
   /// than a default. Only meaningful when \ref levels is true.
   bool levels_first_frame = false;
+  /// \brief Whether a probe folds into private memory and publishes once per period.
+  ///
+  /// See Config::levels_publish_period: the sample-per-sample path writes atomics the control thread
+  /// reads, which is where a meter's cost actually goes.
+  bool levels_publish_period = false;
 };
 
 /// The kind of value a parameter holds, which is what a client shows a control for
@@ -526,6 +531,9 @@ private:
   /// Fixed at compile time like \ref levels_ itself: `execute` reads it per node per quantum, so it
   /// has to be a value the plan owns rather than a flag consulted through anything.
   bool levels_first_frame_ = false;
+  /// Whether a node's probe folds into private memory and is published once per period
+  /// (CompileOptions::levels_publish_period). \ref execute publishes them at the end of the quantum.
+  bool levels_publish_period_ = false;
   std::atomic<uint64_t> guard_trips_{0};
   int input_node_ = -1;            // index in nodes_ whose block input is sampled from the graph
   int output_buffer_ = -1;         // buffer the graph output is read from

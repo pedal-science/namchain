@@ -807,6 +807,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   plan->max_quantum_ = max_quantum;
   plan->silence_buffer_ = silence_buffer;
   plan->levels_first_frame_ = options.levels && options.levels_first_frame;
+  plan->levels_publish_period_ = options.levels && options.levels_publish_period;
   plan->failed_ = std::vector<std::atomic<bool>>(lowered_graph.nodes.size());
   for (std::atomic<bool>& flag : plan->failed_)
     flag.store(false, std::memory_order_relaxed);
@@ -887,7 +888,8 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
     // rather than `push_back`: a Probe holds atomics and is not movable. Nothing is made when the
     // engine is not measuring, which is what leaves this vector empty and `measure_node` idle.
     if (options.levels)
-      plan->levels_.emplace_back();
+      plan->levels_.emplace_back(options.levels_publish_period ? level::Probe::Publish::Period
+                                                              : level::Probe::Publish::Sample);
   }
 
   // Bind inputs now that every output buffer is known.
@@ -1009,6 +1011,15 @@ void RenderPlan::execute(const float* input, float* output, int frames) noexcept
   if (output_buffer_ >= 0 && output != nullptr)
     std::copy(buffers_[static_cast<std::size_t>(output_buffer_)],
               buffers_[static_cast<std::size_t>(output_buffer_)] + frames, output);
+
+  // Once per quantum, after every node has run: with `levels_publish_period` each probe has been
+  // folding into its own private window all quantum, and this is the only place the render thread
+  // writes their atomics. Cheap enough to be unconditional -- a no-op per probe on the sample path,
+  // which is the default -- and putting it here rather than at the call sites is what makes "once per
+  // period" a property of the plan rather than of every caller.
+  if (levels_publish_period_)
+    for (level::Probe& probe : levels_)
+      probe.publish_window();
 }
 
 void RenderPlan::prewarm() noexcept

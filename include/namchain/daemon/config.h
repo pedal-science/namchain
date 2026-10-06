@@ -207,6 +207,18 @@ struct Config
   /// level and not for an edit. Off by default for that reason. `engine.levels` reports the cache's
   /// hit and miss counts, so a client can tell which it got.
   double levels_rate_hz = 0.0;
+  /// \brief When the render thread writes a probe's atomic fields: per sample, or once per period.
+  ///
+  /// `Period` folds samples into plain private memory and adds the window to the atomics once a
+  /// period, which is the same thing the meter reads -- a publish adds rather than sets, so the
+  /// read-and-reset contract is unchanged -- at a fraction of the cache-coherency traffic between the
+  /// render thread and the control thread that reads it. `Sample` is the behaviour every build before
+  /// this one had, and stays the default until the measurement says otherwise:
+  /// bench-results/2026-10-06-levels-switch.md, "Part 4".
+  ///
+  /// One period of latency is the price, and only when the reader arrives after a period was rendered
+  /// and before the next one is: 1.33 ms at 64 frames and 48 kHz.
+  bool levels_publish_period = false;
   /// How long the render thread waits before retrying a device that failed or is not present.
   unsigned device_retry_ms = 250;
   /// How long the control loop's poll sleeps when nothing is pending. This is the reclamation

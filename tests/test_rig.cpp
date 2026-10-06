@@ -289,6 +289,39 @@ TEST_CASE("a plan's level probes measure each node's output where the next node 
   REQUIRE_MESSAGE(plan != nullptr, error);
   REQUIRE(plan->nodes().size() == 3);
 
+  // The same rig, the same signal, measured two ways: per sample (the default) and once per period.
+  // The numbers below are asserted for both, because the modes must be the same arithmetic -- a
+  // publish adds to a probe rather than setting it, so the window a reader takes is the same either
+  // way. A tolerance change here would be the sign of a real difference, not noise.
+  for (const bool publish_period : {false, true})
+  {
+    namchain::render::CompileOptions options = options_for();
+    options.levels_publish_period = publish_period;
+    namchain::rt::Arena measured_arena(1u << 16);
+    auto measured = RenderPlan::compile(graph, options, measured_arena, error);
+    REQUIRE_MESSAGE(measured != nullptr, error);
+
+    std::vector<float> block(kQuantum, 0.5f);
+    std::vector<float> rendered(kQuantum, 0.0f);
+    measured->execute(block.data(), rendered.data(), kQuantum);
+
+    // The input node's output is the block's input; the gain node halves it; the output node's is
+    // the chain's result. Read by index, which is what the daemon does.
+    const auto in = measured->level_of(0)->take();
+    const auto mid = measured->level_of(1)->take();
+    measured->level_of(2)->take();   // the output node: see below
+    CHECK(in.frames == static_cast<uint64_t>(kQuantum));
+    CHECK(namchain::level::db_of_peak(in.peak) == doctest::Approx(-6.0206).epsilon(0.01));
+    CHECK(namchain::level::db_of_peak(mid.peak) == doctest::Approx(-12.0412).epsilon(0.01));
+    CHECK(mid.rms == doctest::Approx(0.25).epsilon(0.001));
+    // A node's output is *allowed* past full scale in the float domain, so the probe does not call
+    // that clipping: the device's encode is where full scale means something.
+    CHECK(mid.clipped == 0);
+    CHECK(measured->level_of(99) == nullptr);
+    // The audio itself is the same in both, which is the promise the whole feature rests on.
+    CHECK(rendered == std::vector<float>(kQuantum, 0.25f));
+  }
+
   std::vector<float> input(kQuantum, 0.5f);
   std::vector<float> output(kQuantum, 0.0f);
   plan->execute(input.data(), output.data(), kQuantum);

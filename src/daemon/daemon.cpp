@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <utility>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -58,6 +59,21 @@ namespace
 /// Every plan gets its own arena; 1 MiB is what the soak compiles any sane rig out of, and a rig
 /// that needs more gets "arena exhausted" rather than a silently truncated graph.
 constexpr std::size_t kArenaBytes = 1u << 20;
+
+/// \brief \p N probes, each made with \p mode.
+///
+/// `std::array::fill` would be the obvious way and cannot be used: it assigns, and a Probe holds
+/// atomics, so it is movable but deliberately not copy-assignable. Constructing each element in place
+/// is the only way to give the whole array a publish mode, and the mode has to be a construction-time
+/// decision anyway -- it is read in the per-sample fold.
+template <std::size_t N>
+std::array<level::Probe, N> probe_array(level::Probe::Publish mode)
+{
+  return [&]<std::size_t... I>(std::index_sequence<I...>) {
+    (void)sizeof...(I);
+    return std::array<level::Probe, N>{((void)I, level::Probe(mode))...};
+  }(std::make_index_sequence<N>{});
+}
 
 /// \brief Whether this peer's messages carry a length prefix rather than being one datagram each.
 ///
@@ -788,9 +804,35 @@ const char* device_state_name(DeviceState state)
 }
 
 Daemon::Daemon(Config config)
-  : config_(std::move(config)), levels_enabled_(config_.levels),
-    levels_first_frame_(config_.levels && config_.levels_first_frame)
+  : config_(std::move(config)),
+    levels_first_frame_(config_.levels && config_.levels_first_frame),
+    levels_publish_period_(config_.levels && config_.levels_publish_period),
+    levels_publish_mode_(levels_publish_period_ ? level::Probe::Publish::Period
+                                                : level::Probe::Publish::Sample),
+    input_levels_(probe_array<kMaxLevelChannels>(levels_publish_mode_)),
+    output_levels_(probe_array<kMaxLevelChannels>(levels_publish_mode_)),
+    chain_levels_(probe_array<kMaxChains>(levels_publish_mode_)),
+    levels_enabled_(config_.levels)
 {
+}
+
+/// Add every device and chain window to its atomic fields, once per period.
+///
+/// Called from account_period, which the render loop calls exactly once per period, so this is the
+/// single place the render thread writes these probes' atomics when publishing per period. With the
+/// sample path it does nothing: those probes were written as they were folded.
+void Daemon::publish_level_windows() noexcept
+{
+  if (!levels_publish_period_)
+    return;
+  const unsigned capture = active_capture_channels_.load();
+  const unsigned playback = active_playback_channels_.load();
+  for (unsigned c = 0; c < capture && c < input_levels_.size(); ++c)
+    input_levels_[c].publish_window();
+  for (unsigned c = 0; c < playback && c < output_levels_.size(); ++c)
+    output_levels_[c].publish_window();
+  for (int c = 0; c < chain_count_ && c < static_cast<int>(chain_levels_.size()); ++c)
+    chain_levels_[static_cast<std::size_t>(c)].publish_window();
 }
 
 Daemon::~Daemon()
@@ -1506,6 +1548,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   // nothing per sample rather than a branch per node per quantum (CompileOptions::levels).
   options.levels = config_.levels;
   options.levels_first_frame = levels_first_frame_;
+  options.levels_publish_period = levels_publish_period_;
 
   // Which chains actually changed. An unchanged chain keeps the plan it has: republishing it would
   // recompile it -- reloading every model on this thread -- and crossfade it, for an edit somebody
@@ -2227,6 +2270,10 @@ void Daemon::promote_render_thread(double period_seconds)
 
 void Daemon::account_period()
 {
+  // The one place the render thread writes the device and chain probes' atomics when publishing per
+  // period: this runs once per period, so the fold and the publish stay in step by construction.
+  publish_level_windows();
+
   const StreamQueueStats queue = device_->queue_stats();
   output_drops_.store(queue.output_drops);
   output_target_drops_.store(queue.output_target_drops);
@@ -2288,7 +2335,8 @@ nlohmann::json Daemon::levels_json()
                                   {"misses", levels_cache_misses_},
                                   {"drains", levels_drains_},
                                   {"rate_hz", config_.levels_rate_hz},
-                                  {"first_frame", levels_first_frame_}};
+                                  {"first_frame", levels_first_frame_},
+                                  {"publish", levels_publish_period_ ? "period" : "sample"}};
   return reply;
 }
 

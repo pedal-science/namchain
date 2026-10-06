@@ -85,13 +85,71 @@ inline double db_of_rms(double rms) noexcept
   return db_of_amplitude(rms);
 }
 
+/// \brief One period's worth of a place in the signal path, in plain memory. Render thread only.
+///
+/// The arithmetic is exactly what \ref Probe::accumulate does per sample -- same scale, same clamps,
+/// same non-finite rule -- with one difference that is the entire point: the result lands in members
+/// no other thread has ever touched, so folding a sample costs a register or a stack slot rather than
+/// a cache line shared with the control thread. \ref Probe packs one of these and adds it to its
+/// atomics once per period.
+///
+/// Not atomic, not volatile, and not to be read by anything but the render thread that owns it: it is
+/// the private half of the pair, and sharing it would reintroduce the cost it exists to remove.
+struct Window
+{
+  /// The largest |sample| in this window, as an amplitude (not a bit pattern -- that trick is for the
+  /// atomic field, where an integer compare has to sort like a float).
+  float peak = 0.0f;
+  /// `sum(x * x * kScaleSq)` over this window, each term clamped to \ref kMaxSquare.
+  uint64_t sum_sq = 0;
+  /// Samples folded into this window.
+  uint64_t frames = 0;
+  /// Samples at or past full scale in this window.
+  uint64_t clipped = 0;
+
+  /// Add one sample. The per-sample body of \ref Probe::accumulate, verbatim.
+  void fold(float x) noexcept
+  {
+    const float magnitude = std::fabs(x);
+    if (magnitude > peak)
+      peak = magnitude;
+    const float square = x * x;
+    uint64_t term = 0;
+    if (std::isfinite(square))
+      term = square < kMaxSquare ? static_cast<uint64_t>(square * kScaleSq + 0.5) : kMaxTerm;
+    sum_sq += term;
+    ++frames;
+    if (magnitude >= 1.0f)
+      ++clipped;
+  }
+};
+
 /// \brief One place in the signal path, measured.
 ///
-/// Every field is an atomic, which is why this is not copyable: a probe lives in a vector that the
-/// control thread may rebuild while a reader is looking at an older plan, and an atomic is not a
-/// value that can be copied.
+/// Every published field is an atomic, which is why this is not copyable: a probe lives in a vector
+/// that the control thread may rebuild while a reader is looking at an older plan, and an atomic is
+/// not a value that can be copied.
+///
+/// **When those atomics are written is the expensive decision.** In \ref Publish::Sample the render
+/// thread folds each sample straight into them, so every sample writes memory the control thread
+/// reads -- and those fields share cache lines, which are then pulled between the cores
+/// continuously. In \ref Publish::Period the render thread folds into \ref window_, plain memory no
+/// other thread has ever touched, and adds that window to the atomics **once per period**.
+///
+/// The meter reads the same either way, because a publish *adds* rather than sets: add and max
+/// against a zeroed reset are order-independent, so any interleaving of a publish and a reader's
+/// reset still answers "the samples since the last read".
 struct Probe
 {
+  /// Where a sample goes when it is folded in.
+  enum class Publish
+  {
+    /// Straight into the atomic fields: one atomic operation per sample per field.
+    Sample,
+    /// Into \ref window_, with the window published once per period (\ref publish_window).
+    Period,
+  };
+
   /// \brief The largest |sample| since the last read, as a float's bit pattern in the low 32 bits.
   ///
   /// A bit pattern rather than a `std::atomic<float>`, which is not guaranteed lock-free; and a
@@ -112,10 +170,24 @@ struct Probe
   /// is, so the wire does not report this per node.
   std::atomic<uint64_t> clipped{0};
 
+  /// \brief Where a sample is folded, and so how often the atomics above are added to.
+  ///
+  /// Fixed when the probe is made, because the two paths differ in what memory they touch rather than
+  /// in what they mean: one writes shared memory per sample, the other writes private memory per
+  /// sample and shared memory per period.
+  Publish publish_mode = Publish::Sample;
+
+  /// \brief The render thread's private accumulator, for \ref Publish::Period.
+  ///
+  /// Plain members, deliberately: this is the memory that must never be shared with the reader, or the
+  /// whole exercise is pointless. Only the render thread ever touches it.
+  Window window_;
+
   Probe() = default;
+  explicit Probe(Publish mode) noexcept : publish_mode(mode) {}
   Probe(const Probe&) = delete;
   Probe& operator=(const Probe&) = delete;
-  /// rief Movable, because a probe lives in a `std::vector` that is reserved and filled as a plan
+  /// \brief Movable, because a probe lives in a `std::vector` that is reserved and filled as a plan
   /// is built. Nothing moves one after publication: the vector is finished before that.
   Probe(Probe&& other) noexcept { adopt(other); }
   Probe& operator=(Probe&& other) noexcept
@@ -142,6 +214,13 @@ struct Probe
   /// Add one sample. Render thread.
   void accumulate(float x) noexcept
   {
+    if (publish_mode == Publish::Period)
+    {
+      // Plain memory, and the whole point: this line is the render thread's own, so folding a
+      // sample here costs a register or a stack slot instead of a cache line shared with the reader.
+      window_.fold(x);
+      return;
+    }
     const float magnitude = std::fabs(x);
     raise_peak(magnitude);
     // One square and a compare, where the amplitude accumulator had an `fabs` and a multiply: the same
@@ -188,6 +267,31 @@ struct Probe
     uint64_t clipped = 0;   ///< samples at or past full scale
   };
 
+  /// \brief Move the private window's numbers into the atomics, once per period. Render thread.
+  ///
+  /// **Folds rather than sets, and that is what keeps the read-and-reset contract intact.** The reader
+  /// zeroes the fields as it reads them; a publish that *stored* would race that reset and lose
+  /// whichever period lost the race. Adding and maxing against a zeroed field is order-independent, so
+  /// every sample is counted exactly once however the two threads interleave: a period published
+  /// before a read is in that read's window, and one published after it is in the next.
+  ///
+  /// The terms go in individually rather than as one aggregate so the per-sample clamp stays
+  /// (\ref kMaxTerm), which is what bounds the sum against a runaway.
+  void publish_window() noexcept
+  {
+    if (publish_mode != Publish::Period)
+      return;
+    raise_peak(window_.peak);
+    if (window_.frames != 0)
+    {
+      sum_sq.fetch_add(window_.sum_sq, std::memory_order_relaxed);
+      frames.fetch_add(window_.frames, std::memory_order_relaxed);
+      if (window_.clipped != 0)
+        clipped.fetch_add(window_.clipped, std::memory_order_relaxed);
+    }
+    window_ = Window{};
+  }
+
   /// Take another probe's numbers and leave it empty. Move only, before publication.
   void adopt(Probe& other) noexcept
   {
@@ -195,6 +299,11 @@ struct Probe
     sum_sq.store(other.sum_sq.load(std::memory_order_relaxed), std::memory_order_relaxed);
     frames.store(other.frames.load(std::memory_order_relaxed), std::memory_order_relaxed);
     clipped.store(other.clipped.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    // The private window too: a probe adopted by a new plan must not carry the old plan's part of a
+    // period into a window whose remainder that plan will never render.
+    window_ = other.window_;
+    other.window_ = Window{};
+    publish_mode = other.publish_mode;
   }
 
   /// \brief Read and reset, so the next window starts empty. Control thread.

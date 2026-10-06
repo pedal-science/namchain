@@ -705,6 +705,17 @@ private:
   std::atomic<bool> render_pool_degraded_{false};
   std::atomic<int> active_format_{static_cast<int>(PcmFormat::Unknown)};
 
+  /// Whether a probe folds one frame per period or every frame (Config::levels_first_frame).
+  const bool levels_first_frame_;
+  /// Whether a probe folds into private memory and publishes once per period
+  /// (Config::levels_publish_period). Read once, like the two above: a plan's probes are made with it.
+  const bool levels_publish_period_;
+  /// \brief The same decision, as the probes want it.
+  ///
+  /// Declared **before** the probe arrays below because they are constructed with it in the
+  /// initialiser list, so it has to be the earlier member for their construction to see its value.
+  const level::Probe::Publish levels_publish_mode_;
+
   /// \brief The device's input and output levels, and each chain's contribution to the bus.
   ///
   /// Written by the render thread as it walks the samples it already has, read by
@@ -716,6 +727,14 @@ private:
   std::array<level::Probe, kMaxLevelChannels> output_levels_;
   std::array<level::Probe, kMaxChains> chain_levels_;
 
+  /// \brief Add every device and chain window to its atomic fields, once per period. Render thread.
+  ///
+  /// The other half of \ref level::Probe::publish_window: with `levels_publish_period` the probes
+  /// above accumulate privately all period and are published here, which is the only place the
+  /// render thread writes their atomics. Called from \ref account_period, which the render loop
+  /// already calls exactly once per period -- so "once per period" is structural, not a promise.
+  void publish_level_windows() noexcept;
+
   /// \brief Whether this daemon measures levels at all (`Config::levels`, `level.h`).
   ///
   /// Const after construction, because it decides two things that cannot change while plans are
@@ -723,8 +742,6 @@ private:
   /// local transition builds one on the render path), and whether `engine.levels` answers. A render
   /// thread reading it per block is reading a value that never changes.
   const bool levels_enabled_;
-  /// Whether a probe folds one frame per period or every frame (Config::levels_first_frame).
-  const bool levels_first_frame_;
 
   /// \brief The held levels reply and when it was drained, for Config::levels_rate_hz.
   ///
