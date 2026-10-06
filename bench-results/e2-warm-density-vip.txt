@@ -1,0 +1,79 @@
+E2 item 3: how many models stay warm on one core (vip, 2026-10-06)
+=================================================================
+
+Tool: namchain 083de32, `namchain-warm-bench contention`, cross-built in the image build's container
+(-march=armv8-a -mtune=cortex-a76) and run on vip with namchaind stopped, under
+`systemd-run --scope --slice=pedal-bench.slice` so the scope could use the isolated cores 2-3
+(system.slice and user.slice are AllowedCPUs=0-1 on this image).
+
+Live rig: NAM Ampeg VT-40 Vol 4 M160 + York Audio ORNG 412 V30 421v-CNT (8192 taps), on core 3 at
+SCHED_FIFO 80. Candidates: library models with **no cab** (that is what the density question is
+about; the plan asks for the render tail beside them). Core 2 at SCHED_FIFO 70. q64, so a quantum
+is 1333 us. 30 s per run, 22500 blocks. Input: pedal.project guitar-di.wav.
+
+Full submodel (--slim 1.0), 6 different library models cycled to N:
+
+   N   render p99   render max   overruns   warm p50   warm p99   warm p99    blocks behind
+          % dead.       % dead                 us         us      % quantum
+   1        8.08        11.7         0          77.1       88.5       6.6            1
+   2        8.34        17.5         0         160.5      185.7      13.9            1
+   4        9.00        12.0         0         346.4      405.3      30.4            1
+   6        9.64        20.8         0         598.2      756.6      56.7            1
+   8       10.60        24.2         0         895.0     1188.2      89.1            1
+  10       10.50        18.6         0        1186.9     1505.5     112.9            6
+  12       10.97        13.3         0        1479.3     1862.8     139.7         2621
+
+Lite submodel (--slim 0.0):
+
+   N   render p99   render max   overruns   warm p50   warm p99   warm p99    blocks behind
+          % dead.       % dead                 us         us      % quantum
+  10        3.65         9.1         0         182.0      241.1      18.1            1
+  20        3.86        10.2         0         532.6      780.4      58.5            1
+  30        3.80         6.4         0         958.0     1298.4      97.4            1
+  40        4.25         6.0         0        1373.2     1882.9     141.2         1379
+  50        4.36         6.5         0        1774.0     2418.7     181.4         6177
+
+With a spinner saturating the warm core (SCHED_FIFO 60, i.e. one notch below the candidates):
+
+   Full  2: 14.0% (14.0 no spinner)      Full  8: 94.3% (89.1)
+   Full  4: 30.0% (30.4)                 Lite 10: 17.1% (18.1)
+   Full  6: 56.4% (56.7)                 Lite 20: 55.4% (58.5)
+                                         Lite 30: 97.5% (97.4)
+                                         Lite 40: 139.2% (141.2)
+
+Reading
+- **Eight Full models stay warm on one core; ten do not.** The bar is E1's: the warm thread's p99
+  under one quantum, i.e. it is tracking the live input rather than falling behind it. At 8 it is
+  89.1%; at 10 it is 112.9%, and at 12 the thread is 2621 blocks (3.5 s) behind and never catches
+  up. Warm work only has to keep up *on average* for a candidate that a catch-up replay will repair
+  at the switch, but a tier-1 candidate that is merely "usually" current is a candidate that is
+  sometimes the wrong sound, so the p99 bar is the right one for tier 1.
+- **Thirty Lite models stay warm; forty do not** (97.4% against 141.2%). The ratio measured here is
+  3.7x, not the 5.8x the tuning numbers suggested, and it is the same story as the Full curve: the
+  per-model cost grows with N as the models crowd the cache -- 6.6% of a quantum for the first Full,
+  11.1% each at 8; 1.8% for the first Lite, 3.2% each at 30.
+- **The plan's estimates were optimistic**: "~10 Full or ~50 Lite per core" is measured at 8 and 30,
+  25% and 40% lower.
+- **It costs the audio little, but not nothing.** With 8 Full candidates the render core's p99 rises
+  from 8.08% to 10.60% of the deadline and its max from 11.7% to 24.2%, with no overruns in any run.
+  The Lite runs' render columns are not comparable: --slim applies to the live rig too, so in those
+  runs the live rig was a Lite model plus its cab, which is why its p99 is 3.65% rather than 8%.
+  E1's numbers, where both sides carried the cab, are the ones to compare with for the render tail.
+- **A competing job on the warm core changes nothing measurable.** The spinner is at a lower
+  priority than the candidates, so the candidates still get their turn; what is left is cache and
+  memory-bandwidth contention, and that moved the warm p99 by at most 5 points (Full 8: 89.1 ->
+  94.3). This is the "housekeeping core under load" case, and it passes.
+- **Memory is not a constraint and is not quoted from here.** The bench's per-candidate RSS came out
+  larger for a Lite than for a Full (which cannot be right for a 3-channel submodel) because it
+  measured what had been allocated rather than what the warm thread had touched; that measurement
+  has since been fixed to fault the buffers in first, but the runs above predate the fix. For the
+  figures that matter, namchain's own working-set model gives 587.5 KiB for an A2-Full and 99.7 KiB
+  for an A2-Lite per block (docs/daemon.md, "Model budget"), and eight Fulls are a few MB against
+  vip's 1 GB.
+
+What this does not show
+- Whether a warm set of *mixed* Full and Lite changes the cliff: the sweeps were all one or the
+  other. A tier-1 set of 8 Fulls plus a tier-2 set of Lites on the same core is the configuration the
+  tiers actually imply, and it needs one run.
+- The bank sizes are the user's rigs, not this table: a bank of 8 rigs x 3 models is 24 instances,
+  which fits at tier 2 (Lite) and does not fit at tier 1 (Full) on one core.

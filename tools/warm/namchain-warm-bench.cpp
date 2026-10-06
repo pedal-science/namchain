@@ -899,6 +899,14 @@ int run_contention(const Args& args)
   for (int i = 0; i < count; ++i)
     warm.push_back(
       make_rig(args.candidates[static_cast<std::size_t>(i) % args.candidates.size()], warm_ir_v, q, args.slim));
+  // Fault the candidates' buffers in before measuring: RSS right after construction counts what was
+  // allocated, not what the warm thread will touch, which under-reported a rig by its whole working
+  // set and made a Lite look bigger than a Full.
+  {
+    std::vector<float> warmup(static_cast<std::size_t>(q));
+    for (auto& rig : warm)
+      rig->process(warmup.data(), warmup.data(), q);
+  }
   const long rss2 = rss_kb();
 
   const std::size_t blocks = static_cast<std::size_t>(args.seconds * kRate) / static_cast<std::size_t>(q);

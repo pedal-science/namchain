@@ -1,0 +1,166 @@
+E2 item 1: Lite against Full, every model in the shipping library
+==========================================================================
+
+2026-10-06. Tool: namchain 083de32, `namchain-warm-bench slim`, built for aarch64 in the image
+build's own container (-march=armv8-a -mtune=cortex-a76, what scripts/deploy-engine --host vip
+produces) and run under colima on the Mac. Cross-checked against the Mac's namchain-render on
+three models: identical to the last digit, so the host does not change these numbers.
+
+Input: pedal.project guitar-di.wav, 48 kHz mono 24-bit, 56.66 s, peak -1.32 dBFS, rms -23.64
+dBFS, crest 22.3 dB, md5 f9ab7f8f7ece122917d9701c3360a32f, at its recorded level. That level
+was checked not to matter: trimming the input 22.7 dB moved the relative null by 1.4 dB.
+Models: the 52 .nam files under /var/lib/pedal/library/models -- all SlimmableContainer, all
+48 kHz, each a 3-channel submodel at max_value 0.5 (Lite) and an 8-channel one at 1.0 (Full).
+No cab here: 35 of the 52 carry their own, and putting the same rigs through York Audio's
+ORNG 412 V30 421v-CNT moves every relative null by 1-2 dB and changes no conclusion.
+
+Method. Render each model twice over the whole input, --slim 0.0 and --slim 1.0, and compare
+sample by sample: both submodels are zero-latency (the best integer lag is 0, and no worse)
+than 1 sample for any model), so this is a null and not an alignment artefact. At each of 11
+switch points 5 s apart, judge a 5 ms equal-power crossfade from one submodel to the other
+with namchain::glitch -- continuity, dropout, high frequency and convergence -- in both
+directions, against whichever submodel ran after the switch.
+
+  null         |Lite - Full| over the whole input, in dBFS
+  wrong-model  the worst |Lite - Full| in the 200 ms after a switch: what a listener hears
+               while a Lite stands in for the Full, which is tier 2's first step
+  handover     switch points on which the crossfade passed every rule
+
+model                                          dir           lite    full     null  nullmax    wrong  handover               finding
+Ampeg SVT VR _ 8x10 _ Beta52A                  Full->Lite  -20.62  -21.37   -30.54    -9.71   -10.90  11/11 clean, d2 x1.0   
+Ampeg SVT VR _ 8x10 _ Beta52A                  Lite->Full  -20.62  -21.37   -30.54    -9.71   -10.90  11/11 clean, d2 x0.9   
+RIFF TAPE 001_Silicon Fuzz Fac                 Full->Lite  -14.87  -14.73   -26.58    -3.89    -5.70  11/11 clean, d2 x1.1   
+RIFF TAPE 001_Silicon Fuzz Fac                 Lite->Full  -14.87  -14.73   -26.58    -3.89    -5.70  11/11 clean, d2 x1.1   
+RIFF TAPE 001_Green Russian +                  Full->Lite  -14.90  -14.53   -26.99    -3.94    -5.80  11/11 clean, d2 x1.2   
+RIFF TAPE 001_Green Russian +                  Lite->Full  -14.90  -14.53   -26.99    -3.94    -5.80  11/11 clean, d2 x1.2   
+Ampeg SVT-4 Pro (Alternate) Wi                 Full->Lite  -14.43  -14.34   -30.22    -7.17    -8.70  11/11 clean, d2 x1.0   
+Ampeg SVT-4 Pro (Alternate) Wi                 Full->Lite  -14.43  -14.34   -30.22    -7.17    -8.70  11/11 clean, d2 x1.0   
+Ampeg SVT-4 Pro (Alternate) Wi                 Lite->Full  -14.43  -14.34   -30.22    -7.17    -8.70  11/11 clean, d2 x1.1   
+Ampeg SVT-4 Pro (Alternate) Wi                 Lite->Full  -14.43  -14.34   -30.22    -7.17    -8.70  11/11 clean, d2 x1.1   
+RIFF TAPE 001_Muff Pi + Twin 6                 Full->Lite  -14.14  -14.03   -30.15    -6.26    -6.30  11/11 clean, d2 x1.2   
+RIFF TAPE 001_Muff Pi + Twin 6                 Lite->Full  -14.14  -14.03   -30.15    -6.26    -6.30  11/11 clean, d2 x1.2   
+Ampeg VT-40 - Vol 7, Bass 6, M                 Full->Lite  -17.97  -17.74   -34.23   -13.60   -13.60  11/11 clean, d2 x1.3   
+Ampeg VT-40 - Vol 7, Bass 6, M                 Lite->Full  -17.97  -17.74   -34.23   -13.60   -13.60  11/11 clean, d2 x1.3   
+Ampeg SVT VR (Alternate) With                  Full->Lite  -11.42  -11.29   -29.61    -4.68    -6.30  11/11 clean, d2 x0.8   
+Ampeg SVT VR (Alternate) With                  Full->Lite  -11.42  -11.29   -29.61    -4.68    -6.30  11/11 clean, d2 x0.8   
+Ampeg SVT VR (Alternate) With                  Lite->Full  -11.42  -11.29   -29.61    -4.68    -6.30  11/11 clean, d2 x0.9   
+Ampeg SVT VR (Alternate) With                  Lite->Full  -11.42  -11.29   -29.61    -4.68    -6.30  11/11 clean, d2 x0.9   
+Ampeg VT-40 - Vol 6, Bass 6, M                 Full->Lite  -17.40  -17.23   -35.97   -16.12   -18.40  11/11 clean, d2 x0.9   
+Ampeg VT-40 - Vol 6, Bass 6, M                 Lite->Full  -17.40  -17.23   -35.97   -16.12   -18.40  11/11 clean, d2 x0.9   
+RIFF TAPE 001_Muff Pi + SSPrea                 Full->Lite  -16.47  -16.55   -35.46   -11.39   -13.60  11/11 clean, d2 x1.7   
+RIFF TAPE 001_Muff Pi + SSPrea                 Lite->Full  -16.47  -16.55   -35.46   -11.39   -13.60  11/11 clean, d2 x1.9   
+Ampeg VT-40 - Vol 6, Bass 6, M                 Full->Lite  -17.34  -17.22   -36.57   -14.00   -17.60  11/11 clean, d2 x0.8   
+Ampeg VT-40 - Vol 6, Bass 6, M                 Lite->Full  -17.34  -17.22   -36.57   -14.00   -17.60  11/11 clean, d2 x0.9   
+AMPEG_CH 2 TREBLE G10                          Full->Lite  -27.25  -27.19   -46.57   -15.57   -16.10  11/11 clean, d2 x1.2   
+AMPEG_CH 2 TREBLE G10                          Lite->Full  -27.25  -27.19   -46.57   -15.57   -16.10  11/11 clean, d2 x1.2   
+Ampeg VT-40 - Vol 6, Bass 6, M                 Full->Lite  -17.39  -17.25   -36.85   -14.39   -18.50  11/11 clean, d2 x1.1   
+Ampeg VT-40 - Vol 6, Bass 6, M                 Lite->Full  -17.39  -17.25   -36.85   -14.39   -18.50  11/11 clean, d2 x1.0   
+AMPEG_CH 2 NEUTRAL G10                         Full->Lite  -28.59  -28.58   -48.34   -14.88   -15.50  11/11 clean, d2 x1.2   
+AMPEG_CH 2 NEUTRAL G10                         Lite->Full  -28.59  -28.58   -48.34   -14.88   -15.50  11/11 clean, d2 x1.2   
+AMPEG_CH 2 NEUTRAL G8                          Full->Lite  -28.69  -28.67   -48.81   -20.20   -20.70  11/11 clean, d2 x1.1   
+AMPEG_CH 2 NEUTRAL G8                          Lite->Full  -28.69  -28.67   -48.81   -20.20   -20.70  11/11 clean, d2 x1.1   
+Ampeg SVT - MD 421                             Full->Lite  -24.70  -24.59   -44.85   -28.05   -29.40  11/11 clean, d2 x1.4   
+Ampeg SVT - MD 421                             Lite->Full  -24.70  -24.59   -44.85   -28.05   -29.40  10/11 clean, d2 x2.4   at 55.00 s, oracle peak -36.4 dBFS: continuity: second difference 0.000047 inside an edit against a limit of 0.000039 (kappa 2.000000 x 0.000019 from the oracles)
+Ampeg VT-40 - Vol 6, Bass 6, M                 Full->Lite  -17.30  -17.22   -37.63   -13.62   -17.00  11/11 clean, d2 x1.1   
+Ampeg VT-40 - Vol 6, Bass 6, M                 Lite->Full  -17.30  -17.22   -37.63   -13.62   -17.00  11/11 clean, d2 x1.2   
+ORNG-V30-e609-Center                           Full->Lite  -18.93  -18.84   -39.43   -16.03   -17.30  11/11 clean, d2 x0.9   
+ORNG-V30-e609-Center                           Lite->Full  -18.93  -18.84   -39.43   -16.03   -17.30  11/11 clean, d2 x0.9   
+Ampeg SVT VR With Cab                          Full->Lite  -11.07  -11.02   -31.98    -6.04    -7.10  11/11 clean, d2 x1.0   
+Ampeg SVT VR With Cab                          Full->Lite  -11.07  -11.02   -31.98    -6.04    -7.10  11/11 clean, d2 x1.0   
+Ampeg SVT VR With Cab                          Lite->Full  -11.07  -11.02   -31.98    -6.04    -7.10  11/11 clean, d2 x0.9   
+Ampeg SVT VR With Cab                          Lite->Full  -11.07  -11.02   -31.98    -6.04    -7.10  11/11 clean, d2 x0.9   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Full->Lite  -20.73  -20.46   -41.71   -18.03   -22.80  11/11 clean, d2 x0.9   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Lite->Full  -20.73  -20.46   -41.71   -18.03   -22.80  11/11 clean, d2 x1.0   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Full->Lite  -20.63  -20.46   -41.84   -19.89   -22.10  11/11 clean, d2 x0.9   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Lite->Full  -20.63  -20.46   -41.84   -19.89   -22.10  11/11 clean, d2 x1.0   
+AMPEG_CH 2 TREBLE G7                           Full->Lite  -28.45  -28.41   -49.88   -18.78   -21.90  11/11 clean, d2 x1.1   
+AMPEG_CH 2 TREBLE G7                           Lite->Full  -28.45  -28.41   -49.88   -18.78   -21.90  11/11 clean, d2 x1.0   
+AMPEG_CH 2 TREBLE G8                           Full->Lite  -27.52  -27.42   -48.93   -15.45   -19.80  11/11 clean, d2 x1.0   
+AMPEG_CH 2 TREBLE G8                           Lite->Full  -27.52  -27.42   -48.93   -15.45   -19.80  11/11 clean, d2 x1.0   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Full->Lite  -18.06  -17.90   -39.55   -21.02   -26.20  11/11 clean, d2 x1.0   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Lite->Full  -18.06  -17.90   -39.55   -21.02   -26.20  11/11 clean, d2 x0.9   
+AMPEG_CH 2 TREBLE G5                           Full->Lite  -27.53  -27.48   -49.20   -18.12   -26.80  11/11 clean, d2 x1.0   
+AMPEG_CH 2 TREBLE G5                           Lite->Full  -27.53  -27.48   -49.20   -18.12   -26.80  11/11 clean, d2 x1.0   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Full->Lite  -22.27  -22.02   -44.02   -24.71   -28.90  11/11 clean, d2 x0.8   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Lite->Full  -22.27  -22.02   -44.02   -24.71   -28.90  11/11 clean, d2 x0.8   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Full->Lite  -18.70  -18.59   -40.82   -17.67   -20.10  11/11 clean, d2 x0.8   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Lite->Full  -18.70  -18.59   -40.82   -17.67   -20.10  11/11 clean, d2 x0.8   
+AMPEG_CH 2 NEUTRAL G7                          Full->Lite  -29.64  -29.73   -52.20   -20.08   -23.80  11/11 clean, d2 x1.1   
+AMPEG_CH 2 NEUTRAL G7                          Lite->Full  -29.64  -29.73   -52.20   -20.08   -23.80  11/11 clean, d2 x1.0   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Full->Lite  -22.43  -22.15   -45.37   -24.52   -29.70  11/11 clean, d2 x0.8   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Lite->Full  -22.43  -22.15   -45.37   -24.52   -29.70  11/11 clean, d2 x0.8   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Full->Lite  -20.49  -20.38   -44.16   -23.74   -27.60  11/11 clean, d2 x0.8   
+Ampeg VT-40 - Vol 4, Bass 6, M                 Lite->Full  -20.49  -20.38   -44.16   -23.74   -27.60  11/11 clean, d2 x0.8   
+AMPEG_CH 2 NEUTRAL G5                          Full->Lite  -28.61  -28.66   -52.52   -16.22   -22.40  11/11 clean, d2 x1.1   
+AMPEG_CH 2 NEUTRAL G5                          Lite->Full  -28.61  -28.66   -52.52   -16.22   -22.40  11/11 clean, d2 x1.0   
+Ampeg VT-40 - Vol 2, Bass 6, M                 Full->Lite  -24.09  -23.86   -47.92   -26.19   -30.50  11/11 clean, d2 x0.9   
+Ampeg VT-40 - Vol 2, Bass 6, M                 Lite->Full  -24.09  -23.86   -47.92   -26.19   -30.50  11/11 clean, d2 x0.8   
+Ampeg SVT-4 Pro With Cab                       Full->Lite  -15.12  -15.04   -39.53   -12.59   -14.90  11/11 clean, d2 x1.1   
+Ampeg SVT-4 Pro With Cab                       Full->Lite  -15.12  -15.04   -39.53   -12.59   -14.90  11/11 clean, d2 x1.1   
+Ampeg SVT-4 Pro With Cab                       Lite->Full  -15.12  -15.04   -39.53   -12.59   -14.90  11/11 clean, d2 x1.2   
+Ampeg SVT-4 Pro With Cab                       Lite->Full  -15.12  -15.04   -39.53   -12.59   -14.90  11/11 clean, d2 x1.2   
+Ampeg SVT - SM75                               Full->Lite  -23.12  -23.08   -48.45   -24.54   -30.00  10/11 clean, d2 x2.1   at 55.00 s, oracle peak -36.3 dBFS: continuity: second difference 0.000066 inside an edit against a limit of 0.000063 (kappa 2.000000 x 0.000032 from the oracles)
+Ampeg SVT - SM75                               Lite->Full  -23.12  -23.08   -48.45   -24.54   -30.00  11/11 clean, d2 x1.9   
+Ampeg SVT - Ultra Hi MD 421                    Full->Lite  -24.62  -24.66   -50.19   -28.99   -33.80  11/11 clean, d2 x1.2   
+Ampeg SVT - Ultra Hi MD 421                    Lite->Full  -24.62  -24.66   -50.19   -28.99   -33.80  11/11 clean, d2 x1.0   
+Ampeg SVT - Gain 10 Ultra Lo a                 Full->Lite  -13.94  -13.79   -40.32   -22.17   -24.30  11/11 clean, d2 x1.2   
+Ampeg SVT - Gain 10 Ultra Lo a                 Lite->Full  -13.94  -13.79   -40.32   -22.17   -24.30  11/11 clean, d2 x1.0   
+Ampeg SVT - Gain 10 Ultra Lo a                 Full->Lite  -14.39  -14.53   -41.76   -19.42   -25.80  11/11 clean, d2 x1.1   
+Ampeg SVT - Gain 10 Ultra Lo a                 Lite->Full  -14.39  -14.53   -41.76   -19.42   -25.80  11/11 clean, d2 x0.8   
+Ampeg SVT - Ultra Lo MD 421                    Full->Lite  -25.31  -25.23   -53.77   -31.87   -33.00  11/11 clean, d2 x1.4   
+Ampeg SVT - Ultra Lo MD 421                    Lite->Full  -25.31  -25.23   -53.77   -31.87   -33.00  11/11 clean, d2 x1.4   
+Ampeg SVT - Ultra Hi SM57                      Full->Lite  -23.37  -23.29   -52.16   -29.48   -36.60  11/11 clean, d2 x1.1   
+Ampeg SVT - Ultra Hi SM57                      Lite->Full  -23.37  -23.29   -52.16   -29.48   -36.60  11/11 clean, d2 x1.1   
+Ampeg SVT - Ultra Lo SM57                      Full->Lite  -24.12  -24.11   -53.68   -27.73   -34.80  11/11 clean, d2 x1.1   
+Ampeg SVT - Ultra Lo SM57                      Lite->Full  -24.12  -24.11   -53.68   -27.73   -34.80  11/11 clean, d2 x1.2   
+APP-SD1-Drive-VI                               Full->Lite  -15.87  -15.87   -50.43   -20.77   -25.90  11/11 clean, d2 x1.3   
+APP-SD1-Drive-VI                               Lite->Full  -15.87  -15.87   -50.43   -20.77   -25.90  11/11 clean, d2 x1.3   
+APP-SD1-Drive-V                                Full->Lite  -15.92  -15.93   -51.19   -12.22   -23.60  11/11 clean, d2 x1.2   
+APP-SD1-Drive-V                                Lite->Full  -15.92  -15.93   -51.19   -12.22   -23.60  11/11 clean, d2 x1.2   
+APP-SD1-Drive-IV                               Full->Lite  -15.98  -15.97   -51.34   -14.56   -23.50  11/11 clean, d2 x1.1   
+APP-SD1-Drive-IV                               Lite->Full  -15.98  -15.97   -51.34   -14.56   -23.50  11/11 clean, d2 x1.1   
+APP-SD1-Drive-III                              Full->Lite  -16.06  -16.09   -52.69   -12.09   -31.60  11/11 clean, d2 x1.1   
+APP-SD1-Drive-III                              Lite->Full  -16.06  -16.09   -52.69   -12.09   -31.60  11/11 clean, d2 x1.1   
+APP-SD1-Boost-III                              Full->Lite  -17.89  -17.86   -55.10   -20.09   -34.20  11/11 clean, d2 x1.0   
+APP-SD1-Boost-III                              Lite->Full  -17.89  -17.86   -55.10   -20.09   -34.20  11/11 clean, d2 x1.0   
+APP-SD1-Boost-II                               Full->Lite  -18.17  -18.16   -55.45   -13.72   -35.30  11/11 clean, d2 x1.0   
+APP-SD1-Boost-II                               Lite->Full  -18.17  -18.16   -55.45   -13.72   -35.30  11/11 clean, d2 x1.0   
+APP-SD1-Drive-II                               Full->Lite  -16.42  -16.42   -54.89   -16.17   -31.50  11/11 clean, d2 x1.1   
+APP-SD1-Drive-II                               Lite->Full  -16.42  -16.42   -54.89   -16.17   -31.50  11/11 clean, d2 x1.2   
+APP-SD1-Boost-I                                Full->Lite  -21.08  -21.07   -60.28   -20.34   -32.80  11/11 clean, d2 x1.0   
+APP-SD1-Boost-I                                Lite->Full  -21.08  -21.07   -60.28   -20.34   -32.80  11/11 clean, d2 x1.0   
+APP-SD1-Drive-I                                Full->Lite  -17.59  -17.59   -57.72   -22.16   -29.60  11/11 clean, d2 x1.1   
+APP-SD1-Drive-I                                Lite->Full  -17.59  -17.59   -57.72   -22.16   -29.60  11/11 clean, d2 x1.1   
+
+handovers judged: 1144 (104 rows x 11 switch points); fully clean: 102 of 104 rows
+null rms, dBFS:    worst   -26.6   median   -44.1   best   -60.3
+null below signal: worst    -9.2   median   -21.7   best   -40.1 dB
+level match:       median |lite rms - full rms| 0.09 dB, worst 0.75 dB
+wrong-model:       worst    -5.7 dBFS, median   -22.2 dBFS
+
+Reading
+-------
+Lite and Full are not one network at two widths. They are two separately trained
+submodels of the same rig: in the worst model here, 56 of the Lite's 1871 weights appear in
+the Full's (3%), and the vendored reference A2.nam shares 4 of 1871 (0.2%). namchain's own
+daemon doc already says as much about the budget path (docs/daemon.md, model_slimmed: "a
+Lite does not sound like the Full the rig names").
+
+So tier 2's premise -- "Lite and Full are separate submodels ... the handover is a small
+change of sound" -- is false as written, on every model in the library. The two are
+level-matched (median 0.09 dB) and time-aligned, so what is left is timbre, and it is not
+small: the null is 9 to 40 dB below the signal (median 21.7), which is 20 to 50 dB above the
+-60 dBFS this project treats as its audibility bar. It is worst exactly where it matters,
+on the amp and full-rig models, and best on the nine SD-1 pedal captures (-35 to -40 dB).
+
+The crossfade itself is not the problem: 102 of 104 rows are clean at every switch point,
+and the two that are not are marginal continuity findings 20-40% over the second-difference
+bar, at 55 s where the DI is a decaying tail (oracle peak -36 dBFS). Where the detector did
+flag something at a musical level -- an HF excess of 3.4-3.9 dB on two SVT models -- the
+absolute level of the excess is -95 dBFS, i.e. 73 dB below the signal.
+
+What a listener hears in tier 2 is therefore not a click. It is the wrong-sounding rig for
+the tens of ms the Full takes to catch up, then a clean crossfade to the right one. Whether
+that is acceptable is the listening test, and it is the only part of item 1 left:
+pedal.project build/e2/audition/ has Lite, Full and an alternating handover for the worst,
+the median, the best and the two flagged models.
