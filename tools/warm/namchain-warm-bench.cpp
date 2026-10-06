@@ -1,4 +1,4 @@
-// namchain-warm-bench — the pedal's experiment E1: can every rig one interaction away be kept warm?
+// namchain-warm-bench — the pedal's experiments E1 and E2 on holding a rig ready to switch to.
 //
 // pedal.project plan.md, Phase 3 step 8, compares four ways of holding a rig ready to switch to:
 //
@@ -10,39 +10,63 @@
 //   D  always warm   every candidate processes the live input all the time; a switch is only a
 //                    crossfade between two running rigs
 //
-// Two modes, because the two questions need different conditions:
+// E1 (run 2026-09-26) answered B, C and D for one model plus an IR, and the contention cost of D.
+// The tier design that came out of it (pedal.project docs/rig-switch-strategies.md) rests on four
+// things E1 did not measure, which are E2 and the last four modes here:
 //
-//   state        offline, deterministic. For each candidate and each switch point in a real input,
-//                builds B's, C's and D's output and judges each with namchain's glitch detector
-//                against the true "after" (the candidate having run all along), and reports how far
-//                B and C are from it over the first 200 ms. Also times C's replay, which is what C
-//                adds to a switch.
+//   slim         item 1. Lite against Full, for every model: the null between them, and whether
+//                handing over from one to the other is audible. Reports the null, and judges a
+//                5 ms equal-power handover at every switch point with the glitch detector in both
+//                directions; --audition writes the same handovers as WAVs to listen to.
 //
-//   contention   real time. The live rig renders on --render-cpu at SCHED_FIFO, paced to the wall
-//                clock one quantum at a time, while a second thread on --warm-cpu runs N candidate
-//                rigs on the same input (arm D). Reports the render thread's block times and
-//                overruns -- what D costs the audio -- and whether the warm thread keeps up, plus
-//                memory per candidate held.
+//   chain        item 2. Catch-up convergence for chains of models in series, against replay
+//                length per model. Bringing stage k up to date needs the true input from
+//                (k-1) x replay before the switch, and each stage then costs (d-k+1) x replay
+//                samples, so the work is d(d+1)/2 single-model replays — the plan's estimate,
+//                which this mode measures rather than assumes.
+//
+//   ir           item 4. An IR kept warm as a record of its input rather than run: at the switch
+//                the convolver is reset and filled from the last `taps` samples of that record.
+//                nam::Linear's state is exactly its last receptive_field inputs, so this should
+//                be exact; the mode says by how much it is not.
+//
+//   contention   item 3, and E1's arm D. The live rig renders on --render-cpu at SCHED_FIFO, paced
+//                to the wall clock one quantum at a time, while a second thread on --warm-cpu runs
+//                N candidate rigs on the same input. Reports the render thread's block times and
+//                overruns -- what warm work costs the audio -- and whether the warm thread keeps
+//                up, plus memory per candidate held. --slim and --no-ir set what is being kept
+//                warm (a Lite or Full submodel, with or without a cab); --spinner loads the warm
+//                core as well, for "keeps up on a housekeeping core under load".
 //
 // A rig here is a NAM model followed by a cab IR (48 kHz WAV, truncated at 8192 taps like
 // nc.cab.ir), each a vendored-core nam::DSP, so the work is the same as namchaind's for such a rig.
+// --no-ir drops the cab, which is what the density numbers are about.
 //
 // Usage:
 //   namchain-warm-bench state      --input in.wav --ir cab.wav --live live.nam cand1.nam [cand2.nam ...]
 //                                  [--switch-every S] [--fade-ms 5] [--quantum 64]
 //                                  [--replay-ms MS]   (C's replay; default the rig's own memory)
+//   namchain-warm-bench slim       --input in.wav cand1.nam [...] [--ir cab.wav]
+//                                  [--switch-every S] [--fade-ms 5] [--slim 0.0] [--audition DIR]
+//   namchain-warm-bench chain      --input in.wav --live m1.nam [m2.nam ...] [--depth 4]
+//                                  [--replays 85,170,340,680] [--switch-every S]
+//   namchain-warm-bench ir         --input in.wav --ir cab.wav --live model.nam [--switch-every S]
 //   namchain-warm-bench contention --input in.wav --ir cab.wav --live live.nam cand1.nam [...]
-//                                  [--count N] [--seconds S] [--quantum 64]
-//                                  [--render-cpu 3] [--warm-cpu 2] [--priority 80]
+//                                  [--count N] [--seconds S] [--quantum 64] [--slim X] [--no-ir]
+//                                  [--spinner] [--render-cpu 3] [--warm-cpu 2] [--priority 80]
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
+#include <cmath>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -51,6 +75,7 @@
 #include "NAM/dsp.h"
 #include "NAM/get_dsp.h"
 #include "NAM/linear.h"
+#include "NAM/slimmable.h"
 
 #include "namchain/glitch.h"
 #include "namchain/rt/scheduling.h"
@@ -78,15 +103,31 @@ struct Rig
   std::vector<NAM_SAMPLE> a, b;
   int prewarm = 0; ///< the amp's own prewarm count: its receptive field
 
-  Rig(const std::string& model, const std::vector<float>& ir, int max_quantum)
+  /// `ir` empty means no cab at all (--no-ir): the density question is about models, and E1 showed
+  /// the cab is about half the cost of a rig on the render core.
+  /// `slim` < 0 leaves the model's own default, which for a SlimmableContainer is its largest
+  /// submodel (pedal.project's Full); 0.0 selects the first submodel (Lite).
+  Rig(const std::string& model, const std::vector<float>& ir, int max_quantum, double slim = -1.0)
   {
     amp = nam::get_dsp(std::filesystem::path(model));
     if (!amp)
       die("cannot load " + model);
-    cab = std::make_unique<nam::Linear>(1, 1, static_cast<int>(ir.size()), false, ir, kRate);
+    if (slim >= 0.0)
+    {
+      auto* slimmable = dynamic_cast<nam::SlimmableModel*>(amp.get());
+      if (slimmable == nullptr)
+        die(model + " is not a SlimmableModel, so --slim cannot select a submodel");
+      slimmable->SetSlimmableSize(slim);
+    }
+    if (!ir.empty())
+    {
+      cab = std::make_unique<nam::Linear>(1, 1, static_cast<int>(ir.size()), false, ir, kRate);
+      cab->Reset(kRate, max_quantum);
+      ir_taps = ir.size();
+    }
     amp->Reset(kRate, max_quantum); // Reset prewarms: this is arm B's state
-    cab->Reset(kRate, max_quantum);
     prewarm = amp->GetPrewarmSamples();
+    max_q = max_quantum;
     a.assign(static_cast<std::size_t>(max_quantum), 0);
     b.assign(static_cast<std::size_t>(max_quantum), 0);
   }
@@ -104,9 +145,19 @@ struct Rig
     NAM_SAMPLE* ai[] = {a.data()};
     NAM_SAMPLE* bi[] = {b.data()};
     amp->process(ai, bi, frames);
-    cab->process(bi, ai, frames);
-    for (int i = 0; i < frames; ++i)
-      out[i] = static_cast<float>(a[static_cast<std::size_t>(i)]);
+    // The amp writes into b; the cab reads b and writes a. With no cab the output is b, not a —
+    // which is where the input still is.
+    if (cab)
+    {
+      cab->process(bi, ai, frames);
+      for (int i = 0; i < frames; ++i)
+        out[i] = static_cast<float>(a[static_cast<std::size_t>(i)]);
+    }
+    else
+    {
+      for (int i = 0; i < frames; ++i)
+        out[i] = static_cast<float>(b[static_cast<std::size_t>(i)]);
+    }
   }
 
   /// Run a span through, `quantum` at a time. `out` may be null to discard.
@@ -121,14 +172,171 @@ struct Rig
       process(in + pos, out != nullptr ? out + pos : scratch.data(), n);
     }
   }
+
+  /// The cab's own output for a span, with the model's output `record` as its input: what an IR
+  /// kept as a record of its input has to be filled from. Chunked at the quantum the cab was reset
+  /// with, which is the buffer size it was told to expect.
+  void cab_of(const std::vector<float>& record, std::size_t from, std::size_t frames, std::vector<float>& out)
+  {
+    if (!cab)
+      die("this rig has no cab");
+    out.resize(frames);
+    std::vector<NAM_SAMPLE> in(static_cast<std::size_t>(max_q)), sink(static_cast<std::size_t>(max_q));
+    for (std::size_t pos = 0; pos < frames; pos += static_cast<std::size_t>(max_q))
+    {
+      const int n = static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(max_q), frames - pos));
+      for (int i = 0; i < n; ++i)
+        in[static_cast<std::size_t>(i)] = static_cast<NAM_SAMPLE>(record[from + pos + static_cast<std::size_t>(i)]);
+      NAM_SAMPLE* pi[] = {in.data()};
+      NAM_SAMPLE* po[] = {sink.data()};
+      cab->process(pi, po, n);
+      for (int i = 0; i < n; ++i)
+        out[pos + static_cast<std::size_t>(i)] = static_cast<float>(sink[static_cast<std::size_t>(i)]);
+    }
+  }
+
+  /// Back to the state a freshly loaded model has, which is what a candidate is caught up from.
+  void reset(int max_quantum)
+  {
+    amp->Reset(kRate, max_quantum);
+    if (cab)
+      cab->Reset(kRate, max_quantum);
+  }
+
+  /// Just the cab: item 4 keeps the model running and fills the convolver from its record.
+  void reset_cab() { cab->Reset(kRate, max_q); }
+
+  std::size_t cab_taps() const { return ir_taps; }
+
+  int max_q = 64;
 };
 
-std::unique_ptr<Rig> make_rig(const std::string& model, const std::vector<float>& ir, int quantum)
+std::unique_ptr<Rig> make_rig(const std::string& model, const std::vector<float>& ir, int quantum,
+                             double slim = -1.0)
 {
-  auto rig = std::make_unique<Rig>(model, ir, quantum);
-  rig->ir_taps = ir.size();
-  return rig;
+  return std::make_unique<Rig>(model, ir, quantum, slim);
 }
+
+/// One model in a chain: its own NAM_SAMPLE buffers and a float buffer its caller reads.
+struct Stage
+{
+  std::unique_ptr<nam::DSP> model;
+  std::vector<NAM_SAMPLE> in, out;
+  std::vector<float> fout;
+  int prewarm = 0;
+
+  Stage(const std::string& path, int max_quantum, double slim)
+  {
+    model = nam::get_dsp(std::filesystem::path(path));
+    if (!model)
+      die("cannot load " + path);
+    if (slim >= 0.0)
+    {
+      auto* slimmable = dynamic_cast<nam::SlimmableModel*>(model.get());
+      if (slimmable == nullptr)
+        die(path + " is not a SlimmableModel, so --slim cannot select a submodel");
+      slimmable->SetSlimmableSize(slim);
+    }
+    model->Reset(kRate, max_quantum);
+    prewarm = model->GetPrewarmSamples();
+    in.assign(static_cast<std::size_t>(max_quantum), 0);
+    out.assign(static_cast<std::size_t>(max_quantum), 0);
+    fout.assign(static_cast<std::size_t>(max_quantum), 0);
+  }
+
+  void reset(int max_quantum) { model->Reset(kRate, max_quantum); }
+
+  /// Process `frames` (<= max_quantum) and return the stage's float output.
+  const float* process(const float* src, int frames)
+  {
+    for (int i = 0; i < frames; ++i)
+      in[static_cast<std::size_t>(i)] = static_cast<NAM_SAMPLE>(src[i]);
+    NAM_SAMPLE* pi[] = {in.data()};
+    NAM_SAMPLE* po[] = {out.data()};
+    model->process(pi, po, frames);
+    for (int i = 0; i < frames; ++i)
+      fout[static_cast<std::size_t>(i)] = static_cast<float>(out[static_cast<std::size_t>(i)]);
+    return fout.data();
+  }
+};
+
+/// Models in series, each stage fed the one before it.
+struct Chain
+{
+  std::vector<std::unique_ptr<Stage>> stages;
+  int quantum = 64;
+
+  Chain(const std::vector<std::string>& models, int max_quantum, double slim) : quantum(max_quantum)
+  {
+    for (const std::string& m : models)
+      stages.push_back(std::make_unique<Stage>(m, max_quantum, slim));
+  }
+
+  std::size_t depth() const { return stages.size(); }
+
+  /// What one stage remembers; a chain's is its deepest stage's, since every stage is replayed for
+  /// the same length in the mode below.
+  std::size_t memory() const
+  {
+    std::size_t m = 0;
+    for (const auto& s : stages)
+      m = std::max(m, static_cast<std::size_t>(s->prewarm));
+    return m;
+  }
+
+  void reset()
+  {
+    for (auto& s : stages)
+      s->reset(quantum);
+  }
+
+  /// Run `frames` of `in` through every stage, into `out` (may be null to discard).
+  void run(const float* in, float* out, std::size_t frames)
+  {
+    for (std::size_t pos = 0; pos < frames; pos += static_cast<std::size_t>(quantum))
+    {
+      const int n = static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(quantum), frames - pos));
+      const float* src = in + pos;
+      for (auto& s : stages)
+        src = s->process(src, n);
+      for (int i = 0; i < n; ++i)
+        if (out != nullptr)
+          out[pos + static_cast<std::size_t>(i)] = src[i];
+    }
+  }
+
+  /// Catch the chain up from its reset state, the way the tier design says to: the true input's
+  /// last `replay` samples per stage. Stage k is correct only once the stages before it are, so it
+  /// is fed the tail of the stage before it, and its own window is (d-k+1) x replay samples long —
+  /// which is where the plan's d(d+1)/2 single-model replays come from. Returns the wall time.
+  double catch_up(const std::vector<float>& x, std::size_t t, std::size_t replay)
+  {
+    const auto t0 = Clock::now();
+    const std::size_t d = depth();
+    std::vector<float> sig(x.begin() + static_cast<std::ptrdiff_t>(t - d * replay),
+                           x.begin() + static_cast<std::ptrdiff_t>(t));
+    for (std::size_t k = 0; k < d; ++k)
+    {
+      stages[k]->reset(quantum);
+      std::vector<float> out(sig.size());
+      run_stage(k, sig, out);
+      if (k + 1 < d)
+        sig.assign(out.end() - static_cast<std::ptrdiff_t>(sig.size() - replay), out.end());
+    }
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+  }
+
+  /// One stage over a span, for the catch-up above.
+  void run_stage(std::size_t k, const std::vector<float>& in, std::vector<float>& out)
+  {
+    for (std::size_t pos = 0; pos < in.size(); pos += static_cast<std::size_t>(quantum))
+    {
+      const int n = static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(quantum), in.size() - pos));
+      const float* r = stages[k]->process(in.data() + pos, n);
+      std::copy(r, r + n, out.begin() + static_cast<std::ptrdiff_t>(pos));
+    }
+  }
+};
 
 std::vector<float> load_ir(const std::string& path)
 {
@@ -182,11 +390,27 @@ long rss_kb()
 
 struct Args
 {
-  std::string mode, input, ir, live;
+  std::string mode, input, ir, live, audition;
   std::vector<std::string> candidates;
   double switch_every = 2.0, fade_ms = 5.0, seconds = 60.0, replay_ms = 0.0;
   int quantum = 64, count = -1, render_cpu = 3, warm_cpu = 2, priority = 80;
+  double slim = -1.0;                 ///< submodel for every rig; <0 is the model's own default
+  bool no_ir = false;                 ///< models alone, no cab: what the density numbers are about
+  std::string warm_ir;                ///< contention: the candidates' own cab, default --ir
+  bool warm_no_ir = false;            ///< contention: candidates without a cab, live rig keeps its own
+  bool spinner = false;               ///< contention: load the warm core as well
+  int depth = 4;                      ///< chain: models in series
+  std::vector<double> replays{85, 170, 340, 680}; ///< chain: replay lengths per model, ms
+  double audition_start = 10.0, audition_seconds = 20.0; ///< slim --audition excerpt
 };
+
+/// --ir is optional in every mode: with none, a rig is the model alone.
+std::vector<float> load_ir_or_none(const Args& args)
+{
+  if (args.no_ir || args.ir.empty())
+    return {};
+  return load_ir(args.ir);
+}
 
 // --- state ------------------------------------------------------------------
 
@@ -207,7 +431,7 @@ void crossfade(const std::vector<float>& from, const std::vector<float>& to, std
 int run_state(const Args& args)
 {
   const std::vector<float> x = load_input(args.input);
-  const std::vector<float> ir = load_ir(args.ir);
+  const std::vector<float> ir = load_ir_or_none(args);
   const int q = args.quantum;
   const std::size_t fade = static_cast<std::size_t>(args.fade_ms * kRate / 1000.0);
   const std::size_t every = static_cast<std::size_t>(args.switch_every * kRate) / static_cast<std::size_t>(q) *
@@ -215,13 +439,14 @@ int run_state(const Args& args)
   const std::size_t window = static_cast<std::size_t>(0.2 * kRate); // "the first 200 ms"
 
   std::printf("namchain-warm-bench %s  state\n", NAMCHAIN_VERSION_STRING);
-  std::printf("input %s: %.1f s; ir %s: %zu taps; quantum %d; fade %.1f ms; a switch every %.2f s\n\n",
-              args.input.c_str(), static_cast<double>(x.size()) / kRate, stem(args.ir).c_str(), ir.size(), q,
+  std::printf("input %s: %.1f s; ir %s; quantum %d; fade %.1f ms; a switch every %.2f s\n\n",
+              args.input.c_str(), static_cast<double>(x.size()) / kRate,
+              ir.empty() ? "none" : (stem(args.ir) + ": " + std::to_string(ir.size()) + " taps").c_str(), q,
               args.fade_ms, static_cast<double>(every) / kRate);
 
   // The live rig, run all the way through once: "before" for every switch.
   std::vector<float> before(x.size());
-  make_rig(args.live, ir, q)->run(x.data(), before.data(), x.size(), q);
+  make_rig(args.live, ir, q, args.slim)->run(x.data(), before.data(), x.size(), q);
 
   std::printf("%-34s %4s  %-26s %-26s %-26s  %s\n", "candidate", "arm", "clicks (glitch detector)",
               "worst err, 0-200 ms", "worst err, settled", "catch-up");
@@ -230,7 +455,7 @@ int run_state(const Args& args)
   {
     // D: the candidate has run all along. This is also the truth B and C are judged against.
     std::vector<float> after(x.size());
-    auto always = make_rig(path, ir, q);
+    auto always = make_rig(path, ir, q, args.slim);
     always->run(x.data(), after.data(), x.size(), q);
     const std::size_t replay =
       args.replay_ms > 0 ? static_cast<std::size_t>(args.replay_ms * kRate / 1000.0) : always->memory();
@@ -257,7 +482,7 @@ int run_state(const Args& args)
           incoming = after;
         else
         {
-          auto rig = make_rig(path, ir, q); // loaded and prewarmed: B's state
+          auto rig = make_rig(path, ir, q, args.slim); // loaded and prewarmed: B's state
           if (arm.name[0] == 'C')
           {
             const auto t0 = Clock::now();
@@ -327,6 +552,308 @@ int run_state(const Args& args)
   return failures == 0 ? 0 : 1;
 }
 
+// --- slim: E2 item 1, Lite against Full ---------------------------------------
+
+/// The switch points the slim, chain and ir modes all use: after the longest replay and the fade,
+/// one every `every` samples, with room for the 200 ms window after each.
+std::vector<std::size_t> switch_points(const std::vector<float>& x, const Args& args, std::size_t lead)
+{
+  const std::size_t every = static_cast<std::size_t>(args.switch_every * kRate);
+  const std::size_t window = static_cast<std::size_t>(0.2 * kRate);
+  std::vector<std::size_t> ts;
+  for (std::size_t t = std::max(every, lead); t + window < x.size(); t += every)
+    ts.push_back(t);
+  return ts;
+}
+
+int run_slim(const Args& args)
+{
+  const std::vector<float> x = load_input(args.input);
+  const std::vector<float> ir = load_ir_or_none(args);
+  const int q = args.quantum;
+  const std::size_t fade = static_cast<std::size_t>(args.fade_ms * kRate / 1000.0);
+  const std::size_t window = static_cast<std::size_t>(0.2 * kRate);
+  const std::vector<std::size_t> ts = switch_points(x, args, fade);
+  const bool audition = !args.audition.empty();
+  if (audition)
+    std::filesystem::create_directories(args.audition);
+
+  std::printf("namchain-warm-bench %s  slim\n", NAMCHAIN_VERSION_STRING);
+  std::printf("input %s: %.1f s; ir %s; quantum %d; fade %.1f ms; %zu switch points every %.2f s\n",
+              args.input.c_str(), static_cast<double>(x.size()) / kRate,
+              ir.empty() ? "none" : (stem(args.ir) + ": " + std::to_string(ir.size()) + " taps").c_str(), q,
+              args.fade_ms, ts.size(), args.switch_every);
+  std::printf("Lite is --slim 0.0 (the first submodel), Full --slim 1.0 (the last, and the default).\n\n");
+  std::printf("%-30s %-10s %8s %8s %9s %9s  %-24s %-12s %s\n", "candidate", "direction", "lite rms", "full rms",
+              "null rms", "null max", "handover (glitch detector)", "wrong-model", "first finding");
+  std::printf("%-30s %-10s %8s %8s %9s %9s  %-24s %-12s\n", "", "", "dBFS", "dBFS", "dBFS", "dBFS", "",
+              "0-200 ms");
+
+  int failures = 0;
+  for (const std::string& path : args.candidates)
+  {
+    auto full = make_rig(path, ir, q, 1.0), lite = make_rig(path, ir, q, 0.0);
+    std::vector<float> F(x.size()), L(x.size());
+    full->run(x.data(), F.data(), x.size(), q);
+    lite->run(x.data(), L.data(), x.size(), q);
+
+    double sq = 0, mx = 0, lsq = 0, fsq = 0;
+    bool finite = true;
+    for (std::size_t i = 0; i < x.size(); ++i)
+    {
+      const double d = std::abs(static_cast<double>(L[i]) - F[i]);
+      sq += d * d;
+      mx = std::max(mx, d);
+      lsq += static_cast<double>(L[i]) * L[i];
+      fsq += static_cast<double>(F[i]) * F[i];
+      if (!std::isfinite(L[i]) || !std::isfinite(F[i]))
+        finite = false;
+    }
+    const double n = static_cast<double>(x.size());
+    const double null_rms = dbfs(std::sqrt(sq / n));
+    if (!finite)
+      std::printf("%-30.30s ** NON-FINITE SAMPLES in this model's output: the numbers below mean nothing\n",
+                  stem(path).c_str());
+
+    struct Row
+    {
+      const char* dir;
+      const std::vector<float>* before;
+      const std::vector<float>* after;
+      int ok = 0, n = 0;
+      double worst = -1000, d2 = 0;
+      std::string finding;
+    } rows[2] = {{"Lite->Full", &L, &F, 0, 0, -1000, 0, ""}, {"Full->Lite", &F, &L, 0, 0, -1000, 0, ""}};
+
+    std::vector<float> y;
+    for (Row& r : rows)
+    {
+      crossfade(*r.before, *r.after, ts.empty() ? 0 : ts.front(), fade, y); // sized
+      for (std::size_t t : ts)
+      {
+        crossfade(*r.before, *r.after, t, fade, y);
+        // What the player hears if the *other* submodel is substituted and never handed over: the
+        // steady difference, over the same 200 ms the state mode judges its arms on.
+        double w = 0;
+        for (std::size_t i = t; i < std::min(x.size(), t + window); ++i)
+          w = std::max(w, std::abs(static_cast<double>((*r.before)[i]) - (*r.after)[i]));
+        r.worst = std::max(r.worst, dbfs(w));
+
+        const std::size_t lo = t - std::min<std::size_t>(t, window), hi = std::min(x.size(), t + window + fade);
+        namchain::glitch::Options opts;
+        std::string error;
+        const namchain::glitch::Report rep = namchain::glitch::analyse(
+          y.data() + lo, r.before->data() + lo, r.after->data() + lo, hi - lo, {{t - lo, t - lo + fade}}, opts, error);
+        ++r.n;
+        if (rep.ok && error.empty())
+          ++r.ok;
+        else if (r.finding.empty())
+        {
+          // The switch time and the level the span is playing at: a "dropout" at -90 dBFS in a
+          // silent tail is a different thing from one at -20 dBFS, and the time is what makes the
+          // finding reproducible.
+          double peak = 0;
+          for (std::size_t i = lo; i < hi; ++i)
+            peak = std::max(peak, std::max(std::abs(static_cast<double>((*r.before)[i])),
+                                           std::abs(static_cast<double>((*r.after)[i]))));
+          char at[64];
+          std::snprintf(at, sizeof at, "at %.2f s, oracle peak %.1f dBFS: ", static_cast<double>(t) / kRate,
+                        dbfs(peak));
+          r.finding = at + (!error.empty() ? error
+                                           : (!rep.findings.empty() ? rep.findings.front().rule + ": " +
+                                                                        rep.findings.front().detail
+                                                                    : std::string("failed")));
+        }
+        r.d2 = std::max(r.d2, rep.reference_d2 > 0 ? rep.max_edit_d2 / rep.reference_d2 : 0.0);
+      }
+    }
+
+    for (const Row& r : rows)
+    {
+      char glitch[64], wrong[40];
+      std::snprintf(glitch, sizeof glitch, "%d/%d clean, d2 x%.1f", r.ok, r.n, r.d2);
+      std::snprintf(wrong, sizeof wrong, "%.1f dBFS", r.worst);
+      std::printf("%-30.30s %-10s %8.2f %8.2f %9.2f %9.2f  %-24s %-12s %s\n", stem(path).c_str(), r.dir,
+                  dbfs(std::sqrt(lsq / n)), dbfs(std::sqrt(fsq / n)), null_rms, dbfs(mx), glitch, wrong,
+                  r.finding.c_str());
+      if (r.ok != r.n)
+        ++failures;
+    }
+
+    if (audition)
+    {
+      // The handover, alternating, so one file carries both directions and the ear can compare it
+      // with the two references either side of it. An excerpt, because the full input is 2.7 M
+      // samples per file and nothing in the judgement turns on the other 30 seconds.
+      const std::size_t from = static_cast<std::size_t>(args.audition_start * kRate);
+      const std::size_t frames =
+        std::min(static_cast<std::size_t>(args.audition_seconds * kRate), x.size() - std::min(from, x.size()));
+      std::vector<float> alt = L;
+      for (std::size_t i = 0; i < ts.size(); ++i)
+        crossfade(alt, i % 2 == 0 ? F : L, ts[i], fade, alt);
+
+      std::string error;
+      const std::string tag = stem(path);
+      const std::pair<const char*, const std::vector<float>*> files[3] = {
+        {"handover", &alt}, {"lite", &L}, {"full", &F}};
+      for (const auto& f : files)
+      {
+        const std::string out = args.audition + "/" + tag + "-" + f.first + ".wav";
+        if (!namchain::save_wav_float32(out, f.second->data() + from, frames, 1, kRate, error))
+          die(out + ": " + error);
+        std::printf("%-30s   wrote %s (%.0f s from %.0f s)\n", "", out.c_str(), frames / kRate,
+                    args.audition_start);
+      }
+    }
+  }
+
+  std::printf("\nnull: |Lite - Full| over the whole input, sample aligned (both submodels are zero-latency).\n"
+              "handover: the %zu switches judged by namchain::glitch against the submodel running after it.\n"
+              "wrong-model: the worst |Lite - Full| in the 200 ms after a switch -- what a listener hears\n"
+              "while a Lite stands in for the Full, which is tier 2's first step.\n",
+              ts.size());
+  return failures == 0 ? 0 : 1;
+}
+
+// --- chain: E2 item 2, catch-up for models in series --------------------------
+
+int run_chain(const Args& args)
+{
+  const std::vector<float> x = load_input(args.input);
+  const int q = args.quantum;
+  const std::size_t window = static_cast<std::size_t>(0.2 * kRate);
+  const std::size_t every = static_cast<std::size_t>(args.switch_every * kRate);
+
+  std::printf("namchain-warm-bench %s  chain\n", NAMCHAIN_VERSION_STRING);
+  std::printf("input %s: %.1f s; quantum %d; depths 1..%d; replays", args.input.c_str(),
+              static_cast<double>(x.size()) / kRate, q, args.depth);
+  for (double r : args.replays)
+    std::printf(" %.0f", r);
+  std::printf(" ms per model; a switch every %.2f s\n\n", args.switch_every);
+  std::printf("catch-up: stage k is reset and fed the tail of the true input (k = 1) or of the stage\n"
+              "before it (k > 1), so stage k costs (d-k+1) x replay samples and the whole chain costs\n"
+              "d(d+1)/2 of them -- the plan's estimate, measured here rather than assumed.\n\n");
+  std::printf("%5s %8s %8s %10s %10s %10s %10s %8s\n", "depth", "replay", "switches", "err 0-200ms", "err settled",
+              "replay mean", "replay max", "replays");
+  std::printf("%5s %8s %8s %10s %10s %10s %10s %8s\n", "", "ms", "", "dBFS", "dBFS", "ms", "ms", "");
+
+  for (int d = 1; d <= args.depth; ++d)
+  {
+    std::vector<std::string> models;
+    for (int i = 0; i < d; ++i)
+      models.push_back(args.candidates[static_cast<std::size_t>(i) % args.candidates.size()]);
+    Chain chain(models, q, args.slim);
+
+    std::vector<float> ref(x.size());
+    chain.reset();
+    chain.run(x.data(), ref.data(), x.size());
+
+    for (double replay_ms : args.replays)
+    {
+      const std::size_t replay = static_cast<std::size_t>(replay_ms * kRate / 1000.0);
+      const std::size_t lead = static_cast<std::size_t>(d) * replay;
+      if (lead + window >= x.size())
+        continue;
+      const std::vector<std::size_t> ts = switch_points(x, args, lead);
+      if (ts.empty())
+        continue;
+      double worst_window = -1000, worst_settled = -1000, sum = 0, mx = 0;
+      for (std::size_t t : ts)
+      {
+        chain.reset();
+        const double ms = chain.catch_up(x, t, replay);
+        sum += ms;
+        mx = std::max(mx, ms);
+        std::vector<float> y(window);
+        chain.run(x.data() + t, y.data(), window);
+        double w = 0, s = 0;
+        for (std::size_t i = 0; i < window; ++i)
+          w = std::max(w, std::abs(static_cast<double>(y[i]) - ref[t + i]));
+        // The settled error is over the rest of the interval, run on from where the window ended:
+        // the chain has to keep going for it to mean anything.
+        const std::size_t end = std::min(x.size(), t + every);
+        const std::size_t rest = end > t + window ? end - (t + window) : 0;
+        if (rest > 0)
+        {
+          std::vector<float> y2(rest);
+          chain.run(x.data() + t + window, y2.data(), rest);
+          for (std::size_t i = 0; i < rest; ++i)
+            s = std::max(s, std::abs(static_cast<double>(y2[i]) - ref[t + window + i]));
+        }
+        worst_window = std::max(worst_window, dbfs(w));
+        worst_settled = std::max(worst_settled, dbfs(s));
+      }
+      std::printf("%5d %8.0f %8zu %10.1f %10.1f %10.2f %10.2f %8zu\n", d, replay_ms, ts.size(), worst_window,
+                  worst_settled, ts.empty() ? 0.0 : sum / static_cast<double>(ts.size()), mx,
+                  static_cast<std::size_t>(d) * (static_cast<std::size_t>(d) + 1) / 2);
+    }
+  }
+  std::printf("\nerr 0-200ms: worst |caught-up chain - chain that ran all along| over the 200 ms after the\n"
+              "switch. err settled: the same over the rest of the interval. replay: wall time for one\n"
+              "catch-up, on this machine -- the budget number has to come from the Core host.\n");
+  return 0;
+}
+
+// --- ir: E2 item 4, an IR kept as a record of its input -----------------------
+
+int run_ir(const Args& args)
+{
+  if (args.ir.empty())
+    die("ir mode needs --ir: it is about filling a convolver from a record of its input");
+  const std::vector<float> x = load_input(args.input);
+  const std::vector<float> ir = load_ir(args.ir);
+  const int q = args.quantum;
+  const std::size_t window = static_cast<std::size_t>(0.2 * kRate);
+  const std::vector<std::size_t> ts = switch_points(x, args, ir.size());
+
+  // The cab's input is the model's output, so the record is a model-only run of the same rig.
+  auto amp_only = make_rig(args.live, {}, q, args.slim);
+  std::vector<float> record(x.size());
+  amp_only->run(x.data(), record.data(), x.size(), q);
+
+  auto rig = make_rig(args.live, ir, q, args.slim);
+  std::vector<float> ref;
+  rig->reset_cab();
+  rig->cab_of(record, 0, record.size(), ref);
+
+  std::printf("namchain-warm-bench %s  ir\n", NAMCHAIN_VERSION_STRING);
+  std::printf("input %s: %.1f s; ir %s: %zu taps; quantum %d; %zu switch points\n", args.input.c_str(),
+              static_cast<double>(x.size()) / kRate, stem(args.ir).c_str(), ir.size(), q, ts.size());
+  std::printf("A warm rig does not have to run its IR, only record what goes into it: at the switch the\n"
+              "convolver is reset and filled from the last %zu samples of that record. nam::Linear's\n"
+              "state is exactly its last receptive_field inputs, so this should be exact.\n\n", ir.size());
+  std::printf("%8s %12s %12s %12s\n", "switch", "err 0-200ms", "err settled", "fill");
+  std::printf("%8s %12s %12s %12s\n", "", "dBFS", "dBFS", "ms");
+
+  double worst_window = -1000, worst_settled = -1000, worst_fill_ms = 0;
+  std::vector<float> fill, y;
+  for (std::size_t t : ts)
+  {
+    rig->reset_cab();
+    const auto t0 = Clock::now();
+    rig->cab_of(record, t - ir.size(), ir.size(), fill);
+    const double fill_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+    worst_fill_ms = std::max(worst_fill_ms, fill_ms);
+
+    rig->cab_of(record, t, window, y);
+    double w = 0;
+    for (std::size_t i = 0; i < window; ++i)
+      w = std::max(w, std::abs(static_cast<double>(y[i]) - ref[t + i]));
+    const std::size_t rest = std::min(x.size(), t + 2 * window) - (t + window);
+    std::vector<float> y2;
+    rig->cab_of(record, t + window, rest, y2);
+    double s = 0;
+    for (std::size_t i = 0; i < rest; ++i)
+      s = std::max(s, std::abs(static_cast<double>(y2[i]) - ref[t + window + i]));
+    worst_window = std::max(worst_window, dbfs(w));
+    worst_settled = std::max(worst_settled, dbfs(s));
+    std::printf("%8zu %12.1f %12.1f %12.3f\n", t, dbfs(w), dbfs(s), fill_ms);
+  }
+  std::printf("\nworst: %.1f dBFS in the first 200 ms, %.1f dBFS settled, fill %.3f ms per switch.\n",
+              worst_window, worst_settled, worst_fill_ms);
+  return worst_window > -120.0 ? 1 : 0;
+}
+
 // --- contention ---------------------------------------------------------------
 
 struct Stats
@@ -351,17 +878,27 @@ Stats stats(std::vector<double> v)
 int run_contention(const Args& args)
 {
   const std::vector<float> x = load_input(args.input);
-  const std::vector<float> ir = load_ir(args.ir);
+  const std::vector<float> ir = load_ir_or_none(args);
+  // The warm candidates' cab: item 3 keeps the models warm and lets the live rig keep its IR, so
+  // the render tail is the one the pedal actually has.
+  std::vector<float> warm_ir_v;
+  if (args.warm_no_ir)
+    warm_ir_v.clear();
+  else if (!args.warm_ir.empty())
+    warm_ir_v = load_ir(args.warm_ir);
+  else
+    warm_ir_v = ir;
   const int q = args.quantum;
   const int count = args.count >= 0 ? args.count : static_cast<int>(args.candidates.size());
   const double deadline_us = q / kRate * 1e6;
 
   const long rss0 = rss_kb();
-  auto live = make_rig(args.live, ir, q);
+  auto live = make_rig(args.live, ir, q, args.slim);
   const long rss1 = rss_kb();
   std::vector<std::unique_ptr<Rig>> warm;
   for (int i = 0; i < count; ++i)
-    warm.push_back(make_rig(args.candidates[static_cast<std::size_t>(i) % args.candidates.size()], ir, q));
+    warm.push_back(
+      make_rig(args.candidates[static_cast<std::size_t>(i) % args.candidates.size()], warm_ir_v, q, args.slim));
   const long rss2 = rss_kb();
 
   const std::size_t blocks = static_cast<std::size_t>(args.seconds * kRate) / static_cast<std::size_t>(q);
@@ -398,6 +935,19 @@ int run_contention(const Args& args)
     }
   });
 
+  // "Keeps up on a housekeeping core under load": a third thread saturating the warm core, as
+  // another job on that core would. Lower priority than the warm thread, so the candidates still
+  // get their turn and what is measured is the contention, not a starved warm thread.
+  std::thread spinner;
+  if (args.spinner)
+    spinner = std::thread([&] {
+      namchain::rt::apply_scheduling(args.priority - 20, args.warm_cpu);
+      volatile double acc = 1.0;
+      while (!done.load(std::memory_order_acquire))
+        acc = acc * 1.0000001 + 1.0;
+      (void)acc;
+    });
+
   std::thread renderer([&] {
     render_sched = namchain::rt::describe_scheduling(namchain::rt::apply_scheduling(args.priority, args.render_cpu));
     std::vector<float> out(static_cast<std::size_t>(q));
@@ -425,14 +975,21 @@ int run_contention(const Args& args)
     done.store(true, std::memory_order_release);
   });
   renderer.join();
+  if (spinner.joinable())
+    spinner.join();
   warmer.join();
 
   const Stats r = stats(render_us), w = stats(warm_us);
   std::printf("namchain-warm-bench %s  contention\n", NAMCHAIN_VERSION_STRING);
-  std::printf("live rig:   %s + %s (%zu taps), quantum %d (deadline %.0f us), %.0f s\n", stem(args.live).c_str(),
-              stem(args.ir).c_str(), ir.size(), q, deadline_us, args.seconds);
+  std::printf("live rig:   %s%s, quantum %d (deadline %.0f us), %.0f s\n", stem(args.live).c_str(),
+              ir.empty() ? " (no ir)"
+                         : (" + " + stem(args.ir) + " (" + std::to_string(ir.size()) + " taps)").c_str(),
+              q, deadline_us, args.seconds);
   std::printf("render:     %s\n", render_sched.c_str());
-  std::printf("warm:       %d candidate rig(s), %s\n", count, warm_sched.c_str());
+  std::printf("warm:       %d candidate rig(s)%s%s%s, %s\n", count,
+              args.slim >= 0.0 ? (" at slim " + std::to_string(args.slim)).c_str() : "",
+              warm_ir_v.empty() ? " with no ir" : " with an ir",
+              args.spinner ? " and a spinner on the same core" : "", warm_sched.c_str());
   std::printf("memory:     live rig %ld kB, candidates %ld kB (%.0f kB each), process %ld kB\n", rss1 - rss0,
               rss2 - rss1, count > 0 ? static_cast<double>(rss2 - rss1) / count : 0.0, rss2);
   std::printf("render us:  p50 %.1f  p99 %.1f  p99.9 %.1f  max %.1f   p99 %.2f%%  max %.1f%% of deadline  "
@@ -451,7 +1008,8 @@ int main(int argc, char** argv)
 {
   Args args;
   if (argc < 2)
-    die("usage: namchain-warm-bench state|contention --input in.wav --ir cab.wav --live live.nam cand.nam ...");
+    die("usage: namchain-warm-bench state|slim|chain|ir|contention --input in.wav --live model.nam "
+        "cand.nam ... [--ir cab.wav]; see the comment at the top of this file");
   args.mode = argv[1];
   for (int i = 2; i < argc; ++i)
   {
@@ -485,16 +1043,56 @@ int main(int argc, char** argv)
       args.warm_cpu = std::atoi(next().c_str());
     else if (a == "--priority")
       args.priority = std::atoi(next().c_str());
+    else if (a == "--slim")
+      args.slim = std::atof(next().c_str());
+    else if (a == "--no-ir")
+      args.no_ir = true;
+    else if (a == "--warm-ir")
+      args.warm_ir = next();
+    else if (a == "--warm-no-ir")
+      args.warm_no_ir = true;
+    else if (a == "--spinner")
+      args.spinner = true;
+    else if (a == "--depth")
+      args.depth = std::atoi(next().c_str());
+    else if (a == "--replays")
+    {
+      args.replays.clear();
+      std::string list = next(), item;
+      std::stringstream ss(list);
+      while (std::getline(ss, item, ','))
+        if (!item.empty())
+          args.replays.push_back(std::atof(item.c_str()));
+    }
+    else if (a == "--audition")
+      args.audition = next();
+    else if (a == "--audition-start")
+      args.audition_start = std::atof(next().c_str());
+    else if (a == "--audition-seconds")
+      args.audition_seconds = std::atof(next().c_str());
     else if (a.rfind("--", 0) == 0)
       die("unknown option " + a);
     else
       args.candidates.push_back(a);
   }
-  if (args.input.empty() || args.ir.empty() || args.live.empty() || args.candidates.empty())
-    die("--input, --ir, --live and at least one candidate model are required");
+  if (args.input.empty())
+    die("--input is required");
+  // What each mode needs. --ir is optional everywhere (without one a rig is the model alone);
+  // chain mode takes its models from the positional list, so it needs no --live, and ir mode is
+  // about one rig's cab, so it needs no candidates.
+  if (args.mode != "ir" && args.candidates.empty())
+    die(args.mode + " mode needs at least one model");
+  if (args.mode != "chain" && args.mode != "slim" && args.live.empty())
+    die("--live is required for " + args.mode + " mode");
   if (args.mode == "state")
     return run_state(args);
+  if (args.mode == "slim")
+    return run_slim(args);
+  if (args.mode == "chain")
+    return run_chain(args);
+  if (args.mode == "ir")
+    return run_ir(args);
   if (args.mode == "contention")
     return run_contention(args);
-  die("mode must be state or contention");
+  die("mode must be state, slim, chain, ir or contention");
 }
