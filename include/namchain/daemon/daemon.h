@@ -294,8 +294,28 @@ public:
   ///
   /// Control thread; public because it is the unit-testable half of the feature, like
   /// \ref handle_request.
+  ///
+  /// This is the *rate-limited* entry point: with Config::levels_rate_hz above 0 it returns the
+  /// held value unless the probes are due to be drained, and \ref collect_levels_if_due is what
+  /// drains them. The reply says which happened (`cache.hits` / `cache.misses`), because a client
+  /// that is being shown a second-old number should be able to find that out rather than infer it.
   nlohmann::json levels_json();
 
+  /// \brief Drain the probes and rebuild the cached reply if the configured interval has passed.
+  ///
+  /// Called by the control loop on its own cadence as well as by \ref levels_json, so the cache is
+  /// warm whether or not anybody is reading: with a rate set, a client's read should cost the
+  /// daemon nothing rather than costing it a measurement at whatever moment the client chose.
+  /// \return whether this call performed a drain.
+  bool collect_levels_if_due();
+
+
+  /// \brief Drain every probe and build the reply from what it took. Control thread.
+  ///
+  /// The half with no policy in it: it always measures and never considers the rate. \ref
+  /// collect_levels_if_due decides *when* to call it, so the two questions -- how a level is read and
+  /// how often -- are answerable separately, which is what the rate switch is.
+  nlohmann::json build_levels_json();
 
 private:
   // --- control thread only -------------------------------------------------
@@ -703,6 +723,26 @@ private:
   /// local transition builds one on the render path), and whether `engine.levels` answers. A render
   /// thread reading it per block is reading a value that never changes.
   const bool levels_enabled_;
+  /// Whether a probe folds one frame per period or every frame (Config::levels_first_frame).
+  const bool levels_first_frame_;
+
+  /// \brief The held levels reply and when it was drained, for Config::levels_rate_hz.
+  ///
+  /// Control thread only, so a plain member rather than anything atomic. Empty until the first
+  /// drain; `levels_taken_at_` is a steady-clock instant, not a wall one, because this is an
+  /// interval and not a date.
+  nlohmann::json levels_cache_;
+  std::chrono::steady_clock::time_point levels_taken_at_{};
+  bool levels_ever_taken_ = false;
+  /// How many reads were answered from the cache and how many cost a drain, since start, plus every
+  /// drain there has been -- including the control loop's own, which no read asked for. Three
+  /// counters rather than two because they answer different questions: `hits`/`misses` say what a
+  /// client's poll cost, and `drains` says whether the cadence is running at all. Reported in the
+  /// reply itself, because "the rate was honoured" is a claim about the daemon and this is how it is
+  /// checked rather than assumed.
+  uint64_t levels_cache_hits_ = 0;
+  uint64_t levels_cache_misses_ = 0;
+  uint64_t levels_drains_ = 0;
 
   /// The backend's output-queue counters (StreamQueueStats), published per block. A dropped or an
   /// inserted period is a click that is not an xrun, so these belong in `engine.status` beside it.

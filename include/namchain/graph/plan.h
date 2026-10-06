@@ -36,6 +36,12 @@ struct CompileOptions
   /// on the render path, and probes that appeared or vanished with a flag read mid-flight would be
   /// probes that some plans write and others do not.
   bool levels = true;
+  /// \brief Whether a node's probe folds one frame per period rather than every frame.
+  ///
+  /// The experiment switch behind Config::levels_first_frame: it cuts the per-sample probe work by
+  /// the period length and makes a meter miss most transients, which is a trade to be measured rather
+  /// than a default. Only meaningful when \ref levels is true.
+  bool levels_first_frame = false;
 };
 
 /// The kind of value a parameter holds, which is what a client shows a control for
@@ -516,6 +522,10 @@ private:
   /// threads, and only the plan knows which nodes are its own. It also dies with the plan, which is
   /// right -- a level from a plan nobody is running is not a level.
   std::vector<level::Probe> levels_;
+  /// Whether a probe folds one frame per period or all of them (CompileOptions::levels_first_frame).
+  /// Fixed at compile time like \ref levels_ itself: `execute` reads it per node per quantum, so it
+  /// has to be a value the plan owns rather than a flag consulted through anything.
+  bool levels_first_frame_ = false;
   std::atomic<uint64_t> guard_trips_{0};
   int input_node_ = -1;            // index in nodes_ whose block input is sampled from the graph
   int output_buffer_ = -1;         // buffer the graph output is read from

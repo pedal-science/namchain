@@ -788,7 +788,8 @@ const char* device_state_name(DeviceState state)
 }
 
 Daemon::Daemon(Config config)
-  : config_(std::move(config)), levels_enabled_(config_.levels)
+  : config_(std::move(config)), levels_enabled_(config_.levels),
+    levels_first_frame_(config_.levels && config_.levels_first_frame)
 {
 }
 
@@ -1504,6 +1505,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   // A plan built with the feature off has no probes at all, which is what makes `levels` cost
   // nothing per sample rather than a branch per node per quantum (CompileOptions::levels).
   options.levels = config_.levels;
+  options.levels_first_frame = levels_first_frame_;
 
   // Which chains actually changed. An unchanged chain keeps the plan it has: republishing it would
   // recompile it -- reloading every model on this thread -- and crossfade it, for an edit somebody
@@ -2251,7 +2253,46 @@ void Daemon::account_period()
   last_queue_ = queue;
 }
 
+bool Daemon::collect_levels_if_due()
+{
+  // Unlimited (the default) means every call drains: that is the behaviour this engine has always
+  // had, and the rate switch must not change it by accident.
+  if (config_.levels_rate_hz > 0.0 && levels_ever_taken_)
+  {
+    const auto interval = std::chrono::duration<double>(1.0 / config_.levels_rate_hz);
+    const auto due = levels_taken_at_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval);
+    if (std::chrono::steady_clock::now() < due)
+      return false;
+  }
+
+  levels_cache_ = build_levels_json();
+  levels_taken_at_ = std::chrono::steady_clock::now();
+  levels_ever_taken_ = true;
+  ++levels_drains_;
+  return true;
+}
+
 nlohmann::json Daemon::levels_json()
+{
+  const bool drained = collect_levels_if_due();
+  if (drained)
+    ++levels_cache_misses_;
+  else
+    ++levels_cache_hits_;
+
+  // The counters ride in the reply so a client -- or a campaign measuring what a poll costs -- can
+  // check that the rate it asked for is the rate it got. One read, one answer: a caller that saw the
+  // numbers and then asked again would be reading a second, later window.
+  nlohmann::json reply = levels_cache_;
+  reply["cache"] = nlohmann::json{{"hits", levels_cache_hits_},
+                                  {"misses", levels_cache_misses_},
+                                  {"drains", levels_drains_},
+                                  {"rate_hz", config_.levels_rate_hz},
+                                  {"first_frame", levels_first_frame_}};
+  return reply;
+}
+
+nlohmann::json Daemon::build_levels_json()
 {
   // One reading per place, *taken* rather than peeked: two callers in a row then describe disjoint
   // windows instead of counting the same samples twice, which is what a meter wants and what makes
@@ -2899,11 +2940,13 @@ void Daemon::render_loop()
       //     input level a meter shows has to be the ADC's, not the chain's, or a routing mistake
       //     reads as a dead input. The decode above walks the same buffer, so the extra work is one
       //     decode per channel the chains do not use. Skipped entirely when this daemon does not
-      //     measure levels (Config::levels).
+      //     measure levels (Config::levels); with `levels_first_frame` only the period's first frame
+      //     is decoded and folded, which is the same reading for a fraction of the work -- the point
+      //     of that switch is to find out what the per-sample work is worth.
       for (unsigned c = 0; levels_enabled_ && c < info.capture_channels && c < input_levels_.size(); ++c)
       {
         level::Probe& probe = input_levels_[c];
-        for (unsigned i = 0; i < info.period_size; ++i)
+        for (unsigned i = 0; i < info.period_size && (!levels_first_frame_ || i == 0); ++i)
           probe.accumulate(pcm_decode(capture_buffer_.data() +
                                         (static_cast<std::size_t>(i) * info.capture_channels + c) * width,
                                       info.format));
@@ -2954,7 +2997,8 @@ void Daemon::render_loop()
         for (int i = 0; i < frames; ++i)
         {
           destination[i] += chain.out[static_cast<std::size_t>(i)];
-          if (out_level != nullptr)
+          // The sum above is the audio and always runs; the fold is the measurement and does not.
+          if (out_level != nullptr && (!levels_first_frame_ || i == 0))
             out_level->accumulate(chain.out[static_cast<std::size_t>(i)]);
         }
       }
@@ -2971,7 +3015,7 @@ void Daemon::render_loop()
         for (unsigned c = 0; c < info.playback_channels; ++c)
         {
           const float sample = bus_[static_cast<std::size_t>(c) * info.period_size + i];
-          if (levels_enabled_ && c < output_levels_.size())
+          if (levels_enabled_ && c < output_levels_.size() && (!levels_first_frame_ || i == 0))
             output_levels_[c].accumulate(sample);
           pcm_encode(playback_buffer_.data() +
                        (static_cast<std::size_t>(i) * info.playback_channels + c) * width,
@@ -4194,6 +4238,14 @@ int Daemon::run()
     // The reclamation window of rig-pipeline.md §5.3: this is the "somebody" that frees a plan once
     // its grace has closed, and the reason the poll timeout is neither zero nor infinite.
     reclaimer_.collect();
+
+    // The level probes, on their own cadence (Config::levels_rate_hz). Here rather than only in the
+    // read path so the cache is warm whether or not a client is reading: with a rate set, a poll
+    // should cost a lookup instead of costing a measurement at whatever moment the client chose. The
+    // poll timeout above is what bounds the accuracy, and it is deliberately not touched -- its job
+    // is reclamation latency, and a meter's freshness is not worth a slower reclaim.
+    if (levels_enabled_)
+      collect_levels_if_due();
   }
 
   stop();

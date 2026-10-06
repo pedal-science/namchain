@@ -841,6 +841,36 @@ the truth is "nobody is measuring".
 This is a switch for **cost**, not for safety: with it off, `engine.levels` is the only thing that
 stops working. Nothing else in this document changes.
 
+### Two finer switches, for measurement rather than for the pedal
+
+Both are **off by default** and both exist to answer "what is the per-sample cost worth", which is a
+question the meter cannot answer from the outside. They were added for the campaign in
+`bench-results/` on the pedal side, and they are documented because a switch nobody can find is a
+switch nobody can reproduce a number with.
+
+| Option | What it does | What it costs |
+|---|---|---|
+| `--levels-rate-hz X` | Drains the probes at most X times a second; a read in between is answered from the held reply. `0` (the default) means every read is a real measurement | Freshness. At 1 Hz a meter shows a value up to a second old — legible for a level, not for an edit |
+| `--levels-first-frame` | A probe folds the period's **first** frame and skips the rest, on the device's input, each chain's output, the playback bus and every node | What the meter reads. One sample per period misses nearly every transient the peak exists to catch, and `rms` is that sample's magnitude rather than a mean over the window |
+
+Four things worth knowing about them:
+
+- **`--levels-rate-hz` does not change the render path at all.** The per-sample fold is the render
+  thread's and it runs whoever is polling; only the *reading* is rate-limited, and reading happens on
+  the control thread. If the question is render headroom, `--no-levels` is the switch and this is not.
+- **The reply says which it gave you.** `cache.hits`, `cache.misses`, `cache.rate_hz` and
+  `cache.first_frame` ride in the levels object, so a client — or a campaign measuring what a poll
+  costs — can check that the rate it asked for is the rate it got instead of assuming it.
+- **`frames` stays honest under first-frame.** It reports 1 per period rather than the period's
+  length, because that is how many samples the level is a mean of. A client that reads `frames` (and
+  ljoss does, to tell an empty window from a silent one) is told a sparse window from a full one.
+- **A rate at or above the client's own changes nothing**, which is the point of choosing it rather
+  than a fixed cap: a 20 Hz meter against a 20 Hz rate costs exactly what it costs today.
+
+Neither switch changes the audio. `--levels` alone decides whether the render path folds anything,
+and the audio it renders is identical either way — pinned by a test that compares two plans compiled
+with the flag on and off, sample for sample.
+
 ## Recording what the device heard
 
 `engine.record` (`namchainctl record start NAME [--seconds S]`, `record stop`, `record`) answers "where

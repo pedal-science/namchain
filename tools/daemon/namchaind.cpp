@@ -77,6 +77,14 @@ void print_usage(std::FILE* stream)
                "                               render path then folds nothing per sample, engine.levels\n"
                "                               is refused, and `features` omits \"levels\"\n"
                "      --no-levels              do not measure audio levels\n"
+               "      --levels-rate-hz X       drain the level probes at most X times a second and answer\n"
+               "                               a read in between from the held value; 0 = every read is a\n"
+               "                               real measurement (default). Lower it to make a meter cost\n"
+               "                               the control thread less, at the price of freshness\n"
+               "      --levels-first-frame     measure one frame per period instead of every frame. An\n"
+               "                               experiment switch: it cuts the per-sample cost by the\n"
+               "                               period length and makes a meter miss transients\n"
+               "      --no-levels-first-frame  measure every frame (default)\n"
                "      --device-retry-ms N      retry backoff after a lost device, default 250\n"
                "      --reclamation-timeout-ms N  control poll timeout, default 20\n"
                "  -v, --verbose                log lifecycle events to stderr\n"
@@ -174,7 +182,8 @@ int main(int argc, char** argv)
     std::string name = argument == "-v" ? "verbose" : argument.substr(2);
     std::string value;
     const bool takes_no_value = name == "verbose" || name == "lock-memory" || name == "no-lock-memory" ||
-                                name == "tcp-listen" || name == "levels" || name == "no-levels";
+                                name == "tcp-listen" || name == "levels" || name == "no-levels" ||
+                                name == "levels-first-frame" || name == "no-levels-first-frame";
     if (!takes_no_value)
     {
       if (i + 1 >= argc)

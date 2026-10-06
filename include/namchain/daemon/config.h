@@ -176,6 +176,37 @@ struct Config
   /// transition compiles a plan on the render path, so a value that could change under it would be a
   /// probe that some plans write and others do not.
   bool levels = true;
+  /// \brief Measure **one frame per period** rather than every frame (experiment switch; off).
+  ///
+  /// The per-sample cost of a level probe is what an appliance pays for having meters at all, and it
+  /// is paid on the render core. This is the crude way to find out what that cost is worth: the
+  /// render path folds the period's first frame into the probes and skips the rest, so the atomic
+  /// work falls by whatever the period length is -- 64x at the pedal's 64-frame period.
+  ///
+  /// It is **not** a free win and it is off by default, because it changes what a meter reads: one
+  /// sample per period misses nearly every transient the peak exists to catch, and the reported `rms`
+  /// is the magnitude of that one sample rather than a mean over the window. `frames` reports 1 per
+  /// period, which is the honest answer to "how many samples is this a level of" and what lets a
+  /// client tell a sparse window from a full one.
+  ///
+  /// Measured on vip (bench-results/2026-10-06-levels-switch.md) rather than assumed.
+  bool levels_first_frame = false;
+  /// \brief The most often a client's read may cost a real measurement, in Hz; 0 is unlimited.
+  ///
+  /// Every read *takes* the probes (level.h), so a client polling at 20 Hz builds the levels JSON --
+  /// a square root and two logarithms per entry, plus the JSON -- twenty times a second. That work is
+  /// on the control thread, not the render thread, so this is not about render headroom: it is about
+  /// what a poll costs the daemon at all.
+  ///
+  /// Above 0, the probes are drained at most this often and a read in between is answered from the
+  /// held value. The control loop also drains on this cadence, so the cache stays warm whether or not
+  /// anybody is reading. A rate at or above the client's own that changes nothing is the point: a
+  /// 20 Hz meter against a 20 Hz rate costs exactly what it costs today.
+  ///
+  /// The trade is freshness: at 1 Hz a meter shows a value up to a second old, which is legible for a
+  /// level and not for an edit. Off by default for that reason. `engine.levels` reports the cache's
+  /// hit and miss counts, so a client can tell which it got.
+  double levels_rate_hz = 0.0;
   /// How long the render thread waits before retrying a device that failed or is not present.
   unsigned device_retry_ms = 250;
   /// How long the control loop's poll sleeps when nothing is pending. This is the reclamation

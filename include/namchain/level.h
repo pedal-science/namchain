@@ -159,8 +159,22 @@ struct Probe
   }
 
   /// Add \p count samples of one buffer. Render thread.
-  void accumulate(const float* buffer, int count) noexcept
+  ///
+  /// \p first_frame_only folds the buffer's **first** sample and skips the rest, which is the
+  /// experiment switch Config::levels_first_frame exists for: the per-sample cost of a probe is what
+  /// an appliance pays for its meters, and this is the crude way to find out what that cost is worth.
+  /// It is not a free win. One sample per period misses nearly every transient a peak exists to
+  /// catch, and the `rms` a read then reports is the magnitude of that one sample, not a mean over
+  /// the window -- which is why the window's `frames` says 1 rather than the period's length. A
+  /// client that reads `frames` can tell a sparse window from a full one and say so.
+  void accumulate(const float* buffer, int count, bool first_frame_only = false) noexcept
   {
+    if (first_frame_only)
+    {
+      if (count > 0)
+        accumulate(buffer[0]);
+      return;
+    }
     for (int i = 0; i < count; ++i)
       accumulate(buffer[i]);
   }

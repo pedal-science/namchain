@@ -172,11 +172,11 @@ bool outputs_finite(const PlanNode& node, int frames) noexcept
 /// scan is a compare and an add per sample on a buffer just written, which is the cheapest a probe
 /// can be, and it is the same walk `outputs_finite` already makes -- kept separate rather than
 /// fused so the guard stays a guard (it can return early; this cannot).
-void measure_node(const PlanNode& node, level::Probe* probe, int frames) noexcept
+void measure_node(const PlanNode& node, level::Probe* probe, int frames, bool first_frame_only) noexcept
 {
   if (probe == nullptr || node.outputs.size() <= 1)
     return;
-  probe->accumulate(node.outputs[0], frames);
+  probe->accumulate(node.outputs[0], frames, first_frame_only);
 }
 
 /// Every node's resolved type and port counts, keyed by id, plus its position in `graph.nodes`.
@@ -806,6 +806,7 @@ std::unique_ptr<RenderPlan> RenderPlan::compile(const Graph& graph, const render
   auto plan = std::unique_ptr<RenderPlan>(new RenderPlan());
   plan->max_quantum_ = max_quantum;
   plan->silence_buffer_ = silence_buffer;
+  plan->levels_first_frame_ = options.levels && options.levels_first_frame;
   plan->failed_ = std::vector<std::atomic<bool>>(lowered_graph.nodes.size());
   for (std::atomic<bool>& flag : plan->failed_)
     flag.store(false, std::memory_order_relaxed);
@@ -1002,7 +1003,7 @@ void RenderPlan::execute(const float* input, float* output, int frames) noexcept
 
     // Last, so the probe measures what the next node in the chain will read rather than what this
     // one computed on the way there.
-    measure_node(node, i < levels_.size() ? &levels_[i] : nullptr, frames);
+    measure_node(node, i < levels_.size() ? &levels_[i] : nullptr, frames, levels_first_frame_);
   }
 
   if (output_buffer_ >= 0 && output != nullptr)

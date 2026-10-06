@@ -336,6 +336,73 @@ TEST_CASE("a plan's level probes measure each node's output where the next node 
   CHECK_MESSAGE(settled, "a bypassed node's probe never settled at its dry input's level");
 }
 
+TEST_CASE("measuring one frame per period instead of all of them still renders the same audio")
+{
+  // The measurement is a reader of the signal and never an input to it, and that has to stay true in
+  // every mode: full, sparse, or off. This is the sparse case -- `levels_first_frame` folds the
+  // period's first frame and skips the rest -- and the assertion is exact equality, because the two
+  // plans call the same node implementations on the same samples and a probe cannot feed back.
+  //
+  // It is worth a test rather than an argument because the fold sits *inside* the loops that also
+  // carry the audio: the playback encode, the chain sum into the bus. A `continue` put in the wrong
+  // place there would quietly drop audio rather than a level, and this is what would catch it.
+  Graph graph;
+  std::string error;
+  REQUIRE_MESSAGE(namchain::graph::parse_graph_json(R"({
+      "nodes": [
+        { "id": "in",  "type": "nc.input" },
+        { "id": "g",   "type": "nc.gain", "gain": 0.5 },
+        { "id": "out", "type": "nc.output" }
+      ],
+      "connections": [
+        { "from": "in", "to": "g" },
+        { "from": "g", "to": "out" }
+      ]
+    })",
+                                                  graph, error),
+                  error);
+
+  namchain::render::CompileOptions every_frame = options_for();
+  namchain::render::CompileOptions first_frame = options_for();
+  first_frame.levels_first_frame = true;
+
+  namchain::rt::Arena arena_a(1u << 16);
+  namchain::rt::Arena arena_b(1u << 16);
+  auto full = RenderPlan::compile(graph, every_frame, arena_a, error);
+  REQUIRE_MESSAGE(full != nullptr, error);
+  auto sparse = RenderPlan::compile(graph, first_frame, arena_b, error);
+  REQUIRE_MESSAGE(sparse != nullptr, error);
+
+  // Both measure -- the switch is how much, not whether -- so every node still has a probe.
+  REQUIRE(full->nodes().size() == sparse->nodes().size());
+  for (std::size_t i = 0; i < sparse->nodes().size(); ++i)
+    CHECK(sparse->level_of(i) != nullptr);
+
+  // Three quanta, so the sparse mode's one-frame-per-quantum is visible in the frames it reports
+  // while the audio stays identical over all of it.
+  std::vector<float> input(kQuantum);
+  for (int i = 0; i < kQuantum; ++i)
+    input[static_cast<std::size_t>(i)] = 0.5f * std::sin(0.1f * static_cast<float>(i));
+  std::vector<float> rendered_full(kQuantum, 0.0f);
+  std::vector<float> rendered_sparse(kQuantum, 0.0f);
+  for (int quantum = 0; quantum < 3; ++quantum)
+  {
+    std::fill(rendered_full.begin(), rendered_full.end(), 0.0f);
+    std::fill(rendered_sparse.begin(), rendered_sparse.end(), 0.0f);
+    full->execute(input.data(), rendered_full.data(), kQuantum);
+    sparse->execute(input.data(), rendered_sparse.data(), kQuantum);
+    CHECK(rendered_full == rendered_sparse);
+  }
+
+  // What the sparse plan reports: one frame per quantum at the gain node that has an output, against
+  // the full plan's kQuantum. The two plans measured the same audio and disagree only about how much
+  // of it they looked at, which is the whole of this switch.
+  const auto sparse_mid = sparse->level_of(1)->take();
+  const auto full_mid = full->level_of(1)->take();
+  CHECK(sparse_mid.frames == 3);
+  CHECK(full_mid.frames == static_cast<uint64_t>(3 * kQuantum));
+}
+
 TEST_CASE("a plan built without levels has no probes, and still renders the same audio")
 {
   // What makes `--no-levels` free rather than cheap: the probes are not made, so `execute` passes a

@@ -232,7 +232,7 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "rigs_root",  "socket",      "socket_mode",     "rt_priority",
                                       "cpu",        "lock_memory",  "output_queue_periods",
                                       "output_queue_floor_periods", "fade_ms", "model_budget_kb", "device_retry_ms",
-                                      "render_threads", "levels",
+                                      "render_threads", "levels", "levels_rate_hz", "levels_first_frame",
                                       "reclamation_timeout_ms", "verbose", "capture_path", "playback_path",
                                       "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
                                       "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
@@ -319,6 +319,8 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_int(doc, "reclamation_timeout_ms", config.reclamation_timeout_ms, path, error) ||
       !read_bool(doc, "lock_memory", config.lock_memory, path, error) ||
       !read_bool(doc, "levels", config.levels, path, error) ||
+      !read_bool(doc, "levels_first_frame", config.levels_first_frame, path, error) ||
+      !read_double(doc, "levels_rate_hz", config.levels_rate_hz, path, error) ||
       !read_bool(doc, "tcp_listen", config.tcp_listen, path, error) ||
       !read_bool(doc, "verbose", config.verbose, path, error))
     return false;
@@ -351,6 +353,29 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
   if (name == "no-levels")
   {
     config.levels = false;
+    return true;
+  }
+  if (name == "levels-first-frame")
+  {
+    config.levels_first_frame = true;
+    return true;
+  }
+  if (name == "no-levels-first-frame")
+  {
+    config.levels_first_frame = false;
+    return true;
+  }
+  if (name == "levels-rate-hz")
+  {
+    if (!parse_double("levels-rate-hz", value, config.levels_rate_hz, error))
+      return false;
+    // A negative rate is not "unlimited by another name": 0 already means that, so this can only be
+    // a mistake, and a daemon that silently ignored it would measure nothing the operator expected.
+    if (config.levels_rate_hz < 0.0)
+    {
+      error = "--levels-rate-hz needs a rate of 0 (unlimited) or more, not '" + value + "'";
+      return false;
+    }
     return true;
   }
   if (name == "backend")

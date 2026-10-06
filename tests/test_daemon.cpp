@@ -3256,9 +3256,15 @@ TEST_CASE("engine.levels reports the device, the chain and every node, and carri
   // (that is the design -- see level.h), so a single read taken at a random moment can legitimately
   // land between two blocks and be empty. A test that read once and demanded samples would be
   // asserting a race, not the feature.
+  //
+  // The deadline is seconds rather than an attempt count, and that is not padding: an attempt count
+  // is a deadline in disguise whose real length depends on how loaded the machine is, and this case
+  // runs beside the ones that compile rigs. It failed on the aarch64 build container -- where the
+  // suite runs under other work -- at 200 attempts of a read plus 2 ms, which is about 400 ms.
   nlohmann::json levels;
   bool have_window = false;
-  for (int attempt = 0; attempt < 200 && !have_window; ++attempt)
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!have_window && std::chrono::steady_clock::now() < deadline)
   {
     const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"engine.levels"})"));
     REQUIRE(reply["ok"] == true);
@@ -3286,18 +3292,32 @@ TEST_CASE("engine.levels reports the device, the chain and every node, and carri
   const auto capture_channels = reported["status"]["capture_channels"].get<unsigned>();
   CHECK(capture_channels >= 1);
 
-  // Now a fresh window to inspect: the same poll-until-there-is-one rule as above.
+  // Now a fresh window to inspect: the same poll-until-there-is-one rule as above, and the same
+  // deadline rather than an attempt count, for the same reason.
+  //
+  // The poll asks for **both** a node's window and the device's, because the assertions below are
+  // about a *whole reply* and a reply is one drain of every probe at once. Waiting only for the node
+  // and then reading the device's frames is the same race in a smaller place: any drain between the
+  // two -- the control loop's, or another client's -- empties the device's probe, and the read that
+  // follows is a window with nothing in it. That is not a fault, it is the read-and-reset design, and
+  // a test that demanded otherwise would be asserting that nobody else is using the daemon.
   have_window = false;
-  for (int attempt = 0; attempt < 200 && !have_window; ++attempt)
+  const auto second_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!have_window && std::chrono::steady_clock::now() < second_deadline)
   {
     const auto again = nlohmann::json::parse(call(config.socket_path, R"({"id":"l3","method":"engine.levels"})"));
     levels = again["levels"];
     const auto& fresh_nodes = levels["chains"][0]["nodes"];
-    have_window = !fresh_nodes.empty() && fresh_nodes[0]["frames"].get<uint64_t>() > 0;
+    const bool node_has_samples = !fresh_nodes.empty() && fresh_nodes[0]["frames"].get<uint64_t>() > 0;
+    const bool device_has_samples = !levels["input"]["frames"].empty() &&
+                                    levels["input"]["frames"][0].get<uint64_t>() > 0 &&
+                                    !levels["output"]["frames"].empty() &&
+                                    levels["output"]["frames"][0].get<uint64_t>() > 0;
+    have_window = node_has_samples && device_has_samples;
     if (!have_window)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
-  REQUIRE_MESSAGE(have_window, "no second level window ever contained samples");
+  REQUIRE_MESSAGE(have_window, "no second level window contained samples for both a node and the device");
   CHECK(levels["input"]["peak"].size() == capture_channels);
   CHECK(levels["output"]["peak"].size() == reported["status"]["playback_channels"].get<unsigned>());
   CHECK(levels["input"]["rms"].size() == capture_channels);
@@ -3421,6 +3441,160 @@ TEST_CASE("levels off: the feature is not advertised, the method is refused, and
   // Everything else is untouched: the switch turns off measuring, not the engine.
   CHECK(status["status"]["state"] == "running");
   CHECK(status["status"]["sample_rate"] == 48000);
+}
+
+TEST_CASE("levels_rate_hz answers a fast poll from the held window, and counts which it gave")
+{
+  // The rate switch exists so a poll costs a lookup instead of a measurement. What has to hold for
+  // that to be true -- and what this test is for -- is that a read inside the interval returns the
+  // *same* numbers rather than a fresh, mostly-empty window, and that the reply says which of the two
+  // it was. A campaign leans on exactly those counters to prove the rate it asked for was honoured.
+  TempDir dir;
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.levels_rate_hz = 1.0;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running";
+  }));
+
+  const auto levels_of = [&config] {
+    return nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"engine.levels"})"))["levels"];
+  };
+
+  const auto first = levels_of();
+  CHECK(first["cache"]["rate_hz"].get<double>() == doctest::Approx(1.0));
+  CHECK(first["cache"]["first_frame"] == false);
+
+  // Reads in quick succession are inside one interval, so they must be the same window: the frame
+  // count of the device's input is the number that would move if the probes had been drained again.
+  // This is what stops the cache from being a second empty window dressed up as a reading.
+  const auto second = levels_of();
+  CHECK(second["input"]["frames"] == first["input"]["frames"]);
+  CHECK(second["blocks"] == first["blocks"]);
+  CHECK(second["cache"]["hits"].get<uint64_t>() > first["cache"]["hits"].get<uint64_t>());
+  CHECK(second["cache"]["misses"] == first["cache"]["misses"]);
+
+  // The control loop drains on its own cadence, so a *drain* has to happen without anybody asking --
+  // which is the difference between a rate limit and a lazy cache. `drains` counts every drain there
+  // has been, `misses` only the ones a read asked for, so this is the counter that can see a
+  // background one: `misses` deliberately does not move here, and asserting on it would have been
+  // asserting that the control loop is *not* running.
+  const uint64_t drains_before = second["cache"]["drains"].get<uint64_t>();
+  bool drained = false;
+  for (int attempt = 0; attempt < 40 && !drained; ++attempt)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    drained = levels_of()["cache"]["drains"].get<uint64_t>() > drains_before;
+  }
+  CHECK_MESSAGE(drained, "the control loop never drained the probes at the configured rate");
+
+  // And the rate is a *limit*: however long the test has been running, the number of drains is the
+  // wall clock at 1 Hz and not the number of reads, which is far larger.
+  const auto last = levels_of();
+  const uint64_t reads = last["cache"]["hits"].get<uint64_t>() + last["cache"]["misses"].get<uint64_t>();
+  CHECK(reads > last["cache"]["drains"].get<uint64_t>());
+}
+
+TEST_CASE("levels_first_frame measures one frame per period, and the engine still renders")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "gain.json", kGainRig);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "gain.json").string();
+  config.levels_first_frame = true;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["blocks"].get<uint64_t>() > 4;
+  }));
+
+  // Every measurement is one sample per period, and it says so: `frames` 1 per node per block rather
+  // than the period's length. A client reading `frames` can therefore tell a sparse window from a
+  // full one, which is the concession this switch makes and the reason it is off by default.
+  //
+  // The read has to be *taken* when a window has samples in it, and every read empties the probes
+  // (level.h), so a single read can legitimately land between two blocks and be empty. Polling until
+  // one is not a race being papered over: it is what a meter does, and the deadline is generous
+  // because the suite runs this beside other cases that are compiling rigs.
+  bool saw_one_frame = false;
+  std::string last_seen;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!saw_one_frame && std::chrono::steady_clock::now() < deadline)
+  {
+    const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"engine.levels"})"));
+    REQUIRE(reply["ok"] == true);
+    const auto& levels = reply["levels"];
+    CHECK(levels["cache"]["first_frame"] == true);
+    REQUIRE(levels["chains"].size() == 1);
+    for (const auto& node : levels["chains"][0]["nodes"])
+    {
+      const uint64_t frames = node["frames"].get<uint64_t>();
+      // The output node has no output port, so nothing is measured at it and it stays 0. A measured
+      // node reports the one frame this mode folds, and never the period's length.
+      CHECK(frames <= 1);
+      if (frames == 1)
+        saw_one_frame = true;
+    }
+    if (!saw_one_frame)
+    {
+      last_seen = levels["chains"][0]["nodes"].dump();
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  }
+  CHECK_MESSAGE(saw_one_frame, "no window ever reported the single frame this mode measures; last: " << last_seen);
+
+  // The engine is otherwise untouched: it is running, with its rig, and the device is still moving
+  // audio through it. Turning the measurement down must not turn the pedal down.
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"id":"s","method":"engine.status"})"));
+  CHECK(status["status"]["state"] == "running");
+  CHECK(status["status"]["blocks"].get<uint64_t>() > 4);
+  CHECK(status["status"]["failed_nodes"].get<uint64_t>() == 0);
 }
 
 TEST_CASE("a device level entry is one window: its peak, rms, clipped and frames agree")
