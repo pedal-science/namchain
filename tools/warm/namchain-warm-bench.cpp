@@ -38,6 +38,17 @@
 //                warm (a Lite or Full submodel, with or without a cab); --spinner loads the warm
 //                core as well, for "keeps up on a housekeeping core under load".
 //
+//   measure      P1, the cost table's own bench (pedal.project
+//                docs/managing-processing-power-and-optimising-for-fast-switching.md, "Measuring a
+//                Core"). One **unit** -- a NAM model at a submodel size, an IR at a tap count, a
+//                node type with a parameter set -- is run as n copies on one core, paced, and
+//                bisected to the largest n whose p99 is under the deadline with zero overruns.
+//                Prints the curve around that n (n-2 .. n+4) and the cost table's JSON fragment:
+//                the row's `core_percent` (1/n), its `sources` (n, p99 at n/n+1/n+2) and the curve.
+//                The copies run one after another on the measured core, which is the shape the
+//                table's n means; --live adds E2's live rig on --render-cpu, and without it the
+//                measured thread paces itself, which is "no other work on that core".
+//
 // A rig here is a NAM model followed by a cab IR (48 kHz WAV, truncated at 8192 taps like
 // nc.cab.ir), each a vendored-core nam::DSP, so the work is the same as namchaind's for such a rig.
 // --no-ir drops the cab, which is what the density numbers are about.
@@ -54,6 +65,14 @@
 //   namchain-warm-bench contention --input in.wav --ir cab.wav --live live.nam cand1.nam [...]
 //                                  [--count N] [--seconds S] [--quantum 64] [--slim X] [--no-ir]
 //                                  [--spinner] [--render-cpu 3] [--warm-cpu 2] [--priority 80]
+//   namchain-warm-bench measure    --input in.wav --unit nam|ir|node
+//                                  [--model M.nam] [--slim 0.0] [--with-ir cab.wav]   (nam)
+//                                  [--ir cab.wav] [--taps N]                          (ir)
+//                                  [--node nc.gain] [--node-param k=v]                (node)
+//                                  [--levels | --no-levels | --levels-first-frame | --levels-publish-period]
+//                                  [--seconds 30] [--quantum 64] [--cpu 2] [--priority 70]
+//                                  [--live L.nam] [--live-ir cab.wav] [--render-cpu 3]
+//                                  [--max N] [--start N] [--no-curve] [--label NAME] [--json PATH]
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -63,6 +82,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -78,9 +99,13 @@
 #include "NAM/slimmable.h"
 
 #include "namchain/glitch.h"
+#include "namchain/graph/graph.h"
+#include "namchain/graph/plan.h"
+#include "namchain/rt/arena.h"
 #include "namchain/rt/scheduling.h"
 #include "namchain/version.h"
 #include "namchain/wav.h"
+#include "namchain/working_set.h"
 
 namespace
 {
@@ -374,6 +399,22 @@ std::string stem(const std::string& path)
   return std::filesystem::path(path).stem().string();
 }
 
+/// Short fixed forms for the fragment below. Hand-built JSON, in the C locale (nothing here calls
+/// setlocale), so the decimal point is a point whatever the host's locale is.
+std::string format_g(double v)
+{
+  char buf[32];
+  std::snprintf(buf, sizeof buf, "%.3g", v);
+  return buf;
+}
+
+std::string format_f(double v)
+{
+  char buf[32];
+  std::snprintf(buf, sizeof buf, "%.3f", v);
+  return buf;
+}
+
 long rss_kb()
 {
   FILE* f = std::fopen("/proc/self/status", "r");
@@ -394,6 +435,10 @@ struct Args
   std::vector<std::string> candidates;
   double switch_every = 2.0, fade_ms = 5.0, seconds = 60.0, replay_ms = 0.0;
   int quantum = 64, count = -1, render_cpu = 3, warm_cpu = 2, priority = 80;
+  /// measure: the core the unit copies run on. `--cpu` and `--warm-cpu` are the same flag under two
+  /// names -- contention calls it the warm core, measure calls it the measured core -- so the last
+  /// one on the command line wins either way.
+  int cpu = 2;
   double slim = -1.0;                 ///< submodel for every rig; <0 is the model's own default
   bool no_ir = false;                 ///< models alone, no cab: what the density numbers are about
   std::string warm_ir;                ///< contention: the candidates' own cab, default --ir
@@ -402,6 +447,18 @@ struct Args
   int depth = 4;                      ///< chain: models in series
   std::vector<double> replays{85, 170, 340, 680}; ///< chain: replay lengths per model, ms
   double audition_start = 10.0, audition_seconds = 20.0; ///< slim --audition excerpt
+  /// measure: the unit and what it is built from. `unit` is "nam", "ir" or "node"; see run_measure.
+  std::string unit = "nam", model, node, label, json, with_ir, live_ir;
+  std::map<std::string, double> node_params;
+  int taps = 0;        ///< ir: the row's tap count; 0 is the file's own length
+  int max_n = 0;       ///< measure: stop doubling here; 0 is 128
+  int start_n = 1;     ///< measure: the first n tried
+  bool no_curve = false; ///< measure: skip n-2, n-1, n+3, n+4 (n+1 and n+2 are always measured)
+  /// measure, node units: the level probes, which is P9's question. On is the engine's own default
+  /// (Config::levels); `--levels-publish-period` is what vip's namchaind.json ships.
+  bool levels = true;
+  bool levels_first_frame = false;
+  bool levels_publish_period = false;
   /// slim: equal-power | equal-gain | compensated. The default is what the engine does now
   /// (rt::Crossfade normalises for the correlation it measures); equal-power is kept because the
   /// recorded E2 tables were run with it, and the difference is the point of the comparison.
@@ -1100,14 +1157,482 @@ int run_contention(const Args& args)
   return overruns == 0 ? 0 : 1;
 }
 
+// --- measure: P1, the cost table's measurements ---------------------------------
+//
+// pedal.project docs/managing-processing-power-and-optimising-for-fast-switching.md, "Measuring a
+// Core" and P1. For one **unit** -- a NAM model at a submodel size, an IR at a tap count, a node type
+// with a parameter set -- find the largest number `n` of copies that still renders a block within the
+// deadline on one core, print the curve around it, and emit the table's JSON fragment. The row's cost
+// is 1/n (D2), which is why the copies are what is measured and not the unit on its own.
+//
+// The copies run one after another on the measured core, each on the block just consumed, which is
+// the shape the table's `n` means: E2 measured "8 A2-Full or 30 A2-Lite per core" by running eight or
+// thirty whole models on one core, and a rig's cost is the sum of its units' (D2). With `--live` a
+// rig renders on another core the way it did in E2, and the measured thread follows it block by
+// block; without it the measured thread paces itself, which is "no other work on that core".
+//
+// What is timed is the whole n-unit loop for one block, so `p99_at_n` is the fraction of a quantum
+// the table records as `n` units' p99 -- 89.1% for eight A2-Fulls, in E2's numbers. The bar is D7's:
+// p99 under the deadline **and** zero overruns. `behind` is the worst lag, in blocks, which is what
+// says a run that is over the cliff never recovers.
+//
+// The header, the no-args usage, the dispatch and the last die all list the modes: keep them in step.
+
+/// One unit under measurement, and how to build a copy of it.
+struct Unit
+{
+  std::string kind;  ///< "nam", "ir" or "node"
+  std::string label; ///< the cost table's row, e.g. NAM.WaveNet.full
+  std::string what;  ///< the file or type, for the banner
+
+  std::string model;      ///< nam: the model file
+  double slim = -1.0;     ///< nam: submodel selector; < 0 is the model's own default (Full), 0.0 Lite
+  std::vector<float> cab; ///< nam: an optional cab, which makes the unit a whole rig
+
+  std::vector<float> taps; ///< ir: the impulse response itself
+
+  std::string node_type;                     ///< node: the node type's name
+  std::map<std::string, double> node_params; ///< node: its parameter set
+  bool levels = true;                        ///< node: compile with level probes (see P9)
+  bool levels_first_frame = false;
+  bool levels_publish_period = false;
+};
+
+/// One copy of a unit.
+struct Instance
+{
+  std::unique_ptr<Rig> rig;                          ///< nam
+  std::unique_ptr<nam::Linear> convolver;            ///< ir
+  std::vector<NAM_SAMPLE> in, out;                   ///< ir: this copy's own buffers
+  std::unique_ptr<namchain::rt::Arena> arena;        ///< node
+  std::unique_ptr<namchain::graph::RenderPlan> plan; ///< node
+};
+
+std::unique_ptr<Instance> make_instance(const Unit& u, int q)
+{
+  auto inst = std::make_unique<Instance>();
+  if (u.kind == "nam")
+  {
+    inst->rig = make_rig(u.model, u.cab, q, u.slim);
+  }
+  else if (u.kind == "ir")
+  {
+    inst->convolver = std::make_unique<nam::Linear>(1, 1, static_cast<int>(u.taps.size()), false, u.taps, kRate);
+    inst->convolver->Reset(kRate, q);
+    inst->in.assign(static_cast<std::size_t>(q), 0);
+    inst->out.assign(static_cast<std::size_t>(q), 0);
+  }
+  else
+  {
+    // A node unit is measured through the engine's own compiler and plan, so what is timed is the
+    // node as the render path runs it -- including the plan's own per-block work -- and not a
+    // reimplementation of it. One plan per copy, each with its own arena, because that is what makes
+    // them independent (the same shape as n rigs on a warm core).
+    inst->arena = std::make_unique<namchain::rt::Arena>(1u << 20);
+    namchain::graph::NodeSpec middle;
+    middle.id = "unit";
+    middle.type = u.node_type;
+    middle.params = u.node_params;
+    namchain::graph::Graph graph;
+    graph.nodes = {namchain::graph::NodeSpec{"in", "nc.input"}, middle,
+                   namchain::graph::NodeSpec{"out", "nc.output"}};
+    graph.connections = {{"in", 0, "unit", 0}, {"unit", 0, "out", 0}};
+    namchain::render::CompileOptions options;
+    options.max_quantum = q;
+    options.levels = u.levels;
+    options.levels_first_frame = u.levels_first_frame;
+    options.levels_publish_period = u.levels_publish_period;
+    std::string error;
+    inst->plan = namchain::graph::RenderPlan::compile(graph, options, *inst->arena, error);
+    if (!inst->plan)
+      die("cannot compile a " + u.node_type + " node: " + error);
+  }
+  return inst;
+}
+
+/// One measured point: `n` copies, one run.
+struct Point
+{
+  int n = 0;
+  double p50 = 0, p99 = 0, p999 = 0, max = 0; ///< microseconds for the whole n-unit loop
+  std::size_t overruns = 0;                   ///< blocks whose loop went past the deadline
+  std::size_t blocks = 0;
+  std::size_t behind = 0; ///< worst lag, in blocks: a run over the cliff never catches up
+  bool pass = false;      ///< p99 under the deadline and zero overruns (D7)
+  std::string sched;      ///< what the measured thread actually got, said once per run
+};
+
+Point measure_units(const Args& args, const Unit& unit, const std::vector<float>& x, int n)
+{
+  const int q = args.quantum;
+  const double deadline_us = q / kRate * 1e6;
+  const std::size_t blocks = static_cast<std::size_t>(args.seconds * kRate) / static_cast<std::size_t>(q);
+  const std::size_t loop = x.size() / static_cast<std::size_t>(q) * static_cast<std::size_t>(q);
+  const long period_ns = static_cast<long>(q / kRate * 1e9);
+
+  std::vector<std::unique_ptr<Instance>> inst;
+  inst.reserve(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i)
+    inst.push_back(make_instance(unit, q));
+
+  std::vector<float> out(static_cast<std::size_t>(q));
+  // The IR unit's input is converted once, outside the loop: in a rig a cab reads the NAM_SAMPLE
+  // buffer the model before it wrote, so converting per copy would measure work no rig does.
+  std::vector<NAM_SAMPLE> ir_in(unit.kind == "ir" ? static_cast<std::size_t>(q) : 0);
+  NAM_SAMPLE* ir_in_ptr[] = {ir_in.data()};
+  const bool is_ir = unit.kind == "ir";
+  const auto run_all = [&](const float* in, float* sink, int frames) {
+    if (is_ir)
+    {
+      for (int i = 0; i < frames; ++i)
+        ir_in[static_cast<std::size_t>(i)] = static_cast<NAM_SAMPLE>(in[i]);
+      for (auto& it : inst)
+      {
+        NAM_SAMPLE* po[] = {it->out.data()};
+        it->convolver->process(ir_in_ptr, po, frames);
+      }
+      return;
+    }
+    for (auto& it : inst)
+    {
+      if (it->rig)
+        it->rig->process(in, sink, frames);
+      else
+        it->plan->execute(in, sink, frames);
+    }
+  };
+
+  // Fault every copy's buffers in before the clock starts: a page fault during the first block is
+  // not the unit's cost.
+  {
+    std::vector<float> warm(static_cast<std::size_t>(q));
+    run_all(warm.data(), out.data(), q);
+  }
+
+  std::vector<double> us;
+  us.reserve(blocks);
+  Point p;
+  p.n = n;
+  p.blocks = blocks;
+  std::string render_sched;
+
+  if (args.live.empty())
+  {
+    // Self-paced: the measured core carries the unit copies and nothing else.
+    p.sched = namchain::rt::describe_scheduling(namchain::rt::apply_scheduling(args.priority, args.cpu));
+    timespec next{};
+    clock_gettime(CLOCK_MONOTONIC, &next);
+    for (std::size_t b = 0; b < blocks; ++b)
+    {
+      next.tv_nsec += period_ns;
+      while (next.tv_nsec >= 1000000000L)
+      {
+        next.tv_nsec -= 1000000000L;
+        ++next.tv_sec;
+      }
+      clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+      const float* in = x.data() + (b * static_cast<std::size_t>(q)) % loop;
+      const auto t0 = Clock::now();
+      run_all(in, out.data(), q);
+      const double this_us = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+      us.push_back(this_us);
+      if (this_us > deadline_us)
+        ++p.overruns;
+      timespec now{};
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      const long late = (now.tv_sec - next.tv_sec) * 1000000000L + (now.tv_nsec - next.tv_nsec);
+      if (late > 0)
+        p.behind = std::max(p.behind, static_cast<std::size_t>(late / period_ns));
+      if (p.behind > blocks)
+        break; // hopelessly behind: the rest of the run is not a measurement
+    }
+  }
+  else
+  {
+    // E2's shape: a live rig on --render-cpu, the unit copies following it block by block.
+    const std::vector<float> live_ir = args.live_ir.empty() ? std::vector<float>{} : load_ir(args.live_ir);
+    auto live = make_rig(args.live, live_ir, q, -1.0);
+    std::atomic<std::size_t> published{0};
+    std::atomic<bool> done{false};
+    std::thread renderer([&] {
+      render_sched =
+        namchain::rt::describe_scheduling(namchain::rt::apply_scheduling(args.priority, args.render_cpu));
+      std::vector<float> lout(static_cast<std::size_t>(q));
+      timespec next{};
+      clock_gettime(CLOCK_MONOTONIC, &next);
+      for (std::size_t b = 0; b < blocks; ++b)
+      {
+        next.tv_nsec += period_ns;
+        while (next.tv_nsec >= 1000000000L)
+        {
+          next.tv_nsec -= 1000000000L;
+          ++next.tv_sec;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, nullptr);
+        const float* in = x.data() + (b * static_cast<std::size_t>(q)) % loop;
+        live->process(in, lout.data(), q);
+        published.store(b + 1, std::memory_order_release);
+      }
+      done.store(true, std::memory_order_release);
+    });
+    const std::string sched =
+      namchain::rt::describe_scheduling(namchain::rt::apply_scheduling(args.priority - 10, args.cpu));
+    p.sched = "live rig on cpu " + std::to_string(args.render_cpu) + ", measured thread " + sched;
+    std::size_t next_block = 0;
+    while (!done.load(std::memory_order_acquire) || next_block < published.load(std::memory_order_acquire))
+    {
+      const std::size_t avail = published.load(std::memory_order_acquire);
+      if (next_block >= avail)
+      {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        continue;
+      }
+      p.behind = std::max(p.behind, avail - next_block);
+      const float* in = x.data() + (next_block * static_cast<std::size_t>(q)) % loop;
+      const auto t0 = Clock::now();
+      run_all(in, out.data(), q);
+      const double this_us = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+      us.push_back(this_us);
+      if (this_us > deadline_us)
+        ++p.overruns;
+      ++next_block;
+    }
+    renderer.join();
+  }
+
+  const Stats s = stats(us);
+  p.p50 = s.p50;
+  p.p99 = s.p99;
+  p.p999 = s.p999;
+  p.max = s.max;
+  p.pass = p.p99 < deadline_us && p.overruns == 0;
+  return p;
+}
+
+void print_point(const Point& p, double deadline_us)
+{
+  std::printf("  %5d  %10.1f %10.1f %10.1f %10.1f  %8.1f %8.1f  %7zu  %6zu  %s\n", p.n, p.p50, p.p99, p.p999,
+              p.max, 100 * p.p99 / deadline_us, 100 * p.max / deadline_us, p.overruns, p.behind,
+              p.pass ? "fits" : "MISSES");
+}
+
+/// The unit the run is about, from the flags. Dies with what is missing rather than guessing.
+Unit make_unit(const Args& args)
+{
+  Unit u;
+  u.kind = args.unit;
+  u.label = args.label;
+  if (u.kind == "nam")
+  {
+    u.model = !args.model.empty() ? args.model : (args.candidates.empty() ? "" : args.candidates.front());
+    if (u.model.empty())
+      die("measure --unit nam needs --model (or one positional model)");
+    u.slim = args.slim;
+    if (!args.with_ir.empty())
+      u.cab = load_ir(args.with_ir);
+    const std::string family = namchain::model_family_from_file(u.model);
+    if (family.empty())
+      die("cannot read " + u.model + "'s architecture, so the row it belongs in is unknown");
+    // The row's size, from the submodel selector: the model's own default is Full, 0.0 selects the
+    // first submodel (Lite), and anything in between is not a row the table has.
+    const std::string size = (u.slim < 0.0 || u.slim >= 1.0) ? "full" : (u.slim <= 0.0 ? "lite" : "slim");
+    if (u.label.empty())
+      u.label = "NAM." + family + "." + size;
+    u.what = stem(u.model) + ", " + size +
+             (u.cab.empty() ? std::string(", no cab")
+                            : ", + " + stem(args.with_ir) + " (" + std::to_string(u.cab.size()) + " taps)");
+  }
+  else if (u.kind == "ir")
+  {
+    if (args.ir.empty())
+      die("measure --unit ir needs --ir");
+    u.taps = load_ir(args.ir);
+    std::size_t file_taps = u.taps.size();
+    // --taps is the row: the table has a cost per tap count, so the same file is measured at
+    // several lengths rather than all of them being one number.
+    const std::size_t want = args.taps > 0 ? static_cast<std::size_t>(args.taps) : file_taps;
+    if (want > file_taps)
+      die(args.ir + " has " + std::to_string(file_taps) + " taps, not " + std::to_string(want));
+    u.taps.resize(want);
+    if (u.label.empty())
+      u.label = "IR." + std::to_string(want);
+    u.what = stem(args.ir) + ", " + std::to_string(want) + " taps";
+  }
+  else if (u.kind == "node")
+  {
+    if (args.node.empty())
+      die("measure --unit node needs --node TYPE (nc.gain, nc.eq.biquad, ...)");
+    u.node_type = args.node;
+    u.node_params = args.node_params;
+    u.levels = args.levels;
+    u.levels_first_frame = args.levels_first_frame;
+    u.levels_publish_period = args.levels_publish_period;
+    if (u.label.empty())
+      u.label = "node." + u.node_type;
+    u.what = u.node_type + (u.node_params.empty() ? std::string(", default params") : ", params set") +
+             (u.levels ? (u.levels_publish_period ? ", levels per period"
+                                                  : (u.levels_first_frame ? ", levels first frame" : ", levels on"))
+                       : ", levels off");
+  }
+  else
+  {
+    die("--unit must be nam, ir or node, not '" + u.kind + "'");
+  }
+  return u;
+}
+
+int run_measure(const Args& args)
+{
+  const std::vector<float> x = load_input(args.input);
+  const int q = args.quantum;
+  const double deadline_us = q / kRate * 1e6;
+  const Unit unit = make_unit(args);
+  const int max_n = args.max_n > 0 ? args.max_n : 128;
+
+  std::printf("namchain-warm-bench %s  measure\n", NAMCHAIN_VERSION_STRING);
+  std::printf("unit:       %s -- %s\n", unit.label.c_str(), unit.what.c_str());
+  std::printf("bar:        p99 under the deadline and zero overruns (D7); quantum %d, deadline %.0f us, "
+              "%.0f s a point, cpu %d\n",
+              q, deadline_us, args.seconds, args.cpu);
+  std::printf("\n%8s %11s %11s %11s %11s  %8s %8s  %7s %7s  %s\n", "n", "p50 us", "p99 us", "p99.9 us",
+              "max us", "p99 %dl", "max %dl", "overruns", "behind", "verdict");
+  (void)0;
+
+  std::map<int, Point> points;
+  const auto at = [&](int n) -> const Point& {
+    const auto found = points.find(n);
+    if (found != points.end())
+      return found->second;
+    const Point p = measure_units(args, unit, x, n);
+    if (points.empty())
+      std::printf("scheduling: %s\n", p.sched.c_str());
+    print_point(p, deadline_us);
+    return points.emplace(n, p).first->second;
+  };
+
+  // D2's bisection: double until it fails, then narrow. `lo` is the last n that fitted.
+  int lo = 0, hi = 0;
+  bool capped = false;
+  int n = std::max(1, args.start_n);
+  while (true)
+  {
+    const Point& p = at(n);
+    if (!p.pass)
+    {
+      hi = n;
+      break;
+    }
+    lo = n;
+    if (n >= max_n)
+    {
+      capped = true;
+      break;
+    }
+    const int doubled = std::min(max_n, n * 2);
+    if (doubled == n)
+    {
+      capped = true;
+      break;
+    }
+    n = doubled;
+  }
+  if (hi > 0 && lo > 0)
+  {
+    while (hi - lo > 1)
+    {
+      const int mid = lo + (hi - lo) / 2;
+      if (at(mid).pass)
+        lo = mid;
+      else
+        hi = mid;
+    }
+  }
+  const int found = lo;
+
+  // The cliff's shape is part of the measurement (D2 step 4): n+1 and n+2 always, and n-2 .. n+4
+  // unless --no-curve, which is what T1 reads.
+  if (found >= 1)
+  {
+    for (const int m : {found + 1, found + 2})
+      if (m <= max_n)
+        at(m);
+    if (!args.no_curve)
+      for (const int d : {-2, -1, 3, 4})
+      {
+        const int m = found + d;
+        if (m >= 1 && m <= max_n)
+          at(m);
+      }
+  }
+
+  const double fraction = found >= 1 ? 1.0 / found : 1.0;
+  std::printf("\n");
+  if (found >= 1)
+    std::printf("n = %d: %d copies of this unit render within the deadline on cpu %d. One unit costs "
+                "1/n = %.3g of a core.\n",
+                found, found, args.cpu, fraction);
+  else
+    std::printf("n = 0: even one copy misses the deadline on cpu %d. There is no cost this unit could "
+                "be admitted with; it is refused (D8's direction).\n",
+                args.cpu);
+  if (capped)
+    std::printf("--max %d was reached without a miss: the cost above is an upper bound, not the cliff.\n", max_n);
+
+  // The table's fragment: the row's value, the source it came from, and the curve it was read off.
+  std::string json = "{\"unit\":\"" + unit.label + "\",\"core_percent\":" + format_g(fraction) +
+                     ",\"quantum\":" + std::to_string(q) + ",\"deadline_us\":" + format_f(deadline_us);
+  if (found >= 1)
+  {
+    const auto pct = [&](int m) {
+      const auto it = points.find(m);
+      return it == points.end() ? std::string("null") : format_f(it->second.p99 / deadline_us);
+    };
+    const auto beat = [&](int m) {
+      const auto it = points.find(m);
+      return it == points.end() ? std::string("null") : std::to_string(it->second.behind);
+    };
+    const auto over = [&](int m) {
+      const auto it = points.find(m);
+      return it == points.end() ? std::string("null") : std::to_string(it->second.overruns);
+    };
+    json += ",\"sources\":{\"n\":" + std::to_string(found) + ",\"p99_at_n\":" + pct(found) +
+            ",\"overruns_at_n\":" + over(found) + ",\"p99_at_n_plus_1\":" + pct(found + 1) +
+            ",\"overruns_at_n_plus_1\":" + over(found + 1) + ",\"p99_at_n_plus_2\":" + pct(found + 2) +
+            ",\"blocks_behind_at_n_plus_1\":" + beat(found + 1) +
+            ",\"at_most\":" + (capped ? "true" : "false") +
+            (capped ? ",\"why\":\"--max " + std::to_string(max_n) + " reached without a miss\"" : "") + "}";
+  }
+  json += ",\"curve\":[";
+  bool first = true;
+  for (const auto& [m, p] : points)
+  {
+    json += std::string(first ? "" : ",") + "{\"n\":" + std::to_string(m) + ",\"p50\":" + format_f(p.p50) +
+            ",\"p99\":" + format_f(p.p99) + ",\"p999\":" + format_f(p.p999) + ",\"max\":" + format_f(p.max) +
+            ",\"p99_fraction\":" + format_f(p.p99 / deadline_us) + ",\"overruns\":" + std::to_string(p.overruns) +
+            ",\"behind\":" + std::to_string(p.behind) + ",\"pass\":" + (p.pass ? "true" : "false") + "}";
+    first = false;
+  }
+  json += "]}";
+  std::printf("fragment: %s\n", json.c_str());
+  if (!args.json.empty())
+  {
+    std::ofstream out(args.json);
+    if (!out)
+      die("cannot write " + args.json);
+    out << json << "\n";
+    std::printf("wrote %s\n", args.json.c_str());
+  }
+  return found >= 1 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
   Args args;
   if (argc < 2)
-    die("usage: namchain-warm-bench state|slim|chain|ir|contention --input in.wav --live model.nam "
-        "cand.nam ... [--ir cab.wav]; see the comment at the top of this file");
+    die("usage: namchain-warm-bench state|slim|chain|ir|contention|measure --input in.wav --live "
+        "model.nam cand.nam ... [--ir cab.wav]; see the comment at the top of this file");
   args.mode = argv[1];
   for (int i = 2; i < argc; ++i)
   {
@@ -1140,7 +1665,15 @@ int main(int argc, char** argv)
     else if (a == "--render-cpu")
       args.render_cpu = std::atoi(next().c_str());
     else if (a == "--warm-cpu")
+    {
       args.warm_cpu = std::atoi(next().c_str());
+      args.cpu = args.warm_cpu;
+    }
+    else if (a == "--cpu")
+    {
+      args.cpu = std::atoi(next().c_str());
+      args.warm_cpu = args.cpu;
+    }
     else if (a == "--priority")
       args.priority = std::atoi(next().c_str());
     else if (a == "--slim")
@@ -1170,6 +1703,50 @@ int main(int argc, char** argv)
       args.audition_start = std::atof(next().c_str());
     else if (a == "--audition-seconds")
       args.audition_seconds = std::atof(next().c_str());
+    else if (a == "--unit")
+      args.unit = next();
+    else if (a == "--model")
+      args.model = next();
+    else if (a == "--node")
+      args.node = next();
+    else if (a == "--node-param")
+    {
+      const std::string pair = next();
+      const std::size_t eq = pair.find('=');
+      if (eq == std::string::npos)
+        die("--node-param takes name=value, not '" + pair + "'");
+      args.node_params[pair.substr(0, eq)] = std::atof(pair.c_str() + eq + 1);
+    }
+    else if (a == "--taps")
+      args.taps = std::atoi(next().c_str());
+    else if (a == "--max")
+      args.max_n = std::atoi(next().c_str());
+    else if (a == "--start")
+      args.start_n = std::atoi(next().c_str());
+    else if (a == "--no-curve")
+      args.no_curve = true;
+    else if (a == "--label")
+      args.label = next();
+    else if (a == "--json")
+      args.json = next();
+    else if (a == "--with-ir")
+      args.with_ir = next();
+    else if (a == "--live-ir")
+      args.live_ir = next();
+    else if (a == "--levels")
+      args.levels = true;
+    else if (a == "--no-levels")
+      args.levels = false;
+    else if (a == "--levels-first-frame")
+    {
+      args.levels = true;
+      args.levels_first_frame = true;
+    }
+    else if (a == "--levels-publish-period")
+    {
+      args.levels = true;
+      args.levels_publish_period = true;
+    }
     else if (a.rfind("--", 0) == 0)
       die("unknown option " + a);
     else
@@ -1179,7 +1756,10 @@ int main(int argc, char** argv)
     die("--input is required");
   // What each mode needs. --ir is optional everywhere (without one a rig is the model alone);
   // chain mode takes its models from the positional list, so it needs no --live, and ir mode is
-  // about one rig's cab, so it needs no candidates.
+  // about one rig's cab, so it needs no candidates. measure mode is about one unit, which its own
+  // flags describe: it needs neither a candidate list nor --live.
+  if (args.mode == "measure")
+    return run_measure(args);
   if (args.mode != "ir" && args.candidates.empty())
     die(args.mode + " mode needs at least one model");
   if (args.mode != "chain" && args.mode != "slim" && args.live.empty())
@@ -1194,5 +1774,5 @@ int main(int argc, char** argv)
     return run_ir(args);
   if (args.mode == "contention")
     return run_contention(args);
-  die("mode must be state, slim, chain, ir or contention");
+  die("mode must be state, slim, chain, ir, contention or measure");
 }

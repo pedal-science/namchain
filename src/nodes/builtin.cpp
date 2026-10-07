@@ -538,7 +538,9 @@ void* create_nam(const graph::NodeSpec& spec, const CompileOptions& options, std
 // good enough?"). The plugin also scales by -18 dB; namchain has always run IRs at unity and still
 // does.
 
-constexpr std::size_t kCabIrMaxTaps = 8192;
+/// The ceiling itself lives in namchain/wav.h: the daemon's cost table has to know it too, so
+/// that an IR is charged for the taps that reach the convolver rather than the file's own count.
+constexpr std::size_t kCabIrMaxTaps = kMaxIrTaps;
 
 /// The taps of a `Linear` .nam: the core's own container for an impulse response.
 bool load_linear_nam(const std::string& path, std::vector<float>& taps, double& rate, std::string& error)

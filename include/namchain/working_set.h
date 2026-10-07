@@ -41,4 +41,21 @@ WorkingSet working_set_from_json(const std::string& json_text, int max_quantum);
 /// \brief Same as working_set_from_json(), reading the file at \p path.
 WorkingSet working_set_from_file(const std::string& path, int max_quantum);
 
+/// \brief The architecture family a model's cost row keys on: the model's own `architecture`, or --
+/// for a `SlimmableContainer`, which is a wrapper rather than a network -- its submodels'.
+///
+/// The pedal's cost table (pedal.project
+/// docs/managing-processing-power-and-optimising-for-fast-switching.md, D2 and D9) keys its NAM rows
+/// by `NAM.<family>.<full|lite>`, and D9 gives the engine the question "what is a unit". This is that
+/// answer: the architecture the file declares, so a row cannot be keyed by a name no model carries.
+/// Empty when the file cannot be read or declares no architecture.
+///
+/// It is deliberately coarse: two WaveNets of different shapes are one family here, which is the
+/// honest limit of what the file says. A finer taxonomy is future work -- the table's `unknown` (D8)
+/// is what an unrecognised model costs until then.
+std::string model_family_from_json(const std::string& json_text);
+
+/// \brief Same as model_family_from_json(), reading the file at \p path.
+std::string model_family_from_file(const std::string& path);
+
 } // namespace namchain

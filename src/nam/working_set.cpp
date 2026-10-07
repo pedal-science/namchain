@@ -377,4 +377,58 @@ WorkingSet working_set_from_file(const std::string& path, int max_quantum)
   return working_set_from_json(ss.str(), max_quantum);
 }
 
+namespace
+{
+
+/// The `architecture` a document declares, or "" when it declares none this can read.
+std::string family_of(const json& model)
+{
+  if (model.is_object() && model.contains("architecture") && model["architecture"].is_string())
+    return model["architecture"].get<std::string>();
+  return {};
+}
+
+} // namespace
+
+std::string model_family_from_json(const std::string& json_text)
+{
+  json doc;
+  try
+  {
+    doc = json::parse(json_text);
+  }
+  catch (const std::exception&)
+  {
+    return {};
+  }
+  // A SlimmableContainer is a wrapper: its cost is its submodels', and so is its name. Its last
+  // submodel is the one the model loads at (container_working_set above) and every submodel of one
+  // container is built the same way, so the last is as good a witness as any.
+  if (family_of(doc) == "SlimmableContainer" && doc.contains("config") && doc["config"].is_object())
+  {
+    const json& cfg = doc["config"];
+    if (cfg.contains("submodels") && cfg["submodels"].is_array() && !cfg["submodels"].empty())
+    {
+      const json& last = cfg["submodels"].back();
+      if (last.is_object() && last.contains("model"))
+      {
+        const std::string inner = family_of(last["model"]);
+        if (!inner.empty())
+          return inner;
+      }
+    }
+  }
+  return family_of(doc);
+}
+
+std::string model_family_from_file(const std::string& path)
+{
+  std::ifstream in(path, std::ios::binary);
+  if (!in)
+    return {};
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return model_family_from_json(ss.str());
+}
+
 } // namespace namchain

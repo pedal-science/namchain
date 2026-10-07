@@ -7,6 +7,15 @@
 namespace namchain
 {
 
+/// \brief The longest impulse response `nc.cab.ir` convolves.
+///
+/// A loaded IR is resampled to the engine rate and then truncated to this many taps (170 ms at
+/// 48 kHz), which is what the pedal supports: "IRs longer than 8192 taps. Not supported; measured as
+/// such rather than left undefined"
+/// (pedal.project docs/managing-processing-power-and-optimising-for-fast-switching.md, "Not doing").
+/// The cost table has no IR row above it, because no longer IR reaches the convolver.
+constexpr std::size_t kMaxIrTaps = 8192;
+
 /// \brief Load a mono WAV file as float samples.
 ///
 /// Reading is delegated to AudioDSPTools' loader (the same one the vendored core's own
