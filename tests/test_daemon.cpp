@@ -62,6 +62,26 @@ struct TempDir
   std::filesystem::path path;
 };
 
+/// The cost table these tests are admitted against. Two Fulls cost 1.0, over D3's 0.8 headroom, so
+/// the second amp is trimmed to Lite (0.15) and the rig costs 0.65 -- which is the shape the model
+/// budget's own 448 KiB had on this library, with the units and the numbers the document asks for.
+std::string test_cost_table()
+{
+  return R"({
+    "host": "test", "measured": "2026-10-07T00:00:00Z", "engine_commit": "c0e3f37", "kernel": "test",
+    "rate": 48000, "quantum": 64, "deadline_us": 1333.333, "headroom": 0.8,
+    "bar": "p99 under the deadline and zero overruns, paced offline",
+    "core_percent": {"NAM": {"WaveNet": {"full": 0.5, "lite": 0.15}}, "IR": {},
+                     "node": {"nc.input": 0.01, "nc.output": 0.01, "nc.gain": 0.01}},
+    "unknown": {"NAM": 0.25, "IR": 0.1, "node": 0.05},
+    "sources": {"NAM.WaveNet.full": {"n": 2, "p99_at_n": 0.95, "p99_at_n_plus_1": 1.3},
+                "NAM.WaveNet.lite": {"n": 6, "p99_at_n": 0.9, "p99_at_n_plus_1": 1.1},
+                "node.nc.input": {"n": 100, "p99_at_n": 0.9, "p99_at_n_plus_1": 1.1},
+                "node.nc.output": {"n": 100, "p99_at_n": 0.9, "p99_at_n_plus_1": 1.1},
+                "node.nc.gain": {"n": 100, "p99_at_n": 0.9, "p99_at_n_plus_1": 1.1}}
+  })";
+}
+
 void write_file(const std::filesystem::path& path, const std::string& contents)
 {
   std::filesystem::create_directories(path.parent_path());
@@ -225,7 +245,7 @@ TEST_CASE("a config file sets the fields the daemon uses")
     "output_queue_periods": 4,
     "output_queue_floor_periods": 2,
     "fade_ms": 2.5,
-    "model_budget_kb": 448,
+    "cost_table": "/etc/namchain/vip-cost.json",
     "device_retry_ms": 500,
     "levels": false,
     "tcp_listen": true,
@@ -265,7 +285,7 @@ TEST_CASE("a config file sets the fields the daemon uses")
   CHECK(config.output_queue_periods == 4u);
   CHECK(config.output_queue_floor_periods == 2u);
   CHECK(config.fade_ms == doctest::Approx(2.5));
-  CHECK(config.model_budget_kb == 448u);
+  CHECK(config.cost_table == "/etc/namchain/vip-cost.json");
   CHECK(config.device_retry_ms == 500u);
   // Measuring is on unless it is turned off, and the key that turns it off is the flag's own name
   // (config.h: "keys are the long flag names without the dashes").
@@ -340,9 +360,11 @@ TEST_CASE("command-line options parse and reject")
   CHECK(config.cpu == -1);
   CHECK(namchain::daemon::apply_option(config, "no-lock-memory", "", error));
   CHECK_FALSE(config.lock_memory);
-  CHECK(config.model_budget_kb == 0u); // off unless a device asks for it
-  CHECK(namchain::daemon::apply_option(config, "model-budget-kb", "448", error));
-  CHECK(config.model_budget_kb == 448u);
+  CHECK(config.cost_table == "/etc/namchain/cost.json"); // the device's own table, by default
+  CHECK(namchain::daemon::apply_option(config, "cost-table", "/tmp/measured.json", error));
+  CHECK(config.cost_table == "/tmp/measured.json");
+  CHECK_FALSE(namchain::daemon::apply_option(config, "cost-table", "", error));
+  CHECK(error.find("needs a path") != std::string::npos);
 
   // Level measuring: on unless it is turned off, so an appliance that wants the per-sample cost back
   // has to say so. Both spellings are accepted from the start, because a flag that can only be
@@ -1958,6 +1980,11 @@ TEST_CASE("a daemon with nothing wrong reports health ok and no issues")
   config.reclamation_timeout_ms = 5;
   config.lock_memory = false;
   config.rt_priority = 0;
+  // A measured device: the cost table is here, so the daemon has nothing to say about that either. (A
+  // table that is missing is an informational issue of its own, which is honest but not what
+  // "nothing wrong" means.)
+  write_file(dir.path / "cost.json", test_cost_table());
+  config.cost_table = (dir.path / "cost.json").string();
 
   Daemon daemon(config);
   std::string error;
@@ -2323,6 +2350,7 @@ std::string two_amp_rig(const char* first, const char* second)
   })";
 }
 
+
 Config budget_config(const TempDir& dir)
 {
   Config config;
@@ -2336,17 +2364,17 @@ Config budget_config(const TempDir& dir)
   config.device_retry_ms = 20;
   config.reclamation_timeout_ms = 5;
   config.period_size = 64;
-  // vip's: one Full and one Lite fit, two Fulls do not (pedal.project, 2026-10-02).
-  config.model_budget_kb = 448;
+  config.cost_table = (dir.path / "cost.json").string();
   return config;
 }
 
 } // namespace
 
-TEST_CASE("the model budget slims the last model it can, says so, and refuses what still does not fit")
+TEST_CASE("the cost table trims the model it can, says so, and refuses what still does not fit")
 {
   TempDir dir;
   write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
   write_file(dir.path / "rigs" / "two-amp.json", two_amp_rig("A2", "A2"));
   const Config config = budget_config(dir);
 
@@ -2370,7 +2398,7 @@ TEST_CASE("the model budget slims the last model it can, says so, and refuses wh
   REQUIRE(hello["ok"] == true);
   bool advertised = false;
   for (const auto& feature : hello["features"])
-    advertised = advertised || feature == "model_budget";
+    advertised = advertised || feature == "cost";
   CHECK(advertised);
 
   // Two Fulls would not fit; the second amp plays its Lite, and the reply says which and by how much.
@@ -2381,8 +2409,9 @@ TEST_CASE("the model budget slims the last model it can, says so, and refuses wh
   CHECK(loaded["slimmed_models"][0]["node"] == "a2");
   CHECK(loaded["slimmed_models"][0]["element"] == "a2");
   CHECK(loaded["slimmed_models"][0]["reference"] == "A2");
-  CHECK(loaded["slimmed_models"][0]["full_bytes"] == 300808);
-  CHECK(loaded["slimmed_models"][0]["slim_bytes"] == 102068);
+  CHECK(loaded["slimmed_models"][0]["row"] == "NAM.WaveNet.lite");
+  CHECK(loaded["slimmed_models"][0]["cost"] == doctest::Approx(0.15));
+  CHECK(loaded["slimmed_models"][0]["full_cost"] == doctest::Approx(0.5));
   const bool adopted = wait_for(config.socket_path, [](const nlohmann::json& status) {
     return status["state"] == "running" && status["adopted_generation"].get<uint64_t>() >= 1 &&
            status["blocks"].get<uint64_t>() > 0;
@@ -2390,10 +2419,16 @@ TEST_CASE("the model budget slims the last model it can, says so, and refuses wh
   CHECK_MESSAGE(adopted, "the slimmed rig never reached the device");
 
   const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
-  CHECK(status["model_budget"]["budget_bytes"] == 458752);
-  CHECK(status["model_budget"]["used_bytes"] == 300808 + 102068);
-  CHECK(status["model_budget"]["full_bytes"] == 2 * 300808);
-  CHECK(status["model_budget"]["over"] == false);
+  CHECK(status["cost"]["cost"] == doctest::Approx(0.67));
+  CHECK(status["cost"]["full_cost"] == doctest::Approx(1.02));
+  CHECK(status["cost"]["headroom"] == doctest::Approx(0.8));
+  CHECK(status["cost"]["over"] == false);
+  CHECK(status["cost"]["verdict"] == "trimmed");
+  CHECK(status["cost"]["trimmed"] == true);
+  CHECK(status["cost"]["table_ok"] == true);
+  REQUIRE(status["cost"]["nodes"].size() == 4);
+  CHECK(status["cost"]["nodes"][2]["row"] == "NAM.WaveNet.lite");
+  CHECK(status["cost"]["nodes"][2]["slimmed"] == true);
   // The budget doing its job is not a fault: the light stays green, and the issue names the block.
   CHECK(status["health"] == "ok");
   bool named = false;
@@ -2439,21 +2474,101 @@ TEST_CASE("the model budget slims the last model it can, says so, and refuses wh
   REQUIRE(refused["ok"] == false);
   CHECK(refused["error"]["code"] == "over_budget");
   const std::string why = refused["error"]["message"];
-  CHECK_MESSAGE(why.find("587.5 KiB") != std::string::npos, why);
-  CHECK_MESSAGE(why.find("448.0 KiB") != std::string::npos, why);
-  CHECK_MESSAGE(why.find("a2 293.8 KiB (cannot be slimmed)") != std::string::npos, why);
+  CHECK_MESSAGE(why.find("1.020 of a core") != std::string::npos, why);
+  CHECK_MESSAGE(why.find("0.800 a rig may have") != std::string::npos, why);
+  CHECK_MESSAGE(why.find("'a1' 0.500") != std::string::npos, why);
+  CHECK_MESSAGE(why.find("'a2' 0.500") != std::string::npos, why);
   const auto after = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
   CHECK(after["generation"] == before);
   CHECK(after["document"]["chains"][0]["nodes"][2]["model"] == "A2-Full");
   CHECK(after["document"]["chains"][0]["nodes"][1]["model"] == "A2");
 }
 
-TEST_CASE("a configured rig over the model budget still plays, with a warning")
+TEST_CASE("rig.cost answers what a rig would cost, without publishing or compiling it")
+{
+  // D9's boundary in one call: the engine owns what a cost means, so the service that owns the bank
+  // asks here for each rig rather than summing rows itself. Nothing may change: this is a question,
+  // not a publish.
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
+  write_file(dir.path / "rigs" / "two-amp.json", two_amp_rig("A2", "A2"));
+  write_file(dir.path / "rigs" / "one-amp.json", two_amp_rig("A2", "A2-Full"));
+  const Config config = budget_config(dir);
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["blocks"].get<uint64_t>() > 0;
+  }));
+  const uint64_t generation = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"))["generation"];
+
+  // Two A2s: 1.02 as written, over the 0.8 headroom, so one is trimmed and it costs 0.67.
+  const auto cost = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.cost","rig":"two-amp.json"})"));
+  REQUIRE_MESSAGE(cost["ok"] == true, cost.dump());
+  CHECK(cost["cost"]["cost"] == doctest::Approx(0.67));
+  CHECK(cost["cost"]["full_cost"] == doctest::Approx(1.02));
+  CHECK(cost["cost"]["over"] == false);
+  CHECK(cost["cost"]["verdict"] == "trimmed");
+  CHECK(cost["cost"]["table_ok"] == true);
+  REQUIRE(cost["slimmed_models"].size() == 1);
+  CHECK(cost["slimmed_models"][0]["node"] == "a2");
+  CHECK(cost["slimmed_models"][0]["row"] == "NAM.WaveNet.lite");
+
+  // One A2 and one A2-Full: nothing to trim on the second, so the first gives way and it still fits.
+  const auto mixed = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.cost","rig":"one-amp.json"})"));
+  REQUIRE_MESSAGE(mixed["ok"] == true, mixed.dump());
+  CHECK(mixed["cost"]["verdict"] == "trimmed");
+  REQUIRE(mixed["slimmed_models"].size() == 1);
+  CHECK(mixed["slimmed_models"][0]["node"] == "a1");
+
+  // A whole document works the same way, and a rig that is over with nothing to trim says so.
+  nlohmann::json apply;
+  apply["method"] = "rig.cost";
+  apply["document"] = nlohmann::json::parse(two_amp_rig("A2-Full", "A2-Full"));
+  const auto over = nlohmann::json::parse(call(config.socket_path, apply.dump()));
+  REQUIRE_MESSAGE(over["ok"] == true, over.dump());
+  CHECK(over["cost"]["over"] == true);
+  CHECK(over["cost"]["verdict"] == "over");
+  CHECK(over["cost"]["cost"] == doctest::Approx(1.02));
+  CHECK(over["slimmed_models"].empty());
+
+  // And nothing was published: the running rig and its generation are untouched.
+  const auto after = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  CHECK(after["generation"] == generation);
+
+  const auto bad = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.cost"})"));
+  CHECK(bad["ok"] == false);
+  CHECK(bad["error"]["code"] == "bad_request");
+  const auto missing = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.cost","rig":"nothing.json"})"));
+  CHECK(missing["ok"] == false);
+  CHECK(missing["error"]["code"] == "rig_not_found");
+}
+
+TEST_CASE("a configured rig over the headroom still plays, with a warning")
 {
   // Refusing the rig a pedal powers up with would leave it silent, which is worse than a rig that may
   // miss a deadline: the configured rig is admitted, and the status says what it costs.
   TempDir dir;
   write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
   write_file(dir.path / "rigs" / "two-full.json", two_amp_rig("A2-Full", "A2-Full"));
   Config config = budget_config(dir);
   config.rig = (dir.path / "rigs" / "two-full.json").string();
@@ -2481,16 +2596,16 @@ TEST_CASE("a configured rig over the model budget still plays, with a warning")
   CHECK_MESSAGE(playing, "the configured rig was not admitted");
 
   const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
-  CHECK(status["model_budget"]["over"] == true);
-  CHECK(status["model_budget"]["used_bytes"] == 2 * 300808);
+  CHECK(status["cost"]["over"] == true);
+  CHECK(status["cost"]["cost"] == doctest::Approx(1.02));
   CHECK(status["health"] == "warn");
   bool warned = false;
   for (const auto& issue : status["issues"])
   {
-    if (issue["code"] == "model_budget_exceeded")
+    if (issue["code"] == "cost_over")
       warned = issue["severity"] == "warn";
   }
-  CHECK_MESSAGE(warned, "no model_budget_exceeded warning");
+  CHECK_MESSAGE(warned, "no cost_over warning");
 }
 
 // ---------------------------------------------------------------------------

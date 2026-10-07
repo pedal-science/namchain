@@ -88,7 +88,7 @@ silently ignored.
 | `output_queue_periods` | `0` | output-ring cap in periods; `0` is off |
 | `output_queue_floor_periods` | `0` | queue floor in periods; `0` is off |
 | `fade_ms` | `5.0` | equal-power crossfade for a structural plan transition |
-| `model_budget_kb` | `0` | what a document's models may read per block, together, in KiB; over it, slimmable models are slimmed and a client's publish that still does not fit is refused. `0` is off. See "Model budget" below |
+| `cost_table` | `/etc/namchain/cost.json` | this device's measured cost table: what each unit costs on one core here. A rig over the table's `headroom` has its dearest models trimmed Full -> Lite, and one that still does not fit is refused. A table that cannot be read leaves every unit at its `unknown` cost, which is the safe direction. See "Cost and admission" below |
 | `device_retry_ms` | `250` | backoff between attempts to open a lost device |
 | `reclamation_timeout_ms` | `20` | the control `poll` timeout, i.e. the reclamation window |
 | `tcp_listen` | `false` | serve control connections on TCP as well |
@@ -373,7 +373,7 @@ One JSON object per message in each direction, over either transport above. A re
 | `engine.hello` | `{"protocol": 2, "token": "…"?}` | `role`, `version`, `protocol` (what the server speaks), `features`, `transport` (`unix`/`tcp`) and `authenticated`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol`. On TCP the token is required and is checked **before** the version, so a peer without it learns nothing else |
 | `engine.schema` | — | the catalogue: every node type **and every macro** in one array, told apart by `kind` (`primitive`/`macro`), with ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. A macro additionally carries the `roles` it lowers to and, per parameter, the `targets` it drives. A parameter whose choices live in the library carries them, resolved from the same scan `engine.assets` reports. See docs/schema.md and docs/macros.md |
 | `engine.assets` | `{"refresh": true?}` | the model and impulse-response library: an entry per file with its `id`, where it is, its size and mtime, and the rate/architecture/length when the file's own header says so. See docs/assets.md |
-| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, a `queue` object (the output queue's cap and floor, and its `output_drops`, `output_target_drops`, `floor_insertions` and `capture_bursts`), a `record` object (as `engine.record`), a `render` object (each block's time from its capture read to its playback write against the period's deadline: `deadline_us`, `worst_us`, `worst_percent`, `over_90_percent`, `over_deadline`, and `load_histogram` as `[percent, blocks]` pairs for the non-empty 1% buckets, 100 meaning at or past the deadline; all cumulative, so a poller takes deltas), device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), a `model_budget` object ("Model budget", below), `health`/`issues` (below), the PCM `format` the device was opened with, the audio `levels` ("Levels", below, with the same shape `engine.levels` returns), and — for ALSA — a `backend_diagnostics` object that splits the one `xruns` number into `capture_overruns` and `playback_underruns` beside `recoveries`, `gate_capture_xruns`, `floor_inserted_frames`, `settle_discarded_frames`, `occupancy_mismatches` and `period_exact` |
+| `engine.status` | — | device state, backend, channels, rig/generation, blocks, xruns, a `queue` object (the output queue's cap and floor, and its `output_drops`, `output_target_drops`, `floor_insertions` and `capture_bursts`), a `record` object (as `engine.record`), a `render` object (each block's time from its capture read to its playback write against the period's deadline: `deadline_us`, `worst_us`, `worst_percent`, `over_90_percent`, `over_deadline`, and `load_histogram` as `[percent, blocks]` pairs for the non-empty 1% buckets, 100 meaning at or past the deadline; all cumulative, so a poller takes deltas), device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), a `cost` object ("Cost and admission", below), `health`/`issues` (below), the PCM `format` the device was opened with, the audio `levels` ("Levels", below, with the same shape `engine.levels` returns), and — for ALSA — a `backend_diagnostics` object that splits the one `xruns` number into `capture_overruns` and `playback_underruns` beside `recoveries`, `gate_capture_xruns`, `floor_inserted_frames`, `settle_discarded_frames`, `occupancy_mismatches` and `period_exact` |
 | `engine.levels` | — | the audio levels, and only them: `state`, `blocks`, `generation`/`audible_generation`, `sample_rate`, `period_size`, `input` and `output` (per device channel: a `peak` in dBFS, an `rms`, a `clipped` count and a `frames` count), and a `chains` array of `{id, name, output_channel, muted, out: {peak, rms, frames, clipped}, nodes: [{node, element, role, peak, rms, frames}]}`. **Read-only and small**, which is why it is a method of its own: a meter polls this rather than building the whole of `engine.status` twenty times a second. Each read *takes* its window (see "Levels", below) |
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
@@ -382,6 +382,7 @@ One JSON object per message in each direction, over either transport above. A re
 | `rig.apply` | `{"document": { … }}` — a whole document, parsed by the same parser a rig file goes through | `name`, `chains`, `generation`; relative model paths resolve against the rigs root |
 | `rig.patch` | `{"ops": [...], "chain": "id"?}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass`. A target is named by `node`, or by `element` with an optional `role` (and `port` for a per-port parameter) | `kind` (`smooth` or `structural`), `applied`, `chain`, `generation` |
 | `rig.get` | — | the rig path (empty for an applied document), `source` (`file`/`applied`), `generation`, `loaded`, the current `document` as the engine parsed it, the `lowered` graph it became (macros expanded, with the engine-minted ids), and a per-chain summary |
+| `rig.cost` | `rig` (a name, as `rig.load` takes) or `document` (a whole document) | what that rig would cost on this device, and the verdict: the same table, trimming and `over` a publish would apply, on a copy that is thrown away. Nothing is published, compiled or loaded. `cost` is the object `engine.status` reports, and `slimmed_models`/`missing_assets` come with it, so a service can cost its whole bank without a second cost model of its own (D9) |
 
 Unknown fields are ignored; an unknown method is `unknown_method`. A malformed message never kills
 the connection or the daemon.
@@ -443,7 +444,7 @@ chain quietly playing on channel 0.
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
 `bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`, `record`, `local_transitions`,
-`meta`, `bypass_ramp`, `model_budget`, `levels`. It grows as the slices land, and
+`meta`, `bypass_ramp`, `cost`, `levels`. It grows as the slices land, and
 absence is how a client degrades rather than guesses: a client that does not see `levels` hides its
 meters rather than drawing a floor.
 
@@ -533,8 +534,9 @@ stops being true disappears, which is the property that makes the light worth ha
 | `not_realtime` | warn | a real-time policy was asked for and is not in force |
 | `memory_not_locked` | warn | `mlockall` was refused while `lock_memory` is on |
 | `asset_missing` | warn | a block's model or IR is not in the library, so it plays as if bypassed. One per block, with `element`, `param`, `kind` and `reference` besides `chain` and `node` (docs/assets.md) |
-| `model_budget_exceeded` | warn | the running document's models read more per block than `model_budget_kb` with everything slimmable slimmed. Only the configured rig gets here (a client's publish is refused instead); it plays, and may miss deadlines |
-| `model_budget_unknown` | warn | the model budget could not estimate a block's model (an architecture it does not know), so it counts as nothing. One per block, with `element` and `reference` |
+| `cost_over` | warn | the running document's units cost more than the table's `headroom` with every model that can be trimmed trimmed. Only the configured rig gets here (a client's publish is refused instead); it plays, and may miss deadlines |
+| `cost_unknown` | warn | a node was charged its `unknown` cost because this device has no measured row for it: admission is guessing, in the expensive direction (D8). One per node, with `element`, `reference` and `row` |
+| `cost_table_missing` | info | there is no readable cost table at `cost_table`, so every unit is charged its unknown cost. The rigs that fit still play; the device has simply not been measured |
 | `model_slimmed` | info | a block plays its smallest model to fit the model budget. One per block, with `element` and `reference`: informational, because it is the budget doing its job, but named, because a Lite does not sound like the Full the rig names |
 | `transition` | info | a structural change is being crossfaded (normal, and it does not colour `health`) |
 
@@ -658,80 +660,85 @@ configured value is not a multi-core measurement; a worker that cannot be create
 than silently dropped, and a configuration naming cores this process may not run on is refused at
 startup, by name.
 
-### Model budget: what a document's models may read per block
+### Cost and admission: what a rig costs on this device
 
-Every chain of a document renders on one thread, on one core, so a document's models share that
-core's L2. A model reads its weights and every layer's history each block: an A2-Full **293.8 KiB** at
-q64, an A2-Lite 99.7 KiB (`namchain/working_set.h`, from the model's config). Two Fulls, 587.5 KiB,
-do not fit a Cortex-A76's 512 KiB L2, and the render's worst blocks then follow the shared L3 and
-DRAM. The tail comes from what the block reads, not from its arithmetic.
+A rig is admitted by what its units **cost**, measured on this device rather than assumed. The rules,
+the units and the measurements are pedal.project
+`docs/managing-processing-power-and-optimising-for-fast-switching.md` (D1–D9, P1–P9); this is the
+engine's half of D9, which gives the engine the cost table, the per-document fit check and the
+refusal, and gives the device the numbers.
 
-> **Re-measured 2026-10-02, and the earlier figure is withdrawn.** The run that first showed this —
-> `pedal.project/bench-results/2026-10-02-two-amp-tail-vip`, whose two-amp rig reached 107–144 % of the
-> deadline in its worst block — was taken while that host was busy with other work. The same rig
-> re-measured on a verified-quiet piv (null backend, q64, 60 s, eight runs across cores 0, 2 and 3)
-> gives p50 11.6 %, p99 13.9–18.5 %, worst 22.8–43.0 % and **0 blocks past the deadline**, flat out and
-> paced alike. Two Fulls still do not fit one core's L2 and the capacity cliff is still real in
-> principle; the magnitude claimed here was not. The correction, the method and the live re-measurement
-> are in `pedal.project/docs/multi-core.md`.
+**The table.** `cost_table` (default `/etc/namchain/cost.json`) is this device's measured table. A
+**unit** is a NAM model at a submodel size (`NAM.<family>.<full|lite>`), an IR at a tap count
+(`IR.<taps>`), or a node type (`node.<nc.type>`). Its cost is `1/n`, where `n` is the largest number
+of copies of that unit that rendered a block within the deadline on one core with zero overruns, and
+**costs add** (D2). The family of a NAM model is the architecture its file declares, or its
+submodels' when it is a `SlimmableContainer` (which is a wrapper, not a network;
+`model_family_from_file`). An IR is charged the cheapest row that is not shorter than it, so a
+6000-tap cab pays the 8192 row. The format is the engine's; the numbers are the device's, measured by
+`namchain-warm-bench measure` on the device and installed with `devices/<host>/cost.json`.
 
-`model_budget_kb` is a ceiling on that, **per core**. `0`, the default, is off. With it set, every
-publish — `rig.load`, `rig.apply`, `rig.patch`, startup, SIGHUP, a rescan's republish — does this on
-the resolved copy, before anything is compiled:
+**Admission.** Every publish — `rig.load`, `rig.apply`, `rig.patch`, startup, SIGHUP, a rescan's
+republish — costs the resolved document and applies D3's headroom, which is the table's own
+`headroom` (0.8):
 
-1. **Estimate every `nc.nam` node** at `period_size`, in document order: chains in order, each chain's
-   nodes as declared. A bypassed node counts, because it keeps running; a block standing in for a
-   missing model counts as nothing. Estimates come from the model's config, never from loading it,
-   and are cached by path, size, mtime and quantum, so a publish does not reparse the library.
-2. **Any chain over one core's ceiling is slimmed first**, last declared first within that chain,
-   until it fits. A chain is executed by one thread and cannot be split, so this binds whatever the
-   document as a whole is allowed; a second core cannot lend its L2 to a chain it is not running.
-3. **Then the document total is brought under `model_budget_kb × cores`**, last declared first, the
-   way it always has been. The cores are `render_threads` bounded by the number of chains: an idle
-   core has no L2 to lend, so a four-thread engine rendering a one-chain document still has one
-   core's budget. A slimmed node runs the submodel `SetSlimmableSize(0.0)` picks, chosen before the
-   model is prepared, so the Full is never allocated or prewarmed.
-4. **If it is still over** with every slimmable model slimmed, a client's publish is refused as
-   `over_budget`, with every model's size in the message and, when it is one chain that is too heavy,
-   that chain named with its own figure. The running document keeps playing.
+1. **Every node is charged**, in document order: chains in order, each chain's nodes as declared. A
+   bypassed node counts, because it keeps running. What a charge needs — a model's family, an IR's
+   taps — is read from the file and cached by path, size and mtime, so a publish does not reparse the
+   library.
+2. **A unit with no row costs `unknown`** (D8), never nothing: `unknown.NAM`, `unknown.IR` and
+   `unknown.node`, each at least the dearest measured row of its kind. An unmeasured device therefore
+   refuses heavy rigs rather than waving them through, and every node charged that way raises a
+   `cost_unknown` warning naming it.
+3. **Over the headroom, models are trimmed Full → Lite** (D6): the dearest saving first, as few nodes
+   as it takes, and only nodes whose Lite row is measured. A trimmed node runs the submodel
+   `SetSlimmableSize(0.0)` picks, chosen before the model is prepared, so the Full is never allocated
+   or prewarmed. A node whose Lite row is not measured saves nothing and is not trimmed for show.
+4. **If it is still over**, a client's publish is refused as `over_budget`, with the total, the
+   headroom and every node's cost and row in the message. The running document keeps playing.
    The configured rig — at startup, on SIGHUP and on a rescan's republish — is **admitted anyway**,
-   with a `model_budget_exceeded` warning: refusing the rig a pedal powers up with would leave it
-   silent, which is worse than a rig that may miss a deadline.
+   with a `cost_over` warning: refusing the rig a pedal powers up with would leave it silent, which is
+   worse than a rig that may miss a deadline.
 
-What a client sees: `slimmed_models` in every rig reply (`rig.load`, `rig.apply`, `rig.patch`,
-`rig.get`) and in each chain of `engine.status`, an entry per slimmed node with `chain` (in the
-replies), `node`, `element`, `reference`, `full_bytes` and `slim_bytes`; a `model_slimmed` issue per
-slimmed node; and `model_budget` in `engine.status`, with `budget_bytes` (the document's ceiling),
-`per_chain_bytes` (one core's), `configured_per_core_bytes` (what the operator wrote),
-`heaviest_chain`/`heaviest_chain_bytes`, `used_bytes` (as slimmed), `full_bytes` (as written) and
-`over`. The document `rig.get` returns is the one written: slimming is the engine's choice about the
-copy it compiles, made afresh on every publish, so no document carries it and a stale choice never
-sticks. A model the estimator cannot read counts as nothing and raises `model_budget_unknown`.
+The rig is the unit, not the chain (D1): a rig renders on one core, all of its chains, so the whole
+document is costed against one core's headroom. A chain is never split across cores, which is why
+`render_threads > 1` is not part of this scheme.
 
-The figure is the L2 of the render's core less room for everything else the block touches: buffers,
-an IR, the stack. vip runs 448 (pedal.project's `devices/vip/`), which fits a Full and a Lite and
-refuses two Fulls.
+**What a client sees.** `slimmed_models` in every rig reply (`rig.load`, `rig.apply`, `rig.patch`,
+`rig.get`) and in each chain of `engine.status`, an entry per trimmed node with `chain` (in the
+replies), `node`, `element`, `reference`, `row`, `cost` and `full_cost`; a `model_slimmed` issue per
+trimmed node; and `cost` in `engine.status`, with `cost` (as it stands), `full_cost` (as written),
+`headroom`, `over`, `verdict` (`fits`, `trimmed` or `over`), `trimmed`, `table` and `table_ok`,
+`table_detail`, `table_host`, `table_measured`, `table_engine_commit`, `table_rows`, `unknown` and
+`nodes` (every node's `row`, `cost`, `measured`, `slimmed` and `working_set_bytes`). `rig.cost` asks
+the same question about a rig that is not playing, which is how the service costs its bank without a
+second cost model of its own (D9).
 
-What it does not do yet, each with the remedy drafted:
+The document `rig.get` returns is the one written: trimming is the engine's choice about the copy it
+compiles, made afresh on every publish, so no document carries it and a stale choice never sticks.
 
-- **Only models are counted.** An IR, a delay line or a mixer reads memory too. Remedy: an estimate
-  per node type, beside its schema, summed the same way.
+**What it does not do yet**, each with the remedy drafted:
+
+- **One row per architecture family.** Two WaveNets of different shapes are one family, which is the
+  honest limit of what a file declares; a finer taxonomy needs the file to say more. Remedy: a family
+  the model names itself, or a per-file row.
 - **The dual render is not counted.** During a structural crossfade both plans render, so a
-  transition between two documents that each fit reads up to twice the budget for `fade_ms`. Remedy:
-  the admission control of plan.md §5.3, which costs the fade.
-- **Full or smallest, nothing between.** A container with more than two submodels is never slimmed
+  transition between two documents that each fit costs up to twice the headroom for `fade_ms`. Remedy:
+  the admission control of plan.md §5.3, which costs the fade; the doc's T4 tests the same boundary
+  while switching.
+- **Costs add, and that is an assumption.** D2's additive model is tested by the doc's T2, not
+  assumed: two models crowding one core's cache cost more than either alone, which is why a row's
+  `1/n` is measured at the fit point rather than from one model. `working_set_bytes` is reported
+  beside every NAM node's cost so the working set against L2 stays visible as T2's falsifier.
+- **Full or smallest, nothing between.** A container with more than two submodels is never trimmed
   part-way, and a `SlimmableWaveNet` (one model that slims by channels) counts at full size and is
-  never slimmed. Remedy: estimate each size the model offers and step down one at a time.
-- **The client cannot say which amp gives way.** The last declared is slimmed first, so inserting an
-  amp before an existing one slims the existing one: a sound the player did not touch changes.
-  Remedy: a per-node `size` parameter (`auto`, `full`, `smallest`), or a slim choice that sticks
-  across publishes so the model just added is the one slimmed.
-- **An estimate, not a measurement.** It reads the config; measured breakpoints per model (plan.md
-  §7.7) would replace it.
-- **A macro that lowers to `nc.nam` would not be counted**, because the budget runs before lowering.
-  None exists.
+  never trimmed. Remedy: a row per size the model offers and a trim that steps down one at a time.
+- **The client cannot say which amp gives way.** The dearest is trimmed first and a tie goes to the
+  later-declared node, so inserting an amp before an existing one can trim the existing one: a sound
+  the player did not touch changes. Remedy: a per-node `size` parameter (`auto`, `full`, `smallest`),
+  or a trim choice that sticks across publishes.
 - **The offline tools do not apply it.** `namchain-render` and the soak render what they are given;
-  the budget is the daemon's.
+  admission is the daemon's.
 
 ## Levels
 
@@ -1011,7 +1018,7 @@ expected.
 Built: **the model budget** — a ceiling on what a document's models read per block, estimated from
 each model's config, met by slimming slimmable models last-declared first and enforced by refusing a
 client's publish that still does not fit (`over_budget`), with the configured rig admitted and
-warned about, and `slimmed_models`, `model_budget` and three issue codes to show it ("Model budget",
+warned about, and `slimmed_models`, `cost` and three issue codes to show it ("Cost and admission",
 above); **the macro layer** — seven macros (`fx.eq.bands`, `fx.eq.tilt`, `fx.filter.cut`,
 `fx.mix.drywet`, `fx.delay.feedback`, `fx.amp.tonestack`, `fx.cab.ir`) lowered per compile into
 biquads, gains, mixes and the existing delay line; a declared param map with a closed transform set,

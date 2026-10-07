@@ -22,7 +22,7 @@
 #include "namchain/assets/registry.h"
 #include "namchain/daemon/config.h"
 #include "namchain/daemon/framing.h"
-#include "namchain/daemon/model_budget.h"
+#include "namchain/daemon/cost_table.h"
 #include "namchain/daemon/recorder.h"
 #include "namchain/daemon/render_pool.h"
 #include "namchain/graph/plan.h"
@@ -347,11 +347,11 @@ private:
   /// \param error_code the protocol error code a failure should be reported under. `compile_failed`
   /// unless the asset registry refused a model or IR reference, which is `asset_missing` -- a
   /// different fix for the user (pick another model) from a graph that will not compile -- or the
-  /// document's models do not fit the model budget, which is `over_budget`.
-  /// \param admit_over_budget publish a document that is over the model budget even with every
-  /// slimmable model slimmed, and report it as a `model_budget_exceeded` warning, rather than refuse
-  /// it. For the publishes nobody can be told "no" about: the configured rig at startup and on SIGHUP,
-  /// and the running document again after a library rescan (docs/daemon.md, "Model budget").
+  /// document's units cost more than the cost table's headroom, which is `over_budget`.
+  /// \param admit_over_budget publish a document that is over the headroom even with every model
+  /// that can be trimmed trimmed, and report it as a `cost_over` warning, rather than refuse it. For
+  /// the publishes nobody can be told "no" about: the configured rig at startup and on SIGHUP, and the
+  /// running document again after a library rescan (docs/daemon.md, "Cost and admission").
   bool publish_document(const graph::Document& document, const std::string& path, const std::string& source,
                         const std::string& base_dir, std::string& error,
                         std::string* error_code = nullptr, bool admit_over_budget = false);
@@ -562,11 +562,15 @@ private:
   /// The references in \ref current_document_ that resolved nowhere, each played as a bypass
   /// (assets::resolve_document). Reported as `asset_missing` issues and per chain in `engine.status`.
   std::vector<assets::MissingAsset> missing_assets_;
-  /// What the model budget made of \ref current_document_: every model's estimate, which ones were
-  /// slimmed, and whether the document was admitted over the budget (docs/daemon.md, "Model budget").
-  BudgetOutcome model_budget_;
-  /// The estimates the budget reads, by file. Control thread.
-  WorkingSetCache working_sets_;
+  /// What the cost table made of \ref current_document_: every unit's charge, which models were
+  /// trimmed, and whether the document was admitted over the headroom (docs/daemon.md, "Cost and
+  /// admission").
+  CostOutcome cost_;
+  /// This device's measured cost table, re-read on SIGHUP. Control thread.
+  CostTable cost_table_;
+  /// What a model's family and an IR's taps are, by file: what a charge needs, cached so a publish
+  /// does not reparse a library. Control thread.
+  UnitCache units_;
   /// \brief What the newest publish did with each chain it changed. Control thread; reported in the
   /// publish's reply and in `engine.status`, so a soak can say which edits faded locally.
   struct ChainTransition
@@ -589,6 +593,10 @@ private:
   /// Republish the running document after a library rescan, when it has missing assets: a model
   /// copied in since then replaces its stand-in without anyone editing the rig.
   void republish_after_rescan();
+  /// Read \ref config_.cost_table again: at startup, and on SIGHUP, which is when an operator who has
+  /// just re-measured the device expects the new numbers to be the ones admission uses. A table that
+  /// cannot be read leaves every unit at its unknown cost and says so -- it is never fatal.
+  void load_cost_table();
   /// The signal mask in force before \ref setup_signals, restored on stop so a library that started
   /// this daemon does not inherit a blocked SIGTERM for the rest of the process's life.
   sigset_t previous_mask_{};

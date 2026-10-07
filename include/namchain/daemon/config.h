@@ -149,14 +149,19 @@ struct Config
   /// before the old is retired. 5 ms is §5.3's default; 0 would be a hard switch, which the glitch
   /// detector catches, so it is accepted but not recommended.
   double fade_ms = 5.0;
-  /// \brief The model budget, in KiB: what the `nc.nam` nodes of a document may read every block,
-  /// together, as estimated from each model's config (working_set.h). 0 turns the budget off.
+  /// \brief Where this device's cost table is: what each unit costs on one core here, measured on
+  /// this device (pedal.project
+  /// docs/managing-processing-power-and-optimising-for-fast-switching.md, D2 and D9).
   ///
-  /// All of a document renders on one thread, so this is one core's: on a Cortex-A76 the 512 KiB L2
-  /// holds one A2-Full model and a Lite one, not two Full ones (docs/daemon.md, "Model budget"). A
-  /// document over it has its slimmable models slimmed, last first, until it fits; one that still
-  /// doesn't is refused from a client and admitted with a warning at startup.
-  unsigned model_budget_kb = 0;
+  /// D9: the format is the engine's -- the engine decides what a unit is and what a cost means -- and
+  /// the numbers are the device's, so this is configuration and not a built-in table. A rig is
+  /// admitted when its units' costs add up to at most the table's `headroom` (D3: 0.8); over it, the
+  /// dearest models are trimmed Full -> Lite (D6), and what still does not fit is refused from a
+  /// client and admitted with a warning at startup.
+  ///
+  /// A missing or unreadable table is not fatal: every unit then costs `unknown` (D8), which is the
+  /// conservative direction, and `engine.status`'s `cost` object says the table is not there.
+  std::string cost_table = "/etc/namchain/cost.json";
   /// \brief Where `engine.record` writes its recordings, one directory each. Empty disables it.
   ///
   /// A client names a recording, never a path: the name is one plain directory component under this,

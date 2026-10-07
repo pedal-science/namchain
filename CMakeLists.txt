@@ -144,7 +144,7 @@ add_library(namchain OBJECT
   src/graph/patch.cpp
   src/daemon/config.cpp
   src/daemon/daemon.cpp
-  src/daemon/model_budget.cpp
+  src/daemon/cost_table.cpp
   src/daemon/platform.cpp
   src/daemon/recorder.cpp
   src/daemon/render_pool.cpp
@@ -307,7 +307,7 @@ if(NAMCHAIN_BUILD_TESTS)
   add_executable(namchain-tests
     tests/test_lookback.cpp
     tests/test_working_set.cpp
-    tests/test_model_budget.cpp
+    tests/test_cost_table.cpp
     tests/test_a2_planar_parity.cpp
     tests/test_render.cpp
     tests/test_soak.cpp

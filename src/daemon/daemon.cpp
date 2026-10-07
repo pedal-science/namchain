@@ -117,7 +117,7 @@ nlohmann::json protocol_features(bool measure_levels)
                                                    "smooth_params", "bypass", "guard",
                                                    "per_chain_mute", "schema", "tcp_transport",
                                                    "assets", "record", "local_transitions", "meta",
-                                                   "bypass_ramp", "model_budget"});
+                                                   "bypass_ramp", "cost"});
   if (measure_levels)
     features.push_back("levels");
   return features;
@@ -719,35 +719,15 @@ std::string string_param(const graph::NodeSpec& node, const char* name)
   return found == node.strings.end() ? std::string() : found->second;
 }
 
-/// Whether the model budget slimmed anything.
-bool budget_slimmed(const BudgetOutcome& budget)
+/// Whether the cost table trimmed anything.
+bool cost_slimmed(const CostOutcome& cost)
 {
-  for (const BudgetedModel& model : budget.models)
+  for (const CostedNode& node : cost.nodes)
   {
-    if (model.slimmed)
+    if (node.slimmed)
       return true;
   }
   return false;
-}
-
-/// Every model the budget counted, with what it reads per block as published: the part of a message a
-/// person acts on, because it says which block to swap for a smaller model. The chain is named only
-/// when the document has more than one.
-std::string describe_models(const BudgetOutcome& budget, bool name_chains)
-{
-  std::string text;
-  for (const BudgetedModel& model : budget.models)
-  {
-    text += text.empty() ? "" : ", ";
-    text += name_chains ? model.chain + "/" + model.node : model.node;
-    if (!model.estimated)
-      text += " (not estimated: " + model.why + ")";
-    else if (model.slimmed)
-      text += " " + format_kib(model.slim_bytes) + " (slimmed from " + format_kib(model.full_bytes) + ")";
-    else
-      text += " " + format_kib(model.full_bytes) + (model.slimmable ? "" : " (cannot be slimmed)");
-  }
-  return text;
 }
 
 void delete_plan_slot(void* object)
@@ -1447,6 +1427,25 @@ bool Daemon::load_rig(const std::string& rig_path, std::string& error, std::stri
                           error, error_code, admit_over_budget);
 }
 
+void Daemon::load_cost_table()
+{
+  cost_table_ = CostTable::load(config_.cost_table);
+  if (!cost_table_.ok)
+  {
+    std::fprintf(stderr,
+                 "[namchaind] cost: no usable table at '%s' (%s): every unit costs its unknown value "
+                 "(NAM %s, IR %s, node %s of a core) and a rig over the headroom is refused anyway\n",
+                 config_.cost_table.c_str(), cost_table_.detail.c_str(),
+                 format_cost(cost_table_.unknown_nam).c_str(), format_cost(cost_table_.unknown_ir).c_str(),
+                 format_cost(cost_table_.unknown_node).c_str());
+    return;
+  }
+  if (config_.verbose)
+    std::fprintf(stderr, "[namchaind] cost: %zu row(s) from %s (host %s, measured %s, engine %s, %s)\n",
+                 cost_table_.rows().size(), cost_table_.path.c_str(), cost_table_.host.c_str(),
+                 cost_table_.measured.c_str(), cost_table_.engine_commit.c_str(), cost_table_.detail.c_str());
+}
+
 void Daemon::republish_after_rescan()
 {
   if (missing_assets_.empty() || current_document_.chains.empty())
@@ -1506,36 +1505,41 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     return false;
   }
 
-  // The model budget, on the resolved copy too: what it slims is a different model compiled from the
-  // same reference, so the chains it touches compare as changed below, and the document a client
-  // wrote still names what it named (docs/daemon.md, "Model budget").
+  // The cost table, on the resolved copy: what it trims is a different model compiled from the same
+  // reference, so the chains it touches compare as changed below, and the document a client wrote
+  // still names what it named (docs/daemon.md, "Cost and admission").
   //
-  // Two ceilings, because the render path has two (docs/daemon.md, "Render threads"): one core's for
-  // any single chain, since a chain is executed by one thread and cannot be split, and one core's per
-  // core the chains can actually be spread over for the document. The spread is bounded by the chain
-  // count: an idle core has no L2 to lend, so a four-core engine rendering a one-chain document still
-  // has one core's budget.
-  const std::size_t per_core_bytes = static_cast<std::size_t>(config_.model_budget_kb) * 1024u;
-  const std::size_t spread =
-    std::min<std::size_t>(std::max(1u, config_.render_threads), std::max<std::size_t>(1, resolved.chains.size()));
-  BudgetOutcome budget = apply_model_budget(resolved, per_core_bytes, per_core_bytes * spread,
-                                            static_cast<int>(config_.period_size), working_sets_);
-  for (BudgetedModel& model : budget.models)
-    model.reference = string_param(document.chains[model.chain_index].graph.nodes[model.node_index], "model");
-  if (budget.over && !admit_over_budget)
+  // The rig is the unit, not the chain (D1): a rig renders on one core, all of its chains, so what is
+  // admitted is the whole document against one core's headroom. Where the cost model's added-up
+  // assumption is wrong -- two models crowding one core's cache cost more than either alone -- the
+  // measurement is what knows, because a row's 1/n was measured at the fit point (D2).
+  CostOutcome cost = apply_cost_table(resolved, cost_table_, units_, static_cast<double>(config_.sample_rate),
+                                      static_cast<int>(config_.period_size));
   {
-    // Which ceiling was hit decides what the user has to do about it, so the message names it: a chain
-    // that is too heavy is one model to replace, a document that is too heavy is one chain too many.
-    const bool chain_over = budget.heaviest_chain_bytes > budget.per_chain_bytes;
-    error = "the models in this document read " + format_kib(budget.used_bytes) +
-            " per block together, more than the model budget of " + format_kib(budget.budget_bytes);
-    if (chain_over)
+    // The reference as the client wrote it, not this device's resolved path: a message that says
+    // which block to swap has to name the block the user can see (docs/assets.md).
+    const graph::Document& written = document;
+    for (CostedNode& node : cost.nodes)
     {
-      error += ", and chain '" + resolved.chains[budget.heaviest_chain].id + "' alone reads " +
-               format_kib(budget.heaviest_chain_bytes) + " against " +
-               format_kib(budget.per_chain_bytes) + " for one core";
+      if (node.chain_index < written.chains.size() &&
+          node.node_index < written.chains[node.chain_index].graph.nodes.size())
+      {
+        const graph::NodeSpec& declared = written.chains[node.chain_index].graph.nodes[node.node_index];
+        const std::string reference =
+          string_param(declared, declared.type == "nc.cab.ir" ? "ir" : "model");
+        if (!reference.empty())
+          node.reference = reference;
+      }
     }
-    error += ", with every one that can be slimmed slimmed: " + describe_models(budget, document.chains.size() > 1);
+  }
+  if (cost.over && !admit_over_budget)
+  {
+    error = "the units in this document cost " + format_cost(cost.cost) +
+            " of a core together, more than the " + format_cost(cost.headroom) + " a rig may have";
+    if (!cost.has_table)
+      error += " (there is no readable cost table at '" + cost.table +
+               "', so every unit costs its unknown value)";
+    error += ", with every model that can be trimmed trimmed: " + describe_costs(cost, document.chains.size() > 1);
     if (error_code != nullptr)
       *error_code = "over_budget";
     return false;
@@ -1584,7 +1588,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     current_name_ = document.name;
     current_document_ = document;
     missing_assets_ = std::move(missing);
-    model_budget_ = std::move(budget);
+    cost_ = std::move(cost);
     last_transitions_.clear();
     return true;
   }
@@ -1858,7 +1862,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   current_document_ = document;
   current_resolved_ = std::move(resolved);
   missing_assets_ = std::move(missing);
-  model_budget_ = std::move(budget);
+  cost_ = std::move(cost);
   published_slots_ = std::move(raw);
   last_published_ = &current_document_;
   last_transitions_ = std::move(transitions);
@@ -1881,21 +1885,20 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     std::fprintf(stderr, "[namchaind] published %s (generation %llu, %zu chain%s: %s)\n", what.c_str(),
                  static_cast<unsigned long long>(generation_), count, count == 1 ? "" : "s", how.c_str());
   }
-  // What the budget did is logged whether or not the daemon is verbose: a slimmed model sounds
-  // different from the one the rig names, and a document over the budget may miss deadlines.
-  if (model_budget_.over)
+  // What the cost table did is logged whether or not the daemon is verbose: a trimmed model sounds
+  // different from the one the rig names (D6), and a document over the headroom may miss deadlines.
+  if (cost_.over)
   {
     std::fprintf(stderr,
-                 "[namchaind] model budget: the document reads %s per block, over the budget of %s, and plays "
+                 "[namchaind] cost: the document costs %s of a core, over the %s a rig may have, and plays "
                  "anyway: %s\n",
-                 format_kib(model_budget_.used_bytes).c_str(), format_kib(model_budget_.budget_bytes).c_str(),
-                 describe_models(model_budget_, count > 1).c_str());
+                 format_cost(cost_.cost).c_str(), format_cost(cost_.headroom).c_str(),
+                 describe_costs(cost_, count > 1).c_str());
   }
-  else if (budget_slimmed(model_budget_))
+  else if (cost_slimmed(cost_))
   {
-    std::fprintf(stderr, "[namchaind] model budget: %s of %s, as slimmed: %s\n",
-                 format_kib(model_budget_.used_bytes).c_str(), format_kib(model_budget_.budget_bytes).c_str(),
-                 describe_models(model_budget_, count > 1).c_str());
+    std::fprintf(stderr, "[namchaind] cost: %s of a core, as trimmed: %s\n", format_cost(cost_.cost).c_str(),
+                 describe_costs(cost_, count > 1).c_str());
   }
   return true;
 }
@@ -2067,13 +2070,18 @@ bool Daemon::start(std::string& error)
     return false;
   }
 
+  // This device's cost table, before anything is published against it. A table that is missing or
+  // unreadable is not fatal: every unit then costs its unknown value (D8), which is the conservative
+  // direction, and `engine.status`'s `cost` object says the table is not there.
+  load_cost_table();
+
   // The startup rig is compiled before the clock exists, so the first plan is there when the first
   // block runs (rig-pipeline.md §5.1 item 2). A failure here is fatal: the operator named a rig.
   if (!config_.rig.empty())
   {
     std::string path;
-    // Admitted over the model budget, with a warning: refusing the configured rig would leave a pedal
-    // with no sound at all, which no budget is worth.
+    // Admitted over the headroom, with a warning: refusing the configured rig would leave a pedal
+    // with no sound at all, which no headroom is worth.
     if (!resolve_startup_rig(config_, config_.rig, path, error) ||
         !load_rig(path, error, nullptr, /*admit_over_budget=*/true))
     {
@@ -3290,38 +3298,52 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       issue["reference"] = miss.reference;
     }
 
-    // The model budget (docs/daemon.md, "Model budget"). A slimmed block is the budget doing what it
-    // was configured to do -- a two-amp rig on a small core is not a fault -- so it is informational,
-    // but it names the block, because it sounds different from the model the rig names. A document
-    // admitted over the budget, and a model the budget cannot see into, are warnings: either may miss
-    // deadlines.
-    for (const BudgetedModel& model : model_budget_.models)
+    // The cost table (docs/daemon.md, "Cost and admission"). A trimmed model is the table doing what
+    // it was configured to do -- a two-amp rig on a small core is not a fault -- so it is
+    // informational, but it names the block, because it sounds different from the model the rig names
+    // (D6). A document admitted over the headroom, and a unit charged `unknown`, are warnings: either
+    // may miss deadlines, and the second is what D8 says an unmeasured unit costs.
+    for (const CostedNode& node : cost_.nodes)
     {
-      if (!model.slimmed && model.estimated)
+      if (!node.slimmed && node.measured)
         continue;
-      if (model.slimmed)
+      if (node.slimmed)
       {
         add("model_slimmed", "info",
-            "node '" + model.node + "' plays its smallest model to fit the model budget: " +
-              format_kib(model.slim_bytes) + " per block instead of " + format_kib(model.full_bytes),
-            1, model.chain, model.node);
+            "node '" + node.node + "' plays its Lite model to fit the cost table: " + format_cost(node.cost) +
+              " of a core instead of " + format_cost(node.cost_full) + " (" + node.row + ")",
+            1, node.chain, node.node);
       }
       else
       {
-        add("model_budget_unknown", "warn",
-            "node '" + model.node + "' is not counted against the model budget: " + model.why, 1, model.chain,
-            model.node);
+        add("cost_unknown", "warn",
+            "node '" + node.node + "' is charged the unknown cost " + format_cost(node.cost) +
+              " of a core: this device has no measured row for it (" + node.row +
+              "), so admission is guessing in the expensive direction (D8)",
+            1, node.chain, node.node);
       }
-      issues.back()["element"] = model.element;
-      issues.back()["reference"] = model.reference;
+      issues.back()["element"] = node.element;
+      issues.back()["reference"] = node.reference;
+      issues.back()["row"] = node.row;
     }
-    if (model_budget_.over)
+    if (cost_.over)
     {
-      add("model_budget_exceeded", "warn",
-          "the document's models read " + format_kib(model_budget_.used_bytes) +
-            " per block together, over the model budget of " + format_kib(model_budget_.budget_bytes) +
-            ", so the render may miss deadlines: " + describe_models(model_budget_, current_document_.chains.size() > 1),
+      add("cost_over", "warn",
+          "the document's units cost " + format_cost(cost_.cost) + " of a core together, over the " +
+            format_cost(cost_.headroom) + " a rig may have, so the render may miss deadlines: " +
+            describe_costs(cost_, current_document_.chains.size() > 1),
           1);
+    }
+    if (!cost_.has_table)
+    {
+      // Informational, not a warning: D8 makes an unmeasured device safe (every unit is charged its
+      // unknown, expensive value and a rig that does not fit is refused), so a pedal with no table
+      // plays and does not miss deadlines -- it just cannot play what it has not measured.
+      add("cost_table_missing", "info",
+          "there is no readable cost table at '" + cost_.table +
+            "', so every unit is charged its unknown cost: measure this device (scripts/measure-core) and "
+            "install devices/<host>/cost.json",
+          0);
     }
 
     // A library root that is configured and not there is worth saying out loud: the palette is empty,
@@ -3373,17 +3395,17 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     return list;
   };
 
-  // The blocks the model budget slimmed, beside the missing assets and for the same reason: the client
-  // that sent the rig learns at once that a block plays a smaller model than it names.
+  // The models the cost table trimmed, beside the missing assets and for the same reason: the client
+  // that sent the rig learns at once that a block plays a smaller model than it names (D6).
   auto slimmed_json = [this]() {
     nlohmann::json list = nlohmann::json::array();
-    for (const BudgetedModel& model : model_budget_.models)
+    for (const CostedNode& node : cost_.nodes)
     {
-      if (!model.slimmed)
+      if (!node.slimmed)
         continue;
-      list.push_back({{"chain", model.chain}, {"node", model.node}, {"element", model.element},
-                      {"reference", model.reference}, {"full_bytes", model.full_bytes},
-                      {"slim_bytes", model.slim_bytes}});
+      list.push_back({{"chain", node.chain}, {"node", node.node}, {"element", node.element},
+                      {"reference", node.reference}, {"cost", node.cost}, {"row", node.row},
+                      {"full_cost", node.cost_full}, {"working_set_bytes", node.working_set_bytes}});
     }
     return list;
   };
@@ -3419,13 +3441,13 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
                            {"kind", assets::kind_name(miss.kind)}, {"reference", miss.reference}});
       }
       entry["missing_assets"] = std::move(missing);
-      // And the blocks the model budget slimmed.
+      // And the models the cost table trimmed.
       nlohmann::json slimmed = nlohmann::json::array();
-      for (const BudgetedModel& model : model_budget_.models)
+      for (const CostedNode& node : cost_.nodes)
       {
-        if (model.slimmed && model.chain == chain.id)
-          slimmed.push_back({{"node", model.node}, {"element", model.element}, {"reference", model.reference},
-                             {"full_bytes", model.full_bytes}, {"slim_bytes", model.slim_bytes}});
+        if (node.slimmed && node.chain == chain.id)
+          slimmed.push_back({{"node", node.node}, {"element", node.element}, {"reference", node.reference},
+                             {"row", node.row}, {"cost", node.cost}, {"full_cost", node.cost_full}});
       }
       entry["slimmed_models"] = std::move(slimmed);
       list.push_back(std::move(entry));
@@ -3721,14 +3743,40 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // The model budget as configured, and what the running document reads against it: 0 throughout when
     // it is off. `used_bytes` is as published, slimmed models at their slim size; `full_bytes` is what
     // the same document would read with none of them slimmed.
-    status["model_budget"] = {{"budget_bytes", model_budget_.budget_bytes},
-                              {"per_chain_bytes", model_budget_.per_chain_bytes},
-                              {"configured_per_core_bytes", static_cast<std::size_t>(config_.model_budget_kb) * 1024u},
-                              {"heaviest_chain", model_budget_.heaviest_chain},
-                              {"heaviest_chain_bytes", model_budget_.heaviest_chain_bytes},
-                              {"used_bytes", model_budget_.used_bytes},
-                              {"full_bytes", model_budget_.full_bytes},
-                              {"over", model_budget_.over}};
+    // What the running rig costs and how it was admitted (D9: the engine owns the verdict). The rows
+    // are the device's, so `table` and `table_rows` say which numbers were used and how many of them
+    // there are -- a rig charged `unknown` because the device has never been measured says so here.
+    nlohmann::json cost_nodes = nlohmann::json::array();
+    for (const CostedNode& node : cost_.nodes)
+    {
+      cost_nodes.push_back({{"chain", node.chain},
+                            {"node", node.node},
+                            {"element", node.element},
+                            {"reference", node.reference},
+                            {"row", node.row},
+                            {"cost", node.cost},
+                            {"full_cost", node.cost_full},
+                            {"measured", node.measured},
+                            {"slimmed", node.slimmed},
+                            {"working_set_bytes", node.working_set_bytes}});
+    }
+    status["cost"] = {{"cost", cost_.cost},
+                      {"full_cost", cost_.full_cost},
+                      {"headroom", cost_.headroom},
+                      {"over", cost_.over},
+                      {"verdict", cost_.verdict},
+                      {"trimmed", cost_.trimmed},
+                      {"table", cost_.table},
+                      {"table_ok", cost_.has_table},
+                      {"table_detail", cost_table_.detail},
+                      {"table_host", cost_table_.host},
+                      {"table_measured", cost_table_.measured},
+                      {"table_engine_commit", cost_table_.engine_commit},
+                      {"table_rows", cost_table_.rows().size()},
+                      {"unknown", {{"NAM", cost_table_.unknown_nam},
+                                   {"IR", cost_table_.unknown_ir},
+                                   {"node", cost_table_.unknown_node}}},
+                      {"nodes", std::move(cost_nodes)}};
 
     // The library at a glance. The listing is `engine.assets`; this is the size of it, so a client
     // that shows a palette can tell "no models installed" from "not asked yet".
@@ -3919,7 +3967,102 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     return ok_response(id, body);
   }
 
-  // --- rig.load / rig.get -------------------------------------------------
+  // --- rig.load / rig.cost / rig.get --------------------------------------
+  if (method == "rig.cost")
+  {
+    // What a rig would cost *before* anyone plays it: the same table, the same verdict and the same
+    // trimming the publish would apply, on a copy that is thrown away. It exists because the rigs the
+    // player can reach are the service's bank, not the engine's (D9): `pedald` owns the bank, so it
+    // asks this for each rig and skips the ones that cannot play -- and because a service that summed
+    // costs itself would be the second cost model D9 rules out.
+    //
+    // Either a `rig` name (as rig.load takes) or a whole `document`, and no side effects: nothing is
+    // published, nothing is compiled and no model is loaded.
+    graph::Document document;
+    std::string base_dir;
+    std::string path;
+    if (doc.contains("rig"))
+    {
+      if (!doc["rig"].is_string())
+        return error_response(id, "bad_request", "'rig' must be a string");
+      std::string error;
+      if (!resolve_rig_name(config_, doc["rig"].get<std::string>(), path, error))
+        return error_response(id, "rig_not_found", error);
+      if (!graph::load_document_json(path, document, error))
+        return error_response(id, "compile_failed", error);
+      base_dir = std::filesystem::path(path).parent_path().string();
+    }
+    else if (doc.contains("document"))
+    {
+      if (!doc["document"].is_object())
+        return error_response(id, "bad_request", "'document' must be an object");
+      std::string error;
+      if (!graph::parse_document_json(doc["document"].dump(), document, error))
+        return error_response(id, "bad_request", error);
+    }
+    else
+    {
+      return error_response(id, "bad_request", "rig.cost needs a 'rig' name or a 'document'");
+    }
+
+    const graph::Validation validation = graph::validate(document);
+    if (!validation.ok)
+      return error_response(id, "bad_request", validation.message);
+
+    graph::Document resolved = document;
+    graph::resolve_relative_paths(resolved, base_dir);
+    std::vector<assets::MissingAsset> missing;
+    std::string error;
+    if (!assets::resolve_document(resolved, assets_, base_dir, error, &missing))
+      return error_response(id, "asset_missing", error);
+
+    const CostOutcome cost = apply_cost_table(resolved, cost_table_, units_,
+                                             static_cast<double>(config_.sample_rate),
+                                             static_cast<int>(config_.period_size));
+    nlohmann::json cost_nodes = nlohmann::json::array();
+    for (const CostedNode& node : cost.nodes)
+    {
+      cost_nodes.push_back({{"chain", node.chain},
+                            {"node", node.node},
+                            {"element", node.element},
+                            {"reference", node.reference},
+                            {"row", node.row},
+                            {"cost", node.cost},
+                            {"full_cost", node.cost_full},
+                            {"measured", node.measured},
+                            {"slimmed", node.slimmed}});
+    }
+    nlohmann::json body;
+    if (!path.empty())
+      body["rig"] = path;
+    body["cost"] = {{"cost", cost.cost},
+                    {"full_cost", cost.full_cost},
+                    {"headroom", cost.headroom},
+                    {"over", cost.over},
+                    {"verdict", cost.verdict},
+                    {"trimmed", cost.trimmed},
+                    {"table", cost.table},
+                    {"table_ok", cost.has_table},
+                    {"nodes", std::move(cost_nodes)}};
+    body["slimmed_models"] = [&cost]() {
+      nlohmann::json list = nlohmann::json::array();
+      for (const CostedNode& node : cost.nodes)
+      {
+        if (node.slimmed)
+          list.push_back({{"chain", node.chain}, {"node", node.node}, {"element", node.element},
+                          {"reference", node.reference}, {"row", node.row}, {"cost", node.cost},
+                          {"full_cost", node.cost_full}});
+      }
+      return list;
+    }();
+    nlohmann::json missing_json_list = nlohmann::json::array();
+    for (const assets::MissingAsset& miss : missing)
+      missing_json_list.push_back({{"chain", miss.chain}, {"node", miss.node}, {"element", miss.element},
+                                   {"param", miss.param}, {"kind", assets::kind_name(miss.kind)},
+                                   {"reference", miss.reference}, {"message", miss.message}});
+    body["missing_assets"] = std::move(missing_json_list);
+    return ok_response(id, body);
+  }
   if (method == "rig.load")
   {
     if (!doc.contains("rig") || !doc["rig"].is_string())
@@ -4216,11 +4359,12 @@ int Daemon::run()
         else if (signo == SIGHUP)
         {
           // A reload is also the moment an operator expects a newly copied model to appear in the
-          // palette, so the library is rescanned with the rig.
+          // palette -- and a re-measured cost table to take effect -- so both are re-read.
+          load_cost_table();
           assets_.refresh();
           std::string path;
           std::string error;
-          // The configured rig again, under the startup's rule: admitted over the model budget.
+          // The configured rig again, under the startup's rule: admitted over the headroom.
           if (!config_.rig.empty() && resolve_startup_rig(config_, config_.rig, path, error) &&
               load_rig(path, error, nullptr, /*admit_over_budget=*/true))
           {
