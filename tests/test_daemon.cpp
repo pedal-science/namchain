@@ -3362,7 +3362,12 @@ TEST_CASE("engine.levels reports the device, the chain and every node, and carri
     REQUIRE(reply.contains("levels"));
     levels = reply["levels"];
     const auto& nodes = levels["chains"][0]["nodes"];
-    have_window = !nodes.empty() && nodes[0]["frames"].get<uint64_t>() > 0;
+    // Both windows or neither: the node's is what the loop is named for, and the device's `blocks`
+    // is asserted below from this same reply. Polling only for the node's and then requiring the
+    // device's is asserting a race -- it failed about one run in six, on the old engine as well as
+    // the new one, which is how it was found.
+    have_window = !nodes.empty() && nodes[0]["frames"].get<uint64_t>() > 0 &&
+                  levels["blocks"].get<uint64_t>() > 0;
     if (!have_window)
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }

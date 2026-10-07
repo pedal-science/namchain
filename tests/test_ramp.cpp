@@ -508,3 +508,34 @@ TEST_CASE("a ramped lane level passes the glitch detector, and an unramped one d
   CHECK_FALSE(control.ok);
   CHECK(control.max_edit_d2 > control.reference_d2);
 }
+
+TEST_CASE("a ramped EQ change adds no energy while it ramps")
+{
+  // The biquad keeps the outgoing filter and the incoming one running and crossfades them with
+  // `rt::Crossfade` -- the same law a plan-level transition uses. Both lanes are the *same input*
+  // through two slightly different filters, so they are correlated at about 1, which is the case
+  // equal power gets wrong: it added up to 3 dB in the middle of every EQ move. The detector cannot
+  // see it (continuous, no dropout, no excess high frequency, converges), so this measures the fade
+  // against the two responses it is moving between.
+  //
+  // A small boost rather than a deep cut: the two lanes have to be close in level for the bump to
+  // show up against the louder of them, and +3 dB at 1 kHz on a 1 kHz tone is the gesture a player
+  // makes. With the old law this measures +1.76 dB; with the normalisation, -0.30.
+  const std::vector<float> input = tone(kFrames);
+  const std::vector<float> y = render_node(one_node_graph(biquad(1000.0, 0.0, 5.0)), input, "gain_db", true, 3.0f);
+  const std::vector<float> before =
+    render_node(one_node_graph(biquad(1000.0, 0.0, 0.0)), input, "gain_db", false, 0.0f);
+  const std::vector<float> after =
+    render_node(one_node_graph(biquad(1000.0, 3.0, 0.0)), input, "gain_db", false, 0.0f);
+
+  double peak = 0.0, louder = 0.0;
+  for (std::size_t i = kEditAt; i < kEditAt + 240; ++i)
+  {
+    peak = std::max(peak, std::abs(static_cast<double>(y[i])));
+    louder = std::max(louder, std::max(std::abs(static_cast<double>(before[i])),
+                                       std::abs(static_cast<double>(after[i]))));
+  }
+  const double excess = 20.0 * std::log10(peak / louder);
+  MESSAGE("excess " << excess << " dB");
+  CHECK(excess < 0.2);
+}
