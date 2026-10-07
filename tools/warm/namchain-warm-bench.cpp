@@ -402,7 +402,10 @@ struct Args
   int depth = 4;                      ///< chain: models in series
   std::vector<double> replays{85, 170, 340, 680}; ///< chain: replay lengths per model, ms
   double audition_start = 10.0, audition_seconds = 20.0; ///< slim --audition excerpt
-  std::string fade_shape = "equal-power"; ///< slim: equal-power | equal-gain | compensated
+  /// slim: equal-power | equal-gain | compensated. The default is what the engine does now
+  /// (rt::Crossfade normalises for the correlation it measures); equal-power is kept because the
+  /// recorded E2 tables were run with it, and the difference is the point of the comparison.
+  std::string fade_shape = "compensated";
 };
 
 /// --ir is optional in every mode: with none, a rig is the model alone.

@@ -88,3 +88,54 @@ What this does not establish
 - The right way to estimate rho in the engine: a short lookback at fade start is what the bench
   does (20 ms). A bypass fade could simply declare rho = 1, since it knows the two signals are the
   same audio.
+
+--------------------------------------------------------------------------------------------------
+2026-10-07, the engine side: measured through the engine's own code, then fixed
+--------------------------------------------------------------------------------------------------
+
+The measurement the plan asked for, in `tests/test_crossfade.cpp`, through the three paths the
+engine's fade is reached by. `fade excess` is the worst peak inside the fade against the louder of
+the two signals it is mixing, in dB:
+
+  path                                            before     after
+  rt::Crossfade, the same audio on both sides    +2.98 dB    +0.00
+  a plan-level transition (a bypass flip)        +3.01 dB    +0.00
+  the nc.xfade node a local transition is built from
+                                                 +3.01 dB    +0.00
+  rt::Crossfade, two unrelated signals           -0.04 dB    -0.04   (the case equal power is for)
+
+All three are red before the fix and green after, and the fourth is the control that says the law is
+still equal power where it should be. The engine's existing transition test could not have caught
+this: its fixture crossfades two plans that differ by a gain, so the two signals are *perfectly*
+correlated, and it passed every glitch rule while thumping -- because a level bump is continuous, is
+not a dropout, adds no excess high frequency and converges.
+
+A second defect fell out of the first. `RenderPlan::prewarm` runs one silent block through the whole
+plan, and `nc.xfade` -- which is `skip_prewarm` precisely so that "the fade is not spent on silence
+before the plan is heard" -- was run anyway: `skip_prewarm` was only honoured by `prewarm_fresh`.
+Every local transition therefore entered its first audible block 64 frames into a 240-frame fade:
+3.7 ms of crossfade where 5 ms was asked for. It also meant the fade's correlation measurement
+compared silence with silence. `prewarm` now skips those nodes too, and a test asserts where the
+fade's midpoint lands (a constant input with its inverse on the other side is g1 - g2, zero at the
+midpoint, so the midpoint's position says where the fade started).
+
+The fix
+-------
+
+`rt::Crossfade` keeps the one equal-power table it had and normalises the weights as it reads them,
+by `1/sqrt(1 + 2*rho*g1*g2)`: exact at every rho rather than at a few, one sqrt and one divide per
+sample for the length of a fade, and nothing at all when rho measures 0. (Five precomputed tables
+were the first cut and cost 655 kB per daemon chain -- 8 chains at kMaxTransitionFrames -- for less
+accuracy than this.) `start(frames, rho)` takes a rho, and the default measures it from the first
+block it is handed, before writing any of it, so no sample is mixed with the wrong law. Measuring rather than declaring is what the call sites need: what a
+transition joins is not known when it starts -- a bypass of a NAM model is two unrelated signals, a
+bypass of a gain is the same audio twice, and an EQ ramp is the same audio through two filters -- and
+the block is in hand before the output is written. rho is clamped to [0, 1], because a negative
+estimate (a 1.33 ms window of near-silence produces one readily) would divide by less than one and
+amplify the fade: written without the clamp in the bench, it turned a +2.9 dB thump into +4.6 dB.
+
+Nothing else changed: the render path still allocates nothing (the existing allocation test covers
+it), `start` stays O(1) on the render path, and the daemon and the three node types that fade --
+`nc.xfade`, `nc.eq.biquad`'s two lanes, `nc.delay`'s two taps -- all pass both signals to `mix`
+before it writes, so all four measure rather than guess. The whole suite passes, on the Mac and in
+the aarch64 container build: 341 cases, 270,069 assertions.

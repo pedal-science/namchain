@@ -15,15 +15,21 @@
 //
 // **But that identity is only the whole story when the two signals are uncorrelated.** The power of
 // g1*a + g2*b is g1^2 + g2^2 + 2*rho*g1*g2, which equal power takes to be 1: true at rho = 0, and
-// **+3 dB at the midpoint at rho = 1**. So a fade between two signals that carry nearly the same
-// audio -- a Lite/Full handover, a bypass toggle's wet and dry, a model swap within a slot -- adds
-// energy instead of holding it, and it is a thump rather than a click: continuous, no dropout, no
-// excess high frequency and it converges, so none of the glitch detector's four rules can see it.
-// Measured 2026-10-07 on 104 of them: +2.6 to +3.0 dB on every model, where two *different* rigs
-// (rho -0.7 to +0.5) are the uncorrelated case this law is right for. The fix is to divide both
-// weights by sqrt(1 + 2*rho*g1*g2) with rho clamped to [0, 1] -- one extra sqrt per table entry,
-// since the table is already built here in `start()` -- and it wants its own commit and transition
-// tests rather than being slipped in. bench-results/e2-fade-thump.txt is the measurement.
+// **+3 dB at the midpoint at rho = 1**. A fade between two signals carrying nearly the same audio --
+// a bypass of a linear node, an EQ or delay ramp, a Lite/Full handover -- adds energy instead of
+// holding it, and that is a thump rather than a click: continuous, no dropout, no excess high
+// frequency, and it converges, so none of the glitch detector's four rules can see it. Measured
+// 2026-10-07 at +3.0 dB through this class, through `nc.xfade` and through a plan-level transition
+// (bench-results/e2-fade-thump.txt), while two *different* rigs (rho -0.7 to +0.5) are the
+// uncorrelated case equal power is right for.
+//
+// So the weights are chosen for the correlation the two signals actually have: `start` takes a rho,
+// and the default measures it from the first block it is given. The table for each rho is built in
+// the constructor -- five of them, a few hundred floats -- so `start` stays O(1) on the render path
+// and the measurement is one block of multiply-adds per fade. Tests: tests/test_crossfade.cpp, which
+// measures the excess through this class, through `nc.xfade` and through a plan-level transition. The table divides both weights by
+// sqrt(1 + 2*rho*g1*g2), which is equal power at rho = 0 and constant amplitude at rho = 1. rho is
+// clamped to [0, 1]: a negative estimate would divide by less than one and *amplify* the fade.
 //
 // The table is built in the constructor (control thread). `start` and `mix` are render-path calls:
 // no allocation, no lock, no syscall.
@@ -37,6 +43,8 @@ namespace rt
 class Crossfade
 {
 public:
+  /// Pass this as \p rho to `start` to have the correlation measured from the first block mixed.
+  static constexpr double kMeasureCorrelation = -1.0;
   /// \param max_frames The longest fade the table covers. A longer `start` is clamped, not refused:
   ///        a fade is a safety mechanism, and refusing one at runtime would be worse than shortening
   ///        it. Sized once, on the control thread.
@@ -46,12 +54,21 @@ public:
   Crossfade& operator=(const Crossfade&) = delete;
 
   /// Render path: begin a fade over \p frames, clamped to `[1, max_frames]`.
-  void start(int frames) noexcept;
+  ///
+  /// \param rho The correlation of the two signals about to be mixed, in [0, 1], or
+  ///        \ref kMeasureCorrelation (the default) to measure it from the first block. Measuring is
+  ///        what the engine's call sites want: what a transition joins is not known when the fade
+  ///        starts -- a bypass of a NAM model is two unrelated signals and a bypass of a gain is the
+  ///        same audio twice -- and the block is in hand before the output is written, so nothing is
+  ///        mixed with the wrong law.
+  void start(int frames, double rho = kMeasureCorrelation) noexcept;
 
   bool active() const noexcept { return remaining_ > 0; }
   int remaining() const noexcept { return remaining_; }
   /// The fade length currently in force, in frames; 0 before the first `start`.
   int length() const noexcept { return length_; }
+  /// The correlation in force: what `start` was given, or what the first block measured.
+  double correlation() const noexcept { return rho_; }
   int max_frames() const noexcept { return max_frames_; }
 
   /// Render path: mix \p a (fading out) and \p b (fading in) into \p out.
@@ -68,12 +85,14 @@ public:
   }
 
 private:
-  std::vector<float> from_; ///< weight for the fading-out signal, indexed by position
-  std::vector<float> to_;   ///< weight for the fading-in signal
+  std::vector<float> from_; ///< equal-power weight for the fading-out signal, by position
+  std::vector<float> to_;   ///< equal-power weight for the fading-in signal
   int max_frames_ = 0;
   int length_ = 0;
   int position_ = 0;
   int remaining_ = 0;
+  float rho_ = 0.0f;       ///< what the weights are normalised for, in [0, 1]
+  bool measure_ = false;   ///< the next `mix` measures the correlation from its block
 };
 
 } // namespace rt

@@ -231,10 +231,14 @@ struct NodeType
   /// `engine.schema` leaves it out and a document may not name it; only the engine places one, as
   /// the crossfade inside a local transition (docs/transitions.md, "Local transitions").
   bool internal = false;
-  /// \brief Leave this node out of \ref graph::RenderPlan::prewarm_fresh.
+  /// \brief Leave this node out of prewarming: neither \ref graph::RenderPlan::prewarm_fresh nor
+  /// the silent block \ref graph::RenderPlan::prewarm runs.
   ///
   /// For a node whose first `process` call is the start of something timed -- a local transition's
-  /// crossfade -- rather than a cold start to get out of the way.
+  /// crossfade, which counts the blocks it has played -- rather than a cold start to get out of the
+  /// way. Running it in `prewarm`'s silent block spent 64 of a 240-frame fade before any audio
+  /// flowed, so the transition was 3.7 ms of crossfade rather than the 5 ms it asked for, and the
+  /// fade's correlation measurement saw silence instead of the two signals it is there to compare.
   bool skip_prewarm = false;
 };
 
@@ -520,6 +524,8 @@ private:
   /// report; an atomic per node rather than a `PlanNode` field because `PlanNode` lives in a vector
   /// and `std::atomic` is not movable.
   std::vector<std::atomic<bool>> failed_;
+  /// True only inside \ref prewarm, so `execute` can leave `skip_prewarm` nodes alone.
+  bool warming_ = false;
   /// \brief One level probe per node, parallel to \ref nodes_ (\ref level_of).
   ///
   /// In the plan rather than in the daemon because a plan is executed by whichever pool worker owns

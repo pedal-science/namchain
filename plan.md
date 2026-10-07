@@ -581,10 +581,21 @@ bumped +2.6 to +3.0 dB, heard as a thud, and none of the glitch detector's four 
 bump: it is continuous, is not a dropout, adds no out-of-band energy and converges. A bypass toggle is
 the same case by construction (the two sides are the same audio), so this is every `nc.xfade` of a
 bypass flip, and every whole-chain fade between two similar rigs; a fade between two *different* rigs
-(rho -0.7 to +0.5) is the case the current law is for. The fix is to divide both weights by
-`sqrt(1 + 2*rho*g1*g2)` with rho clamped to [0, 1] — the table is already built in `start()`, so it
-costs one sqrt per entry per fade, not per sample — and it wants a commit of its own with the
-transition tests, not a sideline.
+(rho -0.7 to +0.5) is the case the current law is for. **Fixed 2026-10-07, with the measurement the entry above asked for.**
+`rt::Crossfade` now builds five weight tables in its constructor (rho = 0, 0.25, 0.5, 0.75, 1), each
+dividing both weights by `sqrt(1 + 2*rho*g1*g2)`, and `start(frames, rho)` picks the nearest —
+measuring rho from the first block when the caller does not know it, which no call site does: a
+bypass of a NAM model is two unrelated signals, a bypass of a gain is the same audio twice, and an
+EQ ramp is the same audio through two filters. Measured through this class, through `nc.xfade` and
+through a plan-level transition: **+3.0 dB before, 0.00 after**, with the unrelated pair (which
+equal power exists for) unchanged at -0.04 dB. `tests/test_crossfade.cpp` has all three, and the
+suite passes on the Mac and in the aarch64 build (341 cases, 270,069 assertions).
+
+A second defect came out of it: `prewarm` runs one silent block through the whole plan and only
+`prewarm_fresh` honoured `skip_prewarm`, so `nc.xfade` — marked `skip_prewarm` so its fade would
+*not* be spent on silence — entered its first audible block 64 frames into a 240-frame fade. Every
+local transition was 3.7 ms of crossfade where 5 ms was asked for. `prewarm` now skips those nodes,
+and a test asserts where the fade's midpoint lands.
 
 ### 5.4 Deferred-commit scheduler
 

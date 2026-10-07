@@ -974,6 +974,11 @@ void RenderPlan::execute(const float* input, float* output, int frames) noexcept
   for (std::size_t i = 0; i < nodes_.size(); ++i)
   {
     PlanNode& node = nodes_[i];
+    // A node whose first block is the start of something timed is left alone here: `prewarm` runs
+    // silence through the whole plan, and for a local transition's crossfade that silence is part of
+    // the fade it has already begun counting.
+    if (warming_ && node.type->skip_prewarm)
+      continue;
     // A node the guard has already failed is not run again: its output is dry for the rest of the
     // plan's life, and re-running it would only re-produce the fault. This is a deliberate exception
     // to G14's "keep it running": a node whose output cannot be trusted is not a node whose state is
@@ -1026,7 +1031,9 @@ void RenderPlan::prewarm() noexcept
 {
   if (max_quantum_ <= 0)
     return;
+  warming_ = true;
   execute(nullptr, nullptr, max_quantum_);
+  warming_ = false;
   // The prewarm's block is silence that no client could have read -- the plan is not published until
   // this returns -- so it is dropped rather than left to dilute a node's first window. `take` is the
   // only way to empty a probe, and on the control thread before publication there is no reader to
