@@ -402,6 +402,7 @@ struct Args
   int depth = 4;                      ///< chain: models in series
   std::vector<double> replays{85, 170, 340, 680}; ///< chain: replay lengths per model, ms
   double audition_start = 10.0, audition_seconds = 20.0; ///< slim --audition excerpt
+  std::string fade_shape = "equal-power"; ///< slim: equal-power | equal-gain | compensated
 };
 
 /// --ir is optional in every mode: with none, a rig is the model alone.
@@ -414,18 +415,77 @@ std::vector<float> load_ir_or_none(const Args& args)
 
 // --- state ------------------------------------------------------------------
 
-/// Equal-power crossfade from `from` to `to` starting at `t`, over `fade` frames; `to` before `t` is
-/// never read.
+/// The two gains at position `i` of a `fade`, for a shape and the correlation the two signals
+/// actually have.
+///
+/// Equal power (cos/sin) is the right law for signals that are *uncorrelated*: it keeps
+/// g1^2 + g2^2 == 1, so the sum's power is constant. It is the wrong law for correlated ones: the
+/// power of g1*a + g2*b is g1^2 + g2^2 + 2*rho*g1*g2, which equal power takes to be 1 -- true only
+/// at rho = 0, and **+3 dB at the midpoint when rho = 1**. Two submodels of the same rig are
+/// rho ~ 0.996, so the fade adds up to 2.6 dB of low-frequency thump at every switch, and no rule in
+/// the glitch detector sees it: it is continuous, has no dropout, no HF excess and converges.
+///
+/// `compensated` divides by the power the sum actually has, given rho; `equal-gain` is the plain
+/// (1-k, k) law, which is exact for rho = 1 and 3 dB down at the midpoint for rho = 0.
+void fade_gains(const std::string& shape, std::size_t i, std::size_t fade, double rho, double& g1, double& g2)
+{
+  const double k = fade == 0 ? 1.0 : std::min(1.0, static_cast<double>(i) / static_cast<double>(fade));
+  if (shape == "equal-gain")
+  {
+    g1 = 1.0 - k;
+    g2 = k;
+    return;
+  }
+  g1 = std::cos(k * M_PI / 2);
+  g2 = std::sin(k * M_PI / 2);
+  if (shape == "compensated")
+  {
+    // **Clamped to [0, 1].** A negative rho would divide by less than one and *amplify* the fade,
+    // which is the opposite of the point: an estimate that noisy (20 ms of near-silence is enough
+    // to produce one) turned a +2.9 dB thump into +4.6 dB when this was written without the clamp.
+    // rho = 0 leaves equal power alone, which is right for signals that really are uncorrelated.
+    const double r = std::min(1.0, std::max(0.0, rho));
+    const double norm = 1.0 / std::sqrt(1.0 + 2.0 * r * g1 * g2);
+    g1 *= norm;
+    g2 *= norm;
+  }
+  else if (shape != "equal-power")
+  {
+    die("unknown fade shape " + shape + "; equal-power, equal-gain or compensated");
+  }
+}
+
+/// Crossfade from `from` to `to` starting at `t`, over `fade` frames; `to` before `t` is never read.
 void crossfade(const std::vector<float>& from, const std::vector<float>& to, std::size_t t, std::size_t fade,
-               std::vector<float>& y)
+               std::vector<float>& y, const std::string& shape = "equal-power", double rho = 0.0)
 {
   y = from;
   for (std::size_t i = t; i < y.size(); ++i)
   {
-    const double k = i - t < fade ? static_cast<double>(i - t) / static_cast<double>(fade) : 1.0;
-    const double g_out = std::cos(k * M_PI / 2), g_in = std::sin(k * M_PI / 2);
+    double g_out = 1.0, g_in = 0.0;
+    if (i - t < fade)
+      fade_gains(shape, i - t, fade, rho, g_out, g_in);
+    else
+    {
+      fade_gains(shape, fade, fade, rho, g_out, g_in);
+    }
     y[i] = static_cast<float>(g_out * from[i] + g_in * to[i]);
   }
+}
+
+/// What the two signals' correlation is as they meet: over the `n` frames before the switch.
+double correlation(const std::vector<float>& a, const std::vector<float>& b, std::size_t t, std::size_t n)
+{
+  const std::size_t from = t > n ? t - n : 0;
+  double ab = 0, aa = 0, bb = 0;
+  for (std::size_t i = from; i < t; ++i)
+  {
+    ab += static_cast<double>(a[i]) * b[i];
+    aa += static_cast<double>(a[i]) * a[i];
+    bb += static_cast<double>(b[i]) * b[i];
+  }
+  const double den = std::sqrt(aa * bb);
+  return den > 0 ? ab / den : 0.0;
 }
 
 int run_state(const Args& args)
@@ -583,11 +643,13 @@ int run_slim(const Args& args)
               args.input.c_str(), static_cast<double>(x.size()) / kRate,
               ir.empty() ? "none" : (stem(args.ir) + ": " + std::to_string(ir.size()) + " taps").c_str(), q,
               args.fade_ms, ts.size(), args.switch_every);
-  std::printf("Lite is --slim 0.0 (the first submodel), Full --slim 1.0 (the last, and the default).\n\n");
-  std::printf("%-30s %-10s %8s %8s %9s %9s  %-24s %-12s %s\n", "candidate", "direction", "lite rms", "full rms",
-              "null rms", "null max", "handover (glitch detector)", "wrong-model", "first finding");
-  std::printf("%-30s %-10s %8s %8s %9s %9s  %-24s %-12s\n", "", "", "dBFS", "dBFS", "dBFS", "dBFS", "",
-              "0-200 ms");
+  std::printf("Lite is --slim 0.0 (the first submodel), Full --slim 1.0 (the last, and the default).\n");
+  std::printf("fade %.1f ms, %s.\n\n", args.fade_ms, args.fade_shape.c_str());
+  std::printf("%-30s %-10s %8s %8s %9s %9s  %-24s %-12s %-18s %s\n", "candidate", "direction", "lite rms",
+              "full rms", "null rms", "null max", "handover (glitch detector)", "wrong-model", "fade excess",
+              "first finding");
+  std::printf("%-30s %-10s %8s %8s %9s %9s  %-24s %-12s %-18s\n", "", "", "dBFS", "dBFS", "dBFS", "dBFS", "",
+              "0-200 ms", "dB, and rho");
 
   int failures = 0;
   for (const std::string& path : args.candidates)
@@ -621,17 +683,34 @@ int run_slim(const Args& args)
       const std::vector<float>* before;
       const std::vector<float>* after;
       int ok = 0, n = 0;
-      double worst = -1000, d2 = 0;
+      double worst = -1000, d2 = 0, excess = -1000, rho_mean = 0;
       std::string finding;
-    } rows[2] = {{"Lite->Full", &L, &F, 0, 0, -1000, 0, ""}, {"Full->Lite", &F, &L, 0, 0, -1000, 0, ""}};
+    } rows[2] = {{"Lite->Full", &L, &F, 0, 0, -1000, 0, -1000, 0, ""},
+                 {"Full->Lite", &F, &L, 0, 0, -1000, 0, -1000, 0, ""}};
 
     std::vector<float> y;
     for (Row& r : rows)
     {
-      crossfade(*r.before, *r.after, ts.empty() ? 0 : ts.front(), fade, y); // sized
+      crossfade(*r.before, *r.after, ts.empty() ? 0 : ts.front(), fade, y, args.fade_shape); // sized
       for (std::size_t t : ts)
       {
-        crossfade(*r.before, *r.after, t, fade, y);
+        // The correlation the two signals have as they meet is what the fade's law has to account
+        // for; the bench measures it rather than assuming it.
+        const double rho = correlation(*r.before, *r.after, t, static_cast<std::size_t>(0.02 * kRate));
+        r.rho_mean += rho;
+        crossfade(*r.before, *r.after, t, fade, y, args.fade_shape, rho);
+        // And the fade's own excess: peak inside the fade against the louder of the two signals.
+        // A fade that adds energy is a thump, and no glitch rule sees one.
+        double pe = 0, pa = 0, pb = 0;
+        for (std::size_t i = t; i < std::min(x.size(), t + fade); ++i)
+        {
+          pe = std::max(pe, std::abs(static_cast<double>(y[i])));
+          pa = std::max(pa, std::abs(static_cast<double>((*r.before)[i])));
+          pb = std::max(pb, std::abs(static_cast<double>((*r.after)[i])));
+        }
+        const double louder = std::max(pa, pb);
+        if (louder > 0)
+          r.excess = std::max(r.excess, dbfs(pe / louder));
         // What the player hears if the *other* submodel is substituted and never handed over: the
         // steady difference, over the same 200 ms the state mode judges its arms on.
         double w = 0;
@@ -670,11 +749,12 @@ int run_slim(const Args& args)
 
     for (const Row& r : rows)
     {
-      char glitch[64], wrong[40];
+      char glitch[64], wrong[40], excess[32];
       std::snprintf(glitch, sizeof glitch, "%d/%d clean, d2 x%.1f", r.ok, r.n, r.d2);
       std::snprintf(wrong, sizeof wrong, "%.1f dBFS", r.worst);
-      std::printf("%-30.30s %-10s %8.2f %8.2f %9.2f %9.2f  %-24s %-12s %s\n", stem(path).c_str(), r.dir,
-                  dbfs(std::sqrt(lsq / n)), dbfs(std::sqrt(fsq / n)), null_rms, dbfs(mx), glitch, wrong,
+      std::snprintf(excess, sizeof excess, "%+.2f (rho %+.3f)", r.excess, r.n > 0 ? r.rho_mean / r.n : 0.0);
+      std::printf("%-30.30s %-10s %8.2f %8.2f %9.2f %9.2f  %-24s %-12s %-18s %s\n", stem(path).c_str(), r.dir,
+                  dbfs(std::sqrt(lsq / n)), dbfs(std::sqrt(fsq / n)), null_rms, dbfs(mx), glitch, wrong, excess,
                   r.finding.c_str());
       if (r.ok != r.n)
         ++failures;
@@ -690,7 +770,11 @@ int run_slim(const Args& args)
         std::min(static_cast<std::size_t>(args.audition_seconds * kRate), x.size() - std::min(from, x.size()));
       std::vector<float> alt = L;
       for (std::size_t i = 0; i < ts.size(); ++i)
-        crossfade(alt, i % 2 == 0 ? F : L, ts[i], fade, alt);
+      {
+        const std::vector<float>& other = i % 2 == 0 ? F : L;
+        crossfade(alt, other, ts[i], fade, alt, args.fade_shape,
+                  correlation(alt, other, ts[i], static_cast<std::size_t>(0.02 * kRate)));
+      }
 
       std::string error;
       const std::string tag = stem(path);
@@ -710,7 +794,10 @@ int run_slim(const Args& args)
   std::printf("\nnull: |Lite - Full| over the whole input, sample aligned (both submodels are zero-latency).\n"
               "handover: the %zu switches judged by namchain::glitch against the submodel running after it.\n"
               "wrong-model: the worst |Lite - Full| in the 200 ms after a switch -- what a listener hears\n"
-              "while a Lite stands in for the Full, which is tier 2's first step.\n",
+              "while a Lite stands in for the Full, which is tier 2's first step.\n"
+              "fade excess: the worst peak inside a fade against the louder of the two signals, in dB.\n"
+              "  Equal power adds 2*rho*g1*g2 at the midpoint where the signals are correlated, so on\n"
+              "  two submodels of one rig (rho ~ 1) it is a +3 dB thump and no glitch rule sees it.\n",
               ts.size());
   return failures == 0 ? 0 : 1;
 }
@@ -1037,6 +1124,8 @@ int main(int argc, char** argv)
       args.switch_every = std::atof(next().c_str());
     else if (a == "--replay-ms")
       args.replay_ms = std::atof(next().c_str());
+    else if (a == "--fade-shape")
+      args.fade_shape = next();
     else if (a == "--fade-ms")
       args.fade_ms = std::atof(next().c_str());
     else if (a == "--seconds")

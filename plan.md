@@ -573,6 +573,19 @@ outstanding: `tail_hold` for a bypassed node with a tail, warm-start model swapp
 two rules above only coalescing exists — admission control does not. `docs/transitions.md` is the
 operational account.
 
+**The fade's law is wrong for correlated signals, and that is audible** (measured 2026-10-07,
+`bench-results/e2-fade-thump.txt`). `rt::Crossfade` is equal-power so that `from^2 + to^2 == 1`, which
+is right when the two signals are uncorrelated and +3 dB at the midpoint when they are not — the power
+of `g1*a + g2*b` is `g1^2 + g2^2 + 2*rho*g1*g2`. Every Lite/Full handover measured (rho 0.91-1.00)
+bumped +2.6 to +3.0 dB, heard as a thud, and none of the glitch detector's four rules can see a level
+bump: it is continuous, is not a dropout, adds no out-of-band energy and converges. A bypass toggle is
+the same case by construction (the two sides are the same audio), so this is every `nc.xfade` of a
+bypass flip, and every whole-chain fade between two similar rigs; a fade between two *different* rigs
+(rho -0.7 to +0.5) is the case the current law is for. The fix is to divide both weights by
+`sqrt(1 + 2*rho*g1*g2)` with rho clamped to [0, 1] — the table is already built in `start()`, so it
+costs one sqrt per entry per fade, not per sample — and it wants a commit of its own with the
+transition tests, not a sideline.
+
 ### 5.4 Deferred-commit scheduler
 
 Structural commits are scheduled at a **future sample** (`t_commit`), not "next block". Commit happens

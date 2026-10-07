@@ -13,6 +13,18 @@
 // property the test checks, and it is the reason the shape is what it is rather than what looks
 // reasonable.
 //
+// **But that identity is only the whole story when the two signals are uncorrelated.** The power of
+// g1*a + g2*b is g1^2 + g2^2 + 2*rho*g1*g2, which equal power takes to be 1: true at rho = 0, and
+// **+3 dB at the midpoint at rho = 1**. So a fade between two signals that carry nearly the same
+// audio -- a Lite/Full handover, a bypass toggle's wet and dry, a model swap within a slot -- adds
+// energy instead of holding it, and it is a thump rather than a click: continuous, no dropout, no
+// excess high frequency and it converges, so none of the glitch detector's four rules can see it.
+// Measured 2026-10-07 on 104 of them: +2.6 to +3.0 dB on every model, where two *different* rigs
+// (rho -0.7 to +0.5) are the uncorrelated case this law is right for. The fix is to divide both
+// weights by sqrt(1 + 2*rho*g1*g2) with rho clamped to [0, 1] -- one extra sqrt per table entry,
+// since the table is already built here in `start()` -- and it wants its own commit and transition
+// tests rather than being slipped in. bench-results/e2-fade-thump.txt is the measurement.
+//
 // The table is built in the constructor (control thread). `start` and `mix` are render-path calls:
 // no allocation, no lock, no syscall.
 #include <vector>
