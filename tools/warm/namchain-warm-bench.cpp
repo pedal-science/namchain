@@ -1257,10 +1257,26 @@ std::unique_ptr<Instance> make_instance(const Unit& u, int q)
     middle.id = "unit";
     middle.type = u.node_type;
     middle.params = u.node_params;
+    // A chain holds exactly one nc.input and one nc.output, so a unit that *is* one of those two is
+    // the graph's own: the plan is the unit and the other end, and what is timed is the node's own
+    // per-block work rather than a reimplementation of it.
     namchain::graph::Graph graph;
-    graph.nodes = {namchain::graph::NodeSpec{"in", "nc.input"}, middle,
-                   namchain::graph::NodeSpec{"out", "nc.output"}};
-    graph.connections = {{"in", 0, "unit", 0}, {"unit", 0, "out", 0}};
+    if (u.node_type == "nc.input")
+    {
+      graph.nodes = {middle, namchain::graph::NodeSpec{"out", "nc.output"}};
+      graph.connections = {{"unit", 0, "out", 0}};
+    }
+    else if (u.node_type == "nc.output")
+    {
+      graph.nodes = {namchain::graph::NodeSpec{"in", "nc.input"}, middle};
+      graph.connections = {{"in", 0, "unit", 0}};
+    }
+    else
+    {
+      graph.nodes = {namchain::graph::NodeSpec{"in", "nc.input"}, middle,
+                     namchain::graph::NodeSpec{"out", "nc.output"}};
+      graph.connections = {{"in", 0, "unit", 0}, {"unit", 0, "out", 0}};
+    }
     namchain::render::CompileOptions options;
     options.max_quantum = q;
     options.levels = u.levels;
