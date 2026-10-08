@@ -3311,24 +3311,37 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     {
       if (!node.slimmed && node.measured)
         continue;
+      bool named = false;
       if (node.slimmed)
       {
         add("model_slimmed", "info",
             "node '" + node.node + "' plays its Lite model to fit the cost table: " + format_cost(node.cost) +
               " of a core instead of " + format_cost(node.cost_full) + " (" + node.row + ")",
             1, node.chain, node.node);
+        named = true;
       }
-      else
+      else if (cost_.has_table)
       {
+        // One warning per node with no row -- but only when the *device* has a table. A device with
+        // no table at all is one condition, not one per node, and `cost_table_missing` below already
+        // says it: a pedal whose light is amber for every rig it plays is a pedal whose light says
+        // nothing. With no table, `status.cost.nodes[].measured` is still false for every node, so
+        // the per-node truth is not lost, it is just not repeated.
         add("cost_unknown", "warn",
             "node '" + node.node + "' is charged the unknown cost " + format_cost(node.cost) +
               " of a core: this device has no measured row for it (" + node.row +
               "), so admission is guessing in the expensive direction (D8)",
             1, node.chain, node.node);
+        named = true;
       }
-      issues.back()["element"] = node.element;
-      issues.back()["reference"] = node.reference;
-      issues.back()["row"] = node.row;
+      // Only this node's issue is annotated: a node that added none (an unmeasured unit on a device
+      // with no table) would otherwise annotate whatever issue happened to be last.
+      if (named)
+      {
+        issues.back()["element"] = node.element;
+        issues.back()["reference"] = node.reference;
+        issues.back()["row"] = node.row;
+      }
     }
     if (cost_.over)
     {
