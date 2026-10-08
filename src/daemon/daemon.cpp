@@ -1432,12 +1432,16 @@ void Daemon::load_cost_table()
   cost_table_ = CostTable::load(config_.cost_table);
   if (!cost_table_.ok)
   {
-    std::fprintf(stderr,
-                 "[namchaind] cost: no usable table at '%s' (%s): every unit costs its unknown value "
-                 "(NAM %s, IR %s, node %s of a core) and a rig over the headroom is refused anyway\n",
-                 config_.cost_table.c_str(), cost_table_.detail.c_str(),
-                 format_cost(cost_table_.unknown_nam).c_str(), format_cost(cost_table_.unknown_ir).c_str(),
-                 format_cost(cost_table_.unknown_node).c_str());
+    // Only when the daemon is being talkative: a missing table is not a fault, it is a device nobody
+    // has measured (D8 charges every unit its unknown cost and the headroom still refuses what does
+    // not fit), and `engine.status.cost` and the `cost_table_missing` issue both say so on demand.
+    if (config_.verbose)
+      std::fprintf(stderr,
+                   "[namchaind] cost: no usable table at '%s' (%s): every unit costs its unknown value "
+                   "(NAM %s, IR %s, node %s of a core) and a rig over the headroom is refused anyway\n",
+                   config_.cost_table.c_str(), cost_table_.detail.c_str(),
+                   format_cost(cost_table_.unknown_nam).c_str(), format_cost(cost_table_.unknown_ir).c_str(),
+                   format_cost(cost_table_.unknown_node).c_str());
     return;
   }
   if (config_.verbose)
