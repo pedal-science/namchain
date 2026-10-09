@@ -1633,7 +1633,11 @@ int run_switch(const Args& args)
         while (release_request.load(std::memory_order_acquire) && !done.load(std::memory_order_acquire))
           std::this_thread::sleep_for(std::chrono::microseconds(50));
         released.store(false, std::memory_order_release);
-        next = published.load(std::memory_order_acquire); // the input it did not render is not its own
+        // `next` is deliberately *not* advanced past the blocks the handover cost: both rigs must see
+        // every input block, or the one this thread was rendering arrives at the swap with a hole in
+        // its history and diverges from the oracle it is judged against (2026-10-09: that is exactly
+        // what the convergence check was failing on). It catches up over the next few blocks, which
+        // is why the device thread drains the pool for the newest block rather than the first.
         continue;
       }
       const bool mine_is_b = holder.load(std::memory_order_acquire) == 0;
@@ -1695,7 +1699,10 @@ int run_switch(const Args& args)
       if (fading)
       {
         // The outgoing rig's audio for this block: whatever the warm thread has published since the
-        // last one, or the block already in hand when it has published nothing.
+        // last one, or the block already in hand when it has published nothing. The *newest* block
+        // wins -- a ring hands them back in order, so the last one taken is the newest -- because the
+        // warm thread may be a block or two behind while it catches up after a handover, and mixing a
+        // stale block into the first frames of a fade is a step the detector correctly calls a click.
         uint32_t index = 0;
         uint64_t seq = 0;
         const float* block = nullptr;
@@ -1710,6 +1717,11 @@ int run_switch(const Args& args)
         {
           fading = false;
           publish_wanted.store(false, std::memory_order_relaxed);
+          // Empty the pool: whatever the warm thread published as the fade closed belongs to the
+          // fade that just ended, and mixing it into the *next* one would mix audio from a different
+          // moment of the input -- the other half of the same bug.
+          while (bus_pool.take(index, seq, block))
+            bus_pool.give_back(index);
           report.handover_blocks = b - fade_started + 1;
         }
       }
