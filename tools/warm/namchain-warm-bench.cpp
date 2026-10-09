@@ -1583,16 +1583,22 @@ int run_switch(const Args& args)
   auto rig_b = make_rig(args.candidates.front(), ir, q, args.slim);
 
   // The oracles: each rig rendered alone over the whole span, offline. The detector judges the
-  // real-time run against them, so "no click" is a comparison rather than an opinion.
+  // real-time run against them, so "no click" is a comparison rather than an opinion. They are their
+  // *own* instances: a model's state is a finite window of its recent input, so a live run that
+  // started from an instance the oracle pass had just driven to the end of the input is a run whose
+  // first half-second is wrong -- which is exactly what the convergence check reported at frame 27
+  // (2026-10-09), a frame no switch had touched.
+  auto oracle_rig_a = make_rig(args.live, ir, q, args.slim);
+  auto oracle_rig_b = make_rig(args.candidates.front(), ir, q, args.slim);
   std::vector<float> oracle_a(blocks * static_cast<std::size_t>(q));
   std::vector<float> oracle_b(blocks * static_cast<std::size_t>(q));
   std::vector<float> oracle_out(static_cast<std::size_t>(q));
   for (std::size_t b = 0; b < blocks; ++b)
   {
     const float* in = x.data() + (b * static_cast<std::size_t>(q)) % loop;
-    rig_a->process(in, oracle_out.data(), q);
+    oracle_rig_a->process(in, oracle_out.data(), q);
     std::copy(oracle_out.begin(), oracle_out.end(), oracle_a.begin() + static_cast<long>(b * static_cast<std::size_t>(q)));
-    rig_b->process(in, oracle_out.data(), q);
+    oracle_rig_b->process(in, oracle_out.data(), q);
     std::copy(oracle_out.begin(), oracle_out.end(), oracle_b.begin() + static_cast<long>(b * static_cast<std::size_t>(q)));
   }
 
