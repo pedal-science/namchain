@@ -1832,6 +1832,12 @@ int run_switch(const Args& args)
   std::string error;
   const namchain::glitch::Report verdict = namchain::glitch::analyse(
     y.data(), oracle_a.data(), oracle_b.data(), y.size(), edits, detector, error);
+  // How far apart the two rigs are, which is the scale any cross-rig comparison has to be read
+  // against: a convergence reading of the same order as this is the analyser deciding which of two
+  // *different* rigs the output should be, not a handover that left a hole.
+  double rig_gap = 0.0;
+  for (std::size_t i = 0; i < y.size(); ++i)
+    rig_gap = std::max(rig_gap, std::abs(static_cast<double>(oracle_a[i]) - static_cast<double>(oracle_b[i])));
   // What a *switch* promises, and what the detector is for, are different things. The detector's
   // rules judge a ramped parameter edit: continuity and high-frequency excess assume the two sides
   // of an edit are the same rig before and after, and a rig switch is by definition a change of
@@ -1859,6 +1865,10 @@ int run_switch(const Args& args)
     std::printf("handover:   %s  convergence %.1f dBFS (limit %.0f), worst dropout %.2f ms\n",
                 handover_ok ? "PASS" : "FAIL", verdict.worst_convergence_dbfs, convergence_limit,
                 verdict.max_dropout_ms);
+    std::printf("            the two rigs differ by up to %.1f dBFS (%.4f), so a convergence reading "
+                "of that order across a switch between different rigs is the comparison, not the "
+                "handover: run the same rig on both sides to judge the handover itself\n",
+                rig_gap > 0 ? 20.0 * std::log10(rig_gap) : -1000.0, rig_gap);
     std::printf("glitch:     %s (for reference)  continuity ref %.3g vs edit %.3g, hf excess %.2f dB "
                 "-- the detector's edit rules, which a rig switch is expected to trip\n",
                 verdict.ok ? "PASS" : "FAIL", verdict.reference_d2, verdict.max_edit_d2,
