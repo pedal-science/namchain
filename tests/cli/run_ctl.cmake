@@ -205,6 +205,18 @@ if(NOT _rc EQUAL 0 OR NOT _out MATCHES "\"applied\":1")
   _fail("`patch` from a file failed (${_rc}): ${_out} ${_err}")
 endif()
 
+# What a rig would cost, without playing it: the call pedald makes for every rig in the bank, and
+# the one a bench uses to put a real compile on the control thread (scripts/measure-housekeeping).
+execute_process(COMMAND "${NAMCHAINCTL}" --socket "${_socket}" cost two-chains.json --compact
+                RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+if(NOT _rc EQUAL 0)
+  _fail("`cost` failed (${_rc}): ${_out} ${_err}")
+endif()
+string(JSON _cost_verdict GET "${_out}" cost verdict)
+if(_cost_verdict STREQUAL "")
+  _fail("`cost` answered without a verdict: ${_out}")
+endif()
+
 # A document with two chains, applied over TCP, then read back: the chain ids are the client's and
 # they survive the round trip.
 execute_process(COMMAND "${NAMCHAINCTL}" --host 127.0.0.1 --port ${_port} --token-file "${_work}/token"

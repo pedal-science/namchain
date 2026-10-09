@@ -71,6 +71,9 @@ void print_usage(std::FILE* stream)
     "  assets [--refresh]     the model and impulse-response library as ids, optionally rescanning it\n"
     "                         first (the scan is cached by size and mtime, so this is cheap)\n"
     "  get                    the document the engine is running, as the engine parsed it\n"
+    "  cost NAME.json         what a rig would cost on this device, and whether it would be admitted:\n"
+    "                         the daemon costs the document exactly as a publish would, then throws\n"
+    "                         the copy away, so nothing plays and nothing changes\n"
     "  load NAME.json         load a rig by name (under the daemon's rigs_root) and crossfade to it\n"
     "  warm NAME.json [--document FILE] [--no-replace]\n"
     "                         hold a rig ready to switch to: compiled, prewarmed and rendering on a\n"
@@ -304,6 +307,8 @@ const char* method_for(const std::string& command)
     return "rig.get";
   if (command == "load")
     return "rig.load";
+  if (command == "cost")
+    return "rig.cost";
   if (command == "warm")
     return "rig.warm";
   if (command == "cool")
@@ -532,6 +537,16 @@ int main(int argc, char** argv)
     // daemon to look at the disk again rather than answer from its scan.
     if (options.refresh)
       request["refresh"] = true;
+  }
+  else if (options.command == "cost")
+  {
+    // What a rig would cost on this device, without playing it: the daemon costs the document
+    // exactly as a publish would and throws the copy away (docs/daemon.md, "Cost and admission").
+    // This is the same call pedald makes for every rig in the bank, and the one a bench uses to
+    // put a real compile on the control thread.
+    if (!needs_one_argument("rig name"))
+      return kExitUsage;
+    request["rig"] = options.positional[0];
   }
   else if (options.command == "load")
   {
