@@ -1519,7 +1519,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   // assumption is wrong -- two models crowding one core's cache cost more than either alone -- the
   // measurement is what knows, because a row's 1/n was measured at the fit point (D2).
   CostOutcome cost = apply_cost_table(resolved, cost_table_, units_, static_cast<double>(config_.sample_rate),
-                                      static_cast<int>(config_.period_size));
+                                      static_cast<int>(config_.period_size), warm_documents());
   {
     // The reference as the client wrote it, not this device's resolved path: a message that says
     // which block to swap has to name the block the user can see (docs/assets.md).
@@ -1934,6 +1934,19 @@ bool Daemon::publish_warm(const graph::Document& document, const std::string& pa
       *error_code = "warm_full";
     return false;
   }
+  // D3's coexistence charge, at the moment the decision is made (2026-10-09): holding this rig warm
+  // costs the rig the player is hearing real time, and T5 measured how much. Warming is refused when
+  // the audible rig could not afford it -- the service falls back to a cold switch, which is the
+  // behaviour it already has for a refused warm -- rather than quietly moving the deadline.
+  if (!coexistence_affords_one_more_warm())
+  {
+    error = "holding another rig warm would put the audible rig over the headroom: its cost times the "
+            "coexistence charge for " + std::to_string(warm_documents() + 1) + " warm documents is more "
+            "than the table's " + format_cost(cost_table_.headroom) + " (D3, measured by T5)";
+    if (error_code != nullptr)
+      *error_code = "over_budget";
+    return false;
+  }
 
   // The same gate every publish goes through: a document that would not be accepted as the running rig
   // is not accepted as a warm one either -- it has to be able to play, because the whole point is that
@@ -1962,7 +1975,7 @@ bool Daemon::publish_warm(const graph::Document& document, const std::string& pa
   }
 
   CostOutcome cost = apply_cost_table(resolved, cost_table_, units_, static_cast<double>(config_.sample_rate),
-                                      static_cast<int>(config_.period_size));
+                                      static_cast<int>(config_.period_size), warm_documents());
   for (CostedNode& node : cost.nodes)
   {
     if (node.chain_index < document.chains.size() &&
@@ -2257,6 +2270,21 @@ bool Daemon::switch_to(const std::string& path, bool fallback, std::string& erro
   body["generation"] = generation_;
   body["reason"] = warm_entry_.present ? "that rig is not the warm one" : "nothing is warm";
   return true;
+}
+
+bool Daemon::coexistence_affords_one_more_warm() const
+{
+  // Nothing charged when the table names no factors: a device measured before 2026-10-09 admits
+  // exactly as it always did.
+  if (cost_table_.coexistence_factors.empty())
+    return true;
+  if (!cost_.has_table)
+    return false;
+  const double factor = cost_table_.coexistence_factor(warm_documents() + 1);
+  if (factor <= 1.0)
+    return true;
+  // What the audible rig costs now, charged as it would be with one more warm document beside it.
+  return cost_.cost * factor <= cost_table_.headroom + 1e-9;
 }
 
 void Daemon::sync_warm_switch()
@@ -5022,6 +5050,14 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["cost"] = {{"cost", cost_.cost},
                       {"full_cost", cost_.full_cost},
                       {"headroom", cost_.headroom},
+                      // The coexistence charge (D3, 2026-10-09): what the deadline actually sees is
+                      // `effective`, the raw sum times the factor the table charges for the warm
+                      // documents held while this rig plays, and `over` is decided on it. A client
+                      // that wants to know whether warming a second rig would push this one over can
+                      // compare `effective` against `headroom` with `warm_documents` one higher.
+                      {"effective", cost_.effective},
+                      {"coexistence", cost_.coexistence},
+                      {"coexistence_warm_documents", cost_.warm_documents},
                       {"over", cost_.over},
                       {"verdict", cost_.verdict},
                       {"trimmed", cost_.trimmed},
@@ -5277,7 +5313,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
 
     const CostOutcome cost = apply_cost_table(resolved, cost_table_, units_,
                                              static_cast<double>(config_.sample_rate),
-                                             static_cast<int>(config_.period_size));
+                                             static_cast<int>(config_.period_size), warm_documents());
     nlohmann::json cost_nodes = nlohmann::json::array();
     for (const CostedNode& node : cost.nodes)
     {
@@ -5297,6 +5333,12 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["cost"] = {{"cost", cost.cost},
                     {"full_cost", cost.full_cost},
                     {"headroom", cost.headroom},
+                    // `rig.cost` answers for the device as it is: with a warm document held, the
+                    // charge is in `effective` (D3, 2026-10-09). A client costing its bank to decide
+                    // what to warm reads both.
+                    {"effective", cost.effective},
+                    {"coexistence", cost.coexistence},
+                    {"coexistence_warm_documents", cost.warm_documents},
                     {"over", cost.over},
                     {"verdict", cost.verdict},
                     {"trimmed", cost.trimmed},

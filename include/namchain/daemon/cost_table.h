@@ -54,6 +54,27 @@ struct CostTable
   /// this, which is the value the rules settled on.
   double headroom = 0.8;
 
+  /// \brief D3's coexistence charge: what a warm document beside the audible one costs it (2026-10-09).
+  ///
+  /// The unit rows are measured on a quiet core, and the fit bar assumes a rig has the core to itself.
+  /// It does not: with a warm document rendering on another core the same rig takes longer -- shared L3
+  /// and DRAM -- and T5 measured what that costs on vip. A rig admitted at 0.735 holds the deadline
+  /// with nothing warm and misses it 4 to 72 times a minute with a neighbour, so `fits` was promising
+  /// the wrong thing and the promise is now charged for.
+  ///
+  /// `factor` is indexed by how many warm documents the engine holds (1 today, 2 when the engine holds
+  /// a rig per inactive core) and multiplies the rig's cost: `effective = cost * factor`. It is a
+  /// device property -- memory traffic, not model arithmetic -- so it lives here, at the top level,
+  /// rather than in a unit row, and a table that names none charges nothing (factor 1.0), which is
+  /// what every table measured before 2026-10-09 does.
+  std::map<int, double> coexistence_factors;
+  std::string coexistence_measured;
+  std::string coexistence_note;
+
+  /// The multiplier for this many warm documents: 1.0 when the table has no charge for it, the
+  /// largest measured factor when the count is beyond what was measured, and never below 1.0.
+  double coexistence_factor(int warm_documents) const;
+
   std::map<std::string, double> nam;  ///< "WaveNet.full" -> 0.125
   std::map<int, double> ir;           ///< taps -> cost
   std::map<std::string, double> node; ///< "nc.gain" -> cost
@@ -141,6 +162,12 @@ struct CostOutcome
   double cost = 0;      ///< as it stands, after trimming
   double full_cost = 0; ///< as written, before trimming
   double headroom = 0.8;
+  /// The charge for rendering beside the warm documents held at the time, and what the rig costs with
+  /// it: `effective = cost * coexistence`. 1.0 and `cost` when nothing is warm or the table charges
+  /// nothing, which is the case for every table measured before 2026-10-09.
+  double coexistence = 1.0;
+  int warm_documents = 0;
+  double effective = 0; ///< what the deadline actually sees, and what `over` is decided on
   bool over = false;    ///< over the headroom: a client's publish is refused
   bool trimmed = false; ///< D6: at least one model plays its Lite submodel to fit
   std::string verdict;  ///< "fits", "trimmed" or "over"
@@ -153,8 +180,13 @@ struct CostOutcome
 /// rig or patch spells it and `rig.get` never returns it. D6: trimming is Full -> Lite, applied only
 /// as far as it needs to be, dearest first -- the node whose Lite saves the most, until the total is
 /// at most the table's headroom or nothing slimmable is left.
+///
+/// \param warm_documents the warm documents the engine is holding while this rig will play. Their cost
+/// to it is the table's coexistence charge, and it is what the trimming and the admission test are
+/// against: with a warm rig beside it a document is trimmed further, or refused, where it would have
+/// fitted alone (D3, 2026-10-09).
 CostOutcome apply_cost_table(graph::Document& resolved, const CostTable& table, UnitCache& units, double rate,
-                             int max_quantum);
+                             int max_quantum, int warm_documents = 0);
 
 /// A cost as the messages and the status report write it: "0.66 of a core".
 std::string format_cost(double cost);

@@ -210,6 +210,68 @@ TEST_CASE("cost table: a rig that fits is admitted as written")
   CHECK(cost_of(outcome, "g3") == doctest::Approx(0.01));
 }
 
+TEST_CASE("cost table: the coexistence charge is what the warm set costs the audible rig")
+{
+  // The shape T5 measured on vip (2026-10-09): with one warm document rendering beside it a rig's cost
+  // is multiplied by 1.25, with two by 1.5. The rule this encodes is that a rig is admitted for the way
+  // it will actually run, which is not the way the rows were measured -- alone on a quiet core.
+  std::string json = test_table_json();
+  const auto at = json.find("\"bar\"");
+  REQUIRE(at != std::string::npos);
+  json.insert(at, "\"coexistence\": {\"factors\": {\"1\": 1.25, \"2\": 1.5}, \"measured\": \"2026-10-09\"}, ");
+
+  const CostTable table = CostTable::from_json(json, "/etc/namchain/cost.json");
+  REQUIRE(table.ok);
+  CHECK(table.coexistence_factor(0) == doctest::Approx(1.0));
+  CHECK(table.coexistence_factor(1) == doctest::Approx(1.25));
+  CHECK(table.coexistence_factor(2) == doctest::Approx(1.5));
+  // Holding more than anyone measured is charged the worst measured case, never less.
+  CHECK(table.coexistence_factor(3) == doctest::Approx(1.5));
+
+  UnitCache units;
+  Document alone = document_of({amp("amp1", example("A2.nam")), cab("cab1", generated("CabIR.nam")), gain("g1")});
+  const CostOutcome unwarmed = apply_cost_table(alone, table, units, 48000.0, 64, 0);
+  CHECK(unwarmed.coexistence == doctest::Approx(1.0));
+  CHECK(unwarmed.effective == doctest::Approx(unwarmed.cost));
+  const double raw = unwarmed.cost;
+
+  // The same rig with one warm document beside it: its cost is the same, what it is charged is not.
+  Document warmed = document_of({amp("amp1", example("A2.nam")), cab("cab1", generated("CabIR.nam")), gain("g1")});
+  const CostOutcome one = apply_cost_table(warmed, table, units, 48000.0, 64, 1);
+  CHECK(one.coexistence == doctest::Approx(1.25));
+  CHECK(one.warm_documents == 1);
+  CHECK(one.effective == doctest::Approx(one.cost * 1.25));
+  CHECK(one.over == (one.effective > table.headroom));
+  // Trimming is against the charged budget, so a rig that fits alone is either trimmed further or
+  // refused -- never admitted at the cost it would have had alone.
+  if (!one.trimmed)
+    CHECK(one.cost == doctest::Approx(raw));
+  else
+    CHECK(one.cost < raw);
+
+  // A rig of three models with no Lite row to fall back on is over when charged, and says so.
+  Document heavy = document_of({amp("amp1", generated("A2-Full.nam")), amp("amp2", generated("A2-Full.nam")),
+                               amp("amp3", generated("A2-Full.nam"))});
+  const CostOutcome two = apply_cost_table(heavy, table, units, 48000.0, 64, 2);
+  CHECK(two.coexistence == doctest::Approx(1.5));
+  CHECK(two.effective == doctest::Approx(two.cost * 1.5));
+  CHECK(two.over);
+  CHECK(two.verdict == "over");
+}
+
+TEST_CASE("cost table: a table with no coexistence charge admits exactly as it did before")
+{
+  // Every table measured before 2026-10-09, and every device that has not run T5.
+  Document document = document_of({amp("amp1", example("A2.nam")), cab("cab1", generated("CabIR.nam")), gain("g1")});
+  const CostTable table = test_table();
+  UnitCache units;
+  const CostOutcome outcome = apply_cost_table(document, table, units, 48000.0, 64, 2);
+  CHECK(outcome.coexistence == doctest::Approx(1.0));
+  CHECK(outcome.effective == doctest::Approx(outcome.cost));
+  CHECK_FALSE(outcome.over);
+  CHECK(outcome.verdict != "over");
+}
+
 TEST_CASE("cost table: over the headroom with nothing to trim is over, and the verdict says so")
 {
   // T4's second rig: two models that are already their own only size, 2 x 0.4 + 0.01 + in + out = 0.83.

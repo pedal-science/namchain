@@ -175,6 +175,33 @@ CostTable CostTable::from_json(const std::string& text, const std::string& path)
   if (headroom > 0.0 && headroom <= 1.0)
     table.headroom = headroom;
 
+  // The coexistence charge (D3, 2026-10-09): {"1": 1.27, "2": 1.47} -- warm documents to the factor
+  // the rig's cost is multiplied by. A table without it charges nothing, which is every table measured
+  // before that date, and the engine then admits exactly as it always did.
+  const auto coexistence = doc.find("coexistence");
+  if (coexistence != doc.end() && coexistence->is_object())
+  {
+    const auto factors = coexistence->find("factors");
+    if (factors != coexistence->end() && factors->is_object())
+    {
+      for (auto entry = factors->begin(); entry != factors->end(); ++entry)
+      {
+        if (!entry.value().is_number())
+          continue;
+        const int count = std::atoi(entry.key().c_str());
+        const double value = entry.value().get<double>();
+        if (count > 0 && value >= 1.0 && std::isfinite(value))
+          table.coexistence_factors[count] = value;
+      }
+    }
+    const auto text = [&](const char* key) {
+      const auto found = coexistence->find(key);
+      return found != coexistence->end() && found->is_string() ? found->get<std::string>() : std::string();
+    };
+    table.coexistence_measured = text("measured");
+    table.coexistence_note = text("note");
+  }
+
   const auto core = doc.find("core_percent");
   if (core != doc.end() && core->is_object())
   {
@@ -348,12 +375,19 @@ UnitCache::Unit UnitCache::get(const std::string& path, bool is_ir, double rate,
 }
 
 CostOutcome apply_cost_table(graph::Document& resolved, const CostTable& table, UnitCache& units, double rate,
-                             int max_quantum)
+                             int max_quantum, int warm_documents)
 {
   CostOutcome outcome;
   outcome.has_table = table.ok;
   outcome.table = table.path;
   outcome.headroom = table.headroom;
+  // D3's coexistence charge (2026-10-09): the rows were measured on a quiet core, and a rig does not
+  // get one while a warm document renders beside it. The charge multiplies the rig's cost, and every
+  // decision below -- what trimming has to reach, and whether the rig is admitted at all -- is made
+  // against the charged figure rather than the raw one.
+  outcome.warm_documents = warm_documents;
+  outcome.coexistence = table.coexistence_factor(warm_documents);
+  const double budget = outcome.coexistence > 0.0 ? table.headroom / outcome.coexistence : table.headroom;
 
   for (std::size_t c = 0; c < resolved.chains.size(); ++c)
   {
@@ -413,8 +447,10 @@ CostOutcome apply_cost_table(graph::Document& resolved, const CostTable& table, 
   // D6: Full -> Lite, applied only as far as it needs to be, and the dearest saving first -- "on as
   // few NAM nodes as it takes, largest first". What a save is worth is the difference between the
   // node's own size and its Lite one, both from the table, so a model whose Lite row is not measured
-  // saves nothing and is not trimmed for show.
-  while (outcome.cost > table.headroom + kEpsilon)
+  // saves nothing and is not trimmed for show. The target is the charge-adjusted budget: with a warm
+  // rig beside it a document is trimmed as far as the coercion charge makes necessary, which is how
+  // the pedal keeps the deadline instead of promising it.
+  while (outcome.cost > budget + kEpsilon)
   {
     CostedNode* best = nullptr;
     double best_saving = 0.0;
@@ -452,9 +488,25 @@ CostOutcome apply_cost_table(graph::Document& resolved, const CostTable& table, 
     resolved.chains[costed.chain_index].graph.nodes[costed.node_index].slim = true;
   }
 
-  outcome.over = outcome.cost > table.headroom + kEpsilon;
+  outcome.effective = outcome.cost * outcome.coexistence;
+  outcome.over = outcome.effective > table.headroom + kEpsilon;
   outcome.verdict = outcome.over ? "over" : (outcome.trimmed ? "trimmed" : "fits");
   return outcome;
+}
+
+double CostTable::coexistence_factor(int warm_documents) const
+{
+  if (warm_documents <= 0 || coexistence_factors.empty())
+    return 1.0;
+  // The largest measured factor at or below this many warm documents. Holding more than anyone
+  // measured is charged what the worst measured case costs, never less.
+  double factor = 1.0;
+  for (const auto& entry : coexistence_factors)
+  {
+    if (entry.first <= warm_documents && entry.second > factor)
+      factor = entry.second;
+  }
+  return factor < 1.0 ? 1.0 : factor;
 }
 
 std::string format_cost(double cost)

@@ -410,6 +410,14 @@ private:
   int document_with_content(uint64_t content) const;
   /// Whether warming is configured at all (\ref Config::warm_cpus).
   bool warm_enabled() const { return !config_.warm_cpus.empty(); }
+  /// \brief How many warm documents the engine is holding right now, which is what D3's coexistence
+  /// charge (2026-10-09) is keyed by. Control thread.
+  int warm_documents() const { return warm_entry_.present ? 1 : 0; }
+  /// \brief Whether the audible rig can afford one more warm document beside it: the charge for
+  /// `warm_documents() + 1` applied to what it costs now must still fit the headroom. False when the
+  /// engine has no cost for the audible document, in which case there is nothing to charge against and
+  /// the honest answer is no. Control thread.
+  bool coexistence_affords_one_more_warm() const;
   /// \brief Whether the render thread is playing \ref published_slots_ for chain \p index and has
   /// nothing in flight or queued for it: the only state a local transition may be planned against,
   /// because it shares instances with exactly that plan. Control thread.
