@@ -2501,12 +2501,18 @@ bool Daemon::start(std::string& error)
         return false;
       }
 #if defined(__linux__)
-      cpu_set_t allowed;
-      CPU_ZERO(&allowed);
-      if (::sched_getaffinity(0, sizeof(allowed), &allowed) == 0 && (cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &allowed)))
+      // Is the cpu one the kernel has -- not "is it in my current affinity mask". systemd's
+      // CPUAffinity= pins the whole process to the control thread's core (0 on the pedal), and the
+      // render thread then *widens* its own mask to the device core, which CAP_SYS_NICE allows;
+      // apply_scheduling does the same for a warm thread. Refusing over the initial mask stopped
+      // namchaind from starting at all on vip with warm_cpus [1, 2] (2026-10-09) -- and a pedal
+      // that refuses to start is a pedal that is silent, which is worse than any amount of missing
+      // warmth. What no capability can conjure is a cpu the kernel does not have.
+      const long online = ::sysconf(_SC_NPROCESSORS_ONLN);
+      if (cpu < 0 || (online > 0 && cpu >= online))
       {
-        error = "warm cpu " + std::to_string(cpu) +
-                " is not one this process may run on (cgroup cpuset, or a cpu the kernel does not have)";
+        error = "warm cpu " + std::to_string(cpu) + " is not a cpu this kernel has (" +
+                std::to_string(online) + " online)";
         return false;
       }
 #endif
