@@ -2306,7 +2306,7 @@ bool warm_pressure(const uint64_t* before, const uint64_t* now)
 {
   uint64_t total = 0;
   uint64_t over_deadline = 0;
-  uint64_t over_ninety = 0;
+  uint64_t pressed = 0;
   for (std::size_t bucket = 0; bucket < kLoadBuckets; ++bucket)
   {
     if (now[bucket] <= before[bucket])
@@ -2315,16 +2315,17 @@ bool warm_pressure(const uint64_t* before, const uint64_t* now)
     total += delta;
     if (bucket == kLoadBuckets - 1)
       over_deadline += delta;
-    else if (bucket >= 90)
-      over_ninety += delta;
+    else if (bucket >= 95)
+      pressed += delta;
   }
   if (total == 0)
     return false;
-  // One block over the deadline is already a fault (D7's bar is zero overruns), and a hundredth of a
-  // window past nine tenths of it is a tail that is growing: a rig with room sits near a third of the
-  // deadline (T5 measured 63% at 0.41 and 108% at 0.735), so this is not the noise around a
-  // comfortable rig.
-  return over_deadline > 0 || over_ninety * 100 >= total;
+  // One block over the deadline is a fault (D7's bar is zero overruns) and the failsafe's reason to
+  // exist. A twentieth past 95% is the early warning: a tail pressed against the edge, which is not
+  // what a busy pedal looks like -- measured with the housekeeping core at 100%, a 0.559 rig put a few
+  // percent of its blocks above 90% and none over the deadline, and cooling on that cooled a warm
+  // document every ten seconds for an hour.
+  return over_deadline > 0 || pressed * 20 >= total;
 }
 
 void Daemon::check_warm_pressure()

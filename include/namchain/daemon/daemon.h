@@ -249,9 +249,12 @@ inline constexpr std::size_t kLoadBuckets = 101;
 /// catches the cases it gets wrong. `before` and `now` are two readings of the render load histogram
 /// (\ref Daemon::load_histogram_), one bucket per percent of the deadline, and the window between
 /// them is the blocks rendered since the last check -- so a spike an hour ago cannot keep the warm set
-/// cooled now. True when any block in that window went over the deadline, or when a hundredth of them
-/// ran past nine tenths of it: a tail that is growing rather than noise, because a rig with room sits
-/// near a third of the deadline (T5 measured 63% at 0.41 and 108% at 0.735).
+/// cooled now. True when any block in that window went over the deadline -- D7's bar, and the fault the
+/// failsafe exists for -- or when a twentieth of them ran past 95% of it, which is a tail pressed
+/// against the edge rather than a busy pedal (measured 2026-10-10: a 0.559 rig with the housekeeping
+/// core at 100% spends a *few percent* of its blocks above 90% and none over the deadline, and an
+/// earlier rule that cooled on a hundredth above 90% cooled a warm document every ten seconds for the
+/// whole hour).
 ///
 /// A free function of the two histograms so it can be read and tested without a render thread
 /// (tests/test_cost_table.cpp).

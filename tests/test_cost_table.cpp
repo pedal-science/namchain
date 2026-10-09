@@ -447,15 +447,24 @@ TEST_CASE("the warm failsafe reads a window of the render load, not the whole ru
   CHECK(namchain::daemon::warm_pressure(before.data(), now.data()));
   now[namchain::daemon::kLoadBuckets - 1] = 0;
 
-  // A growing tail: a hundredth of the window past nine tenths of the deadline, which a rig with room
-  // does not do. One block in a hundred is the threshold.
+  // A busy pedal is not a pressed one: blocks in the 90s happen under load and are not the failsafe's
+  // business (measured: a 0.559 rig with core 0 at 100% spends a few percent of blocks above 90% and
+  // none over the deadline).
   before.assign(namchain::daemon::kLoadBuckets, 0);
   now.assign(namchain::daemon::kLoadBuckets, 0);
   before[30] = 1000;
-  now[30] = 2000;   // 1000 blocks in the window at a comfortable 30%
-  now[93] = 11;     // 11 more past 90%: 11 of 1011, just over one percent
+  now[30] = 2000;   // 1000 blocks in the window
+  now[93] = 40;     // 40 of 1040 past 90%: nearly four percent, and still not pressure
+  CHECK_FALSE(namchain::daemon::warm_pressure(before.data(), now.data()));
+
+  // A tail pressed against the edge is: a twentieth of the window past 95%.
+  before.assign(namchain::daemon::kLoadBuckets, 0);
+  now.assign(namchain::daemon::kLoadBuckets, 0);
+  before[30] = 1000;
+  now[30] = 2000;
+  now[96] = 53;     // 53 of 1053: just over five percent
   CHECK(namchain::daemon::warm_pressure(before.data(), now.data()));
-  now[93] = 10;     // 10 of 1010: just under, and not yet pressure
+  now[96] = 52;     // 52 of 1052: just under
   CHECK_FALSE(namchain::daemon::warm_pressure(before.data(), now.data()));
 
   // No blocks at all in the window is not pressure: a stopped engine must not cool anything.
