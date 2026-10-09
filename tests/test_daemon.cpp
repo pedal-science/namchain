@@ -3973,3 +3973,450 @@ TEST_CASE("a plan's prewarm is not part of the first window a level meter sees")
   }
   CHECK(saw_input);
 }
+
+// ---------------------------------------------------------------------------
+// The warm set (docs/warm-set.md): a document rendered beside the audible one
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// The two rigs the warm-set tests switch between: the same shape, different gains, so which one is
+/// audible is a number in the output rather than a guess.
+const char* kGainHalfRig = R"({
+  "name": "half",
+  "chains": [{ "id": "main", "input_channel": 0, "output_channel": 0, "nodes": [
+    { "id": "in", "type": "nc.input" },
+    { "id": "g", "type": "nc.gain", "gain": 0.5 },
+    { "id": "out", "type": "nc.output" }],
+    "connections": [{ "from": "in", "to": "g" }, { "from": "g", "to": "out" }] }]
+})";
+
+const char* kGainQuarterRig = R"({
+  "name": "quarter",
+  "chains": [{ "id": "main", "input_channel": 0, "output_channel": 0, "nodes": [
+    { "id": "in", "type": "nc.input" },
+    { "id": "g", "type": "nc.gain", "gain": 0.25 },
+    { "id": "out", "type": "nc.output" }],
+    "connections": [{ "from": "in", "to": "g" }, { "from": "g", "to": "out" }] }]
+})";
+
+/// A daemon that renders a `file` or `null` backend with warming on and neither real-time scheduling
+/// nor memory locking: what the test process is, rather than what the appliance is.
+Config warm_config(const TempDir& dir, BackendKind backend)
+{
+  Config config;
+  config.backend = backend;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = (dir.path / "rigs").string();
+  config.capture_path = (dir.path / "in.wav").string();
+  config.playback_path = (dir.path / "out.wav").string();
+  config.capture_channels = 1;
+  config.playback_channels = 1;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  config.warm_cpus = {0};
+  config.warm_priority = 0; // no SCHED_FIFO either: priorities are the pedal's business
+  config.warm_max_behind_blocks = 2;
+  return config;
+}
+
+/// Send one request and parse the reply, failing the test rather than the parse if it is not JSON.
+nlohmann::json request(Daemon& daemon, const std::string& body)
+{
+  const std::string reply = daemon.handle_request(body);
+  const nlohmann::json parsed = nlohmann::json::parse(reply, nullptr, /*allow_exceptions=*/false);
+  REQUIRE_FALSE(parsed.is_discarded());
+  return parsed;
+}
+
+/// The warm entry for the rig nobody is hearing, or null when there is none. The status carries one
+/// entry per document, so "the warm one" is the one that is not audible.
+nlohmann::json warm_entry(const nlohmann::json& status)
+{
+  for (const auto& entry : status["warm"]["set"])
+  {
+    if (entry["state"] != "audible")
+      return entry;
+  }
+  return nlohmann::json();
+}
+
+/// Wait until \p predicate holds for `engine.status`, or give up. The render thread is paced by the
+/// wall clock, so every one of these is a wait for blocks rather than a sleep of a guessed length.
+bool wait_status(Daemon& daemon, const std::function<bool(const nlohmann::json&)>& predicate, int attempts = 400)
+{
+  for (int attempt = 0; attempt < attempts; ++attempt)
+  {
+    const auto reply = request(daemon, R"({"method":"engine.status"})");
+    if (reply["ok"] == true && predicate(reply["status"]))
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  return false;
+}
+
+} // namespace
+
+TEST_CASE("a document is owned by one thread at a time")
+{
+  using namchain::daemon::DocOwner;
+  using namchain::daemon::claim_document;
+  using namchain::daemon::release_document;
+
+  std::atomic<DocOwner> owner{DocOwner::Free};
+  CHECK(claim_document(owner, DocOwner::Warm));
+  CHECK(owner.load() == DocOwner::Warm);
+  // The claim is a claim: a second thread cannot take a document someone owns, which is what makes
+  // "one thread executes a document's plans" true rather than hoped for.
+  CHECK_FALSE(claim_document(owner, DocOwner::Device));
+  CHECK(owner.load() == DocOwner::Warm);
+
+  release_document(owner);
+  CHECK(owner.load() == DocOwner::Free);
+  CHECK(claim_document(owner, DocOwner::Device));
+  CHECK_FALSE(claim_document(owner, DocOwner::Warm));
+}
+
+TEST_CASE("the block pool drops rather than waiting, and counts what it dropped")
+{
+  namchain::daemon::BlockPool pool;
+  pool.configure(4); // four floats per block
+
+  uint32_t index[namchain::daemon::BlockPool::kBlocks];
+  const float* data = nullptr;
+  uint64_t seq = 0;
+  for (unsigned i = 0; i < namchain::daemon::BlockPool::kBlocks; ++i)
+  {
+    float* block = pool.acquire(100 + i);
+    REQUIRE(block != nullptr);
+    block[0] = static_cast<float>(i);
+    index[i] = static_cast<uint32_t>(i);
+    pool.publish(static_cast<uint32_t>(i));
+  }
+  // Every block is in flight, so the producer is refused and says so instead of waiting: a consumer
+  // that is behind must be reported, and the render path must never block on one.
+  CHECK(pool.acquire(999) == nullptr);
+  CHECK(pool.dropped() == 1);
+
+  // The consumer reads them in order, with the sequence number each was published under.
+  for (unsigned i = 0; i < namchain::daemon::BlockPool::kBlocks; ++i)
+  {
+    REQUIRE(pool.take(index[i], seq, data));
+    CHECK(seq == 100 + i);
+    CHECK(data[0] == static_cast<float>(i));
+    pool.give_back(index[i]);
+  }
+  CHECK_FALSE(pool.take(index[0], seq, data));
+  // And the blocks are back: a full round trip leaves the pool as it started.
+  CHECK(pool.acquire(1) != nullptr);
+}
+
+TEST_CASE("a warmed rig renders beside the audible one, and a switch makes it audible")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "half.json", kGainHalfRig);
+  write_file(root / "quarter.json", kGainQuarterRig);
+
+  Config config = warm_config(dir, BackendKind::Null);
+  config.rig = (root / "half.json").string();
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+
+  REQUIRE(wait_status(daemon, [](const nlohmann::json& s) { return s["blocks"].get<uint64_t>() > 4; }));
+
+  // Warming is a request about a rig nobody is hearing: the audible document does not change.
+  const auto before = request(daemon, R"({"method":"engine.status"})");
+  const uint64_t audible_doc = before["status"]["warm"]["active_doc"].get<uint64_t>();
+  const auto warmed = request(daemon, R"({"id":"w","method":"rig.warm","rig":"quarter.json"})");
+  REQUIRE(warmed["ok"] == true);
+  CHECK(warmed["state"] == "warming"); // compiled, not yet rendered
+  CHECK(warmed["cost"]["cost"].get<double>() > 0.0);
+
+  const auto still = request(daemon, R"({"method":"engine.status"})");
+  CHECK(still["status"]["warm"]["active_doc"].get<uint64_t>() == audible_doc);
+  CHECK(still["status"]["rig_name"] == "half");
+
+  // The warm thread renders it on its own core, and once it has, the rig is warm in the only sense
+  // that matters: switching to it will not load or compile anything.
+  REQUIRE(wait_status(daemon, [](const nlohmann::json& s) {
+    const nlohmann::json entry = warm_entry(s);
+    return !entry.is_null() && entry["state"] == "warm" && entry["blocks"].get<uint64_t>() > 0;
+  }));
+
+  const auto switched = request(daemon, R"({"id":"s","method":"rig.switch","rig":"quarter.json"})");
+  REQUIRE(switched["ok"] == true);
+  CHECK(switched["switched"] == "warm");
+  CHECK(switched["completed"] == true);
+  CHECK(switched["handover_blocks"].get<uint64_t>() >= 1);
+
+  // What is audible is the rig that was warmed, and the rig that was audible is warm in its place --
+  // a swap of documents, not a load.
+  const auto after = request(daemon, R"({"method":"engine.status"})");
+  CHECK(after["status"]["rig_name"] == "quarter");
+  REQUIRE(after["status"]["warm"]["set"].size() == 2);
+  bool saw_audible_quarter = false;
+  bool saw_warm_half = false;
+  for (const auto& entry : after["status"]["warm"]["set"])
+  {
+    if (entry["state"] == "audible")
+      saw_audible_quarter = entry["name"] == "quarter";
+    if (entry["state"] == "warm")
+      saw_warm_half = entry["name"] == "half";
+  }
+  CHECK(saw_audible_quarter);
+  CHECK(saw_warm_half);
+
+  // And the warm rig keeps rendering: it is the document that faded out, now kept current.
+  REQUIRE(wait_status(daemon, [](const nlohmann::json& s) {
+    for (const auto& entry : s["warm"]["set"])
+    {
+      if (entry["state"] == "warm" && entry["blocks"].get<uint64_t>() > 0)
+        return true;
+    }
+    return false;
+  }));
+
+  // Cooling is safe while warm: the plans are retired by the warm thread and freed by the control
+  // thread after the reclaimer's grace window.
+  const auto cooled = request(daemon, R"({"id":"c","method":"rig.cool"})");
+  REQUIRE(cooled["ok"] == true);
+  CHECK(cooled["cooled"].size() == 1);
+  const auto empty = request(daemon, R"({"method":"engine.status"})");
+  CHECK(empty["status"]["warm"]["set"].size() == 1); // only the audible one is left
+  CHECK(warm_entry(empty["status"]).is_null());
+}
+
+TEST_CASE("a switch to a rig that is not warm is a cold load, not a refusal")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "half.json", kGainHalfRig);
+  write_file(root / "quarter.json", kGainQuarterRig);
+
+  Config config = warm_config(dir, BackendKind::Null);
+  config.rig = (root / "half.json").string();
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+
+  REQUIRE(wait_status(daemon, [](const nlohmann::json& s) { return s["blocks"].get<uint64_t>() > 4; }));
+
+  // Nothing is warm, so this is `rig.load` with a different name -- and it says so.
+  const auto switched = request(daemon, R"({"id":"s","method":"rig.switch","rig":"quarter.json"})");
+  REQUIRE(switched["ok"] == true);
+  CHECK(switched["switched"] == "cold");
+  CHECK(switched["reason"].get<std::string>().find("nothing is warm") != std::string::npos);
+  const auto status = request(daemon, R"({"method":"engine.status"})");
+  CHECK(status["status"]["warm"]["cold_switches"] == 1);
+
+  // And a client that would rather be told than loaded can ask for that.
+  const auto refused = request(daemon, R"({"id":"r","method":"rig.switch","rig":"half.json","fallback":false})");
+  CHECK(refused["ok"] == false);
+  CHECK(refused["error"]["code"] == "warm_not_ready");
+
+  // Warming is not configured -> named refusals rather than methods that quietly do nothing.
+  TempDir other;
+  write_file(other.path / "rigs" / "half.json", kGainHalfRig);
+  Config plain;
+  plain.backend = BackendKind::Null;
+  plain.socket_path = (other.path / "namchaind.sock").string();
+  plain.rigs_root = (other.path / "rigs").string();
+  plain.lock_memory = false;
+  plain.rt_priority = 0;
+  Daemon cold(plain);
+  REQUIRE_MESSAGE(cold.start(error), error);
+  const auto disabled = request(cold, R"({"method":"rig.warm","rig":"half.json"})");
+  CHECK(disabled["ok"] == false);
+  CHECK(disabled["error"]["code"] == "warm_disabled");
+  const auto no_warm_key = request(cold, R"({"method":"engine.status"})");
+  CHECK_FALSE(no_warm_key["status"].contains("warm"));
+  cold.request_stop();
+}
+
+TEST_CASE("a switch mid-render is continuous audio, and warmth off is bit-identical")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "half.json", kGainHalfRig);
+  write_file(root / "quarter.json", kGainQuarterRig);
+  // One second of a constant, so a dropout is a zero and a click is a step: both are visible in the
+  // output without a signal generator.
+  write_stereo_wav(dir.path / "in.wav", 48000, 1.0f, 1.0f);
+
+  // Warming off: the engine as it was, and the reference the other two runs are compared against.
+  {
+    Config config;
+    config.backend = BackendKind::File;
+    config.socket_path = (dir.path / "off.sock").string();
+    config.rigs_root = root.string();
+    config.capture_path = (dir.path / "in.wav").string();
+    config.playback_path = (dir.path / "off.wav").string();
+    config.capture_channels = 1;
+    config.playback_channels = 1;
+    config.lock_memory = false;
+    config.rt_priority = 0;
+    config.rig = (root / "half.json").string();
+    Daemon daemon(config);
+    std::string error;
+    REQUIRE_MESSAGE(daemon.start(error), error);
+    REQUIRE(wait_status(daemon, [](const nlohmann::json& s) {
+      return s["state"] == "closed" && s["blocks"].get<uint64_t>() > 0;
+    }));
+    daemon.request_stop();
+  }
+  unsigned channels = 0;
+  const std::vector<float> off = read_wav(dir.path / "off.wav", channels);
+  REQUIRE(channels == 1);
+  REQUIRE(off.size() == 48000);
+  CHECK(off[0] == doctest::Approx(0.5f));
+  CHECK(off.back() == doctest::Approx(0.5f));
+
+  // Then with warming on but unused: a configured warm core that holds nothing must change nothing,
+  // and "nothing" here means the same bytes.
+  {
+    Config config = warm_config(dir, BackendKind::File);
+    config.rig = (root / "half.json").string();
+    Daemon daemon(config);
+    std::string error;
+    REQUIRE_MESSAGE(daemon.start(error), error);
+    REQUIRE(wait_status(daemon, [](const nlohmann::json& s) {
+      return s["state"] == "closed" && s["blocks"].get<uint64_t>() > 0;
+    }));
+    daemon.request_stop();
+  }
+  const std::vector<float> plain = read_wav(dir.path / "out.wav", channels);
+  REQUIRE(channels == 1);
+  REQUIRE(plain.size() == off.size());
+  CHECK(std::equal(plain.begin(), plain.end(), off.begin()));
+
+  // Now with a real switch in the middle of the same input.
+  const auto out_path = dir.path / "switched.wav";
+  {
+    Config config = warm_config(dir, BackendKind::File);
+    config.rig = (root / "half.json").string();
+    config.playback_path = out_path.string();
+    // The `file` backend renders flat out; the pace is what gives the control side time to warm a rig
+    // and switch to it while there is still audio left to hear the result in.
+    config.warm_test_pace_us = 250;
+    Daemon daemon(config);
+    std::string error;
+    REQUIRE_MESSAGE(daemon.start(error), error);
+
+    REQUIRE(wait_status(daemon, [](const nlohmann::json& s) { return s["blocks"].get<uint64_t>() > 8; }));
+    const auto warmed = request(daemon, R"({"id":"w","method":"rig.warm","rig":"quarter.json"})");
+    REQUIRE(warmed["ok"] == true);
+    REQUIRE(wait_status(daemon, [](const nlohmann::json& s) {
+      const nlohmann::json entry = warm_entry(s);
+      return !entry.is_null() && entry["warm_blocks"].get<uint64_t>() > 0;
+    }));
+    const auto switched = request(daemon, R"({"id":"s","method":"rig.switch","rig":"quarter.json"})");
+    REQUIRE(switched["ok"] == true);
+    CHECK(switched["switched"] == "warm");
+
+    REQUIRE(wait_status(daemon, [](const nlohmann::json& s) {
+      return s["state"] == "closed" && s["blocks"].get<uint64_t>() > 0;
+    }));
+    daemon.request_stop();
+  }
+
+  const std::vector<float> switched = read_wav(out_path, channels);
+  REQUIRE(channels == 1);
+  REQUIRE(switched.size() == 48000);
+
+  // No gap: a rig that cannot produce silence never does, at any point in the run.
+  float quietest = 1.0f;
+  for (float sample : switched)
+    quietest = std::min(quietest, sample);
+  CHECK(quietest > 0.2f);
+
+  // No click: the fade moves the level from one rig to the other smoothly, so no sample-to-sample
+  // step is anywhere near the difference between the two rigs (0.25).
+  float biggest_step = 0.0f;
+  for (std::size_t i = 1; i < switched.size(); ++i)
+    biggest_step = std::max(biggest_step, std::fabs(switched[i] - switched[i - 1]));
+  CHECK(biggest_step < 0.01f);
+
+  // And it really did switch: the run starts on one rig and ends on the other.
+  CHECK(switched.front() == doctest::Approx(0.5f));
+  CHECK(switched.back() == doctest::Approx(0.25f));
+  // Before the switch the output is exactly the plain run's, block for block: a warm document changes
+  // nothing until it is made audible.
+  bool same_until_switch = true;
+  std::size_t differing = 0;
+  for (std::size_t i = 0; i < switched.size(); ++i)
+  {
+    if (switched[i] != plain[i])
+    {
+      same_until_switch = same_until_switch && differing == 0;
+      ++differing;
+    }
+  }
+  CHECK(differing > 0);
+  CHECK(switched[0] == plain[0]);
+}
+
+TEST_CASE("a starved warm thread is reported, and the audible audio is unaffected")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "half.json", kGainHalfRig);
+  write_file(root / "quarter.json", kGainQuarterRig);
+  write_stereo_wav(dir.path / "in.wav", 48000, 1.0f, 1.0f);
+
+  Config config = warm_config(dir, BackendKind::File);
+  config.rig = (root / "half.json").string();
+  config.warm_test_pace_us = 200;
+  // The test hook: the warm thread holds every block, which is a warm thread the audio interrupt has
+  // made late -- repeatedly, and by much more than a block.
+  config.warm_test_hold_ms = 5;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+
+  REQUIRE(wait_status(daemon, [](const nlohmann::json& s) { return s["blocks"].get<uint64_t>() > 4; }));
+  const auto warmed = request(daemon, R"({"id":"w","method":"rig.warm","rig":"quarter.json"})");
+  REQUIRE(warmed["ok"] == true);
+
+  // Behind by more than `warm_max_behind_blocks`, said as an issue rather than hidden, and with the
+  // blocks the device thread could not hand over counted too.
+  // Only once the warm thread has actually rendered: a document that has rendered nothing is
+  // `warming`, not behind, and the difference is the whole point of the report.
+  const bool behind = wait_status(daemon, [](const nlohmann::json& s) {
+    const nlohmann::json entry = warm_entry(s);
+    return !entry.is_null() && entry["warm_blocks"].get<uint64_t>() > 0 &&
+           entry["behind_blocks"].get<uint64_t>() > 2;
+  });
+  CHECK(behind);
+  const auto status = request(daemon, R"({"method":"engine.status"})");
+  bool saw_issue = false;
+  for (const auto& issue : status["status"]["issues"])
+  {
+    if (issue["code"] == "warm_behind")
+      saw_issue = true;
+  }
+  CHECK(saw_issue);
+  const nlohmann::json starving = warm_entry(status["status"]);
+  CHECK_FALSE(starving.is_null());
+  CHECK(starving["blocks_dropped"].get<uint64_t>() > 0);
+
+  // Nothing was corrupted by it: the audible document's guard is clean, and its output is the plain
+  // run's.
+  CHECK(status["status"]["failed_nodes"] == 0);
+  CHECK(status["status"]["guard_trips"] == 0);
+
+  // And the starvation is not allowed to break the switch itself: the request is deferred until the
+  // warm thread lets go, and it lands.
+  const auto switched = request(daemon, R"({"id":"s","method":"rig.switch","rig":"quarter.json"})");
+  REQUIRE(switched["ok"] == true);
+  CHECK(switched["switched"] == "warm");
+
+  REQUIRE(wait_status(daemon, [](const nlohmann::json& s) {
+    return s["state"] == "closed" && s["blocks"].get<uint64_t>() > 0;
+  }));
+}
