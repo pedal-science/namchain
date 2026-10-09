@@ -1628,16 +1628,36 @@ int run_switch(const Args& args)
       if (release_request.load(std::memory_order_acquire))
       {
         // Let go: the device thread is about to render this rig, and a rig is rendered by one thread
-        // at a time. It does not touch it again until the roles have swapped under it.
+        // at a time. Before it does, this thread finishes every block the device thread has already
+        // rendered -- `published` is the block *after* the last one the device rendered, so rendering
+        // up to it puts both threads on the same index. That is the whole protocol: without it the
+        // rig arriving at the swap is a block behind and renders that block twice (or not at all),
+        // and its state stops matching the oracle it is judged against. (2026-10-09: this, and the
+        // skipped index before it, were what the convergence check was failing on.)
+        while (next < published.load(std::memory_order_acquire) && !done.load(std::memory_order_acquire))
+        {
+          Rig* mine = holder.load(std::memory_order_acquire) == 0 ? rig_b.get() : rig_a.get();
+          const float* in = x.data() + (next * static_cast<std::size_t>(q)) % loop;
+          const auto t0 = Clock::now();
+          mine->process(in, out.data(), q);
+          warm_us.push_back(std::chrono::duration<double, std::micro>(Clock::now() - t0).count());
+          if (publish_wanted.load(std::memory_order_acquire))
+          {
+            uint32_t index = 0;
+            float* block = bus_pool.acquire(next, index);
+            if (block != nullptr)
+            {
+              std::copy(out.begin(), out.end(), block);
+              bus_pool.publish(index);
+            }
+          }
+          warm_blocks.fetch_add(1, std::memory_order_relaxed);
+          ++next;
+        }
         released.store(true, std::memory_order_release);
         while (release_request.load(std::memory_order_acquire) && !done.load(std::memory_order_acquire))
           std::this_thread::sleep_for(std::chrono::microseconds(50));
         released.store(false, std::memory_order_release);
-        // `next` is deliberately *not* advanced past the blocks the handover cost: both rigs must see
-        // every input block, or the one this thread was rendering arrives at the swap with a hole in
-        // its history and diverges from the oracle it is judged against (2026-10-09: that is exactly
-        // what the convergence check was failing on). It catches up over the next few blocks, which
-        // is why the device thread drains the pool for the newest block rather than the first.
         continue;
       }
       const bool mine_is_b = holder.load(std::memory_order_acquire) == 0;
