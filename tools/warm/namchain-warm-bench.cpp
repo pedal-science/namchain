@@ -1832,19 +1832,43 @@ int run_switch(const Args& args)
   std::string error;
   const namchain::glitch::Report verdict = namchain::glitch::analyse(
     y.data(), oracle_a.data(), oracle_b.data(), y.size(), edits, detector, error);
+  // What a *switch* promises, and what the detector is for, are different things. The detector's
+  // rules judge a ramped parameter edit: continuity and high-frequency excess assume the two sides
+  // of an edit are the same rig before and after, and a rig switch is by definition a change of
+  // timbre -- the engine's own tests include "a hard switch trips the spectral rule" as a *passing*
+  // expectation. So the arm fails on what a handover can get wrong and the detector can see:
+  //
+  //   * convergence -- after the fade, the audible output must be the rig that is now audible, which
+  //     a hole, a repeated block or a swapped plan all break (it reads -1000, an exact match, when
+  //     the handover is right);
+  //   * dropout -- nothing may go silent at the seam;
+  //   * and nothing deferred, no block over the deadline, no stale fade block.
+  //
+  // Continuity and hf are printed, not judged: a 5 ms equal-power crossfade between two rigs is
+  // *meant* to change the spectrum, and between one rig and itself it is meant to be a +3 dB bump at
+  // the middle. A reader who wants those judged should switch between two instances of one rig with a
+  // correlated law, which is a different experiment.
+  const double convergence_limit = detector.convergence_db;
+  const bool handover_ok =
+    verdict.worst_convergence_dbfs <= convergence_limit && verdict.max_dropout_ms < 1.0 &&
+    report.deferred == 0 && overruns == 0 && report.stale_fade_blocks == 0;
   if (!error.empty())
     std::printf("glitch:     not judged: %s\n", error.c_str());
   else
   {
-    std::printf("glitch:     %s  continuity ref %.3g vs edit %.3g, worst dropout %.2f ms, "
-                "hf excess %.2f dB, convergence %.1f dBFS\n",
+    std::printf("handover:   %s  convergence %.1f dBFS (limit %.0f), worst dropout %.2f ms\n",
+                handover_ok ? "PASS" : "FAIL", verdict.worst_convergence_dbfs, convergence_limit,
+                verdict.max_dropout_ms);
+    std::printf("glitch:     %s (for reference)  continuity ref %.3g vs edit %.3g, hf excess %.2f dB "
+                "-- the detector's edit rules, which a rig switch is expected to trip\n",
                 verdict.ok ? "PASS" : "FAIL", verdict.reference_d2, verdict.max_edit_d2,
-                verdict.max_dropout_ms, verdict.max_hf_excess_db, verdict.worst_convergence_dbfs);
+                verdict.max_hf_excess_db);
     for (const namchain::glitch::Finding& finding : verdict.findings)
-      std::printf("  %-12s frame %zu  measured %.4g  limit %.4g  %s\n", finding.rule.c_str(), finding.frame,
-                  finding.measured, finding.limit, finding.detail.c_str());
+      if (finding.rule == "convergence" || finding.rule == "dropout")
+        std::printf("  %-12s frame %zu  measured %.4g  limit %.4g  %s\n", finding.rule.c_str(), finding.frame,
+                    finding.measured, finding.limit, finding.detail.c_str());
   }
-  return verdict.ok && error.empty() ? 0 : 1;
+  return handover_ok && error.empty() ? 0 : 1;
 }
 
 int run_measure(const Args& args)
