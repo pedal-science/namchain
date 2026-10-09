@@ -170,6 +170,9 @@ struct CostOutcome
   double effective = 0; ///< what the deadline actually sees, and what `over` is decided on
   bool over = false;    ///< over the headroom: a client's publish is refused
   bool trimmed = false; ///< D6: at least one model plays its Lite submodel to fit
+  /// P8's first step: this document was trimmed to Lite *because it was asked for*, not because it
+  /// had to be -- the rig is on its way to Full and the caller says so (the engine reports it).
+  bool lite_first = false;
   std::string verdict;  ///< "fits", "trimmed" or "over"
   std::vector<CostedNode> nodes;
 };
@@ -185,8 +188,13 @@ struct CostOutcome
 /// to it is the table's coexistence charge, and it is what the trimming and the admission test are
 /// against: with a warm rig beside it a document is trimmed further, or refused, where it would have
 /// fitted alone (D3, 2026-10-09).
+/// \param lite_first trim **every** slimmable model to Lite whatever the budget says (P8). The point
+/// is a rig that can start playing now -- a Lite compiles in about a third of the time -- with the
+/// Full compiled behind it and crossfaded to when it is ready; E2's listening verdict is that a Lite
+/// standing in for a Full is not audible on the models it tested, and D6 still requires it to be
+/// *visible*, which is what \ref CostOutcome::lite_first is for.
 CostOutcome apply_cost_table(graph::Document& resolved, const CostTable& table, UnitCache& units, double rate,
-                             int max_quantum, int warm_documents = 0);
+                             int max_quantum, int warm_documents = 0, bool lite_first = false);
 
 /// A cost as the messages and the status report write it: "0.66 of a core".
 std::string format_cost(double cost);

@@ -260,6 +260,42 @@ TEST_CASE("cost table: the coexistence charge is what the warm set costs the aud
   CHECK(two.verdict == "over");
 }
 
+TEST_CASE("cost table: lite_first trims everything slimmable, and still refuses what stays over")
+{
+  // P8's first step: a rig that can start playing now. A Lite compiles in about a third of the time,
+  // and E2's listening verdict is that a Lite standing in for a Full is not audible on the models it
+  // tested -- so the fast document is the one published first, with the Full compiled behind it.
+  // This is where that trimming happens: the same loop, with nothing left to reach.
+  const CostTable table = test_table();
+  UnitCache units;
+  Document as_written = document_of({amp("amp1", example("A2.nam")), cab("cab1", generated("CabIR.nam")),
+                                     gain("g1"), gain("g2"), gain("g3")});
+  const CostOutcome normal = apply_cost_table(as_written, table, units, 48000.0, 64, 0, false);
+  CHECK(normal.cost == doctest::Approx(0.65));   // 0.4 + 0.2 + three gains + in/out
+  CHECK_FALSE(normal.trimmed);
+  CHECK_FALSE(normal.lite_first);
+  CHECK_FALSE(slimmed(as_written, "amp1"));
+
+  Document fast = document_of({amp("amp1", example("A2.nam")), cab("cab1", generated("CabIR.nam")),
+                               gain("g1"), gain("g2"), gain("g3")});
+  const CostOutcome lite = apply_cost_table(fast, table, units, 48000.0, 64, 0, true);
+  CHECK(lite.lite_first);
+  CHECK(lite.trimmed);
+  CHECK(lite.cost < normal.cost);
+  CHECK(slimmed(fast, "amp1"));                  // the one slimmable model
+  CHECK_FALSE(lite.over);                        // lighter than what it was, so certainly admitted
+
+  // A rig with nothing to trim is what it is, and one that is over stays over: the fast path is a
+  // compile-time trick, not an exemption from D3.
+  Document nothing = document_of({amp("amp1", generated("A2-Full.nam")), amp("amp2", generated("A2-Full.nam")),
+                                  amp("amp3", generated("A2-Full.nam"))});
+  const CostOutcome stuck = apply_cost_table(nothing, table, units, 48000.0, 64, 0, true);
+  CHECK(stuck.lite_first);
+  CHECK_FALSE(stuck.trimmed);
+  CHECK(stuck.over);
+  CHECK(stuck.verdict == "over");
+}
+
 TEST_CASE("cost table: a table with no coexistence charge admits exactly as it did before")
 {
   // Every table measured before 2026-10-09, and every device that has not run T5.

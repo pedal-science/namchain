@@ -375,7 +375,7 @@ UnitCache::Unit UnitCache::get(const std::string& path, bool is_ir, double rate,
 }
 
 CostOutcome apply_cost_table(graph::Document& resolved, const CostTable& table, UnitCache& units, double rate,
-                             int max_quantum, int warm_documents)
+                             int max_quantum, int warm_documents, bool lite_first)
 {
   CostOutcome outcome;
   outcome.has_table = table.ok;
@@ -444,13 +444,17 @@ CostOutcome apply_cost_table(graph::Document& resolved, const CostTable& table, 
     }
   }
 
+  outcome.lite_first = lite_first;
   // D6: Full -> Lite, applied only as far as it needs to be, and the dearest saving first -- "on as
   // few NAM nodes as it takes, largest first". What a save is worth is the difference between the
   // node's own size and its Lite one, both from the table, so a model whose Lite row is not measured
   // saves nothing and is not trimmed for show. The target is the charge-adjusted budget: with a warm
   // rig beside it a document is trimmed as far as the coercion charge makes necessary, which is how
   // the pedal keeps the deadline instead of promising it.
-  while (outcome.cost > budget + kEpsilon)
+  // `lite_first` (P8) is the same loop with nothing left to reach: every slimmable model goes to
+  // Lite, dearest first, so the document can be compiled and published now and the Full published
+  // over it later. A model with no Lite row still saves nothing and is not trimmed for show.
+  while (outcome.cost > (lite_first ? -1.0 : budget) + kEpsilon)
   {
     CostedNode* best = nullptr;
     double best_saving = 0.0;
@@ -489,6 +493,8 @@ CostOutcome apply_cost_table(graph::Document& resolved, const CostTable& table, 
   }
 
   outcome.effective = outcome.cost * outcome.coexistence;
+  // A lite_first document is over only if it is still over with everything trimmed: the caller asked
+  // for the fast compile, not for an exemption from the budget.
   outcome.over = outcome.effective > table.headroom + kEpsilon;
   outcome.verdict = outcome.over ? "over" : (outcome.trimmed ? "trimmed" : "fits");
   return outcome;
