@@ -2079,7 +2079,6 @@ bool Daemon::publish_warm(const graph::Document& document, const std::string& pa
   for (auto& slot : built)
     (void)slot.release();
 
-  const std::string replaced = warm_entry_.present ? warm_entry_.rig : std::string();
   warm_entry_ = WarmEntry{};
   warm_entry_.present = true;
   warm_entry_.document = document;
@@ -2102,7 +2101,6 @@ bool Daemon::publish_warm(const graph::Document& document, const std::string& pa
     std::fprintf(stderr, "[namchaind] warming %s into document %d (generation %llu, %zu chain%s)\n", what.c_str(),
                  target, static_cast<unsigned long long>(generation), count, count == 1 ? "" : "s");
   }
-  (void)replaced;
   return true;
 }
 
@@ -3916,7 +3914,11 @@ void Daemon::switch_begin() noexcept
 
     const uint64_t content = switch_request_content_.load(std::memory_order_acquire);
     const int target = document_with_content(content);
-    if (target < 0 || target == audible || docs_[target].owner.load(std::memory_order_acquire) != DocOwner::Warm)
+    // A warm thread that is not running -- no device has been open yet, or one was lost -- cannot let
+    // go of anything, so the request is withdrawn rather than left to time out.
+    const bool warm_running = warm_.thread.joinable();
+    if (!warm_running || target < 0 || target == audible ||
+        docs_[target].owner.load(std::memory_order_acquire) != DocOwner::Warm)
     {
       // Not warm any more: the client cooled it, warmed something else over it, or it is already the
       // document being heard. Withdrawn and reported rather than served -- the control thread knows
