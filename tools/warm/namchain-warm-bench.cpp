@@ -1556,6 +1556,11 @@ struct SwitchReport
   double handover_us = 0;
   std::size_t switches = 0;
   std::size_t deferred = 0;
+  /// Fade blocks where the outgoing rig's audio for *this* block was not in the pool, so the mixer
+  /// had to use the newest one it had. A non-zero count means the fade mixed two different moments
+  /// of the input, which the continuity and high-frequency checks will call a click -- and it is the
+  /// harness's timing, not the engine's audio.
+  std::size_t stale_fade_blocks = 0;
 };
 
 int run_switch(const Args& args)
@@ -1718,19 +1723,28 @@ int run_switch(const Args& args)
 
       if (fading)
       {
-        // The outgoing rig's audio for this block: whatever the warm thread has published since the
-        // last one, or the block already in hand when it has published nothing. The *newest* block
-        // wins -- a ring hands them back in order, so the last one taken is the newest -- because the
-        // warm thread may be a block or two behind while it catches up after a handover, and mixing a
-        // stale block into the first frames of a fade is a step the detector correctly calls a click.
+        // The outgoing rig's audio for *this* block: the warm thread renders the same block index in
+        // the same period (it caught up before letting go), so the pool should hold exactly `b`.
+        // Blocks are taken in order, so draining until `b` arrives leaves the newer ones for the next
+        // block of the fade; if it never arrives -- the warm thread was late -- the newest available
+        // is used and counted, because mixing a different moment of the input into a fade is a step
+        // and the detector is right to call it one.
         uint32_t index = 0;
         uint64_t seq = 0;
         const float* block = nullptr;
+        bool exact = false;
         while (bus_pool.take(index, seq, block))
         {
           std::copy(block, block + q, outgoing.begin());
           bus_pool.give_back(index);
+          if (seq == b)
+          {
+            exact = true;
+            break;
+          }
         }
+        if (!exact)
+          ++report.stale_fade_blocks;
         fade.mix(outgoing.data(), out.data(), mixed.data(), q);
         std::copy(mixed.begin(), mixed.end(), y.begin() + static_cast<long>(b * static_cast<std::size_t>(q)));
         if (!fade.active())
@@ -1796,6 +1810,11 @@ int run_switch(const Args& args)
   std::printf("warm:       %s\n", warm_sched.c_str());
   std::printf("handover:   %zu switches (%zu deferred), last %zu blocks; blocks here are %.0f us\n",
               report.switches, report.deferred, report.handover_blocks, q / kRate * 1e6);
+  if (report.stale_fade_blocks != 0)
+    std::printf("            %zu fade blocks mixed the newest available outgoing audio instead of this "
+                "block's: the fade spans two moments of the input, which is the harness being late, "
+                "not the engine\n",
+                report.stale_fade_blocks);
   std::printf("render:     p50 %.0f us  p99 %.0f us  p99.9 %.0f us  max %.0f us  over deadline %zu\n",
               r.p50, r.p99, r.p999, r.max, overruns);
   std::printf("warm:       p50 %.0f us  p99 %.0f us  max %.0f us  blocks %llu  worst lag %llu blocks\n",
