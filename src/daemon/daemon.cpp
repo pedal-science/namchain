@@ -5052,12 +5052,14 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
                       {"headroom", cost_.headroom},
                       // The coexistence charge (D3, 2026-10-09): what the deadline actually sees is
                       // `effective`, the raw sum times the factor the table charges for the warm
-                      // documents held while this rig plays, and `over` is decided on it. A client
-                      // that wants to know whether warming a second rig would push this one over can
-                      // compare `effective` against `headroom` with `warm_documents` one higher.
-                      {"effective", cost_.effective},
-                      {"coexistence", cost_.coexistence},
-                      {"coexistence_warm_documents", cost_.warm_documents},
+                      // documents held *now* -- the warm set moves without a publish, so this is
+                      // recomputed here rather than reported as it was when the rig was published.
+                      // `verdict` and `trimmed` are what the publish decided, and stay that way. A
+                      // client asking whether it can warm one more rig can charge `cost` with the
+                      // factor for `coexistence_warm_documents` one higher and compare to `headroom`.
+                      {"effective", cost_.cost * cost_table_.coexistence_factor(warm_documents())},
+                      {"coexistence", cost_table_.coexistence_factor(warm_documents())},
+                      {"coexistence_warm_documents", warm_documents()},
                       {"over", cost_.over},
                       {"verdict", cost_.verdict},
                       {"trimmed", cost_.trimmed},
@@ -5502,6 +5504,12 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["cost"] = {{"cost", warm_entry_.cost.cost},
                     {"full_cost", warm_entry_.cost.full_cost},
                     {"headroom", warm_entry_.cost.headroom},
+                    // The charge this rig was admitted under (D3, 2026-10-09): with one more warm
+                    // document held than when this one was warmed, and it is what let `rig.warm`
+                    // succeed at all.
+                    {"effective", warm_entry_.cost.effective},
+                    {"coexistence", warm_entry_.cost.coexistence},
+                    {"coexistence_warm_documents", warm_entry_.cost.warm_documents},
                     {"over", warm_entry_.cost.over},
                     {"verdict", warm_entry_.cost.verdict},
                     {"trimmed", warm_entry_.cost.trimmed},
