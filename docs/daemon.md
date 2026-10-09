@@ -84,6 +84,9 @@ silently ignored.
 | `rt_priority` | `80` | `SCHED_FIFO` for the render thread; `0` leaves the policy alone |
 | `cpu` | `-1` | pin the render thread to one CPU; `-1` leaves the affinity alone. With `render_threads` above 1 this is the first core of the render set |
 | `render_threads` | `1` | cores the render path uses: one coordinator plus this many minus one workers; `1` is the single-threaded engine. See "Render threads" below |
+| `warm_cpus` | *(empty)* | the cores a warm thread may be pinned to: an array, or a string like `"1,2"`. Empty means the warm set is off, and `rig.warm` is refused as `warm_disabled`. `cpu` may not appear here — the device core already renders the audible document — and `warm_cpus` together with `render_threads` above 1 is refused at startup. See "The warm set" below |
+| `warm_priority` | `70` | `SCHED_FIFO` for a warm thread: below `rt_priority`, so a warm rig can never delay the audible one, and below the audio interrupt's 85, which on the pedal shares a warm core |
+| `warm_max_behind_blocks` | `8` | how far behind the audible document a warm one may fall before `engine.status` carries the `warm_behind` issue. Nothing is refused or dropped at this number: it is where the health light starts saying "the rig you are about to switch to is not current" |
 | `lock_memory` | `true` | `mlockall(MCL_CURRENT)`, never `MCL_FUTURE` (plan.md §14.10) |
 | `output_queue_periods` | `0` | output-ring cap in periods; `0` is off |
 | `output_queue_floor_periods` | `0` | queue floor in periods; `0` is off |
@@ -382,6 +385,9 @@ One JSON object per message in each direction, over either transport above. A re
 | `rig.apply` | `{"document": { … }}` — a whole document, parsed by the same parser a rig file goes through | `name`, `chains`, `generation`; relative model paths resolve against the rigs root |
 | `rig.patch` | `{"ops": [...], "chain": "id"?}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass`. A target is named by `node`, or by `element` with an optional `role` (and `port` for a per-port parameter) | `kind` (`smooth` or `structural`), `applied`, `chain`, `generation` |
 | `rig.get` | — | the rig path (empty for an applied document), `source` (`file`/`applied`), `generation`, `loaded`, the current `document` as the engine parsed it, the `lowered` graph it became (macros expanded, with the engine-minted ids), and a per-chain summary |
+| `rig.warm` | `{"rig": "name.json"}`, or `{"document": { … }}`, with `{"replace": false}` to refuse rather than displace a warm rig | hold a rig ready to switch to: compiled, prewarmed and rendering on a warm core, without touching the audible document. Returns `rig`, `name`, `generation`, `doc`, `core`, `state` (`warming` until it has rendered a block, then `warm`), `replaced` (what it displaced, or null), the same `cost` object `rig.cost` returns, and `slimmed_models`/`missing_assets`. Refused as `warm_disabled`, `warm_full` (`replace` was false), `over_budget`, `asset_missing` or `compile_failed` |
+| `rig.cool` | `{"rig": "name.json"}`, or `{}` for whatever is warm | stop holding a rig ready. Returns `cooled` (the rigs that stopped being warm) and the `warm` object. `warm_disabled` when warmth is off, `warm_not_ready` when the named rig is not the warm one or the document has not been let go yet |
+| `rig.switch` | `{"rig": "name.json"}`, with `{"fallback": false}` to refuse instead of loading cold | make a rig audible: `switched` (`warm` when it was a handover, `cold` when it was a load), `rig`, `generation` (of the content now audible), `doc`, `core`, `handover_blocks`, `fade_ms`, `completed`, and `reason` when it was cold. A rig that is not warm is published exactly as `rig.load` does it, so a footswitch press never ends in silence; `fallback: false` turns that into `warm_not_ready` |
 | `rig.cost` | `rig` (a name, as `rig.load` takes) or `document` (a whole document) | what that rig would cost on this device, and the verdict: the same table, trimming and `over` a publish would apply, on a copy that is thrown away. Nothing is published, compiled or loaded. `cost` is the object `engine.status` reports, and `slimmed_models`/`missing_assets` come with it, so a service can cost its whole bank without a second cost model of its own (D9) |
 
 Unknown fields are ignored; an unknown method is `unknown_method`. A malformed message never kills
@@ -539,6 +545,8 @@ stops being true disappears, which is the property that makes the light worth ha
 | `cost_table_missing` | info | there is no readable cost table at `cost_table`, so every unit is charged its unknown cost. The rigs that fit still play; the device has simply not been measured |
 | `model_slimmed` | info | a block plays its smallest model to fit the model budget. One per block, with `element` and `reference`: informational, because it is the budget doing its job, but named, because a Lite does not sound like the Full the rig names |
 | `transition` | info | a structural change is being crossfaded (normal, and it does not colour `health`) |
+| `warm_behind` | warn | a warm document is more than `warm_max_behind_blocks` behind the audible one, so switching to it would not be current. `count` is how far behind. The rig is still warm and still switchable: this is the live form of the falsifier in `docs/warm-set.md` |
+| `warm_not_ready` | info | a rig has been warmed but has not rendered a block yet. It is compiled and prewarmed, so a switch to it is still a handover; it is simply not yet known to be keeping up |
 
 Two things deliberately *not* issues: a daemon asked for no real-time priority that has none, and one
 asked not to lock memory, are doing exactly what they were told — the test for a healthy daemon
@@ -659,6 +667,57 @@ the kernel rather than remembered) and `render_degraded`. A run whose `render_th
 configured value is not a multi-core measurement; a worker that cannot be created is reported rather
 than silently dropped, and a configuration naming cores this process may not run on is refused at
 startup, by name.
+
+### The warm set: a rig rendered beside the one being heard
+
+A rig can be **warm**: compiled, prewarmed and rendering on a core of its own, processing the same
+input as the audible document, so that switching to it is a handover rather than a load, a parse and a
+fade-in from silence. `rig.warm` asks for one, `rig.switch` makes one audible, `rig.cool` stops
+holding one. `docs/warm-set.md` is the design — the ownership protocol, the handover, what is
+guaranteed and what is not — and this is the surface.
+
+```json
+"warm": {
+  "enabled": true, "device_core": 3, "cores": [1, 2], "priority": 70, "active_doc": 0,
+  "switches": 4, "cold_switches": 1, "withdrawn": 0, "max_behind_blocks": 8,
+  "set": [
+    {"doc": 1, "generation": 7, "audible": false, "state": "warm", "core": 1,
+     "rig": "/var/lib/pedal/library/rigs/next.json", "name": "next", "source": "file",
+     "cost": 0.41, "verdict": "fits", "slimmed": false,
+     "blocks": 9120, "warm_blocks": 9120, "behind_blocks": 0, "worst_behind_blocks": 2,
+     "blocks_dropped": 0, "publish_holds": 0, "handover_blocks": 3}
+  ]
+}
+```
+
+Everything about it is absent when `warm_cpus` is empty, which is how `levels` says it is not
+measuring. One entry per *document* rather than per rig, because that is what the engine holds: the
+document the device is hearing (`state: "audible"`) and the ones being kept warm. `state` is `warming`
+until a warmed document has rendered its first block, `warm` after that, and the numbers beside it are
+what the health light and the switch's own latency are read from — `behind_blocks` (a gauge: the
+device thread's input sequence minus the last one this document rendered), `blocks_dropped` (input
+blocks the device thread could not hand over because the warm thread was behind by the whole pool),
+`publish_holds` (fade blocks in which the outgoing document had published nothing new) and
+`handover_blocks` (what the last switch into this document cost, request to fade closed).
+`device_core` is the core the audible document renders on: the one a warm core may never be.
+
+**What it guarantees.** A switch compiles nothing, loads nothing and allocates nothing on either
+render thread: both documents are already rendering when the switch is asked for. The device thread
+needs one block of setup — the warm thread has to let go of the incoming document — and then a
+`fade_ms` crossfade, so a switch costs a block or two plus the fade (6.3–8 ms at 64 frames and 5 ms)
+against the pedal's 50 ms budget. It can be *deferred* by any number of blocks, and the count is in
+the status; it cannot be dropped, and it cannot make the device thread wait.
+
+**What it does not guarantee.** That the warm rig is current to the last block, or that a rig's
+history is the one the player would have heard had their foot been on that switch all along — that is
+what `behind_blocks` measures and what the pedal's T8 falsifies. Nor that a rig is warm at all: a
+client asks, the engine does what it is told, and a rig that is not warm is switched to cold. The
+engine does not guess which rigs a player is one press away from; the service that owns the bank does
+(D9), and the pedal's `pedald` is that service.
+
+Warming is one document per warm thread in this slice. The configuration accepts a list of warm cores
+because the pedal's layout has two, but only the first is used until D4's packing exists; the rest are
+reported and idle.
 
 ### Cost and admission: what a rig costs on this device
 

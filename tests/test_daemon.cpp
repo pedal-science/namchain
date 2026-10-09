@@ -28,6 +28,7 @@
 
 #include "namchain/daemon/framing.h"
 #include "namchain/daemon/platform.h"
+#include "namchain/rt_check.h"
 #include "namchain/daemon/config.h"
 #include "namchain/daemon/daemon.h"
 #include "namchain/graph/macro.h"
@@ -4308,6 +4309,10 @@ TEST_CASE("a switch mid-render is continuous audio, and warmth off is bit-identi
     REQUIRE_MESSAGE(daemon.start(error), error);
 
     REQUIRE(wait_status(daemon, [](const nlohmann::json& s) { return s["blocks"].get<uint64_t>() > 8; }));
+    // From here the warm path is doing everything it does: input published to a warm thread, a
+    // document rendered on another core, a handover and a fade. None of it may allocate, and the
+    // interposer counts what happens inside an RtScope -- which is both render paths.
+    namchain::rt_reset_counters();
     const auto warmed = request(daemon, R"({"id":"w","method":"rig.warm","rig":"quarter.json"})");
     REQUIRE(warmed["ok"] == true);
     REQUIRE(wait_status(daemon, [](const nlohmann::json& s) {
@@ -4340,6 +4345,10 @@ TEST_CASE("a switch mid-render is continuous audio, and warmth off is bit-identi
   for (std::size_t i = 1; i < switched.size(); ++i)
     biggest_step = std::max(biggest_step, std::fabs(switched[i] - switched[i - 1]));
   CHECK(biggest_step < 0.01f);
+
+  CHECK(namchain::rt_check_available());
+  CHECK(namchain::rt_allocation_count() == 0);
+  CHECK(namchain::rt_deallocation_count() == 0);
 
   // And it really did switch: the run starts on one rig and ends on the other.
   CHECK(switched.front() == doctest::Approx(0.5f));

@@ -71,6 +71,14 @@ void print_usage(std::FILE* stream)
     "  assets [--refresh]     the model and impulse-response library as ids, optionally rescanning it\n"
     "                         first (the scan is cached by size and mtime, so this is cheap)\n"
     "  get                    the document the engine is running, as the engine parsed it\n"
+    "  load NAME.json         load a rig by name (under the daemon's rigs_root) and crossfade to it\n"
+    "  warm NAME.json [--document FILE] [--no-replace]\n"
+    "                         hold a rig ready to switch to: compiled, prewarmed and rendering on a\n"
+    "                         warm core (docs/warm-set.md). --document warms a document from a file\n"
+    "                         instead of a rig name\n"
+    "  cool [NAME.json]       stop holding a rig ready; with no name, whatever is warm\n"
+    "  switch NAME.json [--no-fallback]\n"
+    "                         make a rig audible: a handover when it is warm, a load when it is not\n"
     "  apply FILE             apply a whole document (FILE, or - for stdin)\n"
     "  patch FILE             apply a patch: either an ops array or {\"chain\":..., \"ops\":[...]}\n"
     "  set --node N --param P --value V [--node-port N] [--chain C]\n"
@@ -294,6 +302,14 @@ const char* method_for(const std::string& command)
     return "engine.assets";
   if (command == "get")
     return "rig.get";
+  if (command == "load")
+    return "rig.load";
+  if (command == "warm")
+    return "rig.warm";
+  if (command == "cool")
+    return "rig.cool";
+  if (command == "switch")
+    return "rig.switch";
   if (command == "apply")
     return "rig.apply";
   if (command == "patch" || command == "set")
@@ -339,6 +355,9 @@ struct Options
   std::string value;
   int node_port = -1;
   std::string seconds;
+  std::string document;
+  bool no_replace = false;
+  bool no_fallback = false;
 };
 
 } // namespace
@@ -431,6 +450,15 @@ int main(int argc, char** argv)
       if (!value_of(options.seconds))
         return kExitUsage;
     }
+    else if (word == "--document")
+    {
+      if (!value_of(options.document))
+        return kExitUsage;
+    }
+    else if (word == "--no-replace")
+      options.no_replace = true;
+    else if (word == "--no-fallback")
+      options.no_fallback = true;
     else if (word == "--node-port")
     {
       std::string text;
@@ -504,6 +532,64 @@ int main(int argc, char** argv)
     // daemon to look at the disk again rather than answer from its scan.
     if (options.refresh)
       request["refresh"] = true;
+  }
+  else if (options.command == "load")
+  {
+    if (!needs_one_argument("rig name"))
+      return kExitUsage;
+    request["rig"] = options.positional[0];
+  }
+  else if (options.command == "warm")
+  {
+    // A rig by name, or a whole document from a file: the same two spellings the daemon takes.
+    if (options.document.empty())
+    {
+      if (!needs_one_argument("rig name"))
+        return kExitUsage;
+      request["rig"] = options.positional[0];
+    }
+    else
+    {
+      if (!options.positional.empty())
+      {
+        std::fprintf(stderr, "namchainctl: warm takes a rig name or --document, not both\n");
+        return kExitUsage;
+      }
+      bool ok = false;
+      const std::string text = read_file(options.document, ok);
+      if (!ok)
+      {
+        std::fprintf(stderr, "namchainctl: cannot read '%s'\n", options.document.c_str());
+        return kExitUsage;
+      }
+      nlohmann::json document = nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+      if (document.is_discarded())
+      {
+        std::fprintf(stderr, "namchainctl: '%s' is not valid JSON\n", options.document.c_str());
+        return kExitUsage;
+      }
+      request["document"] = std::move(document);
+    }
+    if (options.no_replace)
+      request["replace"] = false;
+  }
+  else if (options.command == "cool")
+  {
+    if (options.positional.size() > 1)
+    {
+      std::fprintf(stderr, "namchainctl: cool takes at most one rig name\n");
+      return kExitUsage;
+    }
+    if (!options.positional.empty())
+      request["rig"] = options.positional[0];
+  }
+  else if (options.command == "switch")
+  {
+    if (!needs_one_argument("rig name"))
+      return kExitUsage;
+    request["rig"] = options.positional[0];
+    if (options.no_fallback)
+      request["fallback"] = false;
   }
   else if (options.command == "apply")
   {
