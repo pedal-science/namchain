@@ -65,6 +65,9 @@
 //   namchain-warm-bench contention --input in.wav --ir cab.wav --live live.nam cand1.nam [...]
 //                                  [--count N] [--seconds S] [--quantum 64] [--slim X] [--no-ir]
 //                                  [--spinner] [--render-cpu 3] [--warm-cpu 2] [--priority 80]
+//   namchain-warm-bench switch     --input in.wav --live A.nam candB.nam [--ir cab.wav]
+//                                  [--switch-every S] [--fade-ms 5] [--seconds 30] [--quantum 64]
+//                                  [--render-cpu 3] [--warm-cpu 1] [--priority 80]
 //   namchain-warm-bench measure    --input in.wav --unit nam|ir|node
 //                                  [--model M.nam] [--slim 0.0] [--with-ir cab.wav]   (nam)
 //                                  [--ir cab.wav] [--taps N]                          (ir)
@@ -102,7 +105,9 @@
 #include "NAM/slimmable.h"
 
 #include "namchain/daemon/cost_table.h"
+#include "namchain/daemon/doc_runtime.h"
 #include "namchain/glitch.h"
+#include "namchain/rt/crossfade.h"
 #include "namchain/graph/graph.h"
 #include "namchain/graph/plan.h"
 #include "namchain/rt/arena.h"
@@ -1525,6 +1530,266 @@ Unit make_unit(const Args& args)
   return u;
 }
 
+// --- switch ---------------------------------------------------------------------
+//
+// T7's offline half and T8's falsifier (pedal.project
+// docs/managing-processing-power-and-optimising-for-fast-switching.md, P6; namchain docs/warm-set.md).
+//
+// Two rigs, two cores, and the engine's own handover: the device thread renders the rig being heard
+// on --render-cpu at SCHED_FIFO, paced to the wall clock; a warm thread on --warm-cpu keeps the other
+// rig current from the same input, at ten below that priority, which on the pedal is below the audio
+// interrupt too. Every --switch-every seconds the device thread asks the warm thread to let go, takes
+// the rig over on the next block, and crossfades its own fresh audio against the outgoing rig's
+// published block -- one block of setup and then --fade-ms, exactly what the engine does.
+//
+// What it answers:
+//   * the handover, in blocks and microseconds, from the request to the fade closing;
+//   * the device thread's block times while a rig is being kept warm on another core, against the
+//     period's deadline, and how many of them went over it;
+//   * how far behind the warm thread fell (its own lag distribution, and the worst);
+//   * and whether the result is continuous audio, judged by the engine's own glitch detector against
+//     both rigs rendered offline over the same span -- which is the thing a listener would call a
+//     click, said as four numbers.
+struct SwitchReport
+{
+  std::size_t handover_blocks = 0;
+  double handover_us = 0;
+  std::size_t switches = 0;
+  std::size_t deferred = 0;
+};
+
+int run_switch(const Args& args)
+{
+  if (args.candidates.empty())
+    die("switch needs a candidate: --live A.nam candB.nam");
+  const std::vector<float> x = load_input(args.input);
+  const std::vector<float> ir = load_ir_or_none(args);
+  const int q = args.quantum;
+  const double deadline_us = q / kRate * 1e6;
+  const std::size_t blocks = static_cast<std::size_t>(args.seconds * kRate) / static_cast<std::size_t>(q);
+  const std::size_t loop = x.size() / static_cast<std::size_t>(q) * static_cast<std::size_t>(q);
+  const int fade_frames = static_cast<int>(args.fade_ms * kRate / 1000.0);
+  const std::size_t switch_blocks =
+    args.switch_every <= 0 ? blocks
+                           : std::max<std::size_t>(2, static_cast<std::size_t>(args.switch_every * kRate) /
+                                                        static_cast<std::size_t>(q));
+
+  auto rig_a = make_rig(args.live, ir, q, args.slim);
+  auto rig_b = make_rig(args.candidates.front(), ir, q, args.slim);
+
+  // The oracles: each rig rendered alone over the whole span, offline. The detector judges the
+  // real-time run against them, so "no click" is a comparison rather than an opinion.
+  std::vector<float> oracle_a(blocks * static_cast<std::size_t>(q));
+  std::vector<float> oracle_b(blocks * static_cast<std::size_t>(q));
+  std::vector<float> oracle_out(static_cast<std::size_t>(q));
+  for (std::size_t b = 0; b < blocks; ++b)
+  {
+    const float* in = x.data() + (b * static_cast<std::size_t>(q)) % loop;
+    rig_a->process(in, oracle_out.data(), q);
+    std::copy(oracle_out.begin(), oracle_out.end(), oracle_a.begin() + static_cast<long>(b * static_cast<std::size_t>(q)));
+    rig_b->process(in, oracle_out.data(), q);
+    std::copy(oracle_out.begin(), oracle_out.end(), oracle_b.begin() + static_cast<long>(b * static_cast<std::size_t>(q)));
+  }
+
+  namchain::daemon::BlockPool bus_pool;
+  bus_pool.configure(static_cast<std::size_t>(q));
+  std::atomic<uint64_t> published{0};
+  std::atomic<int> holder{0};           ///< which rig the device thread renders: 0 = A, 1 = B
+  std::atomic<bool> publish_wanted{false};
+  std::atomic<bool> release_request{false};
+  std::atomic<bool> released{false};
+  std::atomic<bool> done{false};
+  std::atomic<uint64_t> warm_lag_max{0};
+  std::atomic<uint64_t> warm_blocks{0};
+
+  std::vector<double> render_us;
+  render_us.reserve(blocks);
+  std::vector<double> warm_us;
+  warm_us.reserve(blocks);
+  std::vector<float> y(blocks * static_cast<std::size_t>(q), 0.0f);
+  std::vector<namchain::glitch::Edit> edits;
+  SwitchReport report;
+  std::string render_sched, warm_sched;
+  std::size_t overruns = 0;
+
+  std::thread warmer([&] {
+    warm_sched = namchain::rt::describe_scheduling(
+      namchain::rt::apply_scheduling(args.priority - 10, args.warm_cpu));
+    std::vector<float> out(static_cast<std::size_t>(q));
+    uint64_t next = 0;
+    while (!done.load(std::memory_order_acquire) || next < published.load(std::memory_order_acquire))
+    {
+      const uint64_t avail = published.load(std::memory_order_acquire);
+      if (next >= avail)
+      {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        continue;
+      }
+      if (release_request.load(std::memory_order_acquire))
+      {
+        // Let go: the device thread is about to render this rig, and a rig is rendered by one thread
+        // at a time. It does not touch it again until the roles have swapped under it.
+        released.store(true, std::memory_order_release);
+        while (release_request.load(std::memory_order_acquire) && !done.load(std::memory_order_acquire))
+          std::this_thread::sleep_for(std::chrono::microseconds(50));
+        released.store(false, std::memory_order_release);
+        next = published.load(std::memory_order_acquire); // the input it did not render is not its own
+        continue;
+      }
+      const bool mine_is_b = holder.load(std::memory_order_acquire) == 0;
+      Rig* mine = mine_is_b ? rig_b.get() : rig_a.get();
+      const float* in = x.data() + (next * static_cast<std::size_t>(q)) % loop;
+      const auto t0 = Clock::now();
+      mine->process(in, out.data(), q);
+      warm_us.push_back(std::chrono::duration<double, std::micro>(Clock::now() - t0).count());
+      if (publish_wanted.load(std::memory_order_acquire))
+      {
+        uint32_t index = 0;
+        float* block = bus_pool.acquire(next, index);
+        if (block != nullptr)
+        {
+          std::copy(out.begin(), out.end(), block);
+          bus_pool.publish(index);
+        }
+      }
+      const uint64_t lag = avail - next - 1;
+      if (lag > warm_lag_max.load(std::memory_order_relaxed))
+        warm_lag_max.store(lag, std::memory_order_relaxed);
+      warm_blocks.fetch_add(1, std::memory_order_relaxed);
+      ++next;
+    }
+  });
+
+  std::thread renderer([&] {
+    render_sched = namchain::rt::describe_scheduling(namchain::rt::apply_scheduling(args.priority, args.render_cpu));
+    std::vector<float> out(static_cast<std::size_t>(q));
+    std::vector<float> outgoing(static_cast<std::size_t>(q), 0.0f);
+    std::vector<float> mixed(static_cast<std::size_t>(q), 0.0f);
+    namchain::rt::Crossfade fade(kMaxTransitionFrames);
+    timespec next_time{};
+    clock_gettime(CLOCK_MONOTONIC, &next_time);
+    const long period_ns = static_cast<long>(q / kRate * 1e9);
+    bool fading = false;
+    std::size_t fade_started = 0;
+    std::size_t next_switch = switch_blocks;
+
+    for (std::size_t b = 0; b < blocks; ++b)
+    {
+      next_time.tv_nsec += period_ns;
+      while (next_time.tv_nsec >= 1000000000L)
+      {
+        next_time.tv_nsec -= 1000000000L;
+        ++next_time.tv_sec;
+      }
+      clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_time, nullptr);
+
+      Rig* mine = holder.load(std::memory_order_relaxed) == 0 ? rig_a.get() : rig_b.get();
+      const float* in = x.data() + (b * static_cast<std::size_t>(q)) % loop;
+      const auto t0 = Clock::now();
+      mine->process(in, out.data(), q);
+      const double us = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+      render_us.push_back(us);
+      if (us > deadline_us)
+        ++overruns;
+
+      if (fading)
+      {
+        // The outgoing rig's audio for this block: whatever the warm thread has published since the
+        // last one, or the block already in hand when it has published nothing.
+        uint32_t index = 0;
+        uint64_t seq = 0;
+        const float* block = nullptr;
+        while (bus_pool.take(index, seq, block))
+        {
+          std::copy(block, block + q, outgoing.begin());
+          bus_pool.give_back(index);
+        }
+        fade.mix(outgoing.data(), out.data(), mixed.data(), q);
+        std::copy(mixed.begin(), mixed.end(), y.begin() + static_cast<long>(b * static_cast<std::size_t>(q)));
+        if (!fade.active())
+        {
+          fading = false;
+          publish_wanted.store(false, std::memory_order_relaxed);
+          report.handover_blocks = b - fade_started + 1;
+        }
+      }
+      else
+      {
+        std::copy(out.begin(), out.end(), y.begin() + static_cast<long>(b * static_cast<std::size_t>(q)));
+      }
+
+      // The outgoing side of the next fade starts as this thread's own last block, which is in hand
+      // and cannot be being written by anyone else.
+      std::copy(out.begin(), out.end(), outgoing.begin());
+      published.store(b + 1, std::memory_order_release);
+
+      if (!fading && b >= next_switch)
+      {
+        next_switch = b + switch_blocks;
+        report.switches++;
+        publish_wanted.store(true, std::memory_order_release);
+        release_request.store(true, std::memory_order_release);
+        // Wait for the warm thread to let go, looking once per block: a switch may be deferred, and
+        // it may not make the device thread wait.
+        for (int spins = 0; spins < 1000000 && !released.load(std::memory_order_acquire); ++spins)
+          std::this_thread::yield();
+        if (!released.load(std::memory_order_acquire))
+        {
+          ++report.deferred;
+          publish_wanted.store(false, std::memory_order_release);
+          release_request.store(false, std::memory_order_release);
+          continue;
+        }
+        holder.store(1 - holder.load(std::memory_order_relaxed), std::memory_order_release);
+        release_request.store(false, std::memory_order_release);
+        fade.start(fade_frames);
+        fading = true;
+        fade_started = b;
+        edits.push_back(namchain::glitch::Edit{b * static_cast<std::size_t>(q),
+                                               b * static_cast<std::size_t>(q) + static_cast<std::size_t>(fade_frames)});
+      }
+    }
+    done.store(true, std::memory_order_release);
+  });
+  renderer.join();
+  warmer.join();
+
+  const Stats r = stats(render_us), w = stats(warm_us);
+  std::printf("namchain-warm-bench %s  switch\n", NAMCHAIN_VERSION_STRING);
+  std::printf("rigs:       %s -> %s%s, quantum %d (deadline %.0f us), %.0f s, switch every %.1f s\n",
+              stem(args.live).c_str(), stem(args.candidates.front()).c_str(),
+              ir.empty() ? " (no ir)" : (" + " + stem(args.ir)).c_str(), q, deadline_us, args.seconds,
+              args.switch_every);
+  std::printf("render:     %s\n", render_sched.c_str());
+  std::printf("warm:       %s\n", warm_sched.c_str());
+  std::printf("handover:   %zu switches (%zu deferred), last %zu blocks; blocks here are %.0f us\n",
+              report.switches, report.deferred, report.handover_blocks, q / kRate * 1e6);
+  std::printf("render:     p50 %.0f us  p99 %.0f us  p99.9 %.0f us  max %.0f us  over deadline %zu\n",
+              r.p50, r.p99, r.p999, r.max, overruns);
+  std::printf("warm:       p50 %.0f us  p99 %.0f us  max %.0f us  blocks %llu  worst lag %llu blocks\n",
+              w.p50, w.p99, w.max, static_cast<unsigned long long>(warm_blocks.load()),
+              static_cast<unsigned long long>(warm_lag_max.load()));
+
+  namchain::glitch::Options detector;
+  detector.sample_rate = kRate;
+  std::string error;
+  const namchain::glitch::Report verdict = namchain::glitch::analyse(
+    y.data(), oracle_a.data(), oracle_b.data(), y.size(), edits, detector, error);
+  if (!error.empty())
+    std::printf("glitch:     not judged: %s\n", error.c_str());
+  else
+  {
+    std::printf("glitch:     %s  continuity ref %.3g vs edit %.3g, worst dropout %.2f ms, "
+                "hf excess %.2f dB, convergence %.1f dBFS\n",
+                verdict.ok ? "PASS" : "FAIL", verdict.reference_d2, verdict.max_edit_d2,
+                verdict.max_dropout_ms, verdict.max_hf_excess_db, verdict.worst_convergence_dbfs);
+    for (const namchain::glitch::Finding& finding : verdict.findings)
+      std::printf("  %-12s frame %zu  measured %.4g  limit %.4g  %s\n", finding.rule.c_str(), finding.frame,
+                  finding.measured, finding.limit, finding.detail.c_str());
+  }
+  return verdict.ok && error.empty() ? 0 : 1;
+}
+
 int run_measure(const Args& args)
 {
   const std::vector<float> x = load_input(args.input);
@@ -2042,5 +2307,7 @@ int main(int argc, char** argv)
     return run_ir(args);
   if (args.mode == "contention")
     return run_contention(args);
-  die("mode must be state, slim, chain, ir, contention, measure or rig");
+  if (args.mode == "switch")
+    return run_switch(args);
+  die("mode must be state, slim, chain, ir, contention, switch, measure or rig");
 }
