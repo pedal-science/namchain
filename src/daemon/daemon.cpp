@@ -1934,6 +1934,18 @@ bool Daemon::publish_warm(const graph::Document& document, const std::string& pa
       *error_code = "warm_full";
     return false;
   }
+  // The failsafe's backoff (2026-10-09): a pressure cool just took the warm set away because the
+  // audible rig was missing deadlines. Asking again immediately is how a service turns that into a
+  // loop, so a new warm is refused for a few seconds -- the service's own retry is a minute, and a
+  // cold switch in the meantime is what the pedal did before the ready set existed.
+  if (warm_pressure_holds())
+  {
+    error = "the audible rig was missing the deadline with a warm document beside it, so the warm set "
+            "was cooled and will not be refilled for a few seconds (D3's failsafe)";
+    if (error_code != nullptr)
+      *error_code = "warm_pressure";
+    return false;
+  }
   // D3's coexistence charge, at the moment the decision is made (2026-10-09): holding this rig warm
   // costs the rig the player is hearing real time, and T5 measured how much. Warming is refused when
   // the audible rig could not afford it -- the service falls back to a cold switch, which is the
@@ -2287,6 +2299,72 @@ bool Daemon::coexistence_affords_one_more_warm() const
   return cost_.cost * factor <= cost_table_.headroom + 1e-9;
 }
 
+bool warm_pressure(const uint64_t* before, const uint64_t* now)
+{
+  uint64_t total = 0;
+  uint64_t over_deadline = 0;
+  uint64_t over_ninety = 0;
+  for (std::size_t bucket = 0; bucket < kLoadBuckets; ++bucket)
+  {
+    if (now[bucket] <= before[bucket])
+      continue; // a counter that did not move contributes nothing; one that went backwards is a reset
+    const uint64_t delta = now[bucket] - before[bucket];
+    total += delta;
+    if (bucket == kLoadBuckets - 1)
+      over_deadline += delta;
+    else if (bucket >= 90)
+      over_ninety += delta;
+  }
+  if (total == 0)
+    return false;
+  // One block over the deadline is already a fault (D7's bar is zero overruns), and a hundredth of a
+  // window past nine tenths of it is a tail that is growing: a rig with room sits near a third of the
+  // deadline (T5 measured 63% at 0.41 and 108% at 0.735), so this is not the noise around a
+  // comfortable rig.
+  return over_deadline > 0 || over_ninety * 100 >= total;
+}
+
+void Daemon::check_warm_pressure()
+{
+  // The window is the blocks rendered since the last check, so a busy pedal and an idle one are both
+  // judged on what actually happened rather than on wall-clock time.
+  if (!pressure_histogram_valid_)
+  {
+    for (std::size_t bucket = 0; bucket < kLoadBuckets; ++bucket)
+      pressure_histogram_[bucket] = load_histogram_[bucket].load(std::memory_order_relaxed);
+    pressure_histogram_valid_ = true;
+    return;
+  }
+  std::array<uint64_t, kLoadBuckets> now{};
+  for (std::size_t bucket = 0; bucket < kLoadBuckets; ++bucket)
+    now[bucket] = load_histogram_[bucket].load(std::memory_order_relaxed);
+  const bool pressure = warm_pressure(pressure_histogram_.data(), now.data());
+  pressure_histogram_ = now;
+  if (!pressure || !warm_entry_.present)
+    return;
+
+  // The audible rig is missing deadlines while a warm document renders beside it: the charge was
+  // wrong for this rig or this board, and the answer is to stop paying it. Cooling costs the next
+  // press a cold switch, which is the behaviour the pedal had before the ready set existed.
+  std::string error;
+  std::string code;
+  nlohmann::json cooled = nlohmann::json::array();
+  if (cool_warm("", error, &code, cooled))
+  {
+    ++warm_pressure_cools_;
+    warm_pressure_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    std::fprintf(stderr,
+                 "[namchaind] warm pressure: the audible rig is missing the deadline with a warm "
+                 "document beside it; cooled %s (D3's charge was not enough here)\n",
+                 cooled.dump().c_str());
+  }
+}
+
+bool Daemon::warm_pressure_holds() const
+{
+  return warm_pressure_cools_ > 0 && std::chrono::steady_clock::now() < warm_pressure_until_;
+}
+
 void Daemon::sync_warm_switch()
 {
   const int audible = active_doc_.load(std::memory_order_acquire);
@@ -2388,6 +2466,10 @@ nlohmann::json Daemon::warm_json() const
   warm["switches"] = switches_.load(std::memory_order_relaxed);
   warm["cold_switches"] = warm_cold_switches_.load(std::memory_order_relaxed);
   warm["withdrawn"] = switches_withdrawn_.load(std::memory_order_relaxed);
+  // The failsafe's count, and whether it is holding a new warm off right now (D3, 2026-10-09): a
+  // service that sees `warm_pressure` climbing knows the charge is not enough for what is playing.
+  warm["pressure_cools"] = warm_pressure_cools_;
+  warm["pressure_holding"] = warm_pressure_holds();
   warm["max_behind_blocks"] = config_.warm_max_behind_blocks;
   if (warm_.cpu.load(std::memory_order_relaxed) >= 0)
     warm["thread_core"] = warm_.cpu.load(std::memory_order_relaxed);
@@ -5891,6 +5973,10 @@ int Daemon::run()
     // A warm switch moves which document is audible without a publish, so this is where the control
     // thread's view of "the running document" catches up with it. Cheap when nothing moved.
     sync_warm_switch();
+
+    // D3's failsafe (2026-10-09): the coexistence charge is a measurement, and this is what happens
+    // when the measurement was wrong for this rig -- the warm set goes rather than the deadline.
+    check_warm_pressure();
 
     // The level probes, on their own cadence (Config::levels_rate_hz). Here rather than only in the
     // read path so the cache is warm whether or not a client is reading: with a rate set, a poll

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "namchain/daemon/cost_table.h"
+#include "namchain/daemon/daemon.h"
 
 namespace
 {
@@ -390,4 +391,38 @@ TEST_CASE("cost table: an IR's own length decides its row, not its name")
   CHECK(cost_of(outcome, "cab1") == doctest::Approx(0.05));
   CHECK(cost_of(outcome, "cab2") == doctest::Approx(0.2));
   CHECK(outcome.cost == doctest::Approx(0.27));
+}
+
+TEST_CASE("the warm failsafe reads a window of the render load, not the whole run")
+{
+  // D3's failsafe (2026-10-09): the coexistence charge is a measurement, and this is what notices
+  // when it was wrong. `before` and `now` are two readings of the load histogram -- one bucket per
+  // percent of the deadline, the last one "over it" -- and only the window between them counts, so a
+  // spike an hour ago cannot keep the warm set cooled now.
+  std::vector<uint64_t> before(namchain::daemon::kLoadBuckets, 0), now(namchain::daemon::kLoadBuckets, 0);
+  // A comfortable window: everything around a third of the deadline, as T5 measured for a light rig.
+  before[30] = 100;
+  now[30] = 200;
+  now[32] = 10;
+  CHECK_FALSE(namchain::daemon::warm_pressure(before.data(), now.data()));
+
+  // The same window, with one block over the deadline: D7's bar is zero overruns, so one is a fault.
+  now[namchain::daemon::kLoadBuckets - 1] = 1;
+  CHECK(namchain::daemon::warm_pressure(before.data(), now.data()));
+  now[namchain::daemon::kLoadBuckets - 1] = 0;
+
+  // A growing tail: a hundredth of the window past nine tenths of the deadline, which a rig with room
+  // does not do. One block in a hundred is the threshold.
+  before.assign(namchain::daemon::kLoadBuckets, 0);
+  now.assign(namchain::daemon::kLoadBuckets, 0);
+  before[30] = 1000;
+  now[30] = 2000;   // 1000 blocks in the window at a comfortable 30%
+  now[93] = 11;     // 11 more past 90%: 11 of 1011, just over one percent
+  CHECK(namchain::daemon::warm_pressure(before.data(), now.data()));
+  now[93] = 10;     // 10 of 1010: just under, and not yet pressure
+  CHECK_FALSE(namchain::daemon::warm_pressure(before.data(), now.data()));
+
+  // No blocks at all in the window is not pressure: a stopped engine must not cool anything.
+  std::vector<uint64_t> same(namchain::daemon::kLoadBuckets, 5);
+  CHECK_FALSE(namchain::daemon::warm_pressure(same.data(), same.data()));
 }

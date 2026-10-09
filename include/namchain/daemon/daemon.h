@@ -238,6 +238,25 @@ struct WarmContent
 /// Since slice C there is a second transport. Both carry the same JSON bodies; they differ in framing
 /// (a length prefix, because TCP is a stream) and in trust (a token, because TCP has no filesystem
 /// permissions to offer). See docs/daemon.md §"Two transports" and its threat model.
+/// The buckets of the render load histogram: one per percent of the deadline, the last one being
+/// "over it".
+inline constexpr std::size_t kLoadBuckets = 101;
+
+/// \brief Whether a window of the render load says the warm set is costing the audible rig more than
+/// D3's charge predicted (2026-10-09).
+///
+/// The charge is a measurement, and a measurement of one board in one arrangement; this is what
+/// catches the cases it gets wrong. `before` and `now` are two readings of the render load histogram
+/// (\ref Daemon::load_histogram_), one bucket per percent of the deadline, and the window between
+/// them is the blocks rendered since the last check -- so a spike an hour ago cannot keep the warm set
+/// cooled now. True when any block in that window went over the deadline, or when a hundredth of them
+/// ran past nine tenths of it: a tail that is growing rather than noise, because a rig with room sits
+/// near a third of the deadline (T5 measured 63% at 0.41 and 108% at 0.735).
+///
+/// A free function of the two histograms so it can be read and tested without a render thread
+/// (tests/test_cost_table.cpp).
+bool warm_pressure(const uint64_t* before, const uint64_t* now);
+
 class Daemon
 {
 public:
@@ -418,6 +437,15 @@ private:
   /// engine has no cost for the audible document, in which case there is nothing to charge against and
   /// the honest answer is no. Control thread.
   bool coexistence_affords_one_more_warm() const;
+  /// \brief Act on \ref warm_pressure: cool the warm set and refuse to hold another for a while.
+  ///
+  /// Called from the control loop. Nothing on the render path consults it; it changes what the engine
+  /// is *holding*, not what it is rendering, so the worst case of getting it wrong is a press that
+  /// costs a cold switch. Control thread.
+  void check_warm_pressure();
+  /// True while a pressure cool is in force: `rig.warm` is refused (`warm_pressure`) so a service
+  /// asking every second cannot put the pedal back into the state the failsafe just left.
+  bool warm_pressure_holds() const;
   /// \brief Whether the render thread is playing \ref published_slots_ for chain \p index and has
   /// nothing in flight or queued for it: the only state a local transition may be planned against,
   /// because it shares instances with exactly that plan. Control thread.
@@ -874,6 +902,13 @@ private:
   WarmEntry warm_entry_;
   /// Where the warmed rig came from, in the same vocabulary as \ref current_source_.
   std::atomic<uint64_t> warm_cold_switches_{0};
+  /// The failsafe's own state (2026-10-09), control thread only: the render load histogram as of the
+  /// last check (so a window can be taken), how many times pressure has cooled the warm set, and until
+  /// when a new warm is refused because of it.
+  std::array<uint64_t, kLoadBuckets> pressure_histogram_{};
+  bool pressure_histogram_valid_ = false;
+  uint64_t warm_pressure_cools_ = 0;
+  std::chrono::steady_clock::time_point warm_pressure_until_{};
 
   std::atomic<int> device_state_{static_cast<int>(DeviceState::Closed)};
   std::atomic<uint64_t> blocks_{0};
@@ -1009,7 +1044,6 @@ private:
   /// gate is written in: the worst block, and how many went past 90% and past 100% of the deadline.
   /// One bucket per percent; the last holds everything at or past the deadline. Cumulative for the
   /// daemon's life, so a poller takes deltas.
-  static constexpr std::size_t kLoadBuckets = 101;
   std::array<std::atomic<uint64_t>, kLoadBuckets> load_histogram_{};
   std::atomic<uint64_t> worst_block_ns_{0};
   std::atomic<uint64_t> deadline_ns_{0};

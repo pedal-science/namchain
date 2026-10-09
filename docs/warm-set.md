@@ -321,3 +321,23 @@ a warmed document has not rendered its first block yet).
 * **`render_threads` above 1 together with warmth** — refused by name, above.
 * **Un-warming on the way out.** A rig that stops being a neighbour is cooled by the client
   (`rig.cool`); the engine does not guess.
+
+## The failsafe: the deadline is the truth (2026-10-09)
+
+The coexistence charge (pedal.project D3) is a *measurement* — one board, one arrangement, one set of
+rigs — and a measurement can be wrong for the next rig or the next board. So the engine also watches
+what actually happened. `check_warm_pressure()` runs on the control thread beside `sync_warm_switch()`
+and diffs the render load histogram (one bucket per percent of the deadline, the last one "over it")
+against the reading from the last check: the window is the blocks rendered since, so a spike an hour
+ago cannot keep the warm set cooled now.
+
+The window is pressure when **any** block in it went over the deadline — D7's bar is zero overruns, so
+one is already a fault — or when a hundredth of them ran past nine tenths of it, which a rig with room
+does not do (T5 measured 63% at a 0.41 rig and 108% at 0.735). On pressure the warm set is cooled,
+`pressure_cools` goes up, and a new `rig.warm` is refused with `warm_pressure` for ten seconds, because
+a service asking every second is how a failsafe becomes a loop.
+
+Nothing on the render path consults it: it changes what the engine *holds*, not what it renders, so
+the worst case of getting it wrong is that the next press is a cold switch instead of a handover.
+`warm_pressure()` is a free function of two histograms, tested without a render thread
+(`tests/test_cost_table.cpp`).
