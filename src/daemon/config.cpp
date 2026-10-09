@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 
 #include <cerrno>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -197,6 +198,138 @@ bool read_string(const nlohmann::json& doc, const char* key, std::string& out, c
   return true;
 }
 
+/// \brief A list of cores, from either a JSON array or the "1,2" / "1-2" spelling.
+///
+/// Both spellings because both are already in the project: the pedal's `tune.conf` writes CPU sets as
+/// ranges and a JSON config writes an array. Parsing them in one place is what stops the two from
+/// meaning different things. The list is a *set*, so naming a core twice is a mistake worth reporting
+/// rather than quietly pinning two warm threads to one core.
+bool parse_cpu_list(const std::string& text, std::vector<int>& out, std::string& error)
+{
+  out.clear();
+  std::string current;
+  const auto flush = [&]() {
+    if (current.empty())
+      return true;
+    char* end = nullptr;
+    const long first = std::strtol(current.c_str(), &end, 10);
+    if (end == current.c_str() || *end != '\0' || first < 0 || first > 1023)
+    {
+      error = "'" + current + "' is not a cpu number";
+      return false;
+    }
+    out.push_back(static_cast<int>(first));
+    current.clear();
+    return true;
+  };
+  for (std::size_t i = 0; i < text.size(); ++i)
+  {
+    const char c = text[i];
+    if (c == ',' || c == ' ' || c == '\t')
+    {
+      if (!flush())
+        return false;
+      continue;
+    }
+    if (c == '-')
+    {
+      // A range: the number before it, then the end of it. Expanded rather than kept as a range,
+      // because what the daemon needs is the set of cores, and a range that is later edited into a
+      // list would otherwise have to be re-read by everything downstream.
+      if (!flush())
+        return false;
+      std::size_t j = i + 1;
+      while (j < text.size() && std::isdigit(static_cast<unsigned char>(text[j])))
+        ++j;
+      if (j == i + 1 || out.empty())
+      {
+        error = "a '-' needs a cpu number on both sides";
+        return false;
+      }
+      const long last = std::strtol(text.substr(i + 1, j - i - 1).c_str(), nullptr, 10);
+      if (last < out.back() || last > 1023)
+      {
+        error = "the range '" + text.substr(i + 1, j - i - 1) + "' does not follow '" +
+                std::to_string(out.back()) + "'";
+        return false;
+      }
+      for (long cpu = out.back() + 1; cpu <= last; ++cpu)
+        out.push_back(static_cast<int>(cpu));
+      i = j - 1;
+      continue;
+    }
+    if (!std::isdigit(static_cast<unsigned char>(c)))
+    {
+      error = "'" + std::string(1, c) + "' is not part of a cpu list";
+      return false;
+    }
+    current.push_back(c);
+  }
+  if (!flush())
+    return false;
+  for (std::size_t i = 0; i < out.size(); ++i)
+  {
+    for (std::size_t j = i + 1; j < out.size(); ++j)
+    {
+      if (out[i] == out[j])
+      {
+        error = "cpu " + std::to_string(out[i]) + " is named twice";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool read_cpu_list(const nlohmann::json& doc, const char* key, std::vector<int>& out, const std::string& path,
+                   std::string& error)
+{
+  if (!doc.contains(key))
+    return true;
+  const auto& value = doc[key];
+  if (value.is_string())
+  {
+    if (parse_cpu_list(value.get<std::string>(), out, error))
+      return true;
+    error = path + ": '" + key + "': " + error;
+    return false;
+  }
+  if (!value.is_array())
+  {
+    error = path + ": '" + key + "' must be an array of cpu numbers or a string like \"1,2\"";
+    return false;
+  }
+  std::vector<int> cpus;
+  for (const auto& entry : value)
+  {
+    if (!entry.is_number_integer() && !entry.is_number_unsigned())
+    {
+      error = path + ": every entry of '" + key + "' must be a whole number";
+      return false;
+    }
+    const long long cpu = entry.get<long long>();
+    if (cpu < 0 || cpu > 1023)
+    {
+      error = path + ": '" + key + "' has a cpu out of range";
+      return false;
+    }
+    cpus.push_back(static_cast<int>(cpu));
+  }
+  for (std::size_t i = 0; i < cpus.size(); ++i)
+  {
+    for (std::size_t j = i + 1; j < cpus.size(); ++j)
+    {
+      if (cpus[i] == cpus[j])
+      {
+        error = path + ": '" + key + "' names cpu " + std::to_string(cpus[i]) + " twice";
+        return false;
+      }
+    }
+  }
+  out = std::move(cpus);
+  return true;
+}
+
 } // namespace
 
 bool load_config_file(const std::string& path, Config& config, std::string& error)
@@ -238,7 +371,8 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
                                       "tcp_listen", "tcp_address", "tcp_port", "tcp_max_connections",
                                       "tcp_max_message_bytes", "tcp_token", "tcp_token_file",
                                       "tcp_auth_timeout_ms", "models_root", "irs_root", "record_dir",
-                                      "capture_device_path", "input_device", "device_buffer_frames"};
+                                      "capture_device_path", "input_device", "device_buffer_frames",
+                                      "warm_cpus", "warm_priority", "warm_max_behind_blocks"};
   for (const auto& [key, value] : doc.items())
   {
     bool known = false;
@@ -314,8 +448,11 @@ bool load_config_file(const std::string& path, Config& config, std::string& erro
       !read_unsigned(doc, "tcp_max_connections", config.tcp_max_connections, path, error) ||
       !read_unsigned(doc, "tcp_max_message_bytes", config.tcp_max_message_bytes, path, error) ||
       !read_unsigned(doc, "tcp_auth_timeout_ms", config.tcp_auth_timeout_ms, path, error) ||
+      !read_unsigned(doc, "warm_max_behind_blocks", config.warm_max_behind_blocks, path, error) ||
+      !read_cpu_list(doc, "warm_cpus", config.warm_cpus, path, error) ||
       !read_double(doc, "fade_ms", config.fade_ms, path, error) ||
       !read_int(doc, "rt_priority", config.rt_priority, path, error) ||
+      !read_int(doc, "warm_priority", config.warm_priority, path, error) ||
       !read_int(doc, "cpu", config.cpu, path, error) ||
       !read_int(doc, "reclamation_timeout_ms", config.reclamation_timeout_ms, path, error) ||
       !read_bool(doc, "lock_memory", config.lock_memory, path, error) ||
@@ -564,6 +701,19 @@ bool apply_option(Config& config, const std::string& name, const std::string& va
     return parse_int("cpu", value, config.cpu, error);
   if (name == "render-threads")
     return parse_unsigned("render-threads", value, config.render_threads, error);
+  if (name == "warm-cpus")
+  {
+    if (!parse_cpu_list(value, config.warm_cpus, error))
+    {
+      error = "--warm-cpus: " + error;
+      return false;
+    }
+    return true;
+  }
+  if (name == "warm-priority")
+    return parse_int("warm-priority", value, config.warm_priority, error);
+  if (name == "warm-max-behind-blocks")
+    return parse_unsigned("warm-max-behind-blocks", value, config.warm_max_behind_blocks, error);
 
   error = "unknown option '--" + name + "'";
   return false;

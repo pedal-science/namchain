@@ -144,6 +144,7 @@ add_library(namchain OBJECT
   src/graph/patch.cpp
   src/daemon/config.cpp
   src/daemon/daemon.cpp
+  src/daemon/doc_runtime.cpp
   src/daemon/cost_table.cpp
   src/daemon/platform.cpp
   src/daemon/recorder.cpp

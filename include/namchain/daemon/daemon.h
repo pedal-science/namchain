@@ -21,6 +21,7 @@
 
 #include "namchain/assets/registry.h"
 #include "namchain/daemon/config.h"
+#include "namchain/daemon/doc_runtime.h"
 #include "namchain/daemon/framing.h"
 #include "namchain/daemon/cost_table.h"
 #include "namchain/daemon/recorder.h"
@@ -166,13 +167,6 @@ struct PlanSlot
   std::vector<std::pair<const float*, float*>> on_then;
 };
 
-/// \brief The most chains one document may hold.
-///
-/// A fixed bound rather than a vector, because the render thread's per-chain state is a fixed-sized
-/// array: nothing on the render path may allocate or resize, and rebuilding that state on a publish
-/// would be exactly that. The limit is published to clients as part of the engine's limits.
-inline constexpr int kMaxChains = 8;
-
 /// The widest device whose levels are measured, per direction. Eight is the pedal's stereo interface
 /// with room to spare, and it is a bound rather than a guess: the render thread accumulates into a
 /// fixed array, because the audio thread allocates nothing (namchain/rt_check.h).
@@ -209,9 +203,22 @@ struct PlanCommand
   float value = 0.0f;      ///< SetParam. SetBypass: 1 to bypass, 0 to bring the node back
 };
 
-/// The longest structural crossfade the weight table covers; a larger `fade_ms` is clamped to it.
-/// 16384 frames is 341 ms at 48 kHz and 43 ms at 384 kHz, well past §5.3's 5 ms default.
-inline constexpr int kMaxTransitionFrames = 1 << 14;
+/// \brief One compiled document, handed from the control thread to a warm thread.
+///
+/// A mailbox record rather than a command: it is only ever "here is content for document N", because
+/// everything else a warm thread does -- letting a document go, taking the outgoing one over after a
+/// switch -- is a state it reads, not a message it is sent (docs/warm-set.md).
+struct WarmContent
+{
+  PlanSlot* slots[kMaxChains] = {};
+  uint32_t chain_count = 0;
+  /// The control thread's id for this content: what a switch request names, and what
+  /// `DocRuntime::content` holds once it is installed.
+  uint64_t generation = 0;
+  /// The document the control thread would like it in. Checked again when it is installed, because a
+  /// switch can move a document in between.
+  uint32_t doc = 0;
+};
 
 /// \brief The reference daemon engine.
 ///
@@ -364,6 +371,45 @@ private:
   bool publish_param(const std::string& chain_id, const std::string& node, int port, const std::string& param,
                      double value, std::string& error);
   bool push_slot(uint32_t chain, uint32_t chain_count, PlanSlot* slot);
+  /// \brief Compile \p document and hand it to the warm thread, so that switching to it is a
+  /// handover rather than a load (docs/warm-set.md).
+  ///
+  /// Control thread. Everything `publish_document` does up to publication, and then a mailbox instead
+  /// of the render path: no command is pushed, no generation a client polls is advanced, and the
+  /// running document is not touched. The compilation is the expensive half -- every model is loaded
+  /// and prewarmed -- and it happens here, on the control thread, so that the switch itself is only a
+  /// change of which document the device thread renders.
+  ///
+  /// \param replace warm this rig even though another is already warm, displacing it. With false, a
+  /// warm set that is already full is refused as `warm_full` rather than replaced silently.
+  /// \param error_code `warm_disabled`, `warm_full`, `warm_not_ready`, `over_budget`, `asset_missing`
+  /// or `compile_failed`.
+  bool publish_warm(const graph::Document& document, const std::string& path, const std::string& source,
+                    const std::string& base_dir, bool replace, std::string& error,
+                    std::string* error_code = nullptr);
+  /// \brief Stop warming: retire the warm document's plans and let the document go. Control thread.
+  ///
+  /// A no-op when nothing is warm. \p rig, when not empty, must name a rig that is actually warm, so
+  /// that a client cooling the wrong one is told rather than obeyed. \p cooled receives the rigs that
+  /// stopped being warm (one today).
+  bool cool_warm(const std::string& rig, std::string& error, std::string* error_code, nlohmann::json& cooled);
+  /// \brief Make \p rig audible, as a handover when it is warm and as a publish when it is not.
+  /// Control thread; blocks until the switch completes or its deadline passes.
+  bool switch_to(const std::string& rig, bool fallback, std::string& error, std::string* error_code,
+                 nlohmann::json& body);
+  /// \brief Catch the control thread's view up with a switch the render thread has performed.
+  ///
+  /// A warm switch changes which document is audible without a publish, so the fields that describe
+  /// "the running document" -- its rig, its chains, its cost, its plans -- have to move with it. The
+  /// two compiled contents swap; nothing is recompiled and nothing is freed. Control thread.
+  void sync_warm_switch();
+  /// \brief The warm set, as `engine.status` reports it. Control thread.
+  nlohmann::json warm_json() const;
+  /// Which document holds \p content, or -1. Read by either thread: the lookup a control-thread
+  /// reply and the device thread's switch check both need.
+  int document_with_content(uint64_t content) const;
+  /// Whether warming is configured at all (\ref Config::warm_cpus).
+  bool warm_enabled() const { return !config_.warm_cpus.empty(); }
   /// \brief Whether the render thread is playing \ref published_slots_ for chain \p index and has
   /// nothing in flight or queued for it: the only state a local transition may be planned against,
   /// because it shares instances with exactly that plan. Control thread.
@@ -446,56 +492,85 @@ private:
   void finish_device(std::string& error);
   void close_device();
   void fail_device(const std::string& reason);
-  void drain_commands();
+  void drain_commands(DocRuntime& doc);
+  /// \brief Run one chain's plans for this block, on the participant's share of them.
+  ///
+  /// The planes it reads and writes are the document's, so a document is only ever passed to the
+  /// participant that owns it: the pool splits a *document's* chains when `render_threads` is above
+  /// one, and a warm document is not part of that pool at all.
+  void run_document_chains(DocRuntime& doc, unsigned participant, unsigned participants, int frames) noexcept;
+  /// \brief Everything that must keep one owner, after the plans have run: the crossfade mixes, the
+  /// local-transition bookkeeping and the sum into the document's bus. Render thread.
+  void finish_document_block(DocRuntime& doc, int frames) noexcept;
+  /// \brief Publish the decoded capture for the warm thread, if there is a warm document.
+  ///
+  /// One decode of every channel a chain may name, into a block from the pool. Nothing is decoded
+  /// when nothing is warm, which is what keeps the cost of the feature at zero until it is used.
+  void publish_warm_input() noexcept;
+  /// \brief Advance a document switch by a block, before the plans run: ask for the incoming
+  /// document, take it over when the warm thread has let go of it, and start the fade. Render thread.
+  void switch_begin() noexcept;
+  /// \brief Finish a block: what the device hears is the audible document's bus, or the crossfade
+  /// between two of them while a switch runs. Render thread.
+  void switch_mix(int frames) noexcept;
+  /// The fade length in frames for a structural change, from `fade_ms` and the running rate.
+  int transition_frames() const noexcept;
+  /// \brief The document the device thread is rendering. Render thread (and a relaxed read elsewhere).
+  DocRuntime& active_document() noexcept { return docs_[active_doc_.load(std::memory_order_relaxed)]; }
+  const DocRuntime& active_document() const noexcept { return docs_[active_doc_.load(std::memory_order_relaxed)]; }
   /// After a period is written: publish the backend's queue counters, and hand the period to the
   /// recording if there is one. Render thread.
   void account_period();
   /// Begin an equal-power transition for one chain. Render thread.
-  void start_transition(int index, PlanSlot* next);
+  void start_transition(DocRuntime& doc, int index, PlanSlot* next);
   /// Retire the faded-out plan, promote the incoming one, and start whatever is queued. Render thread.
-  void finish_transition(int index);
+  void finish_transition(DocRuntime& doc, int index);
   /// Take over a chain with a local transition's first plan: copy the carried buffers across and swap,
   /// with no whole-chain fade. Render thread.
-  void start_local_transition(int index, PlanSlot* slot);
+  void start_local_transition(DocRuntime& doc, int index, PlanSlot* slot);
   /// The local transition's crossfades have closed: hand over to its final plan. Render thread.
-  void finish_local_transition(int index);
+  void finish_local_transition(DocRuntime& doc, int index);
   /// Start the next queued chain transition, if one is waiting and none is running. Render thread.
-  void start_queued_transition();
+  void start_queued_transition(DocRuntime& doc);
   /// Retire a chain's plans and forget it: a document with fewer chains than the last one. Render
   /// thread.
-  void drop_chain(int index);
-  /// Recompute the document-level generation fields from the per-chain ones. Render thread.
-  void update_aggregate_state();
+  void drop_chain(DocRuntime& doc, int index);
+  /// Recompute a document's generation fields from its per-chain ones. Render thread.
+  void update_aggregate_state(DocRuntime& doc);
 
-  /// \brief One chain's render state.
+  // --- the warm thread (docs/warm-set.md) ----------------------------------
+  /// \brief Start the warm thread, if warmth is configured. Render thread, before it pins itself.
   ///
-  /// A plain member array of these is the whole reason for \ref kMaxChains: the render thread must
-  /// never allocate, and a per-chain container that could grow would be exactly that. Everything the
-  /// control thread reads for status is an atomic; everything else is render-thread-owned.
-  struct ChainRuntime
-  {
-    PlanSlot* current = nullptr; ///< the audible plan (fading out during a transition)
-    PlanSlot* next = nullptr;    ///< the plan fading in, or null
-    /// A publish that arrived for this chain while it was waiting its turn. One slot, newest wins:
-    /// a burst coalesces to the last request and the superseded plan is retired.
-    PlanSlot* pending = nullptr;
-    /// Frames left before a local transition's final plan takes over from \ref current; 0 when no
-    /// local transition is running.
-    int local_remaining = 0;
-    rt::Crossfade crossfade{kMaxTransitionFrames};
-    std::vector<float> in;
-    std::vector<float> out;
-    std::vector<float> old;
-    std::vector<float> incoming;
-
-    std::atomic<bool> mute{false};
-    std::atomic<bool> transition_active{false};
-    std::atomic<uint64_t> audible_generation{0};
-    std::atomic<uint64_t> target_generation{0};
-    std::atomic<uint64_t> adopted_generation{0};
-    std::atomic<unsigned> failed_nodes{0};
-    std::atomic<uint64_t> guard_trips{0};
-  };
+  /// Called before the render thread promotes itself for the same reason the render pool is: a thread
+  /// is born on its own core, and one created on a core a `SCHED_FIFO` thread is already spinning on
+  /// could never run to pin itself.
+  bool start_warm_thread(std::string& error);
+  /// Park the warm thread and join it. Idempotent; called on the way out of the render loop.
+  void stop_warm_thread() noexcept;
+  /// The warm thread's loop: take work, render what it owns, publish, park.
+  void warm_loop();
+  /// \brief One pass of the warm thread: drain the mailbox, adopt or cool documents, render every
+  /// block waiting in the input pool, publish the bus when a switch is listening. Warm thread.
+  void warm_service() noexcept;
+  /// \brief The document the warm thread should own and render, or null.
+  ///
+  /// Every document that is free, is not the audible one and has content: adopting the outgoing
+  /// document after a switch needs no message, which is what makes the handover one block of setup
+  /// rather than a conversation. Warm thread.
+  DocRuntime* claim_warm_document(int& index) noexcept;
+  /// \brief Render one document for one input block. Warm thread; no crossfade, no transition
+  /// bookkeeping, no levels: a warm document is a document, not a mix.
+  void render_warm_document(DocRuntime& doc, const float* planes, uint64_t seq) noexcept;
+  /// \brief Give \p doc back to nobody: clear what it holds, retire its plans, store `Free`.
+  ///
+  /// \param retire whether the content is going away (a cool) or merely changing hands (a switch,
+  /// which keeps its plans for the device thread to take over).
+  void release_warm_document(DocRuntime& doc, bool retire) noexcept;
+  /// Retire every plan \p doc holds, through the warm thread's own reclaimer, and forget the content.
+  /// Warm thread; the plans are freed by the control thread once the grace window has closed.
+  void retire_warm_content_of(DocRuntime& doc) noexcept;
+  /// Retire content that was never installed -- a compiled document superseded before it landed.
+  void retire_warm_content(const WarmContent& content) noexcept;
 
   /// \brief One open control connection, on either transport.
   ///
@@ -629,27 +704,168 @@ private:
   /// and the render loop can leave by two paths (input exhausted, or a stop), so "finish once, before
   /// the backend is destroyed" is stated rather than implied.
   bool device_finished_ = false;
-  /// One entry per chain of the running document, and how many of them there are. The control thread
-  /// learns the count from its own copy; the render thread learns it from the publish commands.
-  ChainRuntime chains_[kMaxChains];
-  int chain_count_ = 0;
-  /// The chain whose crossfade is in flight, or -1. One at a time, which is what bounds the peak cost
-  /// of a document apply to two of the largest chain rather than two of the whole document.
-  int transitioning_chain_ = -1;
-  /// The document generation the render thread has been told about, and the one before it. The pair
-  /// is what lets `audible_generation` mean "the generation the device is hearing" while an apply is
-  /// still working through the chains.
-  uint64_t rendered_generation_ = 0;
-  uint64_t previous_generation_ = 0;
+  /// \brief The documents this engine can render: the audible one and the warm ones (docs/warm-set.md).
+  ///
+  /// `docs_[active_doc_]` is what the device is hearing. A document is owned by exactly one thread at
+  /// a time (\ref DocOwner), and with warmth off only `docs_[0]` is ever touched -- which is what makes
+  /// a build without it behave exactly as it did before there were documents here at all.
+  DocRuntime docs_[kMaxDocuments];
+  /// The document the device thread is rendering. Written by the device thread, read by everyone: it
+  /// is how a client is told which rig is audible and how the control thread knows which compiled
+  /// content it is looking at.
+  std::atomic<int> active_doc_{0};
+  /// The audio the device thread is writing: the active document's bus, or the crossfade between two
+  /// of them while a switch runs.
+  std::vector<float> bus_;
+  /// \brief One channel's document-switch crossfade.
+  ///
+  /// A wrapper because \ref rt::Crossfade sizes its weight table once and so is deliberately not
+  /// default-constructible, and the switch needs one per playback channel: the fade is over the two
+  /// documents' *buses*, not over a chain, so each channel measures its own correlation.
+  struct SwitchCrossfade
+  {
+    rt::Crossfade fade{kMaxTransitionFrames};
+  };
+  SwitchCrossfade switch_fades_[kMaxLevelChannels];
+  /// \brief The document switch in flight, if any.
+  ///
+  /// Off, waiting for the warm thread to let go of the incoming document, or fading. Only one at a
+  /// time: a switch that arrived while another is fading is served when the fade closes, and the
+  /// control thread's request mailbox is checked then.
+  enum class SwitchPhase
+  {
+    Idle,
+    AwaitingRelease,
+    Fading,
+  };
+  SwitchPhase switch_phase_ = SwitchPhase::Idle;
+  int switch_incoming_ = -1;     ///< the document becoming audible
+  int switch_outgoing_ = -1;     ///< the document fading out (released to the warm thread)
+  /// The outgoing document's audio for the block being mixed: its own last block at first, then
+  /// whatever the warm thread has published. Held when nothing new arrived, and counted.
+  std::vector<float> switch_outgoing_bus_;
+  uint64_t switch_started_block_ = 0;
+  uint64_t switch_seen_seq_ = 0; ///< the last switch request this thread acted on
   /// The driver's xrun counter as of the last block, so the recent-trouble bucket can be fed the
   /// delta rather than the total.
   uint64_t last_xruns_ = 0;
   std::vector<unsigned char> capture_buffer_;
   std::vector<unsigned char> playback_buffer_;
-  /// The playback bus, planar: one run of \ref Config::period_size floats per device playback channel.
-  /// Every chain adds its output into its own channel's plane and the whole bus is encoded once, which
-  /// is what makes two chains writing one channel sum instead of overwrite.
-  std::vector<float> bus_;
+  /// \brief Every decoded capture channel of the block being rendered, for the warm thread to read.
+  ///
+  /// The device thread is the only thread with the capture, so a warm thread renders from what it
+  /// publishes: one plane per channel a chain may name (\ref Config::capture_channels), decoded once.
+  /// Sized when the device opens.
+  std::vector<float> warm_input_planes_;
+  unsigned warm_input_channels_ = 0;
+  /// The input sequence number of the block being rendered: the warm thread's `behind_blocks` is this
+  /// minus the sequence of the last block it rendered.
+  uint64_t input_sequence_ = 0;
+  /// The same number, published for the control thread's status: a plain member would be a race with
+  /// a reader that is not on the render path.
+  std::atomic<uint64_t> input_sequence_published_{0};
+
+  // --- the warm set (docs/warm-set.md) ---------------------------------------------------------
+  //
+  // One warm thread, one compiled document handed to it at a time, and the mailboxes the two threads
+  // and the control thread use to hand work over. Nothing here is a lock: each mailbox is written by
+  // one thread and read by one other, and the handover of a document is the two-phase claim/release
+  // in doc_runtime.h.
+  /// \brief The warm thread: the core it is pinned to, the input it renders from, and what it got.
+  struct WarmRuntime
+  {
+    std::thread thread;
+    /// The core it is pinned to, -1 before it is started. Atomic because the status reports it and the
+    /// thread is started by the render thread.
+    std::atomic<int> cpu{-1};
+    /// What the thread asked the kernel for and what it got. Written by the warm thread once, before
+    /// it renders anything; read only for a report.
+    rt::SchedulingState scheduling;
+    /// The decoded capture blocks the device thread hands over. One pool per warm thread: a pool is
+    /// single-consumer, and two warm threads share nothing.
+    BlockPool inputs;
+    /// "There is work": bumped by whichever thread has published something, waited on by the warm
+    /// thread when it has nothing to do. A counter rather than a flag so a burst cannot be missed.
+    std::atomic<uint64_t> sequence{0};
+    std::atomic<bool> parked{false};
+    /// Blocks this thread has rendered, and the input sequence of the last one.
+    std::atomic<uint64_t> blocks{0};
+  };
+  WarmRuntime warm_;
+  /// \brief Wake the warm thread if it has parked. Any producer of work for it calls this.
+  ///
+  /// The counter is bumped either way -- that is what makes the work visible -- but the futex wake is
+  /// only worth its syscall when the thread is actually parked, which is the handshake `RenderPool`
+  /// uses for the same reason.
+  void wake_warm_thread() noexcept
+  {
+    warm_.sequence.fetch_add(1, std::memory_order_release);
+    if (warm_.parked.load(std::memory_order_acquire))
+      warm_.sequence.notify_one();
+  }
+  /// Control thread -> warm thread: compiled content waiting to be rendered. Single producer, single
+  /// consumer, and a document is only adopted when one is free -- so a command can wait here across a
+  /// switch without anything being lost.
+  rt::SpscRing<WarmContent> warm_commands_{16};
+  /// Device thread -> warm thread: let go of this document (index + 1), or 0. It keeps its content:
+  /// the device thread is about to render it, which is what a switch is.
+  std::atomic<unsigned> warm_release_{0};
+  /// The document the device thread has asked for and not yet taken, or -1.
+  ///
+  /// A second statement of the same handover, and it has to be separate: the warm thread's rule is to
+  /// render every free document that has content, so a document it has just let go of looks exactly
+  /// like one it should pick up, and it would take it back before the device thread could claim it.
+  /// Cleared when the claim lands, or when the request is withdrawn.
+  std::atomic<int> take_request_{-1};
+  /// Control thread -> warm thread: retire this document's content (index + 1), or 0, and then let
+  /// the document go. Used by `rig.cool`; the opposite of \ref warm_release_ in that the content is
+  /// going away rather than changing hands.
+  std::atomic<unsigned> warm_cool_{0};
+  /// Device thread -> warm thread: stop. Set on the way out of the render loop.
+  std::atomic<bool> warm_quit_{false};
+  /// Control thread -> device thread: switch to this content (0 = none), plus a sequence number that
+  /// makes a repeat request visible. The content is checked, not the document: a request for content
+  /// that has since been replaced is withdrawn rather than served.
+  std::atomic<uint64_t> switch_request_content_{0};
+  std::atomic<uint64_t> switch_request_seq_{0};
+  /// Device thread -> control thread: the request it has finished with, and what happened to it.
+  std::atomic<uint64_t> switch_done_seq_{0};
+  std::atomic<uint64_t> switches_{0};
+  std::atomic<uint64_t> switches_withdrawn_{0};
+  /// Which document the last served request landed in, or -1.
+  std::atomic<int> switch_last_doc_{-1};
+  /// Warm thread only: content that could not be installed when it arrived (the document the control
+  /// thread named was not free yet), kept and retried. One slot, newest wins.
+  WarmContent pending_warm_;
+  bool warm_have_pending_ = false;
+  /// Warm thread only: the document it is holding, for the behind-blocks gauge in the status.
+  int warm_doc_ = -1;
+  /// The warm thread's own reclaimer. A plan is retired by whichever thread owns the document it was
+  /// playing in, so there are two producers and the control loop collects both.
+  rt::Reclaimer warm_reclaimer_{2, 64};
+
+  /// \brief The warm document as the control thread sees it: what it was compiled from, what it cost,
+  /// and the plans it owns until the warm thread retires them.
+  struct WarmEntry
+  {
+    bool present = false;
+    graph::Document document;
+    graph::Document resolved;
+    std::vector<PlanSlot*> slots;
+    std::vector<assets::MissingAsset> missing;
+    CostOutcome cost;
+    std::string rig;
+    std::string source;
+    std::string name;
+    std::string base_dir;
+    uint64_t generation = 0;
+    /// The document it was installed into, as last seen. Recomputed rather than trusted: a switch
+    /// moves the content between documents and the entry follows it.
+    int doc = -1;
+  };
+  WarmEntry warm_entry_;
+  /// Where the warmed rig came from, in the same vocabulary as \ref current_source_.
+  std::atomic<uint64_t> warm_cold_switches_{0};
 
   std::atomic<int> device_state_{static_cast<int>(DeviceState::Closed)};
   std::atomic<uint64_t> blocks_{0};

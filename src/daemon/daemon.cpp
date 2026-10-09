@@ -811,7 +811,8 @@ void Daemon::publish_level_windows() noexcept
     input_levels_[c].publish_window();
   for (unsigned c = 0; c < playback && c < output_levels_.size(); ++c)
     output_levels_[c].publish_window();
-  for (int c = 0; c < chain_count_ && c < static_cast<int>(chain_levels_.size()); ++c)
+  const DocRuntime& active = active_document();
+  for (int c = 0; c < active.chain_count && c < static_cast<int>(chain_levels_.size()); ++c)
     chain_levels_[static_cast<std::size_t>(c)].publish_window();
 }
 
@@ -1907,13 +1908,474 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   return true;
 }
 
+int Daemon::transition_frames() const noexcept
+{
+  unsigned rate = active_rate_.load();
+  if (rate == 0)
+    rate = config_.sample_rate;
+  return std::clamp(static_cast<int>(std::llround(config_.fade_ms * static_cast<double>(rate) / 1000.0)), 1,
+                    kMaxTransitionFrames);
+}
+
+bool Daemon::publish_warm(const graph::Document& document, const std::string& path, const std::string& source,
+                          const std::string& base_dir, bool replace, std::string& error, std::string* error_code)
+{
+  if (!warm_enabled())
+  {
+    error = "warming is off: no warm_cpus are configured";
+    if (error_code != nullptr)
+      *error_code = "warm_disabled";
+    return false;
+  }
+  if (!replace && warm_entry_.present)
+  {
+    error = "the warm set already holds '" + warm_entry_.rig + "'";
+    if (error_code != nullptr)
+      *error_code = "warm_full";
+    return false;
+  }
+
+  // The same gate every publish goes through: a document that would not be accepted as the running rig
+  // is not accepted as a warm one either -- it has to be able to play, because the whole point is that
+  // a switch to it is instant.
+  const graph::Validation validation = graph::validate(document);
+  if (!validation.ok)
+  {
+    error = validation.message;
+    return false;
+  }
+  if (document.chains.size() > static_cast<std::size_t>(kMaxChains))
+  {
+    error = "a document may hold at most " + std::to_string(kMaxChains) + " chains, this one has " +
+            std::to_string(document.chains.size());
+    return false;
+  }
+
+  graph::Document resolved = document;
+  graph::resolve_relative_paths(resolved, base_dir);
+  std::vector<assets::MissingAsset> missing;
+  if (!assets::resolve_document(resolved, assets_, base_dir, error, &missing))
+  {
+    if (error_code != nullptr)
+      *error_code = "asset_missing";
+    return false;
+  }
+
+  CostOutcome cost = apply_cost_table(resolved, cost_table_, units_, static_cast<double>(config_.sample_rate),
+                                      static_cast<int>(config_.period_size));
+  for (CostedNode& node : cost.nodes)
+  {
+    if (node.chain_index < document.chains.size() &&
+        node.node_index < document.chains[node.chain_index].graph.nodes.size())
+    {
+      const graph::NodeSpec& declared = document.chains[node.chain_index].graph.nodes[node.node_index];
+      const std::string reference = string_param(declared, declared.type == "nc.cab.ir" ? "ir" : "model");
+      if (!reference.empty())
+        node.reference = reference;
+    }
+  }
+  if (cost.over)
+  {
+    // Never admitted over the headroom, unlike the configured startup rig: a warm document shares its
+    // core with whatever else is on it, and the pedal's rules put the rig that must fit first (D3).
+    error = "the units in this document cost " + format_cost(cost.cost) +
+            " of a core together, more than the " + format_cost(cost.headroom) + " a rig may have";
+    if (!cost.has_table)
+      error += " (there is no readable cost table at '" + cost.table + "', so every unit costs its unknown value)";
+    error += ", with every model that can be trimmed trimmed: " + describe_costs(cost, document.chains.size() > 1);
+    if (error_code != nullptr)
+      *error_code = "over_budget";
+    return false;
+  }
+
+  for (const graph::Chain& chain : document.chains)
+  {
+    if (chain.input_channel >= static_cast<int>(config_.capture_channels))
+    {
+      error = "chain '" + chain.id + "' reads capture channel " + std::to_string(chain.input_channel) +
+              ", but capture_channels is " + std::to_string(config_.capture_channels);
+      return false;
+    }
+    if (chain.output_channel >= static_cast<int>(config_.playback_channels))
+    {
+      error = "chain '" + chain.id + "' writes playback channel " + std::to_string(chain.output_channel) +
+              ", but playback_channels is " + std::to_string(config_.playback_channels);
+      return false;
+    }
+  }
+
+  render::CompileOptions options;
+  options.max_quantum = static_cast<int>(config_.period_size);
+  options.sample_rate = static_cast<double>(config_.sample_rate);
+  options.levels = config_.levels;
+  options.levels_first_frame = levels_first_frame_;
+  options.levels_publish_period = levels_publish_period_;
+
+  const uint64_t generation = generation_ + 1;
+  const std::size_t count = document.chains.size();
+  std::vector<std::unique_ptr<PlanSlot>> built(count);
+  for (std::size_t i = 0; i < count; ++i)
+  {
+    const graph::Chain& chain = resolved.chains[i];
+    auto slot = std::make_unique<PlanSlot>(kArenaBytes);
+    slot->plan = graph::RenderPlan::compile(chain.graph, options, slot->arena, error);
+    if (slot->plan == nullptr)
+    {
+      error = "chain '" + chain.id + "': " + error;
+      return false;
+    }
+    // The first process() call on a freshly built node is tens of times its steady-state cost, and a
+    // stall that long can drain the device ring. It is control-thread work, and here it is what makes
+    // the switch itself free of it.
+    slot->plan->prewarm();
+    slot->input_channel = chain.input_channel;
+    slot->output_channel = chain.output_channel;
+    slot->generation = generation;
+    built[i] = std::move(slot);
+  }
+
+  WarmContent content;
+  content.chain_count = static_cast<uint32_t>(count);
+  content.generation = generation;
+  for (std::size_t i = 0; i < count; ++i)
+    content.slots[i] = built[i].get();
+
+  // Which document takes it: the one the warm content is already in when there is one (a replacement
+  // goes where the rig it replaces was), otherwise the document that is not audible. The warm thread
+  // checks this again when it installs, because a switch can move a document in between.
+  int target = warm_entry_.present ? document_with_content(warm_entry_.generation) : -1;
+  if (target < 0 || target == active_doc_.load(std::memory_order_acquire))
+  {
+    target = -1;
+    const int audible = active_doc_.load(std::memory_order_acquire);
+    for (int i = 0; i < kMaxDocuments; ++i)
+    {
+      if (i != audible)
+      {
+        target = i;
+        break;
+      }
+    }
+  }
+  if (target < 0)
+  {
+    error = "there is no document free to warm";
+    if (error_code != nullptr)
+      *error_code = "warm_full";
+    return false;
+  }
+  content.doc = static_cast<uint32_t>(target);
+
+  if (!warm_commands_.push(content))
+  {
+    error = "the warm mailbox is full; the warm thread is not consuming content";
+    if (error_code != nullptr)
+      *error_code = "warm_not_ready";
+    return false;
+  }
+  wake_warm_thread();
+  // The warm thread owns the plans from here: releasing them here would free a plan it is about to
+  // render.
+  for (auto& slot : built)
+    (void)slot.release();
+
+  const std::string replaced = warm_entry_.present ? warm_entry_.rig : std::string();
+  warm_entry_ = WarmEntry{};
+  warm_entry_.present = true;
+  warm_entry_.document = document;
+  warm_entry_.resolved = std::move(resolved);
+  warm_entry_.missing = std::move(missing);
+  warm_entry_.cost = std::move(cost);
+  warm_entry_.rig = path;
+  warm_entry_.source = source;
+  warm_entry_.name = document.name;
+  warm_entry_.base_dir = base_dir;
+  warm_entry_.generation = generation;
+  warm_entry_.doc = target;
+  for (std::size_t i = 0; i < count; ++i)
+    warm_entry_.slots.push_back(content.slots[i]);
+  generation_ = generation;
+
+  if (config_.verbose)
+  {
+    const std::string what = path.empty() ? (document.name.empty() ? "(applied document)" : document.name) : path;
+    std::fprintf(stderr, "[namchaind] warming %s into document %d (generation %llu, %zu chain%s)\n", what.c_str(),
+                 target, static_cast<unsigned long long>(generation), count, count == 1 ? "" : "s");
+  }
+  (void)replaced;
+  return true;
+}
+
+bool Daemon::cool_warm(const std::string& rig, std::string& error, std::string* error_code, nlohmann::json& cooled)
+{
+  cooled = nlohmann::json::array();
+  if (!warm_enabled())
+  {
+    error = "warming is off: no warm_cpus are configured";
+    if (error_code != nullptr)
+      *error_code = "warm_disabled";
+    return false;
+  }
+  if (!warm_entry_.present)
+    return true; // nothing is warm, which is the state the caller asked for
+
+  if (!rig.empty() && warm_entry_.rig != rig)
+  {
+    error = "'" + rig + "' is not the warm rig ('" + warm_entry_.rig + "' is)";
+    if (error_code != nullptr)
+      *error_code = "warm_not_ready";
+    return false;
+  }
+
+  const int doc = document_with_content(warm_entry_.generation);
+  cooled.push_back(warm_entry_.rig);
+  if (doc >= 0)
+  {
+    // The warm thread does the retiring, because it owns the document: it clears what it holds, hands
+    // the plans to its reclaimer and lets the document go. This thread then waits for that to be
+    // visible, because the alternative -- freeing a plan a render thread might be inside -- is the
+    // failure the reclaimer exists to prevent.
+    warm_cool_.store(static_cast<unsigned>(doc + 1), std::memory_order_release);
+    wake_warm_thread();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+      if (docs_[doc].owner.load(std::memory_order_acquire) == DocOwner::Free &&
+          docs_[doc].content.load(std::memory_order_acquire) == 0)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      reclaimer_.collect();
+      warm_reclaimer_.collect();
+    }
+    if (docs_[doc].owner.load(std::memory_order_acquire) != DocOwner::Free)
+    {
+      error = "the warm document has not been let go yet; cooling it is still in flight";
+      if (error_code != nullptr)
+        *error_code = "warm_not_ready";
+      return false;
+    }
+  }
+  warm_entry_ = WarmEntry{};
+  return true;
+}
+
+bool Daemon::switch_to(const std::string& path, bool fallback, std::string& error, std::string* error_code,
+                       nlohmann::json& body)
+{
+  if (!warm_enabled())
+  {
+    error = "warming is off: no warm_cpus are configured";
+    if (error_code != nullptr)
+      *error_code = "warm_disabled";
+    return false;
+  }
+
+  const int warm_doc = warm_entry_.present ? document_with_content(warm_entry_.generation) : -1;
+  const bool is_warm = warm_entry_.present && warm_entry_.rig == path && warm_doc >= 0 &&
+                       docs_[warm_doc].owner.load(std::memory_order_acquire) == DocOwner::Warm;
+
+  if (is_warm)
+  {
+    const uint64_t content = warm_entry_.generation;
+    // Content first, then the sequence that publishes the request: the render thread reads the
+    // sequence with acquire and the content only after it, so it can never act on a half-written pair.
+    const uint64_t request = switch_request_seq_.load(std::memory_order_relaxed) + 1;
+    switch_request_content_.store(content, std::memory_order_relaxed);
+    switch_request_seq_.store(request, std::memory_order_release);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    bool done = false;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+      if (switch_done_seq_.load(std::memory_order_acquire) >= request)
+      {
+        done = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      reclaimer_.collect();
+      warm_reclaimer_.collect();
+    }
+
+    const int landed = switch_last_doc_.load(std::memory_order_acquire);
+    body["switched"] = done && landed >= 0 ? "warm" : "cold";
+    body["handover_blocks"] = landed >= 0 ? docs_[landed].handover_blocks.load(std::memory_order_relaxed) : 0;
+    body["fade_ms"] = config_.fade_ms;
+    body["completed"] = done && landed >= 0;
+    if (!done || landed < 0)
+    {
+      // The request was withdrawn (the content was cooled or replaced under it) or it is still in
+      // flight. Either way the honest answer is that this was not a warm switch, and the rig is
+      // loaded the way any other rig is -- a footswitch press never ends in silence.
+      if (!fallback)
+      {
+        error = "the warm rig was not switched to";
+        if (error_code != nullptr)
+          *error_code = "warm_not_ready";
+        return false;
+      }
+      std::string code = "compile_failed";
+      if (!load_rig(path, error, &code))
+      {
+        if (error_code != nullptr)
+          *error_code = code;
+        return false;
+      }
+      warm_cold_switches_.fetch_add(1, std::memory_order_relaxed);
+      body["rig"] = path;
+      body["generation"] = generation_;
+      body["reason"] = done ? "the warm rig was replaced before the switch" : "the switch did not complete in time";
+      return true;
+    }
+
+    sync_warm_switch();
+    body["rig"] = current_rig_;
+    body["generation"] = docs_[active_doc_.load(std::memory_order_relaxed)].content.load(std::memory_order_relaxed);
+    body["doc"] = active_doc_.load(std::memory_order_relaxed);
+    body["core"] = config_.cpu;
+    return true;
+  }
+
+  if (!fallback)
+  {
+    error = "'" + path + "' is not the warm rig";
+    if (error_code != nullptr)
+      *error_code = "warm_not_ready";
+    return false;
+  }
+
+  // The cold path, which is `rig.load`: parse, compile, crossfade. Warmth is what makes a switch
+  // fast; it is not what makes it possible.
+  std::string code = "compile_failed";
+  if (!load_rig(path, error, &code))
+  {
+    if (error_code != nullptr)
+      *error_code = code;
+    return false;
+  }
+  warm_cold_switches_.fetch_add(1, std::memory_order_relaxed);
+  body["switched"] = "cold";
+  body["rig"] = path;
+  body["generation"] = generation_;
+  body["reason"] = warm_entry_.present ? "that rig is not the warm one" : "nothing is warm";
+  return true;
+}
+
+void Daemon::sync_warm_switch()
+{
+  const int audible = active_doc_.load(std::memory_order_acquire);
+  const uint64_t audible_content = docs_[audible].content.load(std::memory_order_acquire);
+  if (!warm_entry_.present || audible_content == 0 || audible_content != warm_entry_.generation)
+    return;
+
+  // A warm switch changes which document is audible without a publish, so everything that describes
+  // "the running document" moves with it: the rig, its document, its plans, its cost. The two
+  // compiled contents swap -- nothing is recompiled and nothing is freed.
+  std::swap(current_document_, warm_entry_.document);
+  std::swap(current_resolved_, warm_entry_.resolved);
+  std::swap(published_slots_, warm_entry_.slots);
+  std::swap(missing_assets_, warm_entry_.missing);
+  std::swap(cost_, warm_entry_.cost);
+  std::swap(current_rig_, warm_entry_.rig);
+  std::swap(current_source_, warm_entry_.source);
+  std::swap(current_name_, warm_entry_.name);
+  std::swap(current_base_dir_, warm_entry_.base_dir);
+  last_published_ = &current_document_;
+  last_transitions_.clear();
+
+  // What was audible a moment ago is the warm content now: it lives in the document the switch faded
+  // out, and its content id says so.
+  warm_entry_.doc = -1;
+  warm_entry_.generation = 0;
+  warm_entry_.present = false;
+  for (int i = 0; i < kMaxDocuments; ++i)
+  {
+    if (i == audible)
+      continue;
+    const uint64_t content = docs_[i].content.load(std::memory_order_acquire);
+    if (content == 0)
+      continue;
+    warm_entry_.doc = i;
+    warm_entry_.generation = content;
+    warm_entry_.present = true;
+    break;
+  }
+  // `generation_` is deliberately not moved: it is the last content *allocated*, and a switch does
+  // not allocate. What the device is hearing is `audible_generation`, and `rig.switch`'s reply
+  // carries the content id a client should use.
+}
+
+nlohmann::json Daemon::warm_json() const
+{
+  const int audible = active_doc_.load(std::memory_order_acquire);
+  const uint64_t device_seq = input_sequence_published_.load(std::memory_order_relaxed);
+
+  nlohmann::json set = nlohmann::json::array();
+  for (int i = 0; i < kMaxDocuments; ++i)
+  {
+    const DocRuntime& doc = docs_[i];
+    const uint64_t content = doc.content.load(std::memory_order_acquire);
+    if (content == 0)
+      continue;
+    const uint64_t rendered = doc.input_seq.load(std::memory_order_relaxed);
+    const uint64_t behind = device_seq > rendered ? device_seq - rendered : 0;
+    nlohmann::json entry;
+    entry["doc"] = i;
+    entry["generation"] = content;
+    entry["audible"] = i == audible;
+    entry["state"] = i == audible ? "audible" : (doc.warm_blocks.load(std::memory_order_relaxed) == 0 ? "warming" : "warm");
+    entry["core"] = i == audible ? config_.cpu : warm_.cpu.load(std::memory_order_relaxed);
+    entry["blocks"] = doc.blocks.load(std::memory_order_relaxed);
+    entry["warm_blocks"] = doc.warm_blocks.load(std::memory_order_relaxed);
+    entry["behind_blocks"] = behind;
+    entry["worst_behind_blocks"] = doc.worst_behind.load(std::memory_order_relaxed);
+    entry["blocks_dropped"] = doc.drops.load(std::memory_order_relaxed);
+    entry["publish_holds"] = doc.holds.load(std::memory_order_relaxed);
+    entry["handover_blocks"] = doc.handover_blocks.load(std::memory_order_relaxed);
+    if (warm_entry_.present && warm_entry_.generation == content)
+    {
+      entry["rig"] = warm_entry_.rig;
+      entry["name"] = warm_entry_.name;
+      entry["source"] = warm_entry_.source;
+      entry["cost"] = warm_entry_.cost.cost;
+      entry["verdict"] = warm_entry_.cost.verdict;
+      entry["slimmed"] = warm_entry_.cost.trimmed;
+    }
+    else if (i == audible)
+    {
+      entry["rig"] = current_rig_;
+      entry["name"] = current_name_;
+      entry["source"] = current_source_;
+      entry["cost"] = cost_.cost;
+      entry["verdict"] = cost_.verdict;
+      entry["slimmed"] = cost_.trimmed;
+    }
+    set.push_back(std::move(entry));
+  }
+
+  nlohmann::json warm;
+  warm["enabled"] = warm_enabled();
+  warm["device_core"] = config_.cpu;
+  warm["cores"] = config_.warm_cpus;
+  warm["priority"] = config_.warm_priority;
+  warm["active_doc"] = audible;
+  warm["switches"] = switches_.load(std::memory_order_relaxed);
+  warm["cold_switches"] = warm_cold_switches_.load(std::memory_order_relaxed);
+  warm["withdrawn"] = switches_withdrawn_.load(std::memory_order_relaxed);
+  warm["max_behind_blocks"] = config_.warm_max_behind_blocks;
+  if (warm_.cpu.load(std::memory_order_relaxed) >= 0)
+    warm["thread_core"] = warm_.cpu.load(std::memory_order_relaxed);
+  warm["set"] = std::move(set);
+  return warm;
+}
+
 bool Daemon::chain_settled(std::size_t index) const
 {
   if (index >= published_slots_.size() || index >= static_cast<std::size_t>(kMaxChains) ||
       published_slots_[index] == nullptr)
     return false;
   const uint64_t generation = published_slots_[index]->generation;
-  const ChainRuntime& chain = chains_[index];
+  const ChainRuntime& chain = active_document().chains[index];
   return !chain.transition_active.load() && chain.audible_generation.load() == generation &&
          chain.target_generation.load() == generation;
 }
@@ -2007,6 +2469,50 @@ bool Daemon::start(std::string& error)
   {
     error = "fade_ms must be >= 0";
     return false;
+  }
+  if (!config_.warm_cpus.empty())
+  {
+    // Warming renders a rig nobody is hearing on cores of its own, so what it needs from the
+    // configuration is that those cores are real, are not the device's, and that a warm thread can
+    // never outrank the audible one (docs/warm-set.md).
+    if (config_.render_threads > 1)
+    {
+      error = "warm_cpus and render_threads above 1 cannot both be used: multi-core rendering splits "
+              "one document's chains across cores, and a warm document beside it has never been measured";
+      return false;
+    }
+    if (config_.warm_priority < 0 || config_.warm_priority > 99)
+    {
+      error = "warm_priority must be in [0, 99]";
+      return false;
+    }
+    if (config_.rt_priority > 0 && config_.warm_priority >= config_.rt_priority)
+    {
+      error = "warm_priority " + std::to_string(config_.warm_priority) + " is not below rt_priority " +
+              std::to_string(config_.rt_priority) +
+              ": a warm rig must never be able to delay the rig the player is hearing";
+      return false;
+    }
+    for (int cpu : config_.warm_cpus)
+    {
+      if (cpu == config_.cpu)
+      {
+        error = "cpu " + std::to_string(cpu) +
+                " is both the device core and a warm core: the device core already renders the "
+                "audible document";
+        return false;
+      }
+#if defined(__linux__)
+      cpu_set_t allowed;
+      CPU_ZERO(&allowed);
+      if (::sched_getaffinity(0, sizeof(allowed), &allowed) == 0 && (cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &allowed)))
+      {
+        error = "warm cpu " + std::to_string(cpu) +
+                " is not one this process may run on (cgroup cpuset, or a cpu the kernel does not have)";
+        return false;
+      }
+#endif
+    }
   }
   if (!config_.input_device.empty() && config_.backend != BackendKind::CoreAudio)
   {
@@ -2128,22 +2634,40 @@ void Daemon::stop()
     if (command.kind == PlanCommand::Kind::PublishPlan)
       delete command.slot;
 
-  for (int i = 0; i < kMaxChains; ++i)
+  // Content that was compiled for the warm thread and never landed is still in its mailbox. Free it
+  // here: the thread has been joined, so nothing else can.
+  WarmContent pending;
+  while (warm_commands_.pop(pending))
+    retire_warm_content(pending);
+  warm_have_pending_ = false;
+  pending_warm_ = WarmContent{};
+
+  for (DocRuntime& doc : docs_)
   {
-    for (PlanSlot** slot : {&chains_[i].current, &chains_[i].next, &chains_[i].pending})
+    for (int i = 0; i < kMaxChains; ++i)
     {
-      if (*slot == nullptr)
-        continue;
-      delete *slot;
-      *slot = nullptr;
+      for (PlanSlot** slot : {&doc.chains[i].current, &doc.chains[i].next, &doc.chains[i].pending})
+      {
+        if (*slot == nullptr)
+          continue;
+        delete *slot;
+        *slot = nullptr;
+      }
     }
+    doc.chain_count = 0;
+    doc.transitioning_chain = -1;
+    doc.transition_active.store(false);
+    doc.audible_generation.store(0);
+    doc.target_generation.store(0);
+    doc.adopted_generation.store(0);
+    doc.owner.store(DocOwner::Free);
+    doc.content.store(0);
   }
-  chain_count_ = 0;
-  transitioning_chain_ = -1;
-  transition_active_.store(false);
-  audible_generation_.store(0);
-  target_generation_.store(0);
-  adopted_generation_.store(0);
+  active_doc_.store(0);
+  switch_phase_ = SwitchPhase::Idle;
+  switch_incoming_ = -1;
+  switch_outgoing_ = -1;
+  warm_entry_ = WarmEntry{};
   failed_nodes_.store(0);
   guard_trips_.store(0);
   last_published_ = nullptr;
@@ -2238,13 +2762,29 @@ bool Daemon::open_device(std::string& error)
   capture_buffer_.assign(static_cast<std::size_t>(config_.period_size) * info.capture_bytes_per_frame, 0);
   playback_buffer_.assign(static_cast<std::size_t>(config_.period_size) * info.playback_bytes_per_frame, 0);
   bus_.assign(static_cast<std::size_t>(config_.period_size) * info.playback_channels, 0.0f);
-  for (ChainRuntime& chain : chains_)
+  switch_outgoing_bus_.assign(static_cast<std::size_t>(config_.period_size) * info.playback_channels, 0.0f);
+  // The document the device will render belongs to this thread from here. A switch is the only thing
+  // that ever moves it, and it moves by release and claim like every other handover.
+  if (!claim_document(docs_[active_doc_.load(std::memory_order_relaxed)].owner, DocOwner::Device))
+    docs_[active_doc_.load(std::memory_order_relaxed)].owner.store(DocOwner::Device, std::memory_order_release);
+  warm_input_channels_ = config_.capture_channels;
+  warm_input_planes_.assign(static_cast<std::size_t>(config_.period_size) * warm_input_channels_, 0.0f);
+  for (DocRuntime& doc : docs_)
   {
-    chain.in.assign(config_.period_size, 0.0f);
-    chain.out.assign(config_.period_size, 0.0f);
-    chain.old.assign(config_.period_size, 0.0f);
-    chain.incoming.assign(config_.period_size, 0.0f);
+    doc.bus.assign(static_cast<std::size_t>(config_.period_size) * info.playback_channels, 0.0f);
+    doc.published_bus.assign(doc.bus.size(), 0.0f);
+    doc.bus_pool.configure(doc.bus.size());
+    doc.publish_wanted.store(false, std::memory_order_relaxed);
+    for (ChainRuntime& chain : doc.chains)
+    {
+      chain.in.assign(config_.period_size, 0.0f);
+      chain.out.assign(config_.period_size, 0.0f);
+      chain.old.assign(config_.period_size, 0.0f);
+      chain.incoming.assign(config_.period_size, 0.0f);
+    }
   }
+  if (warm_enabled())
+    warm_.inputs.configure(static_cast<std::size_t>(config_.period_size) * warm_input_channels_);
 
   active_rate_.store(info.sample_rate);
   active_period_.store(info.period_size);
@@ -2393,8 +2933,8 @@ nlohmann::json Daemon::build_levels_json()
 
   nlohmann::json levels;
   levels["blocks"] = blocks_.load();
-  levels["generation"] = adopted_generation_.load();
-  levels["audible_generation"] = audible_generation_.load();
+  levels["generation"] = active_document().adopted_generation.load();
+  levels["audible_generation"] = active_document().audible_generation.load();
   levels["sample_rate"] = active_rate_.load() == 0 ? config_.sample_rate : active_rate_.load();
   levels["period_size"] = active_period_.load() == 0 ? config_.period_size : active_period_.load();
   levels["state"] = device_state_name(device_state());
@@ -2420,9 +2960,10 @@ nlohmann::json Daemon::build_levels_json()
   // and the answer says when it bit.
   constexpr std::size_t kMaxLevelNodes = 2000;
   bool truncated = false;
-  for (int c = 0; c < chain_count_ && c < kMaxChains; ++c)
+  const DocRuntime& level_doc = active_document();
+  for (int c = 0; c < level_doc.chain_count && c < kMaxChains; ++c)
   {
-    const ChainRuntime& chain = chains_[c];
+    const ChainRuntime& chain = level_doc.chains[c];
     if (chain.current == nullptr)
       continue;
     const graph::RenderPlan& plan = *chain.current->plan;
@@ -2523,6 +3064,9 @@ void Daemon::finish_device(std::string& /*error*/)
 
 void Daemon::close_device()
 {
+  // Before anything is resized: the warm thread renders from pools and into buses that `open_device`
+  // is about to size again, and a document it was holding keeps its content for the next open.
+  stop_warm_thread();
   if (device_ == nullptr)
     return;
   // A level window that spans a device restart is a window of two different streams: the peaks are
@@ -2552,9 +3096,9 @@ void Daemon::fail_device(const std::string& reason)
   set_device_state(DeviceState::Lost);
 }
 
-void Daemon::start_transition(int index, PlanSlot* next)
+void Daemon::start_transition(DocRuntime& doc, int index, PlanSlot* next)
 {
-  ChainRuntime& chain = chains_[index];
+  ChainRuntime& chain = doc.chains[index];
   chain.next = next;
   unsigned rate = active_rate_.load();
   if (rate == 0)
@@ -2566,14 +3110,14 @@ void Daemon::start_transition(int index, PlanSlot* next)
   // moment it starts fading in, not the moment the fade closes.
   chain.adopted_generation.store(next->generation);
   chain.transition_active.store(true);
-  transitioning_chain_ = index;
+  doc.transitioning_chain = index;
   transitions_started_.fetch_add(1);
-  update_aggregate_state();
+  update_aggregate_state(doc);
 }
 
-void Daemon::finish_transition(int index)
+void Daemon::finish_transition(DocRuntime& doc, int index)
 {
-  ChainRuntime& chain = chains_[index];
+  ChainRuntime& chain = doc.chains[index];
   if (chain.current != nullptr)
     reclaimer_.retire(chain.current, &delete_plan_slot);
   chain.current = chain.next;
@@ -2581,19 +3125,19 @@ void Daemon::finish_transition(int index)
   chain.transition_active.store(false);
   if (chain.current != nullptr)
     chain.audible_generation.store(chain.current->generation);
-  if (transitioning_chain_ == index)
-    transitioning_chain_ = -1;
+  if (doc.transitioning_chain == index)
+    doc.transitioning_chain = -1;
 
   // A publish that arrived while this fade was in flight starts now, from the plan that has just
   // become audible. Nothing is lost and nothing nests: one structural transition at a time, so a
   // document apply works through its chains one after another rather than all at once.
-  start_queued_transition();
-  update_aggregate_state();
+  start_queued_transition(doc);
+  update_aggregate_state(doc);
 }
 
-void Daemon::start_local_transition(int index, PlanSlot* slot)
+void Daemon::start_local_transition(DocRuntime& doc, int index, PlanSlot* slot)
 {
-  ChainRuntime& chain = chains_[index];
+  ChainRuntime& chain = doc.chains[index];
   chain.target_generation.store(slot->generation);
   chain.adopted_generation.store(slot->generation);
   transitions_started_.fetch_add(1);
@@ -2618,7 +3162,7 @@ void Daemon::start_local_transition(int index, PlanSlot* slot)
     chain.local_remaining = 0;
     chain.transition_active.store(false);
     chain.audible_generation.store(final_slot->generation);
-    update_aggregate_state();
+    update_aggregate_state(doc);
     return;
   }
 
@@ -2636,7 +3180,7 @@ void Daemon::start_local_transition(int index, PlanSlot* slot)
   {
     chain.local_remaining = std::max(1, slot->fade_frames);
     chain.transition_active.store(true);
-    transitioning_chain_ = index;
+    doc.transitioning_chain = index;
   }
   else
   {
@@ -2645,12 +3189,12 @@ void Daemon::start_local_transition(int index, PlanSlot* slot)
     chain.transition_active.store(false);
     chain.audible_generation.store(slot->generation);
   }
-  update_aggregate_state();
+  update_aggregate_state(doc);
 }
 
-void Daemon::finish_local_transition(int index)
+void Daemon::finish_local_transition(DocRuntime& doc, int index)
 {
-  ChainRuntime& chain = chains_[index];
+  ChainRuntime& chain = doc.chains[index];
   chain.local_remaining = 0;
   PlanSlot* finished = chain.current;
   if (finished != nullptr && finished->then != nullptr)
@@ -2667,35 +3211,35 @@ void Daemon::finish_local_transition(int index)
   chain.transition_active.store(false);
   if (chain.current != nullptr)
     chain.audible_generation.store(chain.current->generation);
-  if (transitioning_chain_ == index)
-    transitioning_chain_ = -1;
-  start_queued_transition();
-  update_aggregate_state();
+  if (doc.transitioning_chain == index)
+    doc.transitioning_chain = -1;
+  start_queued_transition(doc);
+  update_aggregate_state(doc);
 }
 
-void Daemon::start_queued_transition()
+void Daemon::start_queued_transition(DocRuntime& doc)
 {
-  if (transitioning_chain_ >= 0)
+  if (doc.transitioning_chain >= 0)
     return;
-  for (int i = 0; i < chain_count_; ++i)
+  for (int i = 0; i < doc.chain_count; ++i)
   {
-    ChainRuntime& chain = chains_[i];
+    ChainRuntime& chain = doc.chains[i];
     if (chain.pending == nullptr)
       continue;
     PlanSlot* pending = chain.pending;
     chain.pending = nullptr;
     if (pending->local)
-      start_local_transition(i, pending);
+      start_local_transition(doc, i, pending);
     else
-      start_transition(i, pending);
+      start_transition(doc, i, pending);
     return;
   }
-  update_aggregate_state();
+  update_aggregate_state(doc);
 }
 
-void Daemon::drop_chain(int index)
+void Daemon::drop_chain(DocRuntime& doc, int index)
 {
-  ChainRuntime& chain = chains_[index];
+  ChainRuntime& chain = doc.chains[index];
   if (chain.current == nullptr && chain.next == nullptr && chain.pending == nullptr)
     return;
 
@@ -2723,37 +3267,37 @@ void Daemon::drop_chain(int index)
   chain.audible_generation.store(0);
   chain.target_generation.store(0);
   chain.adopted_generation.store(0);
-  if (transitioning_chain_ == index)
-    transitioning_chain_ = -1;
-  start_queued_transition();
+  if (doc.transitioning_chain == index)
+    doc.transitioning_chain = -1;
+  start_queued_transition(doc);
 }
 
-void Daemon::update_aggregate_state()
+void Daemon::update_aggregate_state(DocRuntime& doc)
 {
   // The document-level fields answer one question each: is anything still moving, and what is the
   // device actually hearing. `audible_generation` is therefore the document generation only once
   // every chain has settled at it, and the previous one while a staggered apply is still working.
   bool moving = false;
   unsigned fading = 0;
-  for (int i = 0; i < chain_count_; ++i)
+  for (int i = 0; i < doc.chain_count; ++i)
   {
-    if (chains_[i].transition_active.load())
+    if (doc.chains[i].transition_active.load())
       ++fading;
-    if (chains_[i].transition_active.load() || chains_[i].pending != nullptr)
+    if (doc.chains[i].transition_active.load() || doc.chains[i].pending != nullptr)
       moving = true;
   }
   if (fading > max_concurrent_transitions_.load())
     max_concurrent_transitions_.store(fading);
-  transition_active_.store(moving);
-  audible_generation_.store(moving ? previous_generation_ : rendered_generation_);
-  target_generation_.store(rendered_generation_);
+  doc.transition_active.store(moving);
+  doc.audible_generation.store(moving ? doc.previous_generation : doc.rendered_generation);
+  doc.target_generation.store(doc.rendered_generation);
 
   // "Adopted" is the document the render thread has taken up: every chain's command has been
   // processed, whether it started a fade or is waiting its turn.
-  adopted_generation_.store(rendered_generation_);
+  doc.adopted_generation.store(doc.rendered_generation);
 }
 
-void Daemon::drain_commands()
+void Daemon::drain_commands(DocRuntime& doc)
 {
   bool published = false;
   PlanCommand command;
@@ -2774,7 +3318,7 @@ void Daemon::drain_commands()
       // plans share a generation, and a node's index differs between them. An edit resolved against a
       // local transition's final plan reaches it while the transitional plan is the one playing, which
       // is right -- the node is the same instance in both.
-      ChainRuntime& chain = chains_[command.chain];
+      ChainRuntime& chain = doc.chains[command.chain];
       const auto named = [&command](const PlanSlot* slot) {
         return slot != nullptr && slot == command.slot && slot->generation == command.generation;
       };
@@ -2809,17 +3353,20 @@ void Daemon::drain_commands()
     // count the control thread could move under it mid-drain. A slot from a generation this thread has
     // not seen is a new document: remember where the last settled one was, because
     // `audible_generation` reports that until every chain has moved (see update_aggregate_state).
-    if (next->generation != rendered_generation_)
+    if (next->generation != doc.rendered_generation)
     {
-      previous_generation_ = rendered_generation_;
-      rendered_generation_ = next->generation;
+      doc.previous_generation = doc.rendered_generation;
+      doc.rendered_generation = next->generation;
+      // Which content this document holds, as the control thread sees it: written by the owner when
+      // it takes content up, and what a switch request names.
+      doc.content.store(next->generation, std::memory_order_release);
     }
     if (command.chain_count > 0 && command.chain_count <= static_cast<uint32_t>(kMaxChains))
-      chain_count_ = static_cast<int>(command.chain_count);
+      doc.chain_count = static_cast<int>(command.chain_count);
     published = true;
 
     const int index = static_cast<int>(command.chain);
-    ChainRuntime& chain = chains_[index];
+    ChainRuntime& chain = doc.chains[index];
 
     if (chain.current == nullptr)
     {
@@ -2842,7 +3389,7 @@ void Daemon::drain_commands()
       continue;
     }
 
-    if (chain.next != nullptr || chain.local_remaining > 0 || transitioning_chain_ >= 0)
+    if (chain.next != nullptr || chain.local_remaining > 0 || doc.transitioning_chain >= 0)
     {
       // This chain is fading, or another one is and this daemon fades one chain at a time. A burst
       // coalesces to the newest request (the superseded plan is retired here) rather than nesting
@@ -2857,9 +3404,9 @@ void Daemon::drain_commands()
     }
 
     if (next->local)
-      start_local_transition(index, next);
+      start_local_transition(doc, index, next);
     else
-      start_transition(index, next);
+      start_transition(doc, index, next);
   }
 
   // A document with fewer chains than the last one: the chains that are gone stop now. Done after the
@@ -2867,10 +3414,10 @@ void Daemon::drain_commands()
   // still arriving.
   if (published)
   {
-    for (int i = chain_count_; i < kMaxChains; ++i)
-      drop_chain(i);
+    for (int i = doc.chain_count; i < kMaxChains; ++i)
+      drop_chain(doc, i);
   }
-  update_aggregate_state();
+  update_aggregate_state(doc);
 }
 
 void Daemon::render_loop()
@@ -2919,6 +3466,15 @@ void Daemon::render_loop()
       }
       device_started_ = true;
       set_device_state(DeviceState::Running);
+      // The warm thread, once there is a device to render for: it is born on its own core, and the
+      // pools it reads and writes are sized by `open_device` -- so it is started after them and never
+      // has to look at a half-built one.
+      if (warm_enabled())
+      {
+        std::string warm_error;
+        if (!start_warm_thread(warm_error))
+          std::fprintf(stderr, "[namchaind] %s\n", warm_error.c_str());
+      }
       // Last, so that the plan, the model and every stream buffer are covered by MCL_CURRENT.
       if (config_.lock_memory && !memory_locked)
       {
@@ -2964,6 +3520,12 @@ void Daemon::render_loop()
       // tail is defined silence and it is the last real audio there is.
       continue;
     }
+    // A test hook, never parsed from a configuration file: the `file` backend renders flat out, so a
+    // test that wants to drive a switch mid-render needs the device thread to spend wall time on a
+    // block. Outside the measured block, so it cannot flatter the render time.
+    if (config_.warm_test_pace_us != 0)
+      std::this_thread::sleep_for(std::chrono::microseconds(config_.warm_test_pace_us));
+
     // The block's clock starts once its input is in hand: waiting for the device is not render time.
     const auto block_start = std::chrono::steady_clock::now();
 
@@ -2971,29 +3533,52 @@ void Daemon::render_loop()
       // The render path proper: everything here was bound before publication, so it must not touch
       // the allocator, take a lock or make a syscall (namchain/rt_check.h).
       RtScope scope;
-      drain_commands();
+      DocRuntime& active = docs_[active_doc_.load(std::memory_order_relaxed)];
+
+      // Commands first, and against the document that is audible at the top of the block: a plan a
+      // client published is resolved against *that* document's chains, so it is drained into it even
+      // if a switch takes the device thread somewhere else later in this same block.
+      drain_commands(active);
 
       const std::size_t width = info.bytes_per_sample;
       const int frames = static_cast<int>(info.period_size);
       std::fill(bus_.begin(), bus_.end(), 0.0f);
+      input_sequence_ = blocks_.load(std::memory_order_relaxed) + 1;
+      input_sequence_published_.store(input_sequence_, std::memory_order_relaxed);
+
+      // 0. A switch that is waiting for the warm thread to let go of the incoming document, or for
+      //    its own fade, advances here -- before the plans run, so a document taken over this block
+      //    is rendered this block rather than the next one.
+      switch_begin();
+
+      // 0b. The warm thread's input: one decoded copy of the capture, into a free block of the pool.
+      //     Nothing is decoded when nothing is warm, which is what keeps the cost of the feature at
+      //     zero until somebody uses it.
+      publish_warm_input();
 
       // 1. Every chain's input, on the coordinator. The decode is a per-sample conversion and a
       //    chain's plan cannot start before its input exists, so this is not worth sharing out.
-      for (int c = 0; c < chain_count_; ++c)
+      for (DocRuntime& doc : docs_)
       {
-        ChainRuntime& chain = chains_[c];
-        if (chain.current == nullptr)
+        if (doc.owner.load(std::memory_order_acquire) != DocOwner::Device)
           continue;
+        for (int c = 0; c < doc.chain_count; ++c)
+        {
+          ChainRuntime& chain = doc.chains[c];
+          if (chain.current == nullptr)
+            continue;
 
-        // Which channel a chain reads is the *incoming* plan's business when a transition is running:
-        // a document that moved a chain to another input channel means the new plan hears the new
-        // channel from the moment it starts fading in, rather than a fade between two inputs.
-        const PlanSlot* source = chain.next != nullptr ? chain.next : chain.current;
-        const unsigned channel = static_cast<unsigned>(source->input_channel);
-        for (unsigned i = 0; i < info.period_size; ++i)
-          chain.in[i] = pcm_decode(capture_buffer_.data() +
-                                     (static_cast<std::size_t>(i) * info.capture_channels + channel) * width,
-                                   info.format);
+          // Which channel a chain reads is the *incoming* plan's business when a transition is
+          // running: a document that moved a chain to another input channel means the new plan hears
+          // the new channel from the moment it starts fading in, rather than a fade between two
+          // inputs.
+          const PlanSlot* source = chain.next != nullptr ? chain.next : chain.current;
+          const unsigned channel = static_cast<unsigned>(source->input_channel);
+          for (unsigned i = 0; i < info.period_size; ++i)
+            chain.in[i] = pcm_decode(capture_buffer_.data() +
+                                       (static_cast<std::size_t>(i) * info.capture_channels + channel) * width,
+                                     info.format);
+        }
       }
 
       // 1b. What the device actually handed over, per channel and before any routing or mute: the
@@ -3017,51 +3602,19 @@ void Daemon::render_loop()
       render_pool_.run(this, &Daemon::run_chains_entry, frames);
 
       // 3. Everything that must keep one owner, in the order it has always run: the crossfade mixes,
-      //    the transition bookkeeping and the output bus. This is what makes a parallel render
-      //    identical to a serial one rather than merely similar.
-      for (int c = 0; c < chain_count_; ++c)
+      //    the transition bookkeeping and the output bus -- now per document, because a warm document
+      //    has a bus of its own. This is what makes a parallel render identical to a serial one
+      //    rather than merely similar.
+      for (DocRuntime& doc : docs_)
       {
-        ChainRuntime& chain = chains_[c];
-        if (chain.current == nullptr)
+        if (doc.owner.load(std::memory_order_acquire) != DocOwner::Device)
           continue;
-        const PlanSlot* source = chain.next != nullptr ? chain.next : chain.current;
-
-        if (chain.next != nullptr)
-        {
-          // Dual-render: both plans ran on the same participant, and their chain outputs are
-          // equal-power crossfaded here. mix() has finished reading old, so the outgoing plan can be
-          // retired; the control thread frees it after the reclaimer's grace window.
-          chain.crossfade.mix(chain.old.data(), chain.incoming.data(), chain.out.data(), frames);
-          if (!chain.crossfade.active())
-            finish_transition(c);
-        }
-        else if (chain.local_remaining > 0)
-        {
-          // One plan, also during a local transition: its crossfades sit inside it, at the inputs the
-          // edit changed, and everything the edit did not touch runs once.
-          chain.local_remaining -= frames;
-          if (chain.local_remaining <= 0)
-            finish_local_transition(c);
-        }
-
-        // Mute is a zeroing of the *emitted* copy, applied after execute so the chain keeps running:
-        // a muted chain whose inference is skipped freezes state and clicks on unmute (G14). It is
-        // also why this is a skip rather than a reason not to execute at all.
-        if (chain.mute.load())
-          continue;
-
-        float* destination = bus_.data() + static_cast<std::size_t>(source->output_channel) * info.period_size;
-        level::Probe* out_level = levels_enabled_ && c < static_cast<int>(chain_levels_.size())
-                                    ? &chain_levels_[c]
-                                    : nullptr;
-        for (int i = 0; i < frames; ++i)
-        {
-          destination[i] += chain.out[static_cast<std::size_t>(i)];
-          // The sum above is the audio and always runs; the fold is the measurement and does not.
-          if (out_level != nullptr && (!levels_first_frame_ || i == 0))
-            out_level->accumulate(chain.out[static_cast<std::size_t>(i)]);
-        }
+        finish_document_block(doc, frames);
       }
+
+      // 4. What the device is being handed: the audible document's bus, or the crossfade between two
+      //    of them while a switch runs. This is also where a switch that has faded out is closed.
+      switch_mix(frames);
 
       // Global mute, after every chain has run, for the same reason a per-chain mute is a skip.
       if (mute_.load())
@@ -3090,14 +3643,16 @@ void Daemon::render_loop()
     {
       unsigned failed = 0;
       uint64_t trips = 0;
-      for (int c = 0; c < chain_count_; ++c)
+      DocRuntime& guard_doc = active_document();
+      for (int c = 0; c < guard_doc.chain_count; ++c)
       {
-        if (chains_[c].current == nullptr)
+        ChainRuntime& chain = guard_doc.chains[c];
+        if (chain.current == nullptr)
           continue;
-        failed += chains_[c].current->plan->failed_node_count();
-        trips += chains_[c].current->plan->guard_trips();
-        chains_[c].failed_nodes.store(static_cast<unsigned>(chains_[c].current->plan->failed_node_count()));
-        chains_[c].guard_trips.store(chains_[c].current->plan->guard_trips());
+        failed += chain.current->plan->failed_node_count();
+        trips += chain.current->plan->guard_trips();
+        chain.failed_nodes.store(static_cast<unsigned>(chain.current->plan->failed_node_count()));
+        chain.guard_trips.store(chain.current->plan->guard_trips());
       }
       failed_nodes_.store(failed);
       guard_trips_.store(trips);
@@ -3134,6 +3689,7 @@ void Daemon::render_loop()
   // the object is destroyed. A device backend has nothing to finish, and says so by doing nothing.
   finish_device(error);
   close_device();
+  stop_warm_thread();
   render_pool_.stop();
   render_threads_active_.store(1);
 }
@@ -3186,12 +3742,25 @@ void Daemon::publish_render_state()
 
 void Daemon::run_chains(unsigned participant, unsigned participants, int frames) noexcept
 {
+  // Every document this thread owns, which is one of them in every configuration but the block a
+  // switch is taking over in. A warm document is not here at all: it is rendered by its own thread on
+  // its own core, and this one may not touch it.
+  for (DocRuntime& doc : docs_)
+  {
+    if (doc.owner.load(std::memory_order_acquire) == DocOwner::Device)
+      run_document_chains(doc, participant, participants, frames);
+  }
+}
+
+void Daemon::run_document_chains(DocRuntime& doc, unsigned participant, unsigned participants,
+                                 int frames) noexcept
+{
   // Every `participants`-th chain. Nothing here may touch another participant's chain, and nothing
   // here may touch the transition bookkeeping: `current` and `next` are read, never written, and the
   // coordinator does not move them until every participant has finished this block.
-  for (int c = static_cast<int>(participant); c < chain_count_; c += static_cast<int>(participants))
+  for (int c = static_cast<int>(participant); c < doc.chain_count; c += static_cast<int>(participants))
   {
-    ChainRuntime& chain = chains_[c];
+    ChainRuntime& chain = doc.chains[c];
     if (chain.current == nullptr)
       continue;
 
@@ -3206,6 +3775,640 @@ void Daemon::run_chains(unsigned participant, unsigned participants, int frames)
     {
       chain.current->plan->execute(chain.in.data(), chain.out.data(), frames);
     }
+  }
+}
+
+void Daemon::finish_document_block(DocRuntime& doc, int frames) noexcept
+{
+  // One owner for everything that must not be shared: the crossfade mixes, the transition bookkeeping
+  // and the sum into this document's bus. With one document and no transition this is the loop that
+  // has always run, in the order it has always run.
+  const bool audible = &doc == &active_document();
+  std::fill(doc.bus.begin(), doc.bus.end(), 0.0f);
+  for (int c = 0; c < doc.chain_count; ++c)
+  {
+    ChainRuntime& chain = doc.chains[c];
+    if (chain.current == nullptr)
+      continue;
+    const PlanSlot* source = chain.next != nullptr ? chain.next : chain.current;
+
+    if (chain.next != nullptr)
+    {
+      // Dual-render: both plans ran on the same participant, and their chain outputs are equal-power
+      // crossfaded here. mix() has finished reading old, so the outgoing plan can be retired; the
+      // control thread frees it after the reclaimer's grace window.
+      chain.crossfade.mix(chain.old.data(), chain.incoming.data(), chain.out.data(), frames);
+      if (!chain.crossfade.active())
+        finish_transition(doc, c);
+    }
+    else if (chain.local_remaining > 0)
+    {
+      // One plan, also during a local transition: its crossfades sit inside it, at the inputs the
+      // edit changed, and everything the edit did not touch runs once.
+      chain.local_remaining -= frames;
+      if (chain.local_remaining <= 0)
+        finish_local_transition(doc, c);
+    }
+
+    // Mute is a zeroing of the *emitted* copy, applied after execute so the chain keeps running:
+    // a muted chain whose inference is skipped freezes state and clicks on unmute (G14). It is
+    // also why this is a skip rather than a reason not to execute at all.
+    if (chain.mute.load())
+      continue;
+
+    float* destination = doc.bus.data() + static_cast<std::size_t>(source->output_channel) * frames;
+    // The meter follows the audible document: a warm rig's levels are not what the player is hearing,
+    // and a document being faded out is not either.
+    level::Probe* out_level = audible && levels_enabled_ && c < static_cast<int>(chain_levels_.size())
+                                ? &chain_levels_[c]
+                                : nullptr;
+    for (int i = 0; i < frames; ++i)
+    {
+      destination[i] += chain.out[static_cast<std::size_t>(i)];
+      // The sum above is the audio and always runs; the fold is the measurement and does not.
+      if (out_level != nullptr && (!levels_first_frame_ || i == 0))
+        out_level->accumulate(chain.out[static_cast<std::size_t>(i)]);
+    }
+  }
+
+  // What this document last rendered, for the other thread: the outgoing side of a switch is read
+  // from here before a fade has published anything, and the fade itself reads the pool below.
+  doc.published_bus = doc.bus;
+  doc.blocks.fetch_add(1, std::memory_order_relaxed);
+  doc.input_seq.store(input_sequence_, std::memory_order_relaxed);
+  if (doc.owner.load(std::memory_order_relaxed) == DocOwner::Warm)
+    doc.warm_blocks.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// The warm set (docs/warm-set.md)
+// ---------------------------------------------------------------------------
+
+int Daemon::document_with_content(uint64_t content) const
+{
+  if (content == 0)
+    return -1;
+  for (int i = 0; i < kMaxDocuments; ++i)
+  {
+    if (docs_[i].content.load(std::memory_order_acquire) == content)
+      return i;
+  }
+  return -1;
+}
+
+void Daemon::publish_warm_input() noexcept
+{
+  if (!warm_.inputs.configured())
+    return;
+
+  // Only when there is a warm document to render: an idle warm thread costs the render path nothing,
+  // and neither does a configured but unused warm core.
+  bool wanted = false;
+  for (DocRuntime& doc : docs_)
+  {
+    if (doc.owner.load(std::memory_order_acquire) == DocOwner::Warm)
+    {
+      wanted = true;
+      break;
+    }
+  }
+  if (!wanted)
+    return;
+
+  const BackendInfo& info = device_->info();
+  uint32_t index = 0;
+  float* block = warm_.inputs.acquire(input_sequence_);
+  if (block == nullptr)
+  {
+    // Every block is in flight: the warm thread is behind by the whole pool. Counted against the
+    // documents it is holding, because "this rig is not current" is what the number means.
+    for (DocRuntime& doc : docs_)
+    {
+      if (doc.owner.load(std::memory_order_acquire) == DocOwner::Warm)
+        doc.drops.fetch_add(1, std::memory_order_relaxed);
+    }
+    return;
+  }
+
+  const std::size_t width = info.bytes_per_sample;
+  for (unsigned c = 0; c < warm_input_channels_ && c < info.capture_channels; ++c)
+  {
+    float* plane = block + static_cast<std::size_t>(c) * info.period_size;
+    for (unsigned i = 0; i < info.period_size; ++i)
+      plane[i] = pcm_decode(capture_buffer_.data() +
+                              (static_cast<std::size_t>(i) * info.capture_channels + c) * width,
+                            info.format);
+  }
+  warm_.inputs.publish(index);
+  wake_warm_thread();
+}
+
+void Daemon::switch_begin() noexcept
+{
+  const int audible = active_doc_.load(std::memory_order_relaxed);
+
+  if (switch_phase_ == SwitchPhase::Idle)
+  {
+    const uint64_t request = switch_request_seq_.load(std::memory_order_acquire);
+    if (request == switch_seen_seq_ || request == 0)
+      return;
+    switch_seen_seq_ = request;
+
+    const uint64_t content = switch_request_content_.load(std::memory_order_acquire);
+    const int target = document_with_content(content);
+    if (target < 0 || target == audible || docs_[target].owner.load(std::memory_order_acquire) != DocOwner::Warm)
+    {
+      // Not warm any more: the client cooled it, warmed something else over it, or it is already the
+      // document being heard. Withdrawn and reported rather than served -- the control thread knows
+      // what to do next (it falls back to a cold load).
+      take_request_.store(-1, std::memory_order_release);
+      switches_withdrawn_.fetch_add(1, std::memory_order_relaxed);
+      switch_last_doc_.store(-1, std::memory_order_relaxed);
+      switch_done_seq_.store(request, std::memory_order_release);
+      switch_request_content_.store(0, std::memory_order_relaxed);
+      return;
+    }
+
+    // The outgoing side of the fade starts as this document's own last block, which is in hand and
+    // cannot be being written by anyone else: this thread rendered it, last block.
+    switch_outgoing_ = audible;
+    std::copy(docs_[audible].published_bus.begin(), docs_[audible].published_bus.end(),
+              switch_outgoing_bus_.begin());
+    docs_[audible].publish_wanted.store(true, std::memory_order_release);
+    switch_incoming_ = target;
+    switch_phase_ = SwitchPhase::AwaitingRelease;
+    // The document is spoken for from here: the warm thread lets go of it and must not pick it up
+    // again before this thread has taken it, or the handover would be a race the warm thread wins by
+    // being faster.
+    take_request_.store(target, std::memory_order_release);
+    warm_release_.store(static_cast<unsigned>(target + 1), std::memory_order_release);
+    wake_warm_thread();
+    return;
+  }
+
+  if (switch_phase_ == SwitchPhase::AwaitingRelease)
+  {
+    DocRuntime& incoming = docs_[switch_incoming_];
+    if (!claim_document(incoming.owner, DocOwner::Device))
+
+
+    // Content, not owner, is what the request named: if the document was warmed with something else
+    // between the request and this claim, this is a different rig and the request is withdrawn.
+    if (incoming.content.load(std::memory_order_acquire) !=
+        switch_request_content_.load(std::memory_order_acquire))
+    {
+      release_document(incoming.owner);
+      wake_warm_thread(); // it is free again: whatever was warmed there is warm again
+      take_request_.store(-1, std::memory_order_release);
+      switches_withdrawn_.fetch_add(1, std::memory_order_relaxed);
+      switch_phase_ = SwitchPhase::Idle;
+      switch_incoming_ = -1;
+      switch_outgoing_ = -1;
+      docs_[switch_outgoing_ >= 0 ? switch_outgoing_ : active_doc_.load(std::memory_order_relaxed)]
+        .publish_wanted.store(false, std::memory_order_release);
+      switch_done_seq_.store(switch_seen_seq_, std::memory_order_release);
+      switch_request_content_.store(0, std::memory_order_relaxed);
+      return;
+    }
+
+    DocRuntime& outgoing = docs_[switch_outgoing_];
+    // Let go of the outgoing document before anything else touches it: the warm thread picks it up
+    // from `Free` and keeps it current, which is what the rest of the fade is mixed against. It has
+    // to be told: nothing else about this block looks like work to it.
+    release_document(outgoing.owner);
+    wake_warm_thread();
+
+    active_doc_.store(switch_incoming_, std::memory_order_release);
+
+    take_request_.store(-1, std::memory_order_release);
+    const int fade = transition_frames();
+    for (std::size_t ch = 0; ch < kMaxLevelChannels; ++ch)
+      switch_fades_[ch].fade.start(fade);
+    switch_started_block_ = blocks_.load(std::memory_order_relaxed);
+    switches_.fetch_add(1, std::memory_order_relaxed);
+    switch_last_doc_.store(switch_incoming_, std::memory_order_relaxed);
+    switch_phase_ = SwitchPhase::Fading;
+    return;
+  }
+}
+
+void Daemon::switch_mix(int frames) noexcept
+{
+  const int audible = active_doc_.load(std::memory_order_relaxed);
+  DocRuntime& active = docs_[audible];
+
+  if (switch_phase_ != SwitchPhase::Fading)
+  {
+    std::copy(active.bus.begin(), active.bus.end(), bus_.begin());
+    return;
+  }
+
+  // The outgoing document's audio for this block: whatever the warm thread has published since the
+  // last block, or the block already in hand when it has published nothing. A hold is a plateau on
+  // the side that is fading *out*, never a stall on the audible one, and it is counted.
+  DocRuntime& outgoing = docs_[switch_outgoing_];
+  if (outgoing.bus_pool.configured())
+  {
+    uint32_t index = 0;
+    uint64_t seq = 0;
+    const float* block = nullptr;
+    bool fresh = false;
+    while (outgoing.bus_pool.take(index, seq, block))
+    {
+      std::copy(block, block + switch_outgoing_bus_.size(), switch_outgoing_bus_.begin());
+      outgoing.bus_pool.give_back(index);
+      fresh = true;
+    }
+    if (!fresh)
+      outgoing.holds.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  const unsigned channels = active_playback_channels_.load(std::memory_order_relaxed);
+  const std::size_t plane = static_cast<std::size_t>(frames);
+  for (unsigned c = 0; c < channels && c < kMaxLevelChannels; ++c)
+  {
+    const float* from = switch_outgoing_bus_.data() + static_cast<std::size_t>(c) * plane;
+    const float* to = active.bus.data() + static_cast<std::size_t>(c) * plane;
+    float* out = bus_.data() + static_cast<std::size_t>(c) * plane;
+    switch_fades_[c].fade.mix(from, to, out, frames);
+  }
+
+  if (!switch_fades_[0].fade.active())
+  {
+    // The fade has closed: this document is the audible one, and the document that faded out is the
+    // warm one. Nothing has to be published for it any more.
+    outgoing.publish_wanted.store(false, std::memory_order_release);
+    // On the document the switch landed in: that is the one a client asked about, and the one whose
+    // entry in `engine.status` reports how long the handover took.
+    docs_[audible].handover_blocks.store(blocks_.load(std::memory_order_relaxed) - switch_started_block_,
+                                         std::memory_order_relaxed);
+    const uint64_t request = switch_seen_seq_;
+    switch_phase_ = SwitchPhase::Idle;
+    switch_incoming_ = -1;
+    switch_outgoing_ = -1;
+    switch_done_seq_.store(request, std::memory_order_release);
+    switch_request_content_.store(0, std::memory_order_relaxed);
+  }
+}
+
+bool Daemon::start_warm_thread(std::string& error)
+{
+  error.clear();
+  if (!warm_enabled() || warm_.thread.joinable())
+    return true;
+  if (config_.render_threads > 1)
+  {
+    error = "warm_cpus and render_threads above 1 cannot both be used: multi-core rendering splits "
+            "one document's chains across cores, and a warm document beside it has never been measured";
+    return false;
+  }
+  if (!docs_[active_doc_.load(std::memory_order_relaxed)].bus_pool.configured() || !warm_.inputs.configured())
+  {
+    // Nothing to render from or into: this can only mean the device is not open, and the caller starts
+    // the thread when it is.
+    return true;
+  }
+
+  warm_.cpu.store(config_.warm_cpus.front(), std::memory_order_relaxed);
+  warm_quit_.store(false, std::memory_order_relaxed);
+
+  const int cpu = warm_.cpu.load(std::memory_order_relaxed);
+  const int priority = config_.warm_priority;
+  const double period = static_cast<double>(config_.period_size) /
+                        static_cast<double>(config_.sample_rate > 0 ? config_.sample_rate : 1);
+  pthread_t handle{};
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+#if defined(__linux__)
+  // Born on its own core, like a render worker: a thread inherits its creator's affinity, and the
+  // device thread is already pinned and already real-time by the time this runs.
+  if (cpu >= 0 && cpu < CPU_SETSIZE)
+  {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    pthread_attr_setaffinity_np(&attr, sizeof(set), &set);
+  }
+#endif
+  warm_.thread = std::thread([this, priority, cpu, period] {
+    warm_.scheduling = rt::apply_scheduling(priority, cpu, period);
+    if (config_.verbose)
+      std::fprintf(stderr, "[namchaind] warm thread: %s\n", rt::describe_scheduling(warm_.scheduling).c_str());
+    warm_loop();
+  });
+  pthread_attr_destroy(&attr);
+  (void)handle;
+  if (config_.verbose)
+    std::fprintf(stderr, "[namchaind] warm thread on cpu %d at priority %d\n", cpu, config_.warm_priority);
+  return true;
+}
+
+void Daemon::stop_warm_thread() noexcept
+{
+  if (!warm_.thread.joinable())
+    return;
+  warm_quit_.store(true, std::memory_order_release);
+  warm_.sequence.fetch_add(1, std::memory_order_release);
+  warm_.sequence.notify_all();
+  warm_.thread.join();
+}
+
+void Daemon::warm_loop()
+{
+  for (;;)
+  {
+    {
+      // The warm path: the same no-allocation, no-lock, no-syscall discipline as the device thread's
+      // render path. It runs on its own core, at a priority below the render thread and below the
+      // audio interrupt that shares its core on the pedal.
+      RtScope scope;
+      warm_service();
+    }
+    if (warm_quit_.load(std::memory_order_acquire))
+      return;
+
+    const uint64_t seen = warm_.sequence.load(std::memory_order_acquire);
+    warm_.parked.store(true, std::memory_order_release);
+    if (warm_.sequence.load(std::memory_order_acquire) != seen)
+    {
+      warm_.parked.store(false, std::memory_order_release);
+      continue;
+    }
+    if (warm_quit_.load(std::memory_order_acquire))
+      return;
+    unsigned spins = 0;
+    while (spins < 20000 && warm_.sequence.load(std::memory_order_acquire) == seen &&
+           !warm_quit_.load(std::memory_order_acquire))
+    {
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+      ++spins;
+    }
+    if (warm_.sequence.load(std::memory_order_acquire) == seen && !warm_quit_.load(std::memory_order_acquire))
+      warm_.sequence.wait(seen, std::memory_order_acquire);
+    warm_.parked.store(false, std::memory_order_release);
+  }
+}
+
+void Daemon::warm_service() noexcept
+{
+  // 1. The mailbox: compiled content, newest wins. Older commands are retired here rather than at the
+  //    control thread, which may not free a plan a render thread could be inside.
+  WarmContent command = pending_warm_;
+  bool have_command = warm_have_pending_;
+  warm_have_pending_ = false;
+  WarmContent newer;
+  while (warm_commands_.pop(newer))
+  {
+    if (have_command)
+      retire_warm_content(command);
+    command = newer;
+    have_command = true;
+  }
+
+  // 2. A document let go of, either because a switch is taking it over (keep the content) or because
+  //    the control thread is cooling it (retire it).
+  const unsigned release = warm_release_.load(std::memory_order_acquire);
+  if (release != 0)
+  {
+    const int index = static_cast<int>(release) - 1;
+    if (index >= 0 && index < kMaxDocuments && docs_[index].owner.load(std::memory_order_acquire) == DocOwner::Warm)
+    {
+      release_warm_document(docs_[index], /*retire=*/false);
+      warm_release_.store(0, std::memory_order_release);
+    }
+  }
+  const unsigned cool = warm_cool_.load(std::memory_order_acquire);
+  if (cool != 0)
+  {
+    const int index = static_cast<int>(cool) - 1;
+    if (index >= 0 && index < kMaxDocuments && docs_[index].owner.load(std::memory_order_acquire) == DocOwner::Warm)
+    {
+      release_warm_document(docs_[index], /*retire=*/true);
+      warm_cool_.store(0, std::memory_order_release);
+    }
+  }
+
+  // 3. Install content into the document the control thread named for it, when that document is
+  //    ours or empty. It is checked here rather than trusted because a switch can have moved the
+  //    document between the control thread's decision and this block.
+  if (have_command)
+  {
+    const int target = static_cast<int>(command.doc);
+    const int audible = active_doc_.load(std::memory_order_acquire);
+    if (target >= 0 && target < kMaxDocuments && target != audible)
+    {
+      DocRuntime& doc = docs_[target];
+      const DocOwner owner = doc.owner.load(std::memory_order_acquire);
+      const bool ours = owner == DocOwner::Warm;
+      if (ours || (owner == DocOwner::Free && doc.content.load(std::memory_order_acquire) == 0))
+      {
+        if (ours)
+          retire_warm_content_of(doc);
+        doc.chain_count = static_cast<int>(command.chain_count);
+        doc.transitioning_chain = -1;
+        doc.rendered_generation = command.generation;
+        doc.previous_generation = command.generation;
+        doc.audible_generation.store(command.generation, std::memory_order_relaxed);
+        doc.target_generation.store(command.generation, std::memory_order_relaxed);
+        doc.adopted_generation.store(command.generation, std::memory_order_relaxed);
+        doc.transition_active.store(false, std::memory_order_relaxed);
+        for (int c = 0; c < kMaxChains; ++c)
+        {
+          ChainRuntime& chain = doc.chains[c];
+          chain.current = c < static_cast<int>(command.chain_count) ? command.slots[c] : nullptr;
+          chain.next = nullptr;
+          chain.pending = nullptr;
+          chain.local_remaining = 0;
+          chain.mute.store(false, std::memory_order_relaxed);
+          chain.transition_active.store(false, std::memory_order_relaxed);
+          chain.audible_generation.store(chain.current == nullptr ? 0 : command.generation,
+                                         std::memory_order_relaxed);
+          chain.target_generation.store(chain.current == nullptr ? 0 : command.generation,
+                                        std::memory_order_relaxed);
+          chain.adopted_generation.store(chain.current == nullptr ? 0 : command.generation,
+                                         std::memory_order_relaxed);
+        }
+        doc.content.store(command.generation, std::memory_order_release);
+        have_command = false;
+      }
+    }
+    // Not installed this pass: it stays in hand and is retried on the next one. Nothing is lost -- the
+    // content is compiled and owned by this thread -- and `rig.warm` reports `warming` until it lands.
+  }
+  pending_warm_ = have_command ? command : WarmContent{};
+  warm_have_pending_ = have_command;
+
+
+  // 4. Render: one block per input the device thread has published, as many as it takes to catch up.
+  DocRuntime* doc = claim_warm_document(warm_doc_);
+  uint32_t index = 0;
+  uint64_t seq = 0;
+  const float* planes = nullptr;
+  while (warm_.inputs.take(index, seq, planes))
+  {
+    if (doc != nullptr && doc->chain_count > 0)
+      render_warm_document(*doc, planes, seq);
+    // A test hook, never parsed from a configuration file: a warm thread that cannot keep up is the
+    // failure T8 falsifies, and an engineered one is the only way to test that it is *reported*
+    // rather than merely survived.
+    if (config_.warm_test_hold_ms != 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(config_.warm_test_hold_ms));
+    warm_.inputs.give_back(index);
+    // A document taken over by the device thread mid-drain is not ours to render any more.
+    if (doc != nullptr && doc->owner.load(std::memory_order_acquire) != DocOwner::Warm)
+    {
+      doc = claim_warm_document(warm_doc_);
+    }
+  }
+}
+
+void Daemon::render_warm_document(DocRuntime& doc, const float* planes, uint64_t seq) noexcept
+{
+  const int frames = static_cast<int>(active_period_.load(std::memory_order_relaxed));
+  if (frames <= 0)
+    return;
+  const std::size_t plane = static_cast<std::size_t>(frames);
+
+  // Each chain's input, from the decoded planes the device thread published -- the same samples, from
+  // the same decode, that the audible document is being fed.
+  for (int c = 0; c < doc.chain_count; ++c)
+  {
+    ChainRuntime& chain = doc.chains[c];
+    if (chain.current == nullptr)
+      continue;
+    const unsigned channel = static_cast<unsigned>(chain.current->input_channel);
+    if (channel >= warm_input_channels_)
+      continue;
+    const float* source = planes + static_cast<std::size_t>(channel) * plane;
+    std::copy(source, source + frames, chain.in.begin());
+  }
+
+  // One plan per chain: no crossfade and no transition bookkeeping, because a document that is not
+  // audible has nothing to fade between -- warming a rig replaces its content whole.
+  for (int c = 0; c < doc.chain_count; ++c)
+  {
+    ChainRuntime& chain = doc.chains[c];
+    if (chain.current == nullptr)
+      continue;
+    chain.current->plan->execute(chain.in.data(), chain.out.data(), frames);
+  }
+
+  std::fill(doc.bus.begin(), doc.bus.end(), 0.0f);
+  for (int c = 0; c < doc.chain_count; ++c)
+  {
+    ChainRuntime& chain = doc.chains[c];
+    if (chain.current == nullptr || chain.mute.load())
+      continue;
+    float* destination = doc.bus.data() + static_cast<std::size_t>(chain.current->output_channel) * plane;
+    for (int i = 0; i < frames; ++i)
+      destination[i] += chain.out[static_cast<std::size_t>(i)];
+  }
+  std::copy(doc.bus.begin(), doc.bus.end(), doc.published_bus.begin());
+
+  // Published only when a switch is listening: outside a fade nobody reads it, and a warm thread that
+  // published anyway would spend its core on audio nobody will hear.
+  if (doc.publish_wanted.load(std::memory_order_acquire) && doc.bus_pool.configured())
+  {
+    uint32_t index = 0;
+    float* block = doc.bus_pool.acquire(seq);
+    if (block != nullptr)
+    {
+      std::copy(doc.bus.begin(), doc.bus.end(), block);
+      doc.bus_pool.publish(index);
+      wake_warm_thread();
+    }
+  }
+
+  doc.blocks.fetch_add(1, std::memory_order_relaxed);
+  doc.warm_blocks.fetch_add(1, std::memory_order_relaxed);
+  doc.input_seq.store(seq, std::memory_order_relaxed);
+  const uint64_t seen = input_sequence_ - (seq > input_sequence_ ? 0 : seq);
+  if (seen > doc.worst_behind.load(std::memory_order_relaxed))
+    doc.worst_behind.store(seen, std::memory_order_relaxed);
+  if (doc.first_block_ns.load(std::memory_order_relaxed) == 0)
+  {
+    const uint64_t now = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count());
+    doc.first_block_ns.store(now, std::memory_order_relaxed);
+  }
+  warm_.blocks.fetch_add(1, std::memory_order_relaxed);
+}
+
+DocRuntime* Daemon::claim_warm_document(int& index) noexcept
+{
+  // Already ours: a claim is for taking a document *up*, and one this thread is already rendering is
+  // not free to claim. Without this the warm thread would find its own document unclaimable on every
+  // pass after the first and render nothing at all.
+  if (warm_doc_ >= 0 && warm_doc_ < kMaxDocuments)
+  {
+    DocRuntime& mine = docs_[warm_doc_];
+    if (mine.owner.load(std::memory_order_acquire) == DocOwner::Warm &&
+        mine.content.load(std::memory_order_acquire) != 0)
+    {
+      index = warm_doc_;
+      return &mine;
+    }
+  }
+
+  const int audible = active_doc_.load(std::memory_order_acquire);
+  // A document the device thread has asked for is not one to pick up, however free it looks: it is
+  // between owners, which is exactly what the claim protocol makes a window rather than a race.
+  const int spoken_for = take_request_.load(std::memory_order_acquire);
+  for (int i = 0; i < kMaxDocuments; ++i)
+  {
+    if (i == audible || i == spoken_for)
+      continue;
+    DocRuntime& doc = docs_[i];
+    if (doc.content.load(std::memory_order_acquire) == 0)
+      continue; // nothing compiled into it: there is nothing to keep warm
+    if (claim_document(doc.owner, DocOwner::Warm))
+    {
+      index = i;
+      return &doc;
+    }
+  }
+  return nullptr;
+}
+
+void Daemon::release_warm_document(DocRuntime& doc, bool retire) noexcept
+{
+  if (retire)
+    retire_warm_content_of(doc);
+  release_document(doc.owner);
+}
+
+void Daemon::retire_warm_content_of(DocRuntime& doc) noexcept
+{
+  for (int c = 0; c < kMaxChains; ++c)
+  {
+    PlanSlot*& slot = doc.chains[c].current;
+    if (slot == nullptr)
+      continue;
+    if (doc.chains[c].next != nullptr)
+    {
+      warm_reclaimer_.retire(doc.chains[c].next, &delete_plan_slot);
+      doc.chains[c].next = nullptr;
+    }
+    if (doc.chains[c].pending != nullptr)
+    {
+      warm_reclaimer_.retire(doc.chains[c].pending, &delete_plan_slot);
+      doc.chains[c].pending = nullptr;
+    }
+    warm_reclaimer_.retire(slot, &delete_plan_slot);
+    slot = nullptr;
+  }
+  doc.chain_count = 0;
+  doc.content.store(0, std::memory_order_release);
+  doc.publish_wanted.store(false, std::memory_order_relaxed);
+}
+
+void Daemon::retire_warm_content(const WarmContent& content) noexcept
+{
+  for (uint32_t c = 0; c < content.chain_count && c < static_cast<uint32_t>(kMaxChains); ++c)
+  {
+    if (content.slots[c] != nullptr)
+      warm_reclaimer_.retire(content.slots[c], &delete_plan_slot);
   }
 }
 
@@ -3255,13 +4458,13 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     }
     for (std::size_t i = 0; i < current_document_.chains.size() && i < static_cast<std::size_t>(kMaxChains); ++i)
     {
-      if (chains_[i].failed_nodes.load() == 0)
+      if (active_document().chains[i].failed_nodes.load() == 0)
         continue;
       std::string node;
       if (published_slots_[i] != nullptr && published_slots_[i]->plan != nullptr)
       {
         const std::vector<std::string>& ids = published_slots_[i]->plan->node_ids();
-        for (std::size_t n = 0; n < ids.size() && n < chains_[i].failed_nodes.load(); ++n)
+        for (std::size_t n = 0; n < ids.size() && n < active_document().chains[i].failed_nodes.load(); ++n)
         {
           // The first failed node is the useful one to name; the counters carry the rest.
           if (published_slots_[i]->plan->node_failed(n))
@@ -3273,7 +4476,35 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       }
       add("node_failed", "error",
           "a node returned a non-finite sample and has been taken out of the signal path",
-          chains_[i].guard_trips.load(), current_document_.chains[i].id, node);
+          active_document().chains[i].guard_trips.load(), current_document_.chains[i].id, node);
+    }
+    // The warm set's own state: a rig nobody is hearing yet is not trouble, but a rig that is not
+    // current is exactly the thing the player would notice on the next press.
+    if (warm_enabled())
+    {
+      const uint64_t device_seq = input_sequence_published_.load(std::memory_order_relaxed);
+      for (int i = 0; i < kMaxDocuments; ++i)
+      {
+        const DocRuntime& doc = docs_[i];
+        if (doc.content.load(std::memory_order_acquire) == 0)
+          continue;
+        if (i == active_doc_.load(std::memory_order_acquire))
+          continue;
+        if (doc.warm_blocks.load(std::memory_order_relaxed) == 0)
+        {
+          add("warm_not_ready", "info", "a warmed rig has not rendered a block yet", 1);
+          continue;
+        }
+        const uint64_t rendered = doc.input_seq.load(std::memory_order_relaxed);
+        const uint64_t behind = device_seq > rendered ? device_seq - rendered : 0;
+        if (behind > config_.warm_max_behind_blocks)
+        {
+          add("warm_behind", "warn",
+              "the warm rig is " + std::to_string(behind) + " blocks behind the audible one, so a "
+              "switch to it would not be current",
+              behind);
+        }
+      }
     }
     if (recent_xruns_.load() > 0)
       add("xruns", "warn", "the device has missed deadlines recently", recent_xruns_.load());
@@ -3286,7 +4517,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     }
     if (config_.lock_memory && !memory_locked_.load() && device_state() != DeviceState::Closed)
       add("memory_not_locked", "warn", "mlockall was refused, so the run is not pinned in memory", 1);
-    if (transition_active_.load())
+    if (active_document().transition_active.load())
       add("transition", "info", "a structural change is being crossfaded", 1);
 
     // A block whose model or IR is not in the library plays as if bypassed. A warning, one per block,
@@ -3434,7 +4665,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     for (std::size_t i = 0; i < current_document_.chains.size() && i < static_cast<std::size_t>(kMaxChains); ++i)
     {
       const graph::Chain& chain = current_document_.chains[i];
-      const ChainRuntime& runtime = chains_[i];
+      const ChainRuntime& runtime = active_document().chains[i];
       nlohmann::json entry;
       entry["id"] = chain.id;
       entry["name"] = chain.name;
@@ -3661,7 +4892,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["rig_source"] = current_source_;
     status["rig_name"] = current_name_;
     status["generation"] = generation_;
-    status["adopted_generation"] = adopted_generation_.load();
+    status["adopted_generation"] = active_document().adopted_generation.load();
     status["blocks"] = blocks_.load();
     status["xruns"] = xruns_.load();
     // Whatever the backend can say about itself, in its own words. Empty for most, and additive, so
@@ -3708,9 +4939,9 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // touch can be kept (`local_transitions`), and across the whole chain when it cannot.
     status["param_edits"] = "ramped";
     status["structural_transitions"] = "crossfade";
-    status["transition_active"] = transition_active_.load();
-    status["audible_generation"] = audible_generation_.load();
-    status["target_generation"] = target_generation_.load();
+    status["transition_active"] = active_document().transition_active.load();
+    status["audible_generation"] = active_document().audible_generation.load();
+    status["target_generation"] = active_document().target_generation.load();
     status["transitions_started"] = transitions_started_.load();
     // Of those, the ones that kept what the edit did not touch and faded only what it changed
     // (docs/transitions.md, "Local transitions"); and what the newest publish did, chain by chain.
@@ -3756,6 +4987,9 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // through its own transition. The document-level fields above are derived from these, so a client
     // can read either the whole picture or one chain's.
     status["chains"] = chains_json();
+    // The warm set, absent when warming is off -- "absence is the feature flag", as `levels` is.
+    if (warm_enabled())
+      status["warm"] = warm_json();
 
     // The model budget as configured, and what the running document reads against it: 0 throughout when
     // it is off. `used_bytes` is as published, slimmed models at their slim size; `full_bytes` is what
@@ -3964,7 +5198,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       const int index = find_chain(doc["chain"].get<std::string>());
       if (index < 0)
         return error_response(id, "unknown_chain", "no chain '" + doc["chain"].get<std::string>() + "'");
-      chains_[static_cast<std::size_t>(index)].mute.store(muted);
+      active_document().chains[static_cast<std::size_t>(index)].mute.store(muted);
       body["mute"] = muted;
       body["chain"] = doc["chain"];
       return ok_response(id, body);
@@ -4137,6 +5371,152 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["missing_assets"] = missing_json();
     body["slimmed_models"] = slimmed_json();
     body["chains"] = document.chains.size();
+    body["transitions"] = transitions_json();
+    return ok_response(id, body);
+  }
+  if (method == "rig.warm")
+  {
+    // Hold a rig ready to switch to: compiled, prewarmed and rendering on a core of its own, so that
+    // the switch itself is a handover rather than a load (docs/warm-set.md, P6 of the pedal's
+    // document). Nothing about the running document changes here -- that is the whole point.
+    if (!warm_enabled())
+      return error_response(id, "warm_disabled", "warming is off: no warm_cpus are configured");
+
+    graph::Document document;
+    std::string base_dir;
+    std::string path;
+    std::string source;
+    if (doc.contains("rig"))
+    {
+      if (!doc["rig"].is_string())
+        return error_response(id, "bad_request", "'rig' must be a string");
+      std::string error;
+      if (!resolve_rig_name(config_, doc["rig"].get<std::string>(), path, error))
+        return error_response(id, "rig_not_found", error);
+      if (!graph::load_document_json(path, document, error))
+        return error_response(id, "compile_failed", error);
+      base_dir = std::filesystem::path(path).parent_path().string();
+      source = "file";
+    }
+    else if (doc.contains("document"))
+    {
+      if (!doc["document"].is_object())
+        return error_response(id, "bad_request", "'document' must be an object");
+      std::string error;
+      if (!graph::parse_document_json(doc["document"].dump(), document, error))
+        return error_response(id, "bad_request", error);
+      if (session.peer == PeerKind::Remote)
+      {
+        const std::string offender = first_absolute_path(document);
+        if (!offender.empty())
+        {
+          return error_response(id, "path_refused",
+                                "a document from a network client may not name the absolute path '" + offender +
+                                  "'; put the file under the rigs root and name it relatively");
+        }
+      }
+      base_dir = config_.rigs_root;
+      source = "applied";
+    }
+    else
+    {
+      return error_response(id, "bad_request", "rig.warm needs a 'rig' name or a 'document'");
+    }
+
+    bool replace = true;
+    if (doc.contains("replace"))
+    {
+      if (!doc["replace"].is_boolean())
+        return error_response(id, "bad_request", "'replace' must be a boolean");
+      replace = doc["replace"].get<bool>();
+    }
+
+    const std::string previous = warm_entry_.present ? warm_entry_.rig : std::string();
+    std::string error;
+    std::string code = "compile_failed";
+    if (!publish_warm(document, path, source, base_dir, replace, error, &code))
+      return error_response(id, code, error);
+
+    nlohmann::json body;
+    body["rig"] = warm_entry_.rig;
+    body["name"] = warm_entry_.name;
+    body["generation"] = warm_entry_.generation;
+    body["doc"] = warm_entry_.doc;
+    body["core"] = config_.warm_cpus.empty() ? -1 : config_.warm_cpus.front();
+    // `warming` until the warm thread has rendered a block of it: compiled is not the same claim as
+    // rendering, and a client that switches immediately wants to know which it has.
+    const int warm_doc = document_with_content(warm_entry_.generation);
+    const bool rendered = warm_doc >= 0 && docs_[warm_doc].warm_blocks.load(std::memory_order_relaxed) > 0;
+    body["state"] = rendered ? "warm" : "warming";
+    body["replaced"] = previous.empty() ? nlohmann::json(nullptr) : nlohmann::json(previous);
+    body["cost"] = {{"cost", warm_entry_.cost.cost},
+                    {"full_cost", warm_entry_.cost.full_cost},
+                    {"headroom", warm_entry_.cost.headroom},
+                    {"over", warm_entry_.cost.over},
+                    {"verdict", warm_entry_.cost.verdict},
+                    {"trimmed", warm_entry_.cost.trimmed},
+                    {"table", warm_entry_.cost.table},
+                    {"table_ok", warm_entry_.cost.has_table}};
+    body["missing_assets"] = missing_json();
+    nlohmann::json slimmed = nlohmann::json::array();
+    for (const CostedNode& node : warm_entry_.cost.nodes)
+    {
+      if (!node.slimmed)
+        continue;
+      slimmed.push_back({{"chain", node.chain}, {"node", node.node}, {"element", node.element},
+                         {"reference", node.reference}, {"row", node.row}, {"cost", node.cost},
+                         {"full_cost", node.cost_full}});
+    }
+    body["slimmed_models"] = std::move(slimmed);
+    return ok_response(id, body);
+  }
+  if (method == "rig.cool")
+  {
+    // Stop holding a rig ready. The engine never guesses that a rig has stopped being a neighbour:
+    // the service that owns the bank says so (D9).
+    std::string path;
+    if (doc.contains("rig"))
+    {
+      if (!doc["rig"].is_string())
+        return error_response(id, "bad_request", "'rig' must be a string");
+      std::string error;
+      if (!resolve_rig_name(config_, doc["rig"].get<std::string>(), path, error))
+        return error_response(id, "rig_not_found", error);
+    }
+    std::string error;
+    std::string code = "warm_not_ready";
+    nlohmann::json cooled;
+    if (!cool_warm(path, error, &code, cooled))
+      return error_response(id, code, error);
+    nlohmann::json body;
+    body["cooled"] = std::move(cooled);
+    if (warm_enabled())
+      body["warm"] = warm_json();
+    return ok_response(id, body);
+  }
+  if (method == "rig.switch")
+  {
+    // Make a rig audible. A rig that is warm is a handover; one that is not is loaded the way any rig
+    // is, unless the client asked for a refusal -- a footswitch press never ends in silence.
+    if (!doc.contains("rig") || !doc["rig"].is_string())
+      return error_response(id, "bad_request", "rig.switch needs a string 'rig'");
+    std::string path;
+    std::string error;
+    if (!resolve_rig_name(config_, doc["rig"].get<std::string>(), path, error))
+      return error_response(id, "rig_not_found", error);
+    bool fallback = true;
+    if (doc.contains("fallback"))
+    {
+      if (!doc["fallback"].is_boolean())
+        return error_response(id, "bad_request", "'fallback' must be a boolean");
+      fallback = doc["fallback"].get<bool>();
+    }
+    nlohmann::json body;
+    std::string code = "compile_failed";
+    if (!switch_to(path, fallback, error, &code, body))
+      return error_response(id, code, error);
+    body["missing_assets"] = missing_json();
+    body["slimmed_models"] = slimmed_json();
     body["transitions"] = transitions_json();
     return ok_response(id, body);
   }
@@ -4445,8 +5825,14 @@ int Daemon::run()
       end_recording();
 
     // The reclamation window of rig-pipeline.md §5.3: this is the "somebody" that frees a plan once
-    // its grace has closed, and the reason the poll timeout is neither zero nor infinite.
+    // its grace has closed, and the reason the poll timeout is neither zero nor infinite. Both
+    // reclaimers are collected: a plan is retired by whichever thread owned the document it played in.
     reclaimer_.collect();
+    warm_reclaimer_.collect();
+
+    // A warm switch moves which document is audible without a publish, so this is where the control
+    // thread's view of "the running document" catches up with it. Cheap when nothing moved.
+    sync_warm_switch();
 
     // The level probes, on their own cadence (Config::levels_rate_hz). Here rather than only in the
     // read path so the cache is warm whether or not a client is reading: with a rate set, a poll

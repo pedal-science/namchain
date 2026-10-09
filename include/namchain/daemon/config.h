@@ -4,6 +4,7 @@
 // command-line flags for a one-off run. Both spell the same fields, so what the unit passes and what
 // an operator types are the same vocabulary rather than two dialects.
 #include <string>
+#include <vector>
 
 #include "namchain/io/backend.h"
 
@@ -138,6 +139,40 @@ struct Config
   /// A value larger than the cores this process may run on is refused at startup, because a worker
   /// that cannot be pinned is a worker whose timing cannot be reported.
   unsigned render_threads = 1;
+  /// \brief The cores a warm thread may be pinned to; empty means the warm set is off.
+  ///
+  /// A warm thread renders a rig the player is not hearing so that switching to it is a handover
+  /// rather than a load (docs/warm-set.md, and the pedal's
+  /// docs/managing-processing-power-and-optimising-for-fast-switching.md, P6). Which cores those are
+  /// is the device's layout, not the engine's policy: on the pedal core 0 is housekeeping, core 3
+  /// renders what is audible, and the cores between them keep rigs warm -- one of which also carries
+  /// the audio interrupt, which is why warm priority is below it.
+  ///
+  /// \ref cpu may not appear here: the device core is already rendering the document that is audible,
+  /// and a warm document there would be a second document on the core D1 says holds one rig.
+  std::vector<int> warm_cpus;
+  /// SCHED_FIFO priority for a warm thread. Below \ref rt_priority, so a warm rig can never delay the
+  /// audible one, and below the audio interrupt's 85, which on the pedal shares a warm core.
+  int warm_priority = 70;
+  /// \brief How far behind a warm document may fall before `engine.status` says `warm_behind`.
+  ///
+  /// Not a policy -- nothing is refused or dropped at this number -- but an appliance's health light
+  /// has to be able to say "the rig you are about to switch to is not current", and this is where
+  /// that line is drawn. Eight blocks is 10.7 ms at 64 frames: still well inside the switch the warm
+  /// document exists to make fast, and past the point where "one block late" explains it.
+  unsigned warm_max_behind_blocks = 8;
+  /// \brief Test hook: how long the warm thread holds each block, in milliseconds. Never parsed.
+  ///
+  /// A warm thread that starves is the failure T8 falsifies, and an engineered one is the only way to
+  /// test that the starvation is *reported* rather than merely survived. Zero is off, and nothing but
+  /// a test sets it.
+  unsigned warm_test_hold_ms = 0;
+  /// \brief Test hook: microseconds the render loop paces each block. Never parsed.
+  ///
+  /// The `file` backend renders flat out -- it is the offline reference -- so a test that wants to
+  /// drive a switch mid-render through the real protocol needs the device thread to spend wall time
+  /// on a block. Zero is off.
+  unsigned warm_test_pace_us = 0;
   /// mlockall(MCL_CURRENT) once the plan and the stream buffers exist (never MCL_FUTURE, §14.10).
   bool lock_memory = true;
   /// Output-queue cap and floor, in periods; see BackendConfig. 0 disables each.
