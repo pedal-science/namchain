@@ -24,6 +24,20 @@ Cross builds, from piv (it has the cross compilers and qemu-user):
 Run cross-built tests with `qemu-arm-static -cpu cortex-a15 -L /usr/arm-linux-gnueabihf` (or
 `qemu-aarch64-static -L /usr/aarch64-linux-gnu`). `.github/workflows/ci.yml` is the reference.
 
+**`namchain-warm-bench` is built on Linux only** (`CMakeLists.txt`, `NAMCHAIN_BUILD_TOOLS`): it pins
+threads and paces with `clock_nanosleep`, so a build on the Mac never compiles it. A change to it
+that "compiles here" has not been compiled at all — check it in the Linux build container before
+committing, which takes seconds rather than a full build:
+
+```sh
+docker run --rm -v "$PWD:/src:ro" pedal-build:<snapshot> \
+  c++ -fsyntax-only -DNAM_ENABLE_A2_FAST -I/src/include \
+      -isystem /src/vendor/NeuralAmpModelerCore -isystem /src/vendor/NeuralAmpModelerCore/Dependencies/eigen \
+      -isystem /src/vendor/NeuralAmpModelerCore/Dependencies/nlohmann \
+      -march=armv8-a -mtune=cortex-a76 -O3 -DNDEBUG -std=c++20 -Wall -Wextra \
+      /src/tools/warm/namchain-warm-bench.cpp
+```
+
 ## Constraints
 
 - **Nothing on the render path allocates, locks or blocks.** `NAMCHAIN_RT_CHECK` interposes the

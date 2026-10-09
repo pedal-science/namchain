@@ -1665,7 +1665,7 @@ int run_switch(const Args& args)
     std::vector<float> out(static_cast<std::size_t>(q));
     std::vector<float> outgoing(static_cast<std::size_t>(q), 0.0f);
     std::vector<float> mixed(static_cast<std::size_t>(q), 0.0f);
-    namchain::rt::Crossfade fade(kMaxTransitionFrames);
+    namchain::rt::Crossfade fade(namchain::daemon::kMaxTransitionFrames);
     timespec next_time{};
     clock_gettime(CLOCK_MONOTONIC, &next_time);
     const long period_ns = static_cast<long>(q / kRate * 1e9);
@@ -1827,7 +1827,6 @@ int run_measure(const Args& args)
   int n = std::max(1, args.start_n);
   while (true)
   {
-    const Point& p = at(n);
     if (!fits(n))
     {
       hi = n;
