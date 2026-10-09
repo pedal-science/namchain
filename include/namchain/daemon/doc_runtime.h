@@ -114,9 +114,14 @@ public:
   void configure(std::size_t floats_per_block);
   bool configured() const noexcept { return floats_per_block_ != 0; }
 
-  /// Producer: a block to fill, with \p seq recorded as its sequence number, or null when the
-  /// consumer is behind by the whole pool. The returned storage is writable until \ref publish.
-  float* acquire(uint64_t seq) noexcept;
+  /// \brief Producer: a block to fill, with \p seq recorded as its sequence number, or null when the
+  /// consumer is behind by the whole pool.
+  ///
+  /// \param index receives the block's index, which is what \ref publish takes: a block is named by
+  ///        an index and never by its address, and an API that handed back only the storage would
+  ///        leave a caller publishing whichever index it happened to have.
+  /// The returned storage is writable until \ref publish.
+  float* acquire(uint64_t seq, uint32_t& index) noexcept;
 
   /// Producer: hand the block acquired from \ref acquire to the consumer.
   void publish(uint32_t index) noexcept;

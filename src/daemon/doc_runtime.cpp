@@ -38,9 +38,8 @@ void BlockPool::configure(std::size_t floats_per_block)
     free_.push(i);
 }
 
-float* BlockPool::acquire(uint64_t seq) noexcept
+float* BlockPool::acquire(uint64_t seq, uint32_t& index) noexcept
 {
-  uint32_t index = 0;
   if (!free_.pop(index))
   {
     // Every block is either being filled or waiting to be rendered: the warm document is behind by

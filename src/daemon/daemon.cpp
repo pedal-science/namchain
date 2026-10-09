@@ -3877,7 +3877,7 @@ void Daemon::publish_warm_input() noexcept
 
   const BackendInfo& info = device_->info();
   uint32_t index = 0;
-  float* block = warm_.inputs.acquire(input_sequence_);
+  float* block = warm_.inputs.acquire(input_sequence_, index);
   if (block == nullptr)
   {
     // Every block is in flight: the warm thread is behind by the whole pool. Counted against the
@@ -4310,7 +4310,7 @@ void Daemon::render_warm_document(DocRuntime& doc, const float* planes, uint64_t
   if (doc.publish_wanted.load(std::memory_order_acquire) && doc.bus_pool.configured())
   {
     uint32_t index = 0;
-    float* block = doc.bus_pool.acquire(seq);
+    float* block = doc.bus_pool.acquire(seq, index);
     if (block != nullptr)
     {
       std::copy(doc.bus.begin(), doc.bus.end(), block);

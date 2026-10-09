@@ -4089,15 +4089,28 @@ TEST_CASE("the block pool drops rather than waiting, and counts what it dropped"
   uint64_t seq = 0;
   for (unsigned i = 0; i < namchain::daemon::BlockPool::kBlocks; ++i)
   {
-    float* block = pool.acquire(100 + i);
+    uint32_t got = 0;
+    float* block = pool.acquire(100 + i, got);
     REQUIRE(block != nullptr);
+    // The index is the pool's, not the caller's: it is what `publish` takes, and a caller that had to
+    // guess it would publish the wrong block.
+    CHECK(got < namchain::daemon::BlockPool::kBlocks);
     block[0] = static_cast<float>(i);
-    index[i] = static_cast<uint32_t>(i);
-    pool.publish(static_cast<uint32_t>(i));
+    index[i] = got;
+    pool.publish(got);
   }
+  // The blocks are the pool's own and each is handed out once: a pool that returned one index four
+  // times would have four copies of one block in flight and none of the others.
+  for (unsigned i = 0; i < namchain::daemon::BlockPool::kBlocks; ++i)
+  {
+    for (unsigned j = i + 1; j < namchain::daemon::BlockPool::kBlocks; ++j)
+      CHECK(index[i] != index[j]);
+  }
+
   // Every block is in flight, so the producer is refused and says so instead of waiting: a consumer
   // that is behind must be reported, and the render path must never block on one.
-  CHECK(pool.acquire(999) == nullptr);
+  uint32_t refused_index = 0;
+  CHECK(pool.acquire(999, refused_index) == nullptr);
   CHECK(pool.dropped() == 1);
 
   // The consumer reads them in order, with the sequence number each was published under.
@@ -4110,7 +4123,8 @@ TEST_CASE("the block pool drops rather than waiting, and counts what it dropped"
   }
   CHECK_FALSE(pool.take(index[0], seq, data));
   // And the blocks are back: a full round trip leaves the pool as it started.
-  CHECK(pool.acquire(1) != nullptr);
+  uint32_t again = 0;
+  CHECK(pool.acquire(1, again) != nullptr);
 }
 
 TEST_CASE("a warmed rig renders beside the audible one, and a switch makes it audible")
