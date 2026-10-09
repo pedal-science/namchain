@@ -907,6 +907,11 @@ private:
   /// when a new warm is refused because of it.
   std::array<uint64_t, kLoadBuckets> pressure_histogram_{};
   bool pressure_histogram_valid_ = false;
+  /// When the last publish or switch finished. The failsafe does not judge the seconds right after
+  /// one: publishing a heavy rig costs a compile, a page-in and a fade, and T11's run showed the
+  /// setup transient (one block at 215%) being read as "the warm set is costing too much", which
+  /// cooled a warm document that had nothing to do with it.
+  std::chrono::steady_clock::time_point last_publish_at_{};
   uint64_t warm_pressure_cools_ = 0;
   std::chrono::steady_clock::time_point warm_pressure_until_{};
 

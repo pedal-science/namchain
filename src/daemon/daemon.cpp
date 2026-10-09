@@ -1594,6 +1594,8 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     current_document_ = document;
     missing_assets_ = std::move(missing);
     cost_ = std::move(cost);
+  last_publish_at_ = std::chrono::steady_clock::now();
+    last_publish_at_ = std::chrono::steady_clock::now();
     last_transitions_.clear();
     return true;
   }
@@ -1868,6 +1870,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   current_resolved_ = std::move(resolved);
   missing_assets_ = std::move(missing);
   cost_ = std::move(cost);
+  last_publish_at_ = std::chrono::steady_clock::now();
   published_slots_ = std::move(raw);
   last_published_ = &current_document_;
   last_transitions_ = std::move(transitions);
@@ -2326,6 +2329,21 @@ bool warm_pressure(const uint64_t* before, const uint64_t* now)
 
 void Daemon::check_warm_pressure()
 {
+  // A publish's own cost is not the warm set's fault (T11, 2026-10-09): compiling a heavy rig, paging
+  // it in and fading to it puts a spike through the render tail, and judging the warm set on that
+  // window cooled a warm document that had nothing to do with it -- which is why T11's hour ran with
+  // cpu1 at 0.7% and no warm document in either half. The window right after a publish is therefore
+  // taken as a baseline and not judged.
+  constexpr auto kSettle = std::chrono::seconds(3);
+  const bool settled = last_publish_at_.time_since_epoch().count() == 0 ||
+                       std::chrono::steady_clock::now() - last_publish_at_ >= kSettle;
+  if (!settled)
+  {
+    for (std::size_t bucket = 0; bucket < kLoadBuckets; ++bucket)
+      pressure_histogram_[bucket] = load_histogram_[bucket].load(std::memory_order_relaxed);
+    pressure_histogram_valid_ = true;
+    return;
+  }
   // The window is the blocks rendered since the last check, so a busy pedal and an idle one are both
   // judged on what actually happened rather than on wall-clock time.
   if (!pressure_histogram_valid_)
