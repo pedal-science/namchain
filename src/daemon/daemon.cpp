@@ -5145,6 +5145,10 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
                       {"over", cost_.over},
                       {"verdict", cost_.verdict},
                       {"trimmed", cost_.trimmed},
+                      // P8 (2026-10-09): this rig was trimmed to Lite because it was *asked* for that
+                      // -- it is on its way to Full -- rather than because it had to be. D6 requires a
+                      // temporary Lite to be visible, and this is the flag a panel shows.
+                      {"lite_first", cost_.lite_first},
                       {"table", cost_.table},
                       {"table_ok", cost_.has_table},
                       {"table_detail", cost_table_.detail},
@@ -5426,6 +5430,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
                     {"over", cost.over},
                     {"verdict", cost.verdict},
                     {"trimmed", cost.trimmed},
+                    {"lite_first", cost.lite_first},
                     {"table", cost.table},
                     {"table_ok", cost.has_table},
                     {"nodes", std::move(cost_nodes)}};
@@ -5595,6 +5600,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
                     {"over", warm_entry_.cost.over},
                     {"verdict", warm_entry_.cost.verdict},
                     {"trimmed", warm_entry_.cost.trimmed},
+                    {"lite_first", warm_entry_.cost.lite_first},
                     {"table", warm_entry_.cost.table},
                     {"table_ok", warm_entry_.cost.has_table}};
     body["missing_assets"] = missing_json();
