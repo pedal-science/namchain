@@ -1,5 +1,5 @@
-A2-Full and A2-Full + full-length cab on piv, standing in for tib
-==================================================================
+A2-Full and A2-Full + full-length cab on piv
+============================================
 
 2026-09-26. piv (Raspberry Pi 500, Cortex-A76 at 2.4 GHz, no cap), kernel
 7.0.0-1017-raspi-realtime PREEMPT_RT, cores 2-3 isolated, services confined to 0-1
@@ -22,8 +22,7 @@ p99 as % of the deadline, max block, overruns:
 79939b4 convolves with rikkus/AudioDSPTools' PartitionedConvolution (partition multiplies spread
 across the quiet callbacks); 04a1fc8 with the core's nam::Linear, since the fork is deprecated.
 nam::Linear's burst roughly doubles the cab's share of the p99, and is still far inside the
-deadline at q64. On tib the same change is the difference between fitting and not
-(tib-cab-ir.txt).
+deadline at q64.
 
 The worst blocks are ~1 ms whichever convolver runs, and A2-Full alone had one of 1.22 ms. At q64
 that leaves little margin at the very tail; at q32 it overruns. The source of those single slow

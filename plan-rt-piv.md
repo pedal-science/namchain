@@ -246,13 +246,6 @@ automatic rollback and the rehearsed failure path):
 `--cpu 3` (on the stock kernel cpu 3 is simply an ordinary core, so the pin is meaningless but
 harmless and keeps the invocation identical).
 
-### tib, later and different
-
-tib (RK3288, ARMv7) is **not** a repeat of this: its RT kernel has `NO_HZ_FULL` deliberately **off**
-(there are no cores to spare) and its story includes `RT_GROUP_SCHED=n` as the headline fix. Its arm
-set is "does `SCHED_FIFO` now reach the engine at all, and how much does the RT kernel move the tail
-with no isolation to help it". Plan separately, after piv produces a working recipe.
-
 ---
 
 ## 6. Discipline carried from the earlier runs (these are the bugs, not the theory)

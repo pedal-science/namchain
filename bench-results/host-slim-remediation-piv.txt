@@ -449,6 +449,4 @@ To undo: /home/rik/code.local/namchain/tools/soak/host-slim.sh --revert    To re
 #   --apply then restored the intended state, and --check reports green with
 #   "every masked service is recorded in the manifest"
 #
-# The final applied state of both boards is in host-slim-state-piv.txt and
-# host-slim-state-tib.txt. tib additionally shows the init.scope fix surviving a real reboot:
-# the transcript records boot id c82e4bc5 and uptime 4 minutes, with init.scope at 0-1.
+# The final applied state is in host-slim-state-piv.txt.

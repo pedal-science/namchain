@@ -1,6 +1,6 @@
 # Minimal Linux userspace for latency-sensitive audio on ARM SBCs
 
-Scope: how to strip or replace Debian/Ubuntu/Armbian for a headless audio node, with notes for an RK3288 (ARMv7, 2 GB) and Raspberry Pi 5 / BCM2712 (ARMv8). Uncertain items are labelled.
+Scope: how to strip or replace Debian/Ubuntu/Armbian for a headless audio node, with notes for Raspberry Pi 5 / BCM2712 (ARMv8). Uncertain items are labelled.
 
 ## 1. Armbian: minimal images and the build framework
 
@@ -50,9 +50,8 @@ Start from `--variant=minbase` + `--no-install-recommends`, or Armbian `BUILD_MI
 
 Kernel modules must match the exact running kernel, so `linux-headers-$(uname -r)`/DKMS is required for out-of-tree audio drivers. Debian ships `linux-image-rt-arm64` for arm64 and `linux-image-rt-armmp` for ARMv7 multiplatform ([arm64](https://packages.debian.org/sid/arm64/linux-image-rt-arm64), [armmp](https://packages.debian.org/bullseye/linux-image-5.10.0-30-rt-armmp)). Ubuntu offers `linux-lowlatency` (not hard RT) and Pro `realtime-kernel` with the `raspi` variant; the `raspi-realtime` kernel is tracked as a [Launchpad bug](https://lists.snapcraft.io/archives/foundations-bugs/2024-October/526496.html). Community Pi RT: [remusmp/rpi-rt-kernel](https://github.com/remusmp/rpi-rt-kernel) builds a PREEMPT_RT image for Pi 3/4/5 (`./scripts/config --enable PREEMPT_RT`, verified with `uname -a` showing `PREEMPT_RT`). Firmware/DTB must match the board (Armbian `armbian-firmware`, Raspberry Pi `dtoverlay=`); on Pi 5 a HifiBerry HAT needed `dtoverlay=hifiberry-dacplusadcpro`, `force_eeprom_read=0`, and disabling HDMI audio. RT tuning beyond the kernel: `preempt=full`, threaded IRQs, CPU isolation (`isolcpus`/cgroups), `cpufreq` governor `performance`, and `cyclictest` from `rt-tests`.
 
-## Fit for the two target boards
+## Fit for the target board
 
-- **RK3288 (ARMv7, 2 GB):** Armbian supports RK3288 boards (Tinker Board/MiQi class) on its 32-bit rockchip `current`/`edge` kernel ([PR #8649](https://github.com/armbian/build/pull/8649)). Use Armbian minimal or Debian `--variant=minbase` armhf. There is **no Armbian RT kernel** for it; either build `CONFIG_PREEMPT_RT=y` from Armbian's rockchip source, or (uncertain) try Debian's generic `linux-image-rt-armmp` with a correct DTB/U-Boot. 2 GB is ample for a JACK/ALSA node; isolated-core tuning is limited (4 cores).
 - **Raspberry Pi 5 / BCM2712 (ARMv8):** best-supported path — Raspberry Pi OS Lite (already minimal) + Ubuntu Pro `realtime-kernel --variant=raspi`, or the community `rpi-rt-kernel` (Pi 5 tested). Armbian has no official Pi 5 support (community only — uncertain). Use 64-bit; 4–8 cores allow real `isolcpus` for the audio thread.
 
 ## Comparison
@@ -65,6 +64,6 @@ Kernel modules must match the exact running kernel, so `linux-headers-$(uname -r
 | Buildroot | Smallest possible (~MBs, BusyBox, no package manager) | High (cross-compile everything, no apt) | None — rebuild + reflash | CIP-RT or `CONFIG_PREEMPT_RT=y` fragment | Medium — great once stable, poor iterability |
 | Yocto/OpenEmbedded + `meta-realtime` | Tiny and reproducible | Very high | None (package feeds optional) | `linux-yocto-rt`, `meta-realtime` | Medium–high (Elk proves it) but heavy |
 | Elk Audio OS | Purpose-built Yocto audio OS | Low if supported board | Vendor release | EVL/Xenomai hard RT | High on supported boards (Pi 4, i.MX8) |
-| Patchbox OS / Zynthian | Raspbian/RPi OS Lite + audio stack | Very low | apt | Bundled `-rt` kernel | High for Pi, not portable to RK3288 |
+| Patchbox OS / Zynthian | Raspbian/RPi OS Lite + audio stack | Very low | apt | Bundled `-rt` kernel | High for Pi, not portable |
 
-**Bottom line:** on RK3288 the pragmatic route is Armbian minimal or `minbase` + a self-built `CONFIG_PREEMPT_RT=y` rockchip kernel; on Pi 5, Raspberry Pi OS Lite + `pro enable realtime-kernel --variant=raspi` (or `rpi-rt-kernel`) is by far the least effort. Buildroot/Yocto only pay off when you must own the whole stack.
+**Bottom line:** on Pi 5, Raspberry Pi OS Lite + `pro enable realtime-kernel --variant=raspi` (or `rpi-rt-kernel`) is by far the least effort. Buildroot/Yocto only pay off when you must own the whole stack.

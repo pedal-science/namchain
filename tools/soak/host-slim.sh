@@ -12,15 +12,14 @@
 #                                      (read-only; used to reconcile a stale manifest)
 #
 # What it does, and why (full reasoning in docs/distro-slimming.md; measured evidence in
-# bench-results/host-confine-screen.json and bench-results/tib-e5c-*):
+# bench-results/host-confine-screen.json):
 #
 #   1. cpuset confinement of the top-level slices, so housekeeping work cannot run on the
 #      audio cores. `isolcpus=domain` removes cores from load balancing but NOT tasks that
-#      are already affine to them (133 tasks on piv had cores 2-3 in their mask), and on
-#      tib there is no isolcpus at all. The kernel calls cgroup v2 cpuset partitions the
-#      recommended, runtime-tunable interface. Measured: on piv this collapses arch_timer
-#      on the audio cores from ~475k/120s to 23/0 -- i.e. it is what makes nohz_full
-#      actually hold -- and on tib with the real SSL it took driver xruns 746 -> 0.
+#      are already affine to them (133 tasks on piv had cores 2-3 in their mask). The kernel
+#      calls cgroup v2 cpuset partitions the recommended, runtime-tunable interface.
+#      Measured: on piv this collapses arch_timer on the audio cores from ~475k/120s to
+#      23/0 -- i.e. it is what makes nohz_full actually hold.
 #
 #   2. Mask background services that wake up, touch memory or write disk and are irrelevant
 #      to a headless audio node. Mask (not disable): disable still allows socket and
@@ -62,20 +61,17 @@ LIMITS_FILE="/etc/security/limits.d/90-namchain-rttime.conf"
 # ---------------------------------------------------------------------------- board
 board() {
   if [[ -r /proc/device-tree/compatible ]]; then
-    if grep -qa 'rockchip,rk3288' /proc/device-tree/compatible; then echo tib; return; fi
     if grep -qa 'brcm,bcm2712' /proc/device-tree/compatible; then echo piv; return; fi
   fi
   case "$(hostname)" in
-    tinkerboard|tib) echo tib ;;
-    piv)             echo piv ;;
-    *)               echo unknown ;;
+    piv) echo piv ;;
+    *)   echo unknown ;;
   esac
 }
 
 # CPUs the housekeeping side is confined to. Only E5d-style measurement should change these.
 #   piv 0-1 : cores 2-3 are isolated for the engine; the audio IRQ thread lives in the root
 #             cgroup, which this does not touch, so its pin to cpu 2 survives.
-#   tib 0-1 : no isolcpus exists on this board; 2-3 is reserved by convention for the engine.
 housekeeping_cpus() { echo 0-1; }
 audio_cpus()        { echo 2-3; }
 
@@ -183,7 +179,7 @@ EOF
 # 2. mask background services
 service_list() {
   local b; b=$(board)
-  # Common to both boards: anything that periodically wakes, scans, writes disk or indexes.
+  # Common to every board here: anything that periodically wakes, scans, writes disk or indexes.
   cat <<'EOF'
 apt-daily.service apt-daily.timer apt-daily-upgrade.service apt-daily-upgrade.timer
 unattended-upgrades.service man-db.timer plocate-updatedb.timer mlocate.timer
@@ -202,21 +198,8 @@ rsyslog.service sysstat.service
 udisks2.service multipathd.service open-iscsi.service
 EOF
     ;;
-    tib) cat <<'EOF'
-armbian-hardware-monitor.service armbian-led-state.service
-armbian-hardware-optimize.service
-armbian-zram-config.service
-systemd-networkd-wait-online.service
-rsyslog.service cron.service
-EOF
-    ;;
   esac
 }
-
-# armbian-ramlog puts /var/log on a 50MB zram device. It is *not* masked by default because
-# removing it relocates logs to the SD card (write traffic on tib's only block device).
-# It is listed separately so the trade is visible instead of smuggled into a list.
-ramlog_service() { board | grep -qx tib && echo armbian-ramlog.service; }
 
 # A guard, not an absolute: masking the only time source on a box that has no RTC worth
 # trusting is a self-inflicted outage. Masking is allowed only when another time daemon is
@@ -273,11 +256,6 @@ do_mask() {
   if (( ${#clear[@]} > 0 )); then
     run systemctl reset-failed "${clear[@]}"
     [[ $DRY -eq 0 ]] && ok "cleared cosmetic failed state on ${#clear[@]} masked timer(s)"
-  fi
-  local r; r=$(ramlog_service)
-  if [[ -n $r && $(systemctl is-enabled "$r" 2>/dev/null) != masked ]]; then
-    say "  NOT masking $r: it keeps /var/log in RAM. Masking it moves log writes to the"
-    say "  SD card. Decide deliberately; see docs/distro-slimming.md section 4.3."
   fi
 }
 

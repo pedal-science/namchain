@@ -1,6 +1,6 @@
 # Keeping an SBC quiet for latency-sensitive audio: strip down + isolate
 
-Scope: Armbian (Debian/ARMv7, RK3288, 4 cores) and Ubuntu (ARM64, Pi 5, 4 cores) running an audio engine as a `SCHED_FIFO` thread. Kernel building is out of scope; obsolete/x86-only items are flagged inline.
+Scope: Armbian (Debian/ARMv7) and Ubuntu (ARM64, Pi 5, 4 cores) running an audio engine as a `SCHED_FIFO` thread. Kernel building is out of scope; obsolete/x86-only items are flagged inline.
 
 ## 1. Core isolation and ticklessness
 
@@ -17,7 +17,7 @@ isolcpus=domain,managed_irq,2-3 nohz_full=2-3 rcu_nocbs=2-3 irqaffinity=0-1 skew
 - `rcu_nocb_poll` makes the `rcuo/N` kthreads poll instead of being woken, removing a wakeup but burning a housekeeping CPU.
 - `irqaffinity=` sets the default IRQ affinity mask; `skew_tick=1` staggers ticks so they do not coincide across CPUs ([kernel-parameters](https://docs.kernel.org/admin-guide/kernel-parameters.html)).
 
-**Four-core pain.** With `nohz_full=1-3`, CPU0 alone absorbs all unbound work, RCU, vmstat, every IRQ (`irqaffinity=0`), *and* three CPUs' remote ticks. On an RK3288 that core saturates, and "isolated" cores still see global work (TLB shootdowns, RCU grace periods). The usual compromise is to isolate **two** cores (`nohz_full=2-3 irqaffinity=0-1`), or only CPU3, leaving 0-2 as housekeeping. nohz_full also only pays off if the audio thread is genuinely the sole runnable task on that CPU; a multi-threaded engine re-arms the tick immediately.
+**Four-core pain.** With `nohz_full=1-3`, CPU0 alone absorbs all unbound work, RCU, vmstat, every IRQ (`irqaffinity=0`), *and* three CPUs' remote ticks. On a 4-core board that core saturates, and "isolated" cores still see global work (TLB shootdowns, RCU grace periods). The usual compromise is to isolate **two** cores (`nohz_full=2-3 irqaffinity=0-1`), or only CPU3, leaving 0-2 as housekeeping. nohz_full also only pays off if the audio thread is genuinely the sole runnable task on that CPU; a multi-threaded engine re-arms the tick immediately.
 
 ## 2. cgroup v2 / systemd slicing
 

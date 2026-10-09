@@ -1,6 +1,6 @@
 # Why init.scope needs a boot unit instead of a drop-in
 #
-# Reproduced on tib 2026-09-17T14:42:01Z, kernel 7.2.6. Commands are shown
+# Reproduced 2026-09-17T14:42:01Z, kernel 7.2.6. Commands are shown
 # with their output. Nothing is left behind: the probe drop-ins are removed and the
 # runtime property is restored from namchain-host-slim-initconfine.service at the end.
 

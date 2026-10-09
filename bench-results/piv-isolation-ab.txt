@@ -104,7 +104,7 @@ cpu 3, and it does not. The two measurements differ in workload and both are rig
 So the boot arguments deliver a tickless, reserved core **for as long as the engine is the only
 thing on it**, which is why this A/B shows a factor of ten, and they are fragile when the
 machine does anything else. A cgroup v2 `cpuset` partition is what makes them hold in general,
-and it is the next layer rather than a correction: with it, on tib, driver xruns under an
-identical memory load went 746 -> 0 and deadline overruns 14 090 -> 1 (E5c in
-`docs/distro-slimming.md`). The engine-level question -- whether 4 x A2-Full survives a memory
-load *once confined* -- is what the confinement work leaves open.
+and it is the next layer rather than a correction: on piv the confined screen under the same
+memory load still sat 5x above the quiet max, so it buys the tick suppression and not a quiet
+memory system (E1 in `bench-results/host-confine-screen.json`). The engine-level question -- whether
+4 x A2-Full survives a memory load *once confined* -- is what the confinement work leaves open.

@@ -528,9 +528,10 @@ void* create_nam(const graph::NodeSpec& spec, const CompileOptions& options, std
 //
 // Zero-latency convolution through the vendored core's `nam::Linear`, wrapped like nc.nam's DSP.
 // Its Auto implementation is direct for short IRs and FFT for long ones, with every partition's
-// multiply done in the callback that completes a block. On `tib` that burst was p99 62.5% of a
-// 64-frame deadline at 8192 taps (bench-results/tib-cab-ir.txt), too much beside A2-Full; the
-// fork's spread convolver that fixed it is deprecated. On piv it fits.
+// multiply done in the callback that completes a block -- one heavy callback per block rather than
+// work spread across them. On piv at 8192 taps that roughly doubles the cab's share of the block
+// p99, from 8.68% to 15.39% of a 64-frame deadline, and is still far inside it
+// (bench-results/piv-cab-ir.txt). The fork's spread convolver that removed the burst is deprecated.
 //
 // The IR is loaded the way the NAM plugin loads one, less its gain law: resampled to the engine
 // rate with the same cubic resampler, then truncated at 8192 taps (170 ms at 48 kHz). What that

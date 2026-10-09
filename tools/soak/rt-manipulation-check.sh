@@ -57,7 +57,7 @@ set -u
 
 # The audio controller's interrupt, by name. Overridable because it is a property of which
 # USB port the interface is on, and it differs per board: piv's SSL 2+ is on xhci-hcd:usb2,
-# tib's SSL 2+ is on ehci_hcd:usb3 (EHCI, not xHCI), and tib's Realtek is on dwc2.
+# and an interface that lands on an EHCI or dwc2 controller reports one of the other names.
 # Set AUDIO_IRQ_NAME to override. Left unset, the first of the candidates below that is
 # actually present in /proc/interrupts wins, and if none is, the snapshot records that fact
 # instead of silently reporting "(line not found)" for the one interrupt that matters.
@@ -295,8 +295,8 @@ do_compare() {
   }')
   if [[ -z $isolated ]]; then
     # On a host that has no cores to spare, no isolation is the correct configuration rather
-    # than a failure -- tib is a 4-core board running a full userspace, and its kernel config
-    # deliberately declines NO_HZ_FULL. EXPECT_NO_ISOLATION=1 says "I know, and this arm is
+    # than a failure -- a 4-core board running a full userspace may deliberately decline
+    # NO_HZ_FULL. EXPECT_NO_ISOLATION=1 says "I know, and this arm is
     # still the experiment". Without it, an unisolated host is reported as a failure, because
     # on a host that *can* isolate, an arm that silently lost its reservation measures a
     # different machine than the one being reported.

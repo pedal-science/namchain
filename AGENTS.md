@@ -19,7 +19,7 @@ Cross builds, from piv (it has the cross compilers and qemu-user):
 |---|---|
 | aarch64 | `cmake/toolchains/aarch64-linux-gnu.cmake` |
 | armv7, generic (VFPv3-D16, no NEON) | `cmake/toolchains/armv7-linux-gnueabihf.cmake` |
-| armv7 with NEON: `tib` | `cmake/toolchains/armv7-neon-linux-gnueabihf.cmake` |
+| armv7 with NEON (VFPv4) | `cmake/toolchains/armv7-neon-linux-gnueabihf.cmake` |
 
 Run cross-built tests with `qemu-arm-static -cpu cortex-a15 -L /usr/arm-linux-gnueabihf` (or
 `qemu-aarch64-static -L /usr/aarch64-linux-gnu`). `.github/workflows/ci.yml` is the reference.
@@ -37,9 +37,8 @@ Run cross-built tests with `qemu-arm-static -cpu cortex-a15 -L /usr/arm-linux-gn
   vendors (sdatkinson's). rikkus's AudioDSPTools fork is deprecated; don't bring it back.
 - **The A2 planar parity test only means something in Release.** At -O0 it self-skips;
   `-DNAMCHAIN_REQUIRE_A2_PARITY=ON` turns the skip into a failure.
-- **`tib` is armv7 with no compiler.** Build for it on piv with the NEON toolchain file.
 - Numbers measured on a cloud runner or under qemu are not performance numbers. Those come from
-  piv and `tib` (`bench-results/`).
+  piv (`bench-results/`).
 
 ## Where things are
 

@@ -20,7 +20,7 @@
 #
 # Usage:
 #   host-slim-capture.sh piv            -> bench-results/host-slim-state-piv.txt
-#   host-slim-capture.sh tib OUT.txt
+#   host-slim-capture.sh <board> OUT.txt
 #   host-slim-capture.sh --local        -> capture this machine (only useful on a board)
 #
 # Exit: 0 on success, 2 usage, 3 if a board could not be reached.
