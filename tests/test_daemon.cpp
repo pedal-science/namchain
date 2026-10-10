@@ -217,6 +217,21 @@ bool wait_for(const std::string& socket_path, const std::function<bool(const nlo
   return false;
 }
 
+
+/// Poll until a two-step publish's Full has landed *and* is what the device is playing: the Lite has
+/// stopped standing in for it, which is the end state every `lite_first` request is aiming at. The
+/// reply to the request cannot carry that state any more -- the Full is compiled after the reply, on
+/// another thread, which is exactly what makes the Lite pollable (D6).
+bool wait_for_full(const std::string& socket_path)
+{
+  return wait_for(socket_path, [](const nlohmann::json& status) {
+    const auto found = status.find("catch_up");
+    if (found == status.end() || (*found)["full"] != "published")
+      return false;
+    return (*found)["replay"] != "running" && status["cost"]["lite_first"] == false;
+  });
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -2563,18 +2578,34 @@ TEST_CASE("a lite_first load publishes the Lite first and the Full behind it")
   // which is exactly what this wait prevents -- and what can only be asserted if it happened.
   CHECK(loaded["lite"]["adopted"] == true);
 
-  // Step two: the Full, as an ordinary publish -- the same route and the same crossfade as any load.
-  CHECK(loaded["full"]["state"] == "published");
-  CHECK(loaded["full"]["generation"] == plain_generation + 2);
-  CHECK(loaded["full"]["cost"] == doctest::Approx(0.52));
-  CHECK(loaded["full"]["verdict"] == "fits");
-  CHECK(loaded["full"]["trimmed"] == false);
-  CHECK(loaded["generation"] == plain_generation + 2);
-  CHECK(loaded["slimmed_models"].empty()); // the document that ended up running is the Full
-  REQUIRE(loaded["transitions"].size() == 1);
-  CHECK(loaded["transitions"][0]["chain"] == "main");
-  CHECK(loaded["transitions"][0]["kind"] == "crossfade");
+  // Step two: the Full, as an ordinary publish -- the same route and the same crossfade as any load --
+  // but *not* in the reply, because it is compiled after the reply is written, on the catch-up thread.
+  // What the reply says is that it is on its way, and what the Lite it is standing in for is.
+  CHECK(loaded["full"]["state"] == "compiling");
+  CHECK(loaded["full"]["catch_up"]["state"] == "exact");
+  CHECK(loaded["generation"] == plain_generation + 1); // the Lite is the running document for now
+  CHECK_FALSE(loaded["slimmed_models"].empty());       // ... and it is a trimmed one
 
+  // The Lite is a *state*, not a step inside the call: while the Full compiles, `engine.status` says so
+  // -- the Lite's own cost, trimmed, `lite_first` true -- and then the Full arrives.
+  const bool published = wait_for_full(config.socket_path);
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  if (!published)
+    std::fprintf(stderr, "[test-dbg] status: catch_up=%s cost.lite_first=%d generation=%llu audible=%llu\n",
+                 status["catch_up"].dump().c_str(), (int)status["cost"]["lite_first"],
+                 (unsigned long long)status["generation"].get<uint64_t>(),
+                 (unsigned long long)status["audible_generation"].get<uint64_t>()),
+      std::fprintf(stderr, "[test-dbg] blocks=%llu transition_active=%d chain=%s\n",
+                   (unsigned long long)status["blocks"].get<uint64_t>(), (int)status["transition_active"],
+                   status["chains"][0].dump().c_str());
+  CHECK_MESSAGE(published, "the Full never arrived");
+
+  CHECK(status["generation"] == plain_generation + 2);
+  CHECK(status["catch_up"]["full"] == "published");
+  CHECK(status["catch_up"]["replay"] == "exact");
+  REQUIRE(status["last_transitions"].size() == 1);
+  CHECK(status["last_transitions"][0]["chain"] == "main");
+  CHECK(status["last_transitions"][0]["kind"] == "crossfade");
   const bool adopted = wait_for(config.socket_path, [plain_generation](const nlohmann::json& status) {
     return status["state"] == "running" && status["adopted_generation"].get<uint64_t>() >= plain_generation + 2 &&
            status["blocks"].get<uint64_t>() > 0;
@@ -2583,7 +2614,6 @@ TEST_CASE("a lite_first load publishes the Lite first and the Full behind it")
 
   // What the engine reports is the Full: the temporary Lite lasted for the length of the Full's
   // compile, and `lite_first` is false again once the rig is what the document asked for.
-  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
   CHECK(status["cost"]["cost"] == doctest::Approx(0.52));
   CHECK(status["cost"]["trimmed"] == false);
   CHECK(status["cost"]["lite_first"] == false);
@@ -2735,21 +2765,32 @@ TEST_CASE("a lite_first publish whose Lite is already the budget's answer report
   CHECK(loaded["lite"]["trimmed"] == true);
   CHECK(loaded["lite"]["cost"] == doctest::Approx(0.67));
   CHECK(loaded["lite"]["adopted"] == true);
-  CHECK(loaded["full"]["state"] == "unchanged");
-  CHECK(loaded["full"]["generation"] == loaded["lite"]["generation"]);
+  // The Full's own publish is prepared after the reply now, so the reply says `compiling` whatever
+  // comes of it; what this case is about is that an ordinary publish of this rig reaches the document
+  // the Lite already is, which the status finds out and reports as `unchanged` (and the generation
+  // stands still, because a publish that changes nothing does not advance it).
+  CHECK(loaded["full"]["state"] == "compiling");
   CHECK(loaded["generation"] == loaded["lite"]["generation"]);
+  const bool settled = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["catch_up"]["full"] == "unchanged";
+  });
+  CHECK_MESSAGE(settled, "the Full's own publish never settled");
+
   // The state it ends in is the state an ordinary publish of this rig reaches, and the engine reports
   // the Lite that is standing in, because for this rig the Lite *is* the answer (D6). The reply's
   // `lite_first` is about the publish that happened -- a Lite went first -- while the status's is about
   // what is standing in *now*: not a temporary Lite on its way to a Full, so false, with `trimmed`
   // carrying the warning a panel shows.
-  REQUIRE(loaded["slimmed_models"].size() == 1);
-  CHECK(loaded["slimmed_models"][0]["node"] == "a1");
   const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["generation"] == loaded["lite"]["generation"]);
   CHECK(status["cost"]["cost"] == doctest::Approx(0.67));
   CHECK(status["cost"]["trimmed"] == true);
   CHECK(status["cost"]["lite_first"] == false);
   CHECK(status["cost"]["verdict"] == "trimmed");
+  REQUIRE(loaded["slimmed_models"].size() == 1);
+  CHECK(loaded["slimmed_models"][0]["node"] == "a1");
+  CHECK(status["catch_up"]["state"] == "exact");
+  CHECK(status["catch_up"]["replay"] == "none");
 }
 
 TEST_CASE("rig.cost answers what a rig would cost, without publishing or compiling it")
@@ -4549,14 +4590,21 @@ TEST_CASE("a lite_first switch hears the Lite while the Full is compiled, and a 
   CHECK(cold["lite"]["trimmed"] == true);
   CHECK(cold["lite"]["adopted"] == true);
   CHECK(cold["lite"]["cost"] == doctest::Approx(0.17));
-  CHECK(cold["full"]["state"] == "published");
-  CHECK(cold["full"]["cost"] == doctest::Approx(0.52));
-  CHECK(cold["generation"] == cold["full"]["generation"]);
-  CHECK(cold["slimmed_models"].empty());
+  // The Full is compiled after the reply -- that is what makes the Lite a state a client can poll
+  // rather than a step inside the press -- so the reply says where it is and the status says how it
+  // went. D6's flag is on the Lite in the meantime: the trim a panel shows.
+  CHECK(cold["full"]["state"] == "compiling");
+  CHECK(cold["generation"] == cold["lite"]["generation"]);
+  const bool landed = wait_status(daemon, [](const nlohmann::json& s) {
+    return s["catch_up"]["full"] == "published" && s["cost"]["lite_first"] == false;
+  });
+  CHECK_MESSAGE(landed, "the Full never landed after the cold switch");
   const auto after_cold = request(daemon, R"({"method":"engine.status"})");
   CHECK(after_cold["status"]["rig"].get<std::string>().find("slimmable.json") != std::string::npos);
   CHECK(after_cold["status"]["cost"]["cost"] == doctest::Approx(0.52));
   CHECK(after_cold["status"]["cost"]["lite_first"] == false);
+  CHECK(after_cold["status"]["catch_up"]["replay"] == "exact");
+  CHECK(after_cold["status"]["chains"][0]["slimmed_models"].empty());
   CHECK(after_cold["status"]["warm"]["cold_switches"] == 1);
 
   // A switch that did not ask for a Lite says nothing about one: the flag is what puts the object in
@@ -4878,6 +4926,17 @@ TEST_CASE("a lite_first publish crossfades in a Full caught up with the input it
     const auto status_of = [&daemon] {
       return nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.status"})"))["status"];
     };
+    // This daemon has no control loop -- `handle_request` *is* the control thread -- so waiting for the
+    // Full means asking it, not the socket.
+    const auto wait_async = [&status_of](const std::function<bool(const nlohmann::json&)>& predicate) {
+      for (int attempt = 0; attempt < 8000; ++attempt)
+      {
+        if (predicate(status_of()))
+          return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      return false;
+    };
     for (int attempt = 0; attempt < 20000 && !loaded; ++attempt)
     {
       const auto status = status_of();
@@ -4888,15 +4947,22 @@ TEST_CASE("a lite_first publish crossfades in a Full caught up with the input it
         REQUIRE_MESSAGE(load["ok"] == true, load.dump());
         REQUIRE(load["lite_first"] == true);
         CHECK(load["lite"]["adopted"] == true);
-        REQUIRE(load["full"]["state"] == "published");
-        // The Full's state was made current before it was crossfaded in, and the reply says so: the
-        // document's memory was sizeable, the window covered it, and the replay ran.
+        // The Full is compiled off this thread, so the reply says where it is; what the documment's
+        // memory needs is known now, because it comes from `lookback` and not from the compile.
+        REQUIRE(load["full"]["state"] == "compiling");
         CHECK(load["full"]["catch_up"]["state"] == "exact");
-        CHECK(load["full"]["catch_up"]["replay"] == "exact");
         CHECK(load["full"]["catch_up"]["frames"] ==
               expected_catch_up_frames(std::string(NAMCHAIN_EXAMPLE_MODELS_DIR) + "/A2.nam"));
-        CHECK(load["full"]["catch_up"]["blocks"].get<uint64_t>() > 1);
-        full_generation = load["full"]["generation"].get<uint64_t>();
+        // The Full's state is made current before it is crossfaded in: the window covered the models'
+        // receptive field and the replay ran, which the status says once it has.
+        REQUIRE(wait_async([](const nlohmann::json& s) {
+          return s["catch_up"]["full"] == "published" && s["catch_up"]["replay"] != "running" &&
+                 s["cost"]["lite_first"] == false;
+        }));
+        const auto landed = status_of();
+        CHECK(landed["catch_up"]["replay"] == "exact");
+        CHECK(landed["catch_up"]["blocks"].get<uint64_t>() > 1);
+        full_generation = landed["generation"].get<uint64_t>();
         loaded = true;
       }
       else
@@ -4957,6 +5023,90 @@ TEST_CASE("a lite_first publish crossfades in a Full caught up with the input it
                                          << " samples differ from the Full that had been running");
 }
 
+TEST_CASE("the Lite a two-step publish stands in with is a state a client can poll")
+{
+  // D6's requirement, and the reason the Full's compile is not on the control thread: "coming up to
+  // full" has to be something a client can *see*, not something it is told once in a reply that cannot
+  // be asked about again. Two windows are observable here, and this case watches both:
+  //
+  //   * the Full's **compile**: the reply has been written, the Lite is what the device is playing, and
+  //     `cost` still describes the Lite (`lite_first` true, `trimmed` true, its own cost);
+  //   * the Full's **catch-up**: the Full is published -- `generation` has moved and `chain.generation`
+  //     with it -- and the device is still hearing the Lite until its state is current, which the same
+  //     flag and `catch_up.replay == "running"` both say.
+  //
+  // The `file` backend is paced here, which is the only way these windows last long enough to poll: an
+  // unpaced run compiles and catches up in a few milliseconds of wall time.
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
+  write_file(dir.path / "rigs" / "slimmable.json", one_amp_rig("A2"));
+  write_file(dir.path / "rigs" / "pass.json", kGainRig);
+  write_signal_wav(dir.path / "in.wav", 512 * 64, 2);
+
+  Config config = catch_up_file_config(dir);
+  config.rig = (dir.path / "rigs" / "pass.json").string();
+  Daemon daemon(config);
+
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  const auto status_of = [&daemon] {
+    return nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.status"})"))["status"];
+  };
+  for (int attempt = 0; attempt < 8000 && status_of()["blocks"].get<uint64_t>() < 48; ++attempt)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+  const auto loaded = nlohmann::json::parse(
+    daemon.handle_request(R"({"method":"rig.load","rig":"slimmable.json","lite_first":true})"));
+  REQUIRE_MESSAGE(loaded["ok"] == true, loaded.dump());
+  REQUIRE(loaded["lite_first"] == true);
+  const uint64_t lite_generation = loaded["lite"]["generation"].get<uint64_t>();
+  REQUIRE(loaded["full"]["state"] == "compiling");
+
+  bool saw_compiling = false;
+  bool saw_catching_up = false;
+  bool saw_full = false;
+  for (int attempt = 0; attempt < 20000 && !saw_full; ++attempt)
+  {
+    const auto status = status_of();
+    const std::string full = status["catch_up"]["full"];
+    if (full == "compiling")
+    {
+      saw_compiling = true;
+      // The Lite, and only the Lite: what the device is playing is a trimmed rig, and the engine says
+      // so with the numbers that describe *it* rather than the Full that is coming.
+      CHECK(status["cost"]["lite_first"] == true);
+      CHECK(status["cost"]["trimmed"] == true);
+      CHECK(status["cost"]["cost"] == doctest::Approx(0.17));
+      CHECK(status["generation"] == lite_generation);
+      REQUIRE(status["chains"][0]["slimmed_models"].size() == 1);
+      CHECK(status["chains"][0]["slimmed_models"][0]["node"] == "a1");
+      CHECK(status["chains"][0]["audible_generation"] == lite_generation);
+    }
+    if (full == "published" && status["catch_up"]["replay"] == "running")
+    {
+      saw_catching_up = true;
+      // The Full's plans exist and are being replayed into; the device is still on the Lite, which is
+      // the state D6 asks to be visible, and `cost` describes the Full that is on its way.
+      CHECK(status["cost"]["lite_first"] == true);
+      CHECK(status["generation"] > lite_generation);
+      CHECK(status["chains"][0]["audible_generation"] == lite_generation);
+    }
+    if (full == "published" && status["catch_up"]["replay"] != "running" &&
+        status["cost"]["lite_first"] == false)
+    {
+      saw_full = true;
+      CHECK(status["cost"]["cost"] == doctest::Approx(0.52));
+      CHECK(status["cost"]["trimmed"] == false);
+      CHECK(status["generation"] > lite_generation);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  CHECK_MESSAGE(saw_compiling, "the Full's compile was never observable");
+  CHECK_MESSAGE(saw_catching_up, "the Full's catch-up was never observable");
+  CHECK_MESSAGE(saw_full, "the Full never landed");
+}
+
 TEST_CASE("a model with unbounded memory is refused a catch-up, in the reply and in the status")
 {
   // An LSTM's memory cannot be replayed exactly at any length (nam/lookback.h). The rule is that the
@@ -4993,7 +5143,7 @@ TEST_CASE("a model with unbounded memory is refused a catch-up, in the reply and
   REQUIRE_MESSAGE(loaded["ok"] == true, loaded.dump());
   CHECK(loaded["lite_first"] == true);
   CHECK(loaded["lite"]["trimmed"] == true);
-  REQUIRE(loaded["full"]["state"] == "published");
+  REQUIRE(loaded["full"]["state"] == "compiling");
   // No replay was done, and the reply says what stopped it -- naming the node, not just the verdict.
   CHECK(loaded["full"]["catch_up"]["state"] == "unbounded");
   CHECK(loaded["full"]["catch_up"]["replay"] == "none");
@@ -5002,7 +5152,11 @@ TEST_CASE("a model with unbounded memory is refused a catch-up, in the reply and
   CHECK(detail.find("LSTM") != std::string::npos);
   CHECK(detail.find("unbounded") != std::string::npos);
 
-  // And it is a state a client can poll, not only a line in one reply (D6).
+  // The Full still lands -- cold, and saying so: the engine refuses to *promise* exactness, never to
+  // publish. And it is a state a client can poll, not only a line in one reply (D6).
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& s) {
+    return s["catch_up"]["full"] == "published";
+  }));
   const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
   CHECK(status["catch_up"]["state"] == "unbounded");
   CHECK(status["catch_up"]["replay"] == "none");

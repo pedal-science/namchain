@@ -782,22 +782,28 @@ pedal.project `docs/managing-processing-power-and-optimising-for-fast-switching.
 2026-10-09 after the owner listened to E2's fixed audition set and **could not hear a Lite standing in
 for a Full**. That verdict is what licenses the substitution: a cold switch does not have to wait for
 the whole rig to compile, because the Lite — about a third of the work — is not something the player
-can tell from it. **The first increment of P8 is in the engine**; what it does not include is at the
-end of this section.
+can tell from it. **P8 is in the engine**: the two-step publish, the catch-up replay that makes the
+Full's state correct before it is crossfaded in, and the visibility D6 asks for. What is *not* in it is
+at the end of this section.
 
 `rig.load` and `rig.switch` take `"lite_first": true`. On a document with anything slimmable the
-publish becomes two publishes on the control thread:
+publish becomes two publishes, **on two threads**:
 
-1. **The Lite.** The document is trimmed to Lite *whatever the budget says* (`CostOutcome::lite_first`)
-   and published as usual, so the rig starts playing about a third of the compile time sooner. Every
-   slimmable model goes to Lite, dearest first, whether or not it had to; a model whose Lite row is not
-   measured saves nothing and is not trimmed for show.
-2. **The Full.** The same document is published again as an ordinary publish — resolved and trimmed by
-   the budget rather than by the request — compiled while the Lite plays and crossfaded in by the
-   transition machinery every other publish uses (`transitions` in the reply says `crossfade`).
+1. **The Lite**, on the control thread. The document is trimmed to Lite *whatever the budget says*
+   (`CostOutcome::lite_first`) and published as usual, so the rig starts playing about a third of the
+   compile time sooner. Every slimmable model goes to Lite, dearest first, whether or not it had to; a
+   model whose Lite row is not measured saves nothing and is not trimmed for show.
+2. **The Full**, prepared on the control thread and **compiled on the catch-up thread**. The same
+   document is published again as an ordinary publish — resolved and trimmed by the budget rather than
+   by the request — and crossfaded in by the transition machinery every other publish uses. What the
+   control thread does for it is the *prepare* (validate, resolve, cost, which chains changed), which
+   loads no model; the compile — the seconds a control loop would otherwise spend unable to answer
+   anything — is not this thread's. That is what makes the Lite a state a client can **poll** rather
+   than a step inside one call, which is D6's requirement; the request's reply therefore says
+   `compiling` and `engine.status` says how it went.
 
-Between the two, the control thread **waits for the Lite to be what the device is playing** (bounded
-by a fade; the same wait a local transition makes). Without that wait the second publish would arrive
+Between the two the control thread **waits for the Lite to be what the device is playing** (bounded by
+a fade; the same wait a local transition makes). Without that wait the second publish would arrive
 while the first was still fading, and a plan that arrives mid-fade becomes *pending* — the newer one
 retires it (`doc_runtime.h`) — so the Lite would be compiled, published and never heard, which is the
 one thing the request is for.
@@ -805,17 +811,18 @@ one thing the request is for.
 **What the reply says.** `lite_first` is true when a Lite was published first, and then:
 
 ```jsonc
-{ "ok": true, "rig": "…", "generation": 3,
+{ "ok": true, "rig": "…", "generation": 2,            // the Lite: what is audible when this is written
   "lite_first": true,
-  "lite": { "generation": 2, "adopted": true,          // the render thread settled on it
+  "lite": { "generation": 2, "adopted": true,         // the render thread settled on it
             "cost": 0.17, "full_cost": 0.52, "verdict": "trimmed", "trimmed": true,
             "slimmed_models": [ { "chain": "main", "node": "a1", "row": "NAM.WaveNet.lite", … } ] },
-  "full": { "state": "published", "generation": 3,     // the Full is what is running now
-            "cost": 0.52, "trimmed": false, "verdict": "fits" } }
+  "full": { "state": "compiling",                     // compiled on the catch-up thread from here
+            "catch_up": { "state": "exact", "replay": "running", "frames": 6347, … } } }
 ```
 
-`full.state` is `published`, `refused` (with `error`/`code`), `unchanged`, or `nothing_to_trim`. The
-cases worth knowing:
+`full.state` is `nothing_to_trim` (the synchronous cases below), `compiling` (the Full is being built),
+or `refused` (with `error`/`code`) when the Full cannot follow the Lite at all — over the headroom at
+its own cost, an asset that has gone, a document that no longer validates. The cases worth knowing:
 
 - **Nothing slimmable.** The Lite *is* the document as written, so there is nothing behind it to
   compile: one publish happens, not two, `lite_first` is false, `lite` is absent, and
@@ -823,9 +830,10 @@ cases worth knowing:
   ordinary publish.
 - **The Lite is already the budget's answer.** A rig that is over the headroom and has one slimmable
   model ends at the same document whether it was asked for a Lite or trimmed to fit, so the second
-  publish has nothing to do: `full.state` is `unchanged`, `full.generation` equals `lite.generation`
-  (a publish that changes nothing does not advance it), and the reply's `lite_first` is true because a
-  Lite *was* published first. The Lite that is left is not a temporary one, so `engine.status`'s
+  publish has nothing to do: by the time it is prepared the document it would publish is the one
+  already playing, and `engine.status`'s `catch_up.full` says `unchanged` (`generation` does not
+  advance, because a publish that changes nothing is not one), while the reply's `lite_first` is true
+  because a Lite *was* published first. The Lite that is left is not a temporary one, so `engine.status`'s
   `cost.lite_first` reports false and `cost.trimmed` carries D6's warning instead — the difference
   between "coming up to full" and "Lite: *blocks*", which are two different things to tell a player.
 - **Over the headroom at Lite.** Refused as `over_budget`, naming the total, the headroom and every
@@ -837,18 +845,32 @@ cases worth knowing:
   `refused` and the reason in `full.error`/`full.code`. `engine.status`'s `cost.lite_first` stays true
   while that Lite stands in, which is the flag a panel shows.
 
-**What a client can and cannot see.** The temporary Lite is visible in the reply and nowhere else:
-both publishes happen on the control thread before the reply is written, so a poll of `engine.status`
-(or `engine.lite_pending` in the service) is answered after the Full has landed and can only ever
-describe the rig as it ends up. **Two questions, deliberately answered twice**: the reply's
-`lite_first` is about the publish that just happened — a Lite went first, so the rig started playing
-sooner — while `engine.status`'s `cost.lite_first` is about what is standing in *now*, which is true
-only while a Lite the request published is still what the device is playing on its way to a Full. They
-differ in the `unchanged` case above, and nowhere else. `cost.lite_first` is never true for a rig with
-nothing to trim. `lite.adopted` is what the engine read back from the render thread after that wait:
+**What a client can see (D6).** The temporary Lite is a **state**, not a step inside one call, and
+there are two windows of it to observe:
+
+- **While the Full is compiled** — `engine.status`'s `catch_up.full` is `compiling`, and `cost` is still
+  the Lite's: `cost.lite_first` true, `cost.trimmed` true, `cost.cost` the Lite's, and the per-chain
+  `slimmed_models` naming what was trimmed. `generation` is the Lite's, because the Lite *is* the
+  published document until the Full lands; `chains[i].audible_generation` says the same thing from the
+  render thread's side.
+- **While the Full is caught up** (below) — `catch_up.full` is `published`, `catch_up.replay` is
+  `running`, and `cost.lite_first` is still true: the Full's plans exist and its generation has
+  advanced, but the device is hearing the Lite until the replay has made the Full's state current.
+  `chains[i].audible_generation` is still the Lite's, which is what makes "coming up to full" a claim a
+  client can check rather than believe.
+
+`cost.lite_first` is cleared when the render thread is *playing* the Full — not when the Full is
+published — so a panel that shows "Lite: coming up to full" shows it for exactly as long as it is true.
+It is never true for a rig with nothing to trim, and in the `unchanged` case above it is false as soon
+as the Full's own prepare has run, because the Lite that is left is not standing in for anything.
+
+**Two questions, deliberately answered twice**: the reply's `lite_first` is about the publish that just
+happened — a Lite went first, so the rig started playing sooner — while `engine.status`'s
+`cost.lite_first` is about what is standing in *now*. They differ in the `unchanged` case, and nowhere
+else. `lite.adopted` is what the engine read back from the render thread after that wait:
 **false** means the Lite was published but this thread did not see the device settle on it inside the
 wait's bound (no device is running, or the chain was still working through an earlier transition), and
-the Full went in after it anyway.
+the Full is compiled and published after it anyway.
 
 **The catch-up replay is in.** E1/E2 measured that replaying about 170 ms per model into a cold
 instance makes it bit-exact at depths 1–4, and that is what makes the Full's first 170 ms *correct*
@@ -890,8 +912,10 @@ rather than merely faded in. It is here now, in four pieces:
 "catch_up": { "state": "exact",     // the document's own answer: exact, inexact, empty, unbounded,
                                     // unknown or too_long
               "replay": "exact",    // what happened: exact, gap, no_input, busy, abandoned or none
+              "full": "published",  // where the two-step publish's Full is: compiling, published,
+                                    // unchanged, refused, ...
               "frames": 6347,       // engine frames of input the models need replayed
-              "blocks": 101,        // blocks replayed and mirrored when the reply was written
+              "blocks": 101,        // blocks replayed and mirrored when the status was built
               "running": false, "detail": "…" }   // detail when something is not exact, or not exact enough
 ```
 

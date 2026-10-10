@@ -1481,6 +1481,7 @@ bool Daemon::publish_lite_first(const graph::Document& document, const std::stri
   catch_up_report_.state = plan.state;
   catch_up_report_.detail = plan.detail;
   catch_up_report_.frames = plan.window_frames;
+  catch_up_report_.full = "preparing";
 
   // Recording starts here and stops when the catch-up is over. A document whose memory cannot be
   // replayed is not recorded for at all: nothing is promised about it, and the reply says why.
@@ -1530,6 +1531,7 @@ bool Daemon::publish_lite_first(const graph::Document& document, const std::stri
     if (armed)
       disarm_catch_up();
     catch_up_report_.replay = "none";
+    catch_up_report_.full = "nothing_to_trim";
     catch_up_report_.detail = "nothing to trim: the Lite is the document as written, so there is no Full to catch up";
     if (report != nullptr)
     {
@@ -1559,84 +1561,44 @@ bool Daemon::publish_lite_first(const graph::Document& document, const std::stri
   }
   lite_json["adopted"] = adopted;
 
-  // Step two: the Full. An ordinary publish of the same document -- resolved and trimmed by the
-  // budget rather than by the request -- compiled here on the control thread while the Lite plays,
-  // and crossfaded in by the existing transition machinery. **With a catch-up**: the plans are
-  // compiled whole and marked, so the render thread holds them until the catch-up thread has replayed
-  // the input that has just been playing into them (P8). Without one -- an LSTM, a node whose state a
-  // replay cannot restore, a history that never arrived -- the Full comes up cold and the reply says
-  // so rather than leaving it to be inferred from what the first blocks sound like.
+  // Step two: the Full, in the background. What the control thread does here is the *prepare* --
+  // validate, resolve, cost, which chains changed -- which loads no model; the compile itself is the
+  // catch-up thread's, and the control loop is free from the moment this returns. That is what makes
+  // the Lite a state a client can poll rather than a step inside one call (D6), and it is also what
+  // gives the catch-up its owner: the same thread compiles the Full and then replays the input into it.
+  //
+  // The Full is still an ordinary publish of the same document -- resolved and trimmed by the budget
+  // rather than by the request -- and it is installed by `service_async_full` on this thread when the
+  // compile lands, through exactly the publish path everything else uses. What the reply can say now is
+  // therefore `compiling`, and `engine.status`'s `catch_up` is what says how it went.
   nlohmann::json full_json;
   std::string full_error;
   std::string full_code = "compile_failed";
-  const bool full_expected = armed;
-  if (publish_document(document, path, source, base_dir, full_error, &full_code, admit_over_budget,
-                       /*lite_first=*/false, full_expected ? &plan : nullptr))
+  const CatchUpPlan full_plan = armed ? plan : CatchUpPlan{};
+  if (start_async_full(document, path, source, base_dir, admit_over_budget, full_plan, full_error, &full_code))
   {
-    // `published` when the Full differs from the Lite -- which it does whenever the budget left
-    // anything untrimmed -- and `unchanged` when an ordinary publish of this rig trims exactly what the
-    // request trimmed, so the second publish legitimately had nothing to do. A publish that changes
-    // nothing does not advance the generation (publish_document), which is what tells the two apart.
-    const bool changed = generation_ != lite_generation;
-    full_json["state"] = changed ? "published" : "unchanged";
-    full_json["generation"] = generation_;
-    full_json["cost"] = cost_.cost;
-    full_json["full_cost"] = cost_.full_cost;
-    full_json["verdict"] = cost_.verdict;
-    full_json["trimmed"] = cost_.trimmed;
-
-    if (full_expected && changed)
-    {
-      // Hand the marked plans to the catch-up thread. It drains the history, replays it into them and
-      // then keeps them current until the render thread takes them over; the render thread holds them
-      // in `pending` until then, so the Lite is what plays for those few blocks.
-      CatchUpJob job;
-      job.window_frames = plan.window_frames;
-      for (std::size_t i = 0; i < published_slots_.size() && job.chain_count < kMaxChains; ++i)
-      {
-        PlanSlot* slot = published_slots_[i];
-        if (slot == nullptr || !slot->catch_up.load(std::memory_order_acquire))
-          continue;
-        job.slots[job.chain_count] = slot;
-        job.channel[job.chain_count] = slot->input_channel;
-        job.frames[job.chain_count] = i < plan.chains.size() ? plan.chains[i].frames : plan.window_frames;
-        ++job.chain_count;
-      }
-      if (job.chain_count > 0)
-        start_catch_up_job(job);
-      else
-        disarm_catch_up();
-    }
-    else if (armed)
-    {
-      // `unchanged`: the Full *is* the Lite, so there is no state to rebuild -- what is playing has
-      // been playing all along.
-      disarm_catch_up();
-      catch_up_report_.replay = "none";
-      catch_up_report_.detail = "an ordinary publish of this rig compiles the document that is already playing";
-    }
+    full_json["state"] = "compiling";
+    catch_up_report_.full = "compiling";
+    catch_up_report_.replay = armed ? "running" : "none";
   }
   else
   {
-    // The Lite is playing and the Full is not: the rig stands in until another publish replaces it.
-    // The publish the client did get is not rolled back -- a footswitch press never ends in silence --
-    // so this is a success with the Full's failure named in it, and `cost_.lite_first` stays true,
-    // which is what `engine.lite_pending` and the status's cost object go on reporting.
+    // The Full cannot follow the Lite: over the headroom at its own cost, an asset that has gone, a
+    // document that no longer validates. The Lite is playing and the publish is not rolled back -- a
+    // footswitch press never ends in silence -- so this is a success with the Full's failure named in
+    // it, and `cost_.lite_first` stays true, which is what the status's cost object goes on reporting.
     full_json["state"] = "refused";
-    full_json["generation"] = generation_;
+    full_json["generation"] = lite_generation;
     full_json["error"] = full_error;
     full_json["code"] = full_code;
+    catch_up_report_.full = "refused";
+    catch_up_report_.detail = full_error;
     if (armed)
       disarm_catch_up();
     catch_up_report_.replay = "none";
     std::fprintf(stderr, "[namchaind] lite-first: the Full did not publish (%s): %s\n", full_code.c_str(),
                  full_error.c_str());
   }
-
-  // The reply says what became of the catch-up, so it waits for the *replay* -- a bounded wait for
-  // tens of milliseconds of work, not for the fade, which the render thread starts on its own once
-  // the state is current. Nothing here delays the Lite, which is already playing.
-  wait_for_catch_up_replay();
 
   if (report != nullptr)
   {
@@ -1702,13 +1664,16 @@ void Daemon::start_catch_up_job(const CatchUpJob& job)
     catch_up_job_ = job;
     catch_up_job_.id = catch_up_job_id_.fetch_add(1, std::memory_order_relaxed) + 1;
     catch_up_job_ready_ = true;
+    async_full_.phase = AsyncFull::Phase::CatchingUp;
+    // Busy from the handover, not from the thread's first instruction: the control thread's own report
+    // pass runs between the two and must not read a job that has not started as a job that is over.
+    catch_up_busy_.store(true, std::memory_order_release);
   }
   if (!catch_up_thread_.joinable())
   {
     catch_up_quit_.store(false, std::memory_order_release);
     // A thread, not a pool member: it exists only for the length of a two-step publish, and it must
-    // never be a thread the render path shares a core with in a way it did not choose. It is born
-    // before the job is picked up (below), so nothing can miss it.
+    // never be a thread the render path shares a core with in a way it did not choose.
     catch_up_thread_ = std::thread([this] { catch_up_loop(); });
   }
   catch_up_wake_.notify_one();
@@ -1726,41 +1691,257 @@ void Daemon::stop_catch_up_thread() noexcept
     catch_up_thread_.join();
 }
 
-void Daemon::wait_for_catch_up_replay()
+bool Daemon::start_async_full(const graph::Document& document, const std::string& path, const std::string& source,
+                              const std::string& base_dir, bool admit_over_budget, const CatchUpPlan& catch_up,
+                              std::string& error, std::string* error_code)
 {
-  const uint64_t want = catch_up_job_id_.load(std::memory_order_acquire);
-  if (want == 0 || catch_up_done_id_.load(std::memory_order_acquire) == want)
+  // The prepare is the control thread's half, and it is the cheap half: nothing here loads a model.
+  PreparedPublish prepared;
+  const bool catching_up = catch_up.replayable;
+  if (!prepare_publish(document, path, source, base_dir, admit_over_budget, /*lite_first=*/false, catching_up,
+                       prepared, error, error_code))
+    return false;
+
   {
-    // Nothing was handed over, or it is already done.
-  }
-  else
-  {
-    // Bounded: the replay is one receptive field per chain, tens of milliseconds for the models on
-    // this pedal, and the Lite is playing whether or not it arrives. The reply says what happened
-    // either way rather than hanging on it.
-    for (int attempt = 0; attempt < 2000; ++attempt)
+    std::lock_guard<std::mutex> lock(catch_up_mutex_);
+    if (async_full_.phase != AsyncFull::Phase::Idle)
     {
-      if (catch_up_done_id_.load(std::memory_order_acquire) == want)
-        break;
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      // One Full at a time: a second two-step publish replaces the first, whose compile is no longer
+      // the document anybody is waiting for (the thread notices at its next phase check and drops what
+      // it built).
+      async_full_ = AsyncFull{};
     }
+    async_full_.document = document;
+    async_full_.path = path;
+    async_full_.source = source;
+    async_full_.base_dir = base_dir;
+    async_full_.admit_over_budget = admit_over_budget;
+    async_full_.catch_up = catch_up;
+    async_full_.stamp = prepared.stamp;
+    async_full_.options = prepared.options;
+    // `publish_document` builds its plans for `prepared.generation + 1`; the compile has to agree
+    // with it, or the install would publish plans that claim to be the generation already playing.
+    async_full_.generation = prepared.generation + 1;
+    async_full_.graphs.reserve(prepared.resolved.chains.size());
+    async_full_.input_channel.clear();
+    async_full_.output_channel.clear();
+    for (const graph::Chain& chain : prepared.resolved.chains)
+    {
+      async_full_.graphs.push_back(chain.graph);
+      async_full_.input_channel.push_back(chain.input_channel);
+      async_full_.output_channel.push_back(chain.output_channel);
+    }
+    async_full_.phase = AsyncFull::Phase::Compiling;
+  }
+  if (!catch_up_thread_.joinable())
+  {
+    catch_up_quit_.store(false, std::memory_order_release);
+    catch_up_thread_ = std::thread([this] { catch_up_loop(); });
+  }
+  catch_up_wake_.notify_one();
+  return true;
+}
+
+void Daemon::service_async_full()
+{
+  AsyncFull* full = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(catch_up_mutex_);
+    if (async_full_.phase != AsyncFull::Phase::AwaitingInstall)
+      return;
+    if (async_full_.prebuilt.empty())
+    {
+      // The compile itself failed -- a model that cannot be loaded, an arena exhausted. The Lite
+      // stands; say which chain and why, and let the next two-step publish try again.
+      const std::string why = async_full_.compile_error.empty() ? "the Full did not compile"
+                                                                : async_full_.compile_error;
+      async_full_ = AsyncFull{};
+      catch_up_report_.full = "refused";
+      catch_up_report_.detail = why;
+      catch_up_report_.replay = "none";
+      disarm_catch_up();
+      std::fprintf(stderr, "[namchaind] lite-first: the Full did not compile: %s\n", why.c_str());
+      return;
+    }
+    full = &async_full_;
   }
 
-  catch_up_report_.running = catch_up_busy_.load(std::memory_order_acquire);
-  const int outcome = catch_up_done_outcome_.load(std::memory_order_relaxed);
-  switch (outcome)
+  // Install: the same `publish_document` every other publish goes through, with the plans the
+  // catch-up thread compiled handed to it. Everything the install checks -- the ring's room, the
+  // channels, the budget -- is checked here, on the thread that owns that state.
+  PreparedPublish prepared;
+  std::string error;
+  std::string code = "compile_failed";
+  const bool prepared_ok = prepare_publish(full->document, full->path, full->source, full->base_dir,
+                                           full->admit_over_budget, /*lite_first=*/false,
+                                           full->catch_up.replayable, prepared, error, &code);
+  if (!prepared_ok)
   {
-  case 1: catch_up_report_.replay = "exact"; break;
-  case 2: catch_up_report_.replay = "gap"; break;
-  case 3: catch_up_report_.replay = "no_input"; break;
-  case 4: catch_up_report_.replay = "abandoned"; break;
-  default: break;
+    // The document the Full was prepared for cannot be published now. The Lite stands, and the reply
+    // that asked for the Full has already gone out saying it was on its way, so this is where a
+    // client finds out -- `catch_up.full` and the detail.
+    std::fprintf(stderr, "[namchaind] lite-first: the Full was refused (%s): %s\n", code.c_str(), error.c_str());
+    const std::string why = error;
+    {
+      std::lock_guard<std::mutex> lock(catch_up_mutex_);
+      async_full_ = AsyncFull{};
+    }
+    catch_up_report_.full = "refused";
+    catch_up_report_.detail = why;
+    disarm_catch_up();
+    return;
   }
-  if (catch_up_report_.replay.empty())
-    catch_up_report_.replay = catch_up_report_.running ? "running" : "none";
-  catch_up_report_.blocks = catch_up_done_blocks_.load(std::memory_order_relaxed);
-  if (catch_up_report_.frames == 0)
-    catch_up_report_.frames = static_cast<std::size_t>(catch_up_done_frames_.load(std::memory_order_relaxed));
+  if (prepared.unchanged)
+  {
+    // An ordinary publish of this rig compiles the document that is already playing: the Full *is* the
+    // Lite, so there is nothing to catch up and nothing to crossfade. The Lite that is left is not a
+    // temporary one, which is what `cost.lite_first` reports (false) and `cost.trimmed` carries.
+    {
+      std::lock_guard<std::mutex> lock(catch_up_mutex_);
+      async_full_ = AsyncFull{};
+    }
+    catch_up_report_.full = "unchanged";
+    catch_up_report_.detail = "an ordinary publish of this rig compiles the document that is already playing";
+    // The Lite that is left is not standing in for anything: it *is* the budget's answer for this rig,
+    // which `cost.trimmed` carries and `cost.lite_first` must not (D6's distinction). And nothing was
+    // replayed into anything, because there is no second document.
+    cost_.lite_first = false;
+    catch_up_report_.replay = "none";
+    disarm_catch_up();
+    return;
+  }
+
+  // The stamp is the check that the compiled plans are still the ones this document asks for: the
+  // library, the warm set, the budget's trimming and the generation all have to be what they were when
+  // the compile started. A mismatch is not a failure -- the publish compiles the chains itself, on this
+  // thread -- but it is worth saying, because it means the control loop spent the compile after all.
+  const bool usable = prepared.stamp == full->stamp;
+  if (!usable)
+    std::fprintf(stderr,
+                 "[namchaind] lite-first: the Full's prepared plans are stale (the library or the warm set "
+                 "moved); compiling it here\n");
+
+  CatchUpPlan catch_up_plan = full->catch_up;
+  PrebuiltPlans prebuilt;
+  {
+    std::lock_guard<std::mutex> lock(catch_up_mutex_);
+    if (usable)
+      prebuilt = std::move(async_full_.prebuilt);
+  }
+
+  const uint64_t before = generation_;
+  const bool published = publish_document(full->document, full->path, full->source, full->base_dir, error, &code,
+                                          full->admit_over_budget, /*lite_first=*/false, &catch_up_plan,
+                                          usable ? &prebuilt : nullptr);
+  if (!published)
+  {
+    std::fprintf(stderr, "[namchaind] lite-first: the Full was refused (%s): %s\n", code.c_str(), error.c_str());
+    std::string why = error;
+    {
+      std::lock_guard<std::mutex> lock(catch_up_mutex_);
+      async_full_ = AsyncFull{};
+    }
+    catch_up_report_.full = "refused";
+    catch_up_report_.detail = std::move(why);
+    disarm_catch_up();
+    return;
+  }
+
+  const bool changed = generation_ != before;
+  catch_up_report_.full = changed ? "published" : "unchanged";
+  if (!changed)
+  {
+    // `publish_document` decided nothing would change after all (the Lite already compiles this
+    // document): the Lite is not temporary and there is nothing to catch up.
+    {
+      std::lock_guard<std::mutex> lock(catch_up_mutex_);
+      async_full_ = AsyncFull{};
+    }
+    disarm_catch_up();
+    return;
+  }
+
+  // The Lite is what the device hears until the render thread takes the Full over, so the flag a panel
+  // shows stays true across the catch-up as well; `clear_lite_first_when_adopted` is what ends it.
+  cost_.lite_first = true;
+
+  CatchUpJob job;
+  job.window_frames = catch_up_plan.window_frames;
+  for (std::size_t i = 0; i < published_slots_.size() && job.chain_count < kMaxChains; ++i)
+  {
+    PlanSlot* slot = published_slots_[i];
+    if (slot == nullptr || !slot->catch_up.load(std::memory_order_acquire))
+      continue;
+    job.slots[job.chain_count] = slot;
+    job.channel[job.chain_count] = slot->input_channel;
+    job.frames[job.chain_count] =
+      i < catch_up_plan.chains.size() ? catch_up_plan.chains[i].frames : catch_up_plan.window_frames;
+    ++job.chain_count;
+  }
+  if (job.chain_count == 0)
+  {
+    // Nothing was marked -- no catch-up was possible for this document -- so the Full is simply what
+    // is playing from here, and the Lite's flag ends with it.
+    {
+      std::lock_guard<std::mutex> lock(catch_up_mutex_);
+      async_full_ = AsyncFull{};
+    }
+    if (catch_up_report_.replay != "busy")
+      catch_up_report_.replay = "none";
+    catch_up_report_.full = "published";
+    disarm_catch_up();
+    return;
+  }
+
+  catch_up_report_.replay = "running";
+  start_catch_up_job(job);
+}
+
+void Daemon::service_catch_up_report()
+{
+  const uint64_t want = catch_up_job_id_.load(std::memory_order_acquire);
+  if (want == 0)
+    return;
+  catch_up_report_.running = catch_up_busy_.load(std::memory_order_acquire) ||
+                             catch_up_done_id_.load(std::memory_order_acquire) != want;
+  if (catch_up_done_id_.load(std::memory_order_acquire) == want)
+  {
+    switch (catch_up_done_outcome_.load(std::memory_order_relaxed))
+    {
+    case 1: catch_up_report_.replay = "exact"; break;
+    case 2: catch_up_report_.replay = "gap"; break;
+    case 3: catch_up_report_.replay = "no_input"; break;
+    case 4: catch_up_report_.replay = "abandoned"; break;
+    default: break;
+    }
+    catch_up_report_.blocks = catch_up_done_blocks_.load(std::memory_order_relaxed);
+  }
+
+  // The job is over when the catch-up thread is no longer in it -- which includes the handover, which
+  // sets `busy` before the thread runs. Then the phase parks, so the next two-step publish can start.
+  if (!catch_up_busy_.load(std::memory_order_acquire))
+  {
+    std::lock_guard<std::mutex> lock(catch_up_mutex_);
+    if (async_full_.phase == AsyncFull::Phase::CatchingUp)
+      async_full_ = AsyncFull{};
+  }
+}
+
+void Daemon::clear_lite_first_when_adopted()
+{
+  if (!cost_.lite_first)
+    return;
+  // The Full has to have *landed*: while it is still compiling, the published document is the Lite and
+  // the audible check below would pass trivially, clearing the flag the moment it was set.
+  if (catch_up_report_.full != "published")
+    return;
+  const DocRuntime& doc = active_document();
+  if (doc.audible_generation.load(std::memory_order_acquire) != generation_ ||
+      doc.transition_active.load(std::memory_order_acquire))
+    return;
+  // The Full the Lite was standing in for is what the device is playing now: the trim is no longer a
+  // thing the player is hearing, which is the moment D6's flag is about.
+  cost_.lite_first = false;
 }
 
 nlohmann::json Daemon::catch_up_json() const
@@ -1768,6 +1949,7 @@ nlohmann::json Daemon::catch_up_json() const
   nlohmann::json json;
   json["state"] = catch_up_report_.state;
   json["replay"] = catch_up_report_.replay.empty() ? "none" : catch_up_report_.replay;
+  json["full"] = catch_up_report_.full.empty() ? "idle" : catch_up_report_.full;
   json["frames"] = catch_up_report_.frames;
   json["blocks"] = catch_up_report_.blocks;
   json["running"] = catch_up_report_.running;
@@ -1829,18 +2011,86 @@ void Daemon::catch_up_loop()
   for (;;)
   {
     CatchUpJob job;
+    bool compile = false;
     {
       std::unique_lock<std::mutex> lock(catch_up_mutex_);
       catch_up_wake_.wait(lock, [this] {
-        return catch_up_job_ready_ || catch_up_quit_.load(std::memory_order_acquire);
+        return catch_up_job_ready_ || async_full_.phase == AsyncFull::Phase::Compiling ||
+               catch_up_quit_.load(std::memory_order_acquire);
       });
-      if (catch_up_quit_.load(std::memory_order_acquire) && !catch_up_job_ready_)
-        return;
-      job = catch_up_job_;
-      catch_up_job_ready_ = false;
+      if (catch_up_quit_.load(std::memory_order_acquire))
+        return; // stop() is the only thing that sets it, and it is not waiting for this work
+      if (async_full_.phase == AsyncFull::Phase::Compiling)
+        compile = true;
+      else if (catch_up_job_ready_)
+      {
+        job = catch_up_job_;
+        catch_up_job_ready_ = false;
+      }
+      else
+      {
+        continue; // the phase moved under us: look again rather than serve nothing
+      }
     }
-    serve_catch_up(job);
+    if (compile)
+      compile_async_full();
+    else
+      serve_catch_up(job);
   }
+}
+
+void Daemon::compile_async_full()
+{
+  // The compile the control thread did not wait for: every chain of P8's Full, into its own plan.
+  // Nothing here touches the daemon's published state -- that is the whole point of the split.
+  PrebuiltPlans built;
+  std::string error;
+  std::vector<graph::Graph> graphs;
+  render::CompileOptions options;
+  std::vector<int> inputs;
+  std::vector<int> outputs;
+  uint64_t generation = 0;
+  bool catching_up = false;
+  {
+    std::lock_guard<std::mutex> lock(catch_up_mutex_);
+    graphs = async_full_.graphs;
+    options = async_full_.options;
+    inputs = async_full_.input_channel;
+    outputs = async_full_.output_channel;
+    generation = async_full_.generation;
+    catching_up = async_full_.catch_up.replayable;
+  }
+
+  built.resize(graphs.size());
+  for (std::size_t i = 0; i < graphs.size(); ++i)
+  {
+    built[i] = compile_chain_slot(graphs[i], options, generation, inputs[i], outputs[i], catching_up, error);
+    if (built[i] == nullptr)
+    {
+      error = "chain " + std::to_string(i) + ": " + error;
+      break;
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(catch_up_mutex_);
+  if (async_full_.phase != AsyncFull::Phase::Compiling)
+  {
+    // Superseded while compiling: the plans are nobody's, and they go out of scope here.
+    return;
+  }
+  if (built.empty() || built.back() == nullptr)
+  {
+    async_full_.compile_error = error;
+    async_full_.prebuilt.clear();
+  }
+  else
+  {
+    async_full_.prebuilt = std::move(built);
+    async_full_.compile_error.clear();
+  }
+  async_full_.compiled = true;
+  async_full_.phase = AsyncFull::Phase::AwaitingInstall;
+  // No wake: the control thread polls -- its own cadence, and every request -- and installs there.
 }
 
 void Daemon::serve_catch_up(const CatchUpJob& job)
@@ -1870,6 +2120,12 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
   //    made exact from a window with no holes in it, so a ring that dropped a block inside the
   //    window is waited out rather than papered over: the history rolls on and the next blocks are
   //    contiguous again.
+  //
+  // The window ends at the newest block that is *there* -- not at the newest the device has rendered:
+  // a producer that is running ahead (an unpaced `file` or `null` backend) would otherwise keep this
+  // loop chasing a head it can never reach. Whatever arrives after the window is fed by the mirror
+  // phase below, which is the same input and the same plans, so stopping here costs nothing.
+  std::size_t chased = 0;
   for (;;)
   {
     const float* data = nullptr;
@@ -1878,10 +2134,19 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
     {
       catch_up_window_.append(data, seq);
       catch_up_input_.give_back();
+      if (catch_up_window_.covers(need))
+      {
+        if (++chased > 64 || !catch_up_input_.has_data())
+          break; // a full, contiguous window: this is the history the Full is caught up from
+      }
+      else
+      {
+        chased = 0;
+      }
       continue;
     }
     if (catch_up_window_.covers(need))
-      break; // a full, contiguous window: this is the history the Full is caught up from
+      break; // drained to the head, and what is held covers every chain
     if (!catch_up_input_.armed() || catch_up_quit_.load(std::memory_order_acquire))
     {
       outcome = 3;
@@ -1986,6 +2251,8 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
   }
 
   catch_up_done_blocks_.store(blocks + mirrored, std::memory_order_relaxed);
+  // The ring and the window are this thread's; `catch_up_report_` is the control thread's, and it
+  // folds `catch_up_busy_` in on its own pass (service_catch_up_report).
   catch_up_input_.disarm();
   catch_up_window_.clear();
   catch_up_busy_.store(false, std::memory_order_release);
@@ -2096,13 +2363,54 @@ void Daemon::republish_after_rescan()
     std::fprintf(stderr, "[namchaind] library rescanned, but the rig did not republish: %s\n", error.c_str());
 }
 
-bool Daemon::publish_document(const graph::Document& document, const std::string& path, const std::string& source,
-                              const std::string& base_dir, std::string& error, std::string* error_code,
-                              bool admit_over_budget, bool lite_first, const CatchUpPlan* catch_up)
+/// \brief What a prepare produced, as a string a second prepare can be compared against.
+///
+/// A publish prepared on one thread and installed on another (P8's Full) is only valid if nothing it
+/// depended on moved in between: the resolved document, which models the budget trimmed, the warm
+/// documents the charge was computed for, and the generation the plans were built for. This is that
+/// check -- one string, built the same way both times.
+std::unique_ptr<PlanSlot> Daemon::compile_chain_slot(const graph::Graph& graph, const render::CompileOptions& options,
+                                                     uint64_t generation, int input_channel, int output_channel,
+                                                     bool catch_up, std::string& error)
 {
-  // A catch-up publish is the Full of a `lite_first` request: its plans are replayed into before they
-  // are heard (P8), which is only possible if they are the plan's own state to begin with.
-  const bool catching_up = catch_up != nullptr && catch_up->replayable;
+  auto slot = std::make_unique<PlanSlot>(kArenaBytes);
+  slot->plan = graph::RenderPlan::compile(graph, options, slot->arena, error);
+  if (slot->plan == nullptr)
+    return nullptr;
+  // The first process() call on a freshly built node is tens of times its steady-state cost, and a
+  // stall that long can drain the device ring. It is control-thread work -- or catch-up-thread work,
+  // which is also off the render path -- before publication (plan.md §3.3).
+  slot->plan->prewarm();
+  slot->input_channel = input_channel;
+  slot->output_channel = output_channel;
+  slot->generation = generation;
+  // P8: this plan has never rendered, so its state is silence. The catch-up thread replays the input
+  // the device has just been playing into it before the render thread is allowed to fade it in; until
+  // then the render thread holds it in `pending`.
+  if (catch_up)
+    slot->catch_up.store(true, std::memory_order_release);
+  return slot;
+}
+
+std::string Daemon::publish_stamp(const PreparedPublish& prepared)
+{
+  std::string stamp = graph::document_to_json(prepared.resolved);
+  stamp += "\n#warm=" + std::to_string(prepared.cost.warm_documents);
+  stamp += "\n#gen=" + std::to_string(prepared.generation);
+  stamp += "\n#catch=" + std::string(prepared.catching_up ? "1" : "0");
+  stamp += "\n#slim=";
+  for (const CostedNode& node : prepared.cost.nodes)
+  {
+    if (node.slimmed)
+      stamp += std::to_string(node.chain_index) + "," + std::to_string(node.node_index) + ";";
+  }
+  return stamp;
+}
+
+bool Daemon::prepare_publish(const graph::Document& document, const std::string& path, const std::string& source,
+                             const std::string& base_dir, bool admit_over_budget, bool lite_first, bool catching_up,
+                             PreparedPublish& prepared, std::string& error, std::string* error_code)
+{
   const graph::Validation validation = graph::validate(document);
   if (!validation.ok)
   {
@@ -2213,23 +2521,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     }
   }
 
-  if (changed_count == 0 && published_slots_.size() == document.chains.size())
-  {
-    // Nothing about the running document would change. Where it came from is still worth recording --
-    // it is what a later patch republishes under -- but the generation does not advance, because no
-    // new plan exists and a client that polls for adoption should not see one.
-    current_rig_ = path;
-    current_source_ = source;
-    current_base_dir_ = base_dir;
-    current_name_ = document.name;
-    current_document_ = document;
-    missing_assets_ = std::move(missing);
-    cost_ = std::move(cost);
-  last_publish_at_ = std::chrono::steady_clock::now();
-    last_publish_at_ = std::chrono::steady_clock::now();
-    last_transitions_.clear();
-    return true;
-  }
+  prepared.unchanged = changed_count == 0 && published_slots_.size() == document.chains.size();
 
   for (const graph::Chain& chain : document.chains)
   {
@@ -2255,8 +2547,70 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   const int fade_frames = std::clamp(
     static_cast<int>(std::llround(config_.fade_ms * static_cast<double>(rate) / 1000.0)), 1, kMaxTransitionFrames);
 
-  const uint64_t generation = generation_ + 1;
-  const std::size_t count = document.chains.size();
+
+  prepared.document = document;
+  prepared.resolved = std::move(resolved);
+  prepared.missing = std::move(missing);
+  prepared.cost = cost;
+  prepared.changed = std::move(changed);
+  prepared.changed_count = changed_count;
+  prepared.fade_frames = fade_frames;
+  prepared.generation = generation_;
+  prepared.count = document.chains.size();
+  prepared.options = options;
+  prepared.path = path;
+  prepared.source = source;
+  prepared.base_dir = base_dir;
+  prepared.name = document.name;
+  prepared.admit_over_budget = admit_over_budget;
+  prepared.lite_first = lite_first;
+  prepared.catching_up = catching_up;
+  prepared.stamp = publish_stamp(prepared);
+  return true;
+}
+
+bool Daemon::publish_document(const graph::Document& document, const std::string& path, const std::string& source,
+                              const std::string& base_dir, std::string& error, std::string* error_code,
+                              bool admit_over_budget, bool lite_first, const CatchUpPlan* catch_up,
+                              PrebuiltPlans* prebuilt)
+{
+  // A catch-up publish is the Full of a `lite_first` request: its plans are replayed into before they
+  // are heard (P8), which is only possible if they are the plan's own state to begin with.
+  const bool catching_up = catch_up != nullptr && catch_up->replayable;
+
+  // Everything that needs this thread's caches and no model load: validate, resolve, cost, and which
+  // chains changed. Separated because P8's Full is *compiled* on the catch-up thread and installed
+  // here, and both halves have to agree about what is being published -- the stamp is how they check.
+  PreparedPublish prepared;
+  if (!prepare_publish(document, path, source, base_dir, admit_over_budget, lite_first, catching_up, prepared,
+                       error, error_code))
+    return false;
+
+  if (prepared.unchanged)
+  {
+    // Nothing about the running document would change. Where it came from is still worth recording --
+    // it is what a later patch republishes under -- but the generation does not advance, because no
+    // new plan exists and a client that polls for adoption should not see one.
+    current_rig_ = prepared.path;
+    current_source_ = prepared.source;
+    current_base_dir_ = prepared.base_dir;
+    current_name_ = prepared.name;
+    current_document_ = prepared.document;
+    missing_assets_ = std::move(prepared.missing);
+    cost_ = std::move(prepared.cost);
+    last_publish_at_ = std::chrono::steady_clock::now();
+    last_transitions_.clear();
+    return true;
+  }
+
+  graph::Document& resolved = prepared.resolved;
+  CostOutcome& cost = prepared.cost;
+  std::vector<bool>& changed = prepared.changed;
+  const int fade_frames = prepared.fade_frames;
+  const uint64_t generation = prepared.generation + 1;
+  const std::size_t count = prepared.count;
+  const render::CompileOptions& options = prepared.options;
+
   // Per chain: the slot to push (none for a chain that is unchanged, or that only ramps), and what the
   // chain's published plan becomes. Ramps are pushed after every plan, resolved against the plan whose
   // node indices they carry.
@@ -2438,25 +2792,22 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
 
     if (!planned)
     {
-      // The whole chain, as it always was: a fresh plan, dual-rendered and crossfaded by the render thread.
-      auto slot = std::make_unique<PlanSlot>(kArenaBytes);
-      slot->plan = graph::RenderPlan::compile(chain.graph, options, slot->arena, error);
-      if (slot->plan == nullptr)
+      // The whole chain, as it always was: a fresh plan, dual-rendered and crossfaded by the render
+      // thread. A plan already compiled for exactly this chain -- P8's Full, compiled on the catch-up
+      // thread while the Lite played -- is taken instead; the caller has vouched for it by stamp.
+      std::unique_ptr<PlanSlot> slot;
+      if (prebuilt != nullptr && i < prebuilt->size() && (*prebuilt)[i] != nullptr)
+        slot = std::move((*prebuilt)[i]);
+      else
       {
-        error = "chain '" + chain.id + "': " + error;
-        return false;
+        slot = compile_chain_slot(chain.graph, options, generation, chain.input_channel, chain.output_channel,
+                                  catching_up, error);
+        if (slot == nullptr)
+        {
+          error = "chain '" + chain.id + "': " + error;
+          return false;
+        }
       }
-      // The first process() call on a freshly built node is tens of times its steady-state cost, and a
-      // stall that long can drain the device ring. It is control-thread work, before publication (§3.3).
-      slot->plan->prewarm();
-      slot->input_channel = chain.input_channel;
-      slot->output_channel = chain.output_channel;
-      slot->generation = generation;
-      // P8: this plan has never rendered, so its state is silence. The catch-up thread replays the
-      // input the device has just been playing into it before the render thread is allowed to fade it
-      // in; until then the render thread holds it in `pending`.
-      if (catching_up)
-        slot->catch_up.store(true, std::memory_order_release);
       finals[i] = slot.get();
       built[i] = std::move(slot);
       ++plans_built;
@@ -2509,7 +2860,7 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   current_name_ = document.name;
   current_document_ = document;
   current_resolved_ = std::move(resolved);
-  missing_assets_ = std::move(missing);
+  missing_assets_ = std::move(prepared.missing);
   cost_ = std::move(cost);
   last_publish_at_ = std::chrono::steady_clock::now();
   published_slots_ = std::move(raw);
@@ -5253,6 +5604,14 @@ std::string Daemon::handle_request(const std::string& request)
 
 std::string Daemon::handle_request(const std::string& request, Session& session)
 {
+  // The control thread's housekeeping, done before it answers anything: a Full the catch-up thread has
+  // finished compiling is installed here (its install is a publish, which needs this thread), and the
+  // two-step publish's report is folded in from the catch-up thread's counters. It is what makes a
+  // `lite_first` publish finish even when nobody is polling -- and what makes `engine.status` describe
+  // the Lite while the Full is still being compiled (D6).
+  service_async_full();
+  service_catch_up_report();
+  clear_lite_first_when_adopted();
   // The health summary: one field for a light to bind to, and the reasons behind it as stable codes a
   // client maps to its own words rather than parsing (docs/ui-integration-plan.md §1.6). Issues are
   // *current state*: one that stops being true disappears, which is why the cumulative counters are
@@ -6708,6 +7067,13 @@ int Daemon::run()
     // A warm switch moves which document is audible without a publish, so this is where the control
     // thread's view of "the running document" catches up with it. Cheap when nothing moved.
     sync_warm_switch();
+
+    // P8's Full, on its way in without this thread having compiled it: install it when the catch-up
+    // thread has finished, fold in what the replay did, and end `cost.lite_first` once the render
+    // thread is playing the Full rather than the Lite that stood in for it (D6).
+    service_async_full();
+    service_catch_up_report();
+    clear_lite_first_when_adopted();
 
     // D3's failsafe (2026-10-09): the coexistence charge is a measurement, and this is what happens
     // when the measurement was wrong for this rig -- the warm set goes rather than the deadline.

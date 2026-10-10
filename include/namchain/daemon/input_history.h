@@ -126,6 +126,13 @@ public:
     tail_.store(tail + 1, std::memory_order_release);
   }
 
+  /// Whether the producer has published a block the consumer has not taken yet. A peek, for a
+  /// consumer deciding whether it has reached the newest history or is merely behind it.
+  bool has_data() const noexcept
+  {
+    return tail_.load(std::memory_order_relaxed) != head_.load(std::memory_order_acquire);
+  }
+
   /// Drop the consumer's position: everything already written is skipped, so a window taken next
   /// starts from the newest block. Used when a catch-up begins and the ring's older content is not
   /// wanted. Consumer only.

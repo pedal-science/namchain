@@ -445,6 +445,67 @@ private:
   bool publish_lite_first(const graph::Document& document, const std::string& path, const std::string& source,
                           const std::string& base_dir, std::string& error, std::string* error_code,
                           bool admit_over_budget, nlohmann::json* report);
+  /// \brief A document worked out as far as this thread's caches can take it, before a model is
+  /// loaded.
+  ///
+  /// `publish_document` is prepare -> compile -> install, and P8's Full splits it across two threads:
+  /// the control thread prepares (validate, resolve, cost, which chains changed) and installs, while
+  /// the catch-up thread compiles the plans. Nothing here is the daemon's published state -- it is a
+  /// *candidate* one, and it only becomes the engine's when `publish_document` installs it.
+  struct PreparedPublish
+  {
+    graph::Document document; ///< as the client wrote it
+    graph::Document resolved; ///< references resolved, and models trimmed by the budget
+    std::vector<assets::MissingAsset> missing;
+    CostOutcome cost;
+    std::vector<bool> changed; ///< per chain, against the document that is running
+    std::size_t changed_count = 0;
+    /// Nothing would change and the chain count matches: the publish is a no-op that only records
+    /// where the document came from.
+    bool unchanged = false;
+    int fade_frames = 0;
+    uint64_t generation = 0; ///< the generation the plans will be built for (`generation_ + 1`)
+    std::size_t count = 0;
+    render::CompileOptions options;
+    std::string path, source, base_dir, name;
+    bool admit_over_budget = false;
+    bool lite_first = false;
+    bool catching_up = false;
+    /// Everything above that a compile depends on, as one string: how a publish compiled on another
+    /// thread is checked against the document it is installed for.
+    std::string stamp;
+  };
+
+  /// \brief Plans compiled off the control thread, indexed by chain (null where there are none).
+  ///
+  /// What the catch-up thread hands back for P8's Full: the publish still validates, costs and
+  /// installs them -- it just does not spend the compile in the control loop, which is what lets
+  /// `engine.status` describe the Lite that is playing (D6).
+  using PrebuiltPlans = std::vector<std::unique_ptr<PlanSlot>>;
+
+  /// \brief Everything a publish decides before it loads a model. Control thread.
+  ///
+  /// \param catching_up the document is the Full of a `lite_first` request: its chains are compiled
+  /// whole (never as local transitions, which share node instances with the plan that is playing) and
+  /// marked for the catch-up.
+  /// \param prepared the candidate publish; untouched on failure except where an error is reported.
+  bool prepare_publish(const graph::Document& document, const std::string& path, const std::string& source,
+                       const std::string& base_dir, bool admit_over_budget, bool lite_first, bool catching_up,
+                       PreparedPublish& prepared, std::string& error, std::string* error_code);
+
+  /// \brief What a prepare produced, as one string a second prepare can be compared against. See
+  /// \ref PreparedPublish::stamp.
+  static std::string publish_stamp(const PreparedPublish& prepared);
+
+  /// \brief Compile one chain's plan into a slot, off any publish state. Safe on a worker thread.
+  ///
+  /// The single home for "a whole chain, prewarmed, bound and optionally marked for the catch-up":
+  /// `publish_document` calls it on the control thread, the catch-up thread calls it for P8's Full.
+  static std::unique_ptr<PlanSlot> compile_chain_slot(const graph::Graph& graph,
+                                                      const render::CompileOptions& options, uint64_t generation,
+                                                      int input_channel, int output_channel, bool catch_up,
+                                                      std::string& error);
+
   /// \brief Compile every chain of \p document, prewarm the plans, and publish them together.
   ///
   /// Control thread. All-or-nothing: if any chain fails to compile, or its channels are not available,
@@ -476,7 +537,8 @@ private:
   bool publish_document(const graph::Document& document, const std::string& path, const std::string& source,
                         const std::string& base_dir, std::string& error,
                         std::string* error_code = nullptr, bool admit_over_budget = false,
-                        bool lite_first = false, const CatchUpPlan* catch_up = nullptr);
+                        bool lite_first = false, const CatchUpPlan* catch_up = nullptr,
+                        PrebuiltPlans* prebuilt = nullptr);
   /// \brief Resolve a `set_param` against a chain's newest published plan and push it on the ring.
   ///
   /// \param chain_id the chain to resolve against, or empty to resolve by node id -- which is an error
@@ -736,6 +798,11 @@ private:
     /// (another catch-up was still running), `abandoned` (the render thread gave up waiting and
     /// faded the Full in anyway). Empty until a catch-up has been tried or deliberately not tried.
     std::string replay = "none";
+    /// Where the two-step publish's Full is: `idle`, `preparing` (prepared, waiting for the compile),
+    /// `compiling`, `published`, `unchanged`, `refused`, `superseded` or `catching_up`. This is the
+    /// half of D6's visibility that the *reply* cannot carry once the compile moves off the control
+    /// thread: a client polls `engine.status` and watches the Full arrive.
+    std::string full = "idle";
     std::string detail;
     std::size_t frames = 0; ///< the window the document needs, in engine frames
     std::size_t blocks = 0; ///< blocks replayed (and mirrored) when the report was built
@@ -755,11 +822,6 @@ private:
   /// and asks `catch_up_plan` about the result. Never fails: a document that cannot be resolved gets
   /// `unknown` with the reason, which is what the reply reports.
   CatchUpPlan catch_up_plan_for(const graph::Document& document, const std::string& base_dir);
-  /// \brief Wait, briefly, for the catch-up's replay to have happened so the reply can report it.
-  ///
-  /// Control thread. It waits for the *replay*, not for the fade the render thread starts afterwards:
-  /// the answer to "was the state made exact" is known then, and the Lite is playing throughout.
-  void wait_for_catch_up_replay();
   /// Stop recording, and clear what the last catch-up needed. Control thread; a no-op when nothing is
   /// armed.
   void disarm_catch_up() noexcept;
@@ -770,6 +832,9 @@ private:
   /// The catch-up thread: take a job, drain the history, replay it, keep the plans current until the
   /// render thread takes them over.
   void catch_up_loop();
+  /// One compile, on the catch-up thread: every chain of the Full the control thread prepared. Puts the
+  /// plans on \ref async_full_ and moves it to `AwaitingInstall`.
+  void compile_async_full();
   /// One job, on the catch-up thread.
   void serve_catch_up(const CatchUpJob& job);
   /// Render thread: record this block's decoded capture for a catch-up. One atomic load when none is
@@ -782,6 +847,63 @@ private:
   int catch_up_hold_frames() const noexcept;
   /// Build the `catch_up` object the reply and the status carry.
   nlohmann::json catch_up_json() const;
+  /// \brief The Full of a two-step publish, compiled off the control thread (P8, and D6's visibility).
+  ///
+  /// The control thread's half is the *prepare* -- validate, resolve, cost, which chains changed --
+  /// and the install; the catch-up thread's half is the compile of every chain, which is the seconds
+  /// a client would otherwise spend unable to ask the engine anything. Guarded by \ref catch_up_mutex_,
+  /// because the two threads hand it back and forth.
+  struct AsyncFull
+  {
+    /// Where the hand-over has got to. `Compiling` is the state D6 is about: the Lite is playing, the
+    /// Full's plans do not exist yet, and the control loop is free to answer.
+    enum class Phase
+    {
+      Idle = 0,
+      Compiling,      ///< the catch-up thread is loading models
+      AwaitingInstall,///< compiled; the control thread installs it on its next pass
+      CatchingUp,     ///< installed; the catch-up thread is making its state current
+    };
+
+    Phase phase = Phase::Idle;
+    /// Prepared on the control thread.
+    graph::Document document;
+    std::string path, source, base_dir;
+    bool admit_over_budget = false;
+    CatchUpPlan catch_up;
+    /// \ref PreparedPublish::stamp for the prepare the compile was started from: if a second prepare
+    /// of the same document says something else, the compiled plans are not the ones to install.
+    std::string stamp;
+    render::CompileOptions options;
+    std::vector<graph::Graph> graphs; ///< one per chain, as the compile will read them
+    std::vector<int> input_channel, output_channel;
+    uint64_t generation = 0;
+    /// Compiled on the catch-up thread; moved into the publish by the control thread, and anything
+    /// left over is freed by it.
+    PrebuiltPlans prebuilt;
+    bool compiled = false;
+    std::string compile_error;
+    /// The catch-up job the install produced, handed to the catch-up thread when the install lands.
+    CatchUpJob job;
+  };
+
+  /// \brief Prepare a Full and hand it to the catch-up thread to compile. Control thread.
+  ///
+  /// False when the Full is not one that can follow the Lite at all (over the headroom, an asset that
+  /// has gone, nothing to trim): the caller reports it and the Lite stands, exactly as a synchronous
+  /// second publish would have reported it.
+  bool start_async_full(const graph::Document& document, const std::string& path, const std::string& source,
+                        const std::string& base_dir, bool admit_over_budget, const CatchUpPlan& catch_up,
+                        std::string& error, std::string* error_code);
+  /// \brief Install a compiled Full, if there is one -- called from the control loop and from every
+  /// request, so a quiet daemon still publishes it. Control thread.
+  void service_async_full();
+  /// Fold the catch-up thread's own counters into \ref catch_up_report_. Control thread.
+  void service_catch_up_report();
+  /// \brief Clear `cost.lite_first` once the Full the Lite was standing in for is what the device is
+  /// playing. Control thread; cheap when there is nothing to clear.
+  void clear_lite_first_when_adopted();
+
   /// The catch-up thread as the status reports it: whether it is running, and the ring's counters.
   bool catch_up_thread_running() const noexcept { return catch_up_thread_.joinable(); }
 
@@ -1068,7 +1190,7 @@ private:
   /// The catch-up thread. Started on the first catch-up and parked on a condition variable when
   /// there is none -- a daemon that never publishes with `lite_first` never has it.
   std::thread catch_up_thread_;
-  std::mutex catch_up_mutex_;
+  mutable std::mutex catch_up_mutex_;
   std::condition_variable catch_up_wake_;
   bool catch_up_job_ready_ = false; ///< guarded by \ref catch_up_mutex_
   CatchUpJob catch_up_job_;         ///< guarded by \ref catch_up_mutex_
@@ -1079,6 +1201,9 @@ private:
   std::vector<float> catch_up_scratch_;
   /// What became of the last catch-up. Control thread.
   CatchUpReport catch_up_report_;
+  /// The Full of a two-step publish, being compiled and then caught up off this thread. Guarded by
+  /// \ref catch_up_mutex_, which is also the catch-up thread's parking lock.
+  AsyncFull async_full_;
   /// Which job the fields below belong to, and the outcome the catch-up thread published for it.
   std::atomic<uint64_t> catch_up_job_id_{0};
   std::atomic<uint64_t> catch_up_done_id_{0};
