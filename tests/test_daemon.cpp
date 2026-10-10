@@ -2793,6 +2793,139 @@ TEST_CASE("a lite_first publish whose Lite is already the budget's answer report
   CHECK(status["catch_up"]["replay"] == "none");
 }
 
+TEST_CASE("a model whose memory outlasts the old fixed hold is still caught up exactly")
+{
+  // The pedal's own failure, reproduced on the test backend (2026-10-10). A window that covers a
+  // model's receptive field can only be filled at the speed of the audio clock -- the catch-up thread
+  // holds the newest `frames` of history, so it reaches a covering window `frames` after the plans
+  // exist. The render thread's patience used to be a fixed 12000 frames (250 ms), which is *shorter
+  // than the window* for any model that needs more: it gave up first, took the Full over cold, and
+  // `catch_up.replay` read `no_input` with `blocks: 0` while the fill loop finished a block later
+  // saying `need_met`. vip's model needs 14539 frames, so every `lite_first` press on the board did
+  // exactly that.
+  //
+  // So the case is the *shape* of the failure, not vip's model: a slimmable document whose memory is
+  // longer than `kCatchUpHoldFrames`, published with `lite_first`, from a rig that has been playing
+  // long enough for the ring to hold some history. The assertion is the one the pedal could not meet:
+  // the replay ran, it was exact, and the Full is what the device is playing.
+  TempDir dir;
+  const auto models = dir.path / "models";
+  write_budget_library(models);
+
+  // A2's own two submodels, each with wider dilations: what a replay has to cover is the model's
+  // memory, which `get_receptive_field()` computes from `dilation * (kernel - 1)` -- channels do not
+  // enter it at all -- so scaling the dilations lengthens both submodels by the same amount and keeps
+  // their weights consistent with the files they came from. Small enough to compile here, which vip's
+  // own model is not.
+  nlohmann::json full = nlohmann::json::parse(std::ifstream(models / "A2-Full.nam"));
+  const nlohmann::json lite = nlohmann::json::parse(std::ifstream(std::string(NAMCHAIN_TEST_DATA_DIR) +
+                                                                  "/A2-Lite.nam"));
+  const auto lookback_of = [](const nlohmann::json& model) {
+    const auto path = std::filesystem::temp_directory_path() /
+                      ("namchain-catch-up-model-" + std::to_string(::getpid()) + ".nam");
+    {
+      std::ofstream out(path);
+      out << model.dump();
+    }
+    const namchain::LookbackResult result = namchain::compute_lookback_from_file(path.string());
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+    return result;
+  };
+  const auto with_dilations = [](const nlohmann::json& base, int dilations) {
+    nlohmann::json model = base;
+    for (auto& layer : model["config"]["layers"])
+      if (layer.contains("dilations") && layer["dilations"].is_array())
+        for (auto& d : layer["dilations"])
+          d = d.get<int>() * dilations;
+    return model;
+  };
+
+  nlohmann::json container;
+  container["version"] = full.value("version", std::string("0.7.0"));
+  container["architecture"] = "SlimmableContainer";
+  // The container carries no weights of its own -- its submodels do -- but the .nam loader requires
+  // the key, which is how the vendored `example_models/A2.nam` is written.
+  container["weights"] = nlohmann::json::array();
+  container["sample_rate"] = full.value("sample_rate", 48000);
+  container["config"] = {{"submodels", nlohmann::json::array()}};
+  namchain::LookbackResult lookback;
+  // 4x the old hold, to be unambiguous about which side of it this document is on.
+  const std::size_t want = namchain::daemon::kCatchUpHoldFrames * 4;
+  for (int scale = 2; scale <= 256; scale *= 2)
+  {
+    container["config"]["submodels"] = nlohmann::json::array(
+      {{{"max_value", 0.5}, {"model", with_dilations(lite, scale)}},
+       {{"max_value", 1.0}, {"model", with_dilations(full, scale)}}});
+    lookback = lookback_of(container);
+    if (lookback.ok() && static_cast<std::size_t>(lookback.samples) > want)
+      break;
+  }
+  REQUIRE_MESSAGE(lookback.ok(), lookback.detail);
+  REQUIRE(static_cast<std::size_t>(lookback.samples) > want);
+  {
+    std::ofstream out(models / "long.nam");
+    out << container.dump();
+  }
+  write_file(dir.path / "cost.json", test_cost_table());
+  write_file(dir.path / "rigs" / "long.json", one_amp_rig("long.nam"));
+  const Config config = budget_config(dir);
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  // Play the rig normally first. This is what the ring is for: it is armed by the *second* publish,
+  // and by then the device has been rendering this document long enough that the window can be filled
+  // from history rather than from the clock -- the same history a press reaches the Full through on
+  // the pedal (the Lite is what plays while the Full compiles).
+  const auto plain = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.load","rig":"long.json"})"));
+  REQUIRE_MESSAGE(plain["ok"] == true, plain.dump());
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["blocks"].get<uint64_t>() > 100;
+  }));
+
+  const auto loaded = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.load","rig":"long.json","lite_first":true})"));
+  REQUIRE_MESSAGE(loaded["ok"] == true, loaded.dump());
+  // The document's own answer, and the hold that answer needs: the reply's `catch_up.frames` is the
+  // model's memory, and the status's `hold_frames` is what the render thread will wait for it.
+  CHECK(loaded["lite_first"] == true);
+  CHECK(loaded["full"]["catch_up"]["state"] == "exact");
+  CHECK(loaded["full"]["catch_up"]["frames"] == static_cast<std::size_t>(lookback.samples));
+
+  REQUIRE(wait_for_full(config.socket_path));
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["catch_up"]["state"] == "exact");
+  CHECK(status["catch_up"]["replay"] == "exact");
+  CHECK(status["catch_up"]["blocks"].get<std::size_t>() > 1);
+  CHECK(status["catch_up"]["progress"] == "done");
+  CHECK(status["catch_up"]["fill"] == "need_met");
+  CHECK(status["catch_up"]["hold_frames"].get<std::size_t>() >=
+        static_cast<std::size_t>(lookback.samples));
+  // The history was fed and drained, and nothing was dropped: a window with a hole would have been
+  // reported as `gap` rather than `exact`, but saying the ring did its job is the point of the report.
+  CHECK(status["catch_up"]["ring"]["written"].get<uint64_t>() > 0);
+  CHECK(status["catch_up"]["ring"]["consumed"].get<uint64_t>() > 0);
+  CHECK(status["catch_up"]["ring"]["dropped"] == 0);
+  CHECK(status["catch_up"]["period_mismatch"] == 0);
+  CHECK(status["catch_up"]["window"]["contiguous"].get<std::size_t>() >=
+        status["catch_up"]["window"]["need"].get<std::size_t>());
+  CHECK(status["cost"]["lite_first"] == false);
+}
+
 TEST_CASE("rig.cost answers what a rig would cost, without publishing or compiling it")
 {
   // D9's boundary in one call: the engine owns what a cost means, so the service that owns the bank

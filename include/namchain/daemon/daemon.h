@@ -218,6 +218,16 @@ struct PlanSlot
   /// Blocks the catch-up thread has replayed or mirrored into this plan: what the replay cost and
   /// what a report can show.
   std::atomic<uint64_t> catch_up_blocks{0};
+  /// \brief How long the render thread will hold this plan in `pending` before it takes it over
+  /// anyway, in frames. Set by the control thread when the catch-up job is handed over, and read by
+  /// the render thread every block: a plain `int` because it is written before the plan is published
+  /// and never again, so the publication is the barrier (the same reason \ref input_channel is).
+  ///
+  /// This is the chain's own memory plus \ref kCatchUpHoldMarginFrames, floored at
+  /// \ref kCatchUpHoldFrames: a window that covers a model's receptive field is filled at the speed
+  /// of the audio clock, so a fixed hold shorter than the field expires before there is anything to
+  /// replay (2026-10-10, and the reason every pedal `lite_first` press reported `no_input`).
+  int catch_up_hold_frames = 0;
 };
 
 /// The widest device whose levels are measured, per direction. Eight is the pedal's stereo interface
@@ -807,6 +817,10 @@ private:
     std::size_t frames = 0; ///< the window the document needs, in engine frames
     std::size_t blocks = 0; ///< blocks replayed (and mirrored) when the report was built
     bool running = false;   ///< a catch-up job is in flight
+    /// How long the render thread will hold the Full waiting for that replay, in frames: the longest
+    /// of the chains' own budgets (`PlanSlot::catch_up_hold_frames`). Reported because it is the
+    /// bound that decides `abandoned` against `exact`, and it is not a constant any more.
+    std::size_t hold_frames = 0;
     /// \brief Where the *catch-up thread* had got to when this report was folded in: `idle` (no job
     /// yet), `filling` (draining the ring into a window that covers), `replaying` (feeding the plans),
     /// `mirroring` (keeping them current until the render thread takes them over), `done`.
@@ -876,6 +890,11 @@ private:
   void advance_catch_up(DocRuntime& doc, int frames) noexcept;
   /// How long a catch-up plan may be held before the render thread gives up, in frames.
   int catch_up_hold_frames() const noexcept;
+  /// \brief How long the render thread will hold a catch-up plan whose chain needs \p chain_frames of
+  /// input: \ref kCatchUpHoldMarginFrames above the chain's own memory, at least
+  /// \ref kCatchUpHoldFrames, at most \ref kMaxCatchUpHoldFrames, rounded to a whole device period.
+  /// Control thread, when a catch-up job is handed over. See `PlanSlot::catch_up_hold_frames`.
+  int catch_up_hold_budget_frames(std::size_t chain_frames) const noexcept;
   /// Build the `catch_up` object the reply and the status carry.
   nlohmann::json catch_up_json() const;
   /// \brief The Full of a two-step publish, compiled off the control thread (P8, and D6's visibility).

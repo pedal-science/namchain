@@ -905,8 +905,14 @@ rather than merely faded in. It is here now, in four pieces:
    produces, so the gap the compile left is closed by the same input the device is hearing rather than
    by a guess. A plan is only ever executed by one of the two: `PlanSlot::catch_up_owner` is claimed
    before each block and released after, the render thread claims it before it crossfades. Patience is
-   bounded (`kCatchUpHoldFrames`, a quarter of a second): past it the Full is crossfaded in with
-   whatever state it has, and `catch_up.replay` says `abandoned`.
+   bounded, and the bound is **the chain's own memory plus a quarter of a second**: past it the Full is
+   crossfaded in with whatever state it has, and `catch_up.replay` says `abandoned`. It has to be at
+   least the document's memory, because that is how long a covering window takes to *fill* — the ring
+   holds the newest `frames` of input, so it reaches one at the speed of the audio clock. A fixed
+   quarter of a second was shorter than the window for vip's model (14539 frames, 303 ms), so the render
+   thread gave up before the replay could run and every `lite_first` press on the pedal published a cold
+   Full: `catch_up.replay: no_input`, `catch_up.blocks: 0` (2026-10-10; `tests/test_daemon.cpp`, "a model
+   whose memory outlasts the old fixed hold is still caught up exactly").
 4. **The fade is the ordinary one, and the ordinary one is compensated.** `rt::Crossfade` normalises its
    equal-power weights by the correlation it measures from the first block, which is the law E2 measured
    (bench `--fade-shape compensated`, the bench's default); the bench's *unshaped* shape is its
@@ -923,8 +929,29 @@ rather than merely faded in. It is here now, in four pieces:
               "full": "published",  // where the two-step publish's Full is: compiling, published,
                                     // unchanged, refused, ...
               "frames": 6347,       // engine frames of input the models need replayed
+              "hold_frames": 18432, // how long the render thread will hold the Full for that replay
               "blocks": 101,        // blocks replayed and mirrored when the status was built
               "running": false, "detail": "…" }   // detail when something is not exact, or not exact enough
+```
+
+`engine.status`'s `catch_up` carries three more fields beside those, and they are the *history's* own
+account rather than the plan's — the difference between a replay that never ran because the ring was
+empty, one that never ran because the window never covered, and one that ran imperfectly. Every field is
+a counter with one writer, so a poll can be read as a delta across a press:
+
+```jsonc
+"ring":   { "armed": true, "configured": true, "block_frames": 64, "channels": 2, "blocks": 1024,
+            "written": 684, "consumed": 684, "dropped": 0, "head": 684, "tail": 684,
+            "newest_seq": 59662, "oldest_seq": 59662 },  // one increment each on the render path,
+                                                         // beside the store that was already there
+"window": { "held": 228, "contiguous": 228, "blocks": 256, "need": 228 },  // what the catch-up thread
+                                                         // built: `need` above `contiguous` is a hole,
+                                                         // `need` above `held` is a window still filling
+"progress": "done",              // idle, filling, replaying, mirroring, done: where that thread is
+"fill": "need_met",              // why it left the fill: need_met, drained_head, deadline, unarmed, quit
+"history_block_frames": 64,      // what the recording was sized for, against what the device renders:
+"device_period_size": 64,        //   a device whose period is not the one the history was sized for
+"period_mismatch": 0             //   records nothing, and this counter is the only trace that leaves
 ```
 
 `engine.status` carries the same object as `catch_up`, which is what makes the stand-in and its outcome

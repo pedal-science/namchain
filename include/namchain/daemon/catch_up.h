@@ -48,14 +48,42 @@ inline constexpr std::size_t kMaxCatchUpFrames = 1u << 17;
 /// window (reported, not hidden) rather than promising a state it does not have.
 inline constexpr std::size_t kCatchUpSlackFrames = 48000;
 
-/// \brief How long the render thread holds a Full that is being caught up before it gives up and
-/// crossfades it in anyway, in frames.
+/// \brief How long the render thread holds a Full that is being caught up, in frames: the *floor*,
+/// which a document whose memory is longer than this raises.
 ///
 /// A quarter of a second at 48 kHz: long enough for a replay and the handful of blocks it takes the
 /// catch-up thread to be current, short enough that a press is never left on the Lite for a
 /// noticeable time. The plan is taken over whatever state it is in at that point, and the reply says
 /// the catch-up was abandoned (`full.catch_up.state`).
+///
+/// **The floor is not the budget** (2026-10-10). A replay can only be exact from a window as long as
+/// the model's memory, and on the pedal that window is filled at the speed of the audio clock: the
+/// catch-up thread holds the newest `frames` of history, so it reaches a covering window `frames`
+/// after the plans exist, not before. A document whose memory is longer than this constant therefore
+/// *cannot* be replayed inside it -- the render thread gave up first, took the plan over cold, and
+/// `catch_up.replay` said `no_input` with the window one block short of covering. That is what the
+/// pedal did on every `lite_first` press: vip's model needs 14539 frames (303 ms) against this 12000
+/// (250 ms). The budget is \ref kCatchUpHoldFrames plus the chain's own memory, which is what
+/// \ref Daemon::start_catch_up_job gives each slot.
 inline constexpr std::size_t kCatchUpHoldFrames = 12000;
+
+/// \brief What the render thread's patience adds to a chain's own replay length, in frames.
+///
+/// The replay itself is not real-time work (it is whole blocks fed as fast as the plan takes them),
+/// so what this covers is the fill's own resolution, the replay of `frames` samples through the
+/// nodes, and the handover -- a quarter of a second at 48 kHz, which is the old whole budget. It is
+/// headroom, not a wait: a catch-up that is ready sooner is taken over sooner, because the render
+/// thread's condition is the plan's own sequence and this only bounds how long it will wait.
+inline constexpr std::size_t kCatchUpHoldMarginFrames = 12000;
+
+/// \brief The longest a chain may be held waiting for its catch-up, in frames.
+///
+/// \ref kCatchUpHoldFrames plus \ref kCatchUpHoldMarginFrames plus the longest replay the engine
+/// promises (\ref kMaxCatchUpFrames): about 3.3 s at 48 kHz. Not a constant the render thread uses --
+/// it uses the per-chain budget \ref PlanSlot::catch_up_hold_frames -- but the bound the control
+/// thread builds that budget inside.
+inline constexpr std::size_t kMaxCatchUpHoldFrames =
+  kMaxCatchUpFrames + kCatchUpHoldMarginFrames + kCatchUpHoldFrames;
 
 /// One chain's share of a catch-up.
 struct CatchUpChain

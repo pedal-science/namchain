@@ -1896,6 +1896,7 @@ void Daemon::service_async_full()
   // shows stays true across the catch-up as well; `clear_lite_first_when_adopted` is what ends it.
   cost_.lite_first = true;
 
+  std::size_t hold_frames = 0;
   CatchUpJob job;
   job.window_frames = catch_up_plan.window_frames;
   for (std::size_t i = 0; i < published_slots_.size() && job.chain_count < kMaxChains; ++i)
@@ -1907,6 +1908,13 @@ void Daemon::service_async_full()
     job.channel[job.chain_count] = slot->input_channel;
     job.frames[job.chain_count] =
       i < catch_up_plan.chains.size() ? catch_up_plan.chains[i].frames : catch_up_plan.window_frames;
+    // P8's patience, per chain, before the render thread gives up on the replay (2026-10-10). The
+    // window that covers a model's receptive field is filled at the speed of the audio clock, so the
+    // hold has to be at least that long -- a fixed quarter second expired first on the pedal, and the
+    // plan was taken over cold with the window one block short. Written here, before the job is handed
+    // over, so the render thread's publication of the slot is the only barrier needed.
+    slot->catch_up_hold_frames = catch_up_hold_budget_frames(job.frames[job.chain_count]);
+    hold_frames = std::max<std::size_t>(hold_frames, static_cast<std::size_t>(slot->catch_up_hold_frames));
     ++job.chain_count;
   }
   if (job.chain_count == 0)
@@ -1925,6 +1933,7 @@ void Daemon::service_async_full()
   }
 
   catch_up_report_.replay = "running";
+  catch_up_report_.hold_frames = hold_frames;
   start_catch_up_job(job);
 }
 
@@ -2002,6 +2011,7 @@ nlohmann::json Daemon::catch_up_json() const
   json["frames"] = catch_up_report_.frames;
   json["blocks"] = catch_up_report_.blocks;
   json["running"] = catch_up_report_.running;
+  json["hold_frames"] = catch_up_report_.hold_frames;
   if (!catch_up_report_.detail.empty())
     json["detail"] = catch_up_report_.detail;
 
@@ -2040,6 +2050,21 @@ int Daemon::catch_up_hold_frames() const noexcept
   if (period == 0)
     period = config_.period_size;
   const std::size_t blocks = std::max<std::size_t>(1, kCatchUpHoldFrames / std::max(1u, period));
+  return static_cast<int>(blocks * period);
+}
+
+int Daemon::catch_up_hold_budget_frames(std::size_t chain_frames) const noexcept
+{
+  // The chain's memory plus the margin, floored at the old fixed hold and bounded by
+  // `kMaxCatchUpHoldFrames`. Rounded up to a whole block, because the render thread counts in blocks
+  // and a budget that is not a multiple of the period can expire half a block early.
+  unsigned period = active_period_.load();
+  if (period == 0)
+    period = config_.period_size;
+  period = std::max(1u, period);
+  const std::size_t want = std::min(kMaxCatchUpHoldFrames, chain_frames + kCatchUpHoldMarginFrames);
+  const std::size_t at_least = std::max<std::size_t>(kCatchUpHoldFrames, want);
+  const std::size_t blocks = (at_least + period - 1) / period;
   return static_cast<int>(blocks * period);
 }
 
@@ -2391,10 +2416,16 @@ void Daemon::advance_catch_up(DocRuntime& doc, int frames) noexcept
       continue;
 
     // Bounded patience: a catch-up that never arrives must not leave the player on the Lite for ever.
+    // The bound is this chain's own -- its memory plus a margin, floored at `kCatchUpHoldFrames` --
+    // because the window it is waiting for is filled at the speed of the audio clock (see
+    // `PlanSlot::catch_up_hold_frames`). It is a *bound*, not a wait: the takeover below happens the
+    // block the plan's own sequence becomes current, which is normally the same block the window
+    // covers.
     if (!slot->catch_up_abandoned.load(std::memory_order_relaxed))
     {
       chain.catch_up_frames_held += frames;
-      if (chain.catch_up_frames_held > catch_up_hold_frames())
+      const int budget = slot->catch_up_hold_frames > 0 ? slot->catch_up_hold_frames : catch_up_hold_frames();
+      if (chain.catch_up_frames_held > budget)
         slot->catch_up_abandoned.store(true, std::memory_order_release);
     }
 
