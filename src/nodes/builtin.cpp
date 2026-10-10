@@ -1298,8 +1298,11 @@ const ParamDesc kBiquadParams[] = {
   // No maximum: the real limit is Nyquist at whatever rate the rig runs at, which the schema does not
   // know and a fixed 20 kHz would get wrong at 96 kHz. The node's own check owns that bound and says
   // so, which is the difference between a schema limit and an engine limit.
+  //
+  // 10 Hz is allowed, not merely approached: the macros that drive this (the cuts, the cab) offer it
+  // as their minimum, and a value a macro accepts must compile when the rig is next loaded.
   {.id = "freq", .name = "Frequency", .unit = "Hz", .default_value = 1000.0, .has_min = true,
-   .min = 10.0, .min_inclusive = false, .scale = ParamScale::Log, .rampable = true},
+   .min = 10.0, .scale = ParamScale::Log, .rampable = true},
   {.id = "q", .name = "Q", .default_value = 0.707, .has_min = true, .min = 0.0,
    .min_inclusive = false, .has_max = true, .max = 20.0, .scale = ParamScale::Log, .rampable = true},
   {.id = "gain_db", .name = "Gain", .unit = "dB", .default_value = 0.0, .has_min = true, .min = -30.0,

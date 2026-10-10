@@ -316,13 +316,15 @@ TEST_CASE("every value a macro parameter admits is one its targets admit")
   };
   for (const MacroType* macro : namchain::graph::all_macro_types())
   {
-    CAPTURE(macro->id);
+    const std::string macro_id = macro->id;
+    CAPTURE(macro_id);
     for (int i = 0; i < macro->param_count; ++i)
     {
       const MacroParamDecl& param = macro->params[i];
       if (param.desc.kind != namchain::render::ParamKind::Number)
         continue;
-      CAPTURE(param.desc.id);
+      const std::string param_id = param.desc.id;
+      CAPTURE(param_id);
       // The ends the macro itself admits (an open end is approached, not reached).
       std::vector<double> ends;
       if (param.desc.has_min)
@@ -332,7 +334,8 @@ TEST_CASE("every value a macro parameter admits is one its targets admit")
       for (int t = 0; t < param.target_count; ++t)
       {
         const namchain::graph::MacroTarget& target = param.targets[t];
-        CAPTURE(target.role);
+        const std::string role = target.role;
+        CAPTURE(role);
         const namchain::render::NodeType* target_type = nullptr;
         for (int n = 0; n < macro->node_count; ++n)
         {
