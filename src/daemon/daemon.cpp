@@ -1957,6 +1957,10 @@ void Daemon::service_catch_up_report()
   catch_up_report_.device_period_size =
     device_period != 0 ? device_period : static_cast<int>(active_period_.load(std::memory_order_relaxed));
   catch_up_report_.period_mismatch = catch_up_period_mismatch_.load(std::memory_order_relaxed);
+  catch_up_report_.hold_exact = catch_up_hold_exact_.load(std::memory_order_relaxed);
+  catch_up_report_.hold_abandoned = catch_up_hold_abandoned_.load(std::memory_order_relaxed);
+  catch_up_report_.hold_exact_at = catch_up_hold_exact_at_.load(std::memory_order_relaxed);
+  catch_up_report_.hold_abandoned_at = catch_up_hold_abandoned_at_.load(std::memory_order_relaxed);
 
   if (want == 0)
     return;
@@ -2041,6 +2045,10 @@ nlohmann::json Daemon::catch_up_json() const
   json["history_block_frames"] = catch_up_report_.history_block_frames;
   json["device_period_size"] = catch_up_report_.device_period_size;
   json["period_mismatch"] = catch_up_report_.period_mismatch;
+  json["hold"] = {{"exact", catch_up_report_.hold_exact},
+                  {"abandoned", catch_up_report_.hold_abandoned},
+                  {"exact_at", catch_up_report_.hold_exact_at},
+                  {"abandoned_at", catch_up_report_.hold_abandoned_at}};
   return json;
 }
 
@@ -2426,7 +2434,12 @@ void Daemon::advance_catch_up(DocRuntime& doc, int frames) noexcept
       chain.catch_up_frames_held += frames;
       const int budget = slot->catch_up_hold_frames > 0 ? slot->catch_up_hold_frames : catch_up_hold_frames();
       if (chain.catch_up_frames_held > budget)
+      {
         slot->catch_up_abandoned.store(true, std::memory_order_release);
+        catch_up_hold_abandoned_.fetch_add(1, std::memory_order_relaxed);
+        catch_up_hold_abandoned_at_.store(static_cast<uint64_t>(chain.catch_up_frames_held),
+                                          std::memory_order_relaxed);
+      }
     }
 
     const bool exact = slot->catch_up_seq.load(std::memory_order_acquire) == previous_block;
@@ -2443,6 +2456,11 @@ void Daemon::advance_catch_up(DocRuntime& doc, int frames) noexcept
     // thread is not inside the plan, and the last block it replayed is the one before this one.
     if (!claim_catch_up(slot->catch_up_owner, CatchUpOwner::Render))
       continue;
+    if (exact)
+    {
+      catch_up_hold_exact_.fetch_add(1, std::memory_order_relaxed);
+      catch_up_hold_exact_at_.store(static_cast<uint64_t>(chain.catch_up_frames_held), std::memory_order_relaxed);
+    }
     slot->catch_up.store(false, std::memory_order_release);
     chain.pending = nullptr;
     chain.catch_up_frames_held = 0;

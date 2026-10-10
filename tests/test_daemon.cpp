@@ -2924,6 +2924,11 @@ TEST_CASE("a model whose memory outlasts the old fixed hold is still caught up e
   CHECK(status["catch_up"]["window"]["contiguous"].get<std::size_t>() >=
         status["catch_up"]["window"]["need"].get<std::size_t>());
   CHECK(status["cost"]["lite_first"] == false);
+  // Which way the hand-over went: the replay made the plan exactly current, rather than the render
+  // thread's patience running out and taking it over as it stood (which reports `abandoned`).
+  CHECK(status["catch_up"]["hold"]["exact"].get<uint64_t>() > 0);
+  CHECK(status["catch_up"]["hold"]["abandoned"] == 0);
+
 }
 
 TEST_CASE("rig.cost answers what a rig would cost, without publishing or compiling it")

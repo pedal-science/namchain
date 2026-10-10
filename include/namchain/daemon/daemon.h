@@ -852,6 +852,17 @@ private:
     uint64_t ring_tail = 0;
     uint64_t ring_newest_seq = 0;
     uint64_t ring_oldest_seq = 0;
+    /// \brief Whether the render thread took the Full over because the replay had made it exact, or
+    /// because its patience ran out: the first is `catch_up.replay: exact`, the second `abandoned`.
+    /// Cumulative since the daemon started, and the one pair of counters that says which of the two
+    /// the hand-over was -- `replay` alone cannot, because a plan taken over as `exact` is briefly
+    /// reportable as `abandoned` too if it is held a block longer than it needs to be.
+    uint64_t hold_exact = 0;
+    uint64_t hold_abandoned = 0;
+    /// The block count each last happened at, for "was the replay already current when it was
+    /// abandoned".
+    uint64_t hold_exact_at = 0;
+    uint64_t hold_abandoned_at = 0;
   };
 
   /// \brief Start recording input for a catch-up, and work out nothing else: the job comes later.
@@ -1298,6 +1309,13 @@ private:
   /// Blocks the device thread refused to record since the last arm because `info.period_size` was not
   /// the period the history was sized for.
   std::atomic<uint64_t> catch_up_period_mismatch_{0};
+  /// Which way the render thread's hand-over went, and at which block: the replay made the plan exact
+  /// (`exact`), or its patience ran out (`abandoned`). Cumulative since the last arm, one relaxed
+  /// increment on the render path -- which is two atomics per hand-over, not per block.
+  std::atomic<uint64_t> catch_up_hold_exact_{0};
+  std::atomic<uint64_t> catch_up_hold_abandoned_{0};
+  std::atomic<uint64_t> catch_up_hold_exact_at_{0};
+  std::atomic<uint64_t> catch_up_hold_abandoned_at_{0};
 
   /// \brief The warm document as the control thread sees it: what it was compiled from, what it cost,
   /// and the plans it owns until the warm thread retires them.

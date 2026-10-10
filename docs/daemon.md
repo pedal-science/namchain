@@ -949,6 +949,11 @@ a counter with one writer, so a poll can be read as a delta across a press:
                                                          // `need` above `held` is a window still filling
 "progress": "done",              // idle, filling, replaying, mirroring, done: where that thread is
 "fill": "need_met",              // why it left the fill: need_met, drained_head, deadline, unarmed, quit
+"hold":   { "exact": 1, "abandoned": 0, "exact_at": 49152, "abandoned_at": 0 },  // which way the
+                                 // hand-over went, and how many frames the render thread had held it:
+                                 // `exact` is the replay making the plan current, `abandoned` is its
+                                 // patience running out. `catch_up.replay` alone cannot say -- a plan
+                                 // taken over as exact is briefly reportable as abandoned too
 "history_block_frames": 64,      // what the recording was sized for, against what the device renders:
 "device_period_size": 64,        //   a device whose period is not the one the history was sized for
 "period_mismatch": 0             //   records nothing, and this counter is the only trace that leaves
