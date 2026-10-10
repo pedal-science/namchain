@@ -4899,12 +4899,6 @@ void Daemon::render_loop()
       //     zero until somebody uses it.
       publish_warm_input();
 
-      // 0c. The catch-up's input history (P8), for the same reason and with the same discipline: one
-      //     decoded copy of the capture into a ring, and nothing at all when no two-step publish is
-      //     in flight. This is the buffer that holds *history* -- the warm pool above is a hand-over
-      //     buffer that drops what does not fit, which is why the replay could not use it.
-      write_input_history();
-
       // 1. Every chain's input, on the coordinator. The decode is a per-sample conversion and a
       //    chain's plan cannot start before its input exists, so this is not worth sharing out.
       for (DocRuntime& doc : docs_)
@@ -4964,6 +4958,27 @@ void Daemon::render_loop()
       // 4. What the device is being handed: the audible document's bus, or the crossfade between two
       //    of them while a switch runs. This is also where a switch that has faded out is closed.
       switch_mix(frames);
+
+      // 4b. The catch-up's input history (P8): one decoded copy of this block's capture into a ring,
+      //     and nothing at all when no two-step publish is in flight. The position matters, and it is
+      //     the whole of the hand-over's correctness (2026-10-10):
+      //
+      //     It was written before the plans ran, next to the warm pool. That makes the ring's newest
+      //     block the one the device is rendering *now*, and the catch-up thread -- which feeds the
+      //     Full's plans from it as fast as they are published -- is therefore always one block ahead
+      //     of the condition the render thread takes the plan over on (`catch_up_seq == the block just
+      //     rendered`). The condition could then only be satisfied by winning a race between two
+      //     threads inside one 1.33 ms block, which is lost in the steady state: measured on the pedal,
+      //     the render thread saw `catch_up_seq` exactly one block past the comparison on every check
+      //     of the whole catch-up. The plan was taken over on the patience bound instead, and only
+      //     after that did the comparison agree -- `hold.abandoned: 1`, `hold.exact: 0`.
+      //
+      //     Written here, at the end of the block, the newest block in the ring is the one just
+      //     rendered, so the check at the top of the next block sees exactly the state it requires as
+      //     soon as the catch-up thread has fed it: no race, and the hand-over happens the block the
+      //     window covers. Nothing else reads the ring, and the replay's own block alignment is
+      //     unaffected -- the sequence recorded is the block's either way.
+      write_input_history();
 
       // Global mute, after every chain has run, for the same reason a per-chain mute is a skip.
       if (mute_.load())
