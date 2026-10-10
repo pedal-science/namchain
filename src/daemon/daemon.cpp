@@ -2172,40 +2172,43 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
   }
 
   // 2. Replay it, oldest block first, one plan at a time. Each plan is claimed for the duration, so
-  //    the render thread cannot take one over while it is being fed.
-  bool all_covered = catch_up_window_.covers(need);
-  if (all_covered)
+  //    the render thread cannot take one over while it is being fed. A chain is judged against *its
+  //    own* memory rather than the longest chain's -- they are replayed together but they do not need
+  //    the same history -- and "exact" is only claimed when every one of them was covered.
+  bool any_replayed = false;
+  bool all_covered = true;
+  for (unsigned c = 0; c < job.chain_count; ++c)
   {
-    for (unsigned c = 0; c < job.chain_count; ++c)
+    PlanSlot* slot = job.slots[c];
+    if (slot == nullptr || slot->plan == nullptr || slot->catch_up_abandoned.load(std::memory_order_acquire))
+      continue;
+    if (!claim_catch_up(slot->catch_up_owner, CatchUpOwner::CatchUp))
+      continue; // the render thread has it: it has given up waiting and taken it over
+    const ReplayResult replay =
+      replay_window(*slot->plan, catch_up_window_, static_cast<unsigned>(job.channel[c]), job.frames[c], scratch);
+    if (replay.covered)
     {
-      PlanSlot* slot = job.slots[c];
-      if (slot == nullptr || slot->plan == nullptr || slot->catch_up_abandoned.load(std::memory_order_acquire))
-        continue;
-      if (!claim_catch_up(slot->catch_up_owner, CatchUpOwner::CatchUp))
-        continue; // the render thread has it: it has given up waiting and taken it over
-      const ReplayResult replay =
-        replay_window(*slot->plan, catch_up_window_, static_cast<unsigned>(job.channel[c]), job.frames[c], scratch);
-      if (replay.covered)
-      {
-        // The state is "as of" the last block replayed: one less than the block the render thread
-        // will render next, which is the condition it takes the plan over on.
-        slot->catch_up_seq.store(replay.last_seq, std::memory_order_release);
-        slot->catch_up_blocks.fetch_add(replay.blocks, std::memory_order_relaxed);
-        blocks = std::max(blocks, replay.blocks);
-        frames = std::max(frames, replay.frames);
-      }
-      else
-      {
-        all_covered = false;
-      }
-      release_catch_up(slot->catch_up_owner);
+      // The state is "as of" the last block replayed: one less than the block the render thread
+      // will render next, which is the condition it takes the plan over on.
+      slot->catch_up_seq.store(replay.last_seq, std::memory_order_release);
+      slot->catch_up_blocks.fetch_add(replay.blocks, std::memory_order_relaxed);
+      blocks = std::max(blocks, replay.blocks);
+      frames = std::max(frames, replay.frames);
+      any_replayed = true;
     }
-    outcome = all_covered ? 1 : 2;
+    else
+    {
+      all_covered = false;
+    }
+    release_catch_up(slot->catch_up_owner);
   }
+  if (any_replayed)
+    outcome = all_covered ? 1 : 2;
+  // Nothing replayed at all leaves `outcome` at "no input", which is what the fill loop decided.
 
-  // The render thread is told what the replay was worth before the mirroring starts: the reply to the
-  // request that caused all this waits on it, and the answer is settled the moment the window has been
-  // replayed.
+  // The render thread is told what the replay was worth before the mirroring starts: the device's
+  // hold on the Full is released by the plan's own sequence, and `engine.status` reports the outcome
+  // from that point on.
   catch_up_done_blocks_.store(blocks, std::memory_order_relaxed);
   catch_up_done_frames_.store(frames, std::memory_order_relaxed);
   catch_up_done_outcome_.store(outcome, std::memory_order_release);
