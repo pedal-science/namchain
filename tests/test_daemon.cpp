@@ -2928,7 +2928,21 @@ TEST_CASE("a model whose memory outlasts the old fixed hold is still caught up e
   // thread's patience running out and taking it over as it stood (which reports `abandoned`).
   CHECK(status["catch_up"]["hold"]["exact"].get<uint64_t>() > 0);
   CHECK(status["catch_up"]["hold"]["abandoned"] == 0);
-
+  // And *when*: within a few blocks of the window being covered, not at the patience bound. This is
+  // the assertion that fails when the hand-over decision cannot see the state it needs -- with the old
+  // fixed bound restored, and again when the decision compared the sequence the catch-up thread writes
+  // *after* executing a block, the takeover came at the budget instead (`hold.abandoned` set, while
+  // `replay` stayed `exact` because the window had covered).
+  const uint64_t frames = status["catch_up"]["frames"].get<uint64_t>();
+  const uint64_t at = status["catch_up"]["hold"]["exact_at"].get<uint64_t>();
+  CHECK_MESSAGE(at <= frames + 4 * static_cast<uint64_t>(config.period_size),
+                "the plan was held for " << at << " frames against the " << frames
+                                         << " the window needs: the hand-over missed, and the bound "
+                                            "took it instead");
+  // The plan's own sequences: what the hand-over reads is written after what has been executed, so it
+  // is never behind it.
+  CHECK(status["catch_up"]["seq"]["fed"].get<uint64_t>() >=
+        status["catch_up"]["seq"]["executed"].get<uint64_t>());
 }
 
 TEST_CASE("rig.cost answers what a rig would cost, without publishing or compiling it")

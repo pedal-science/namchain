@@ -875,6 +875,13 @@ private:
     /// abandoned".
     uint64_t hold_exact_at = 0;
     uint64_t hold_abandoned_at = 0;
+    /// \brief How far the replay had fed the plan, and how far the *executed* state had got.
+    ///
+    /// `fed` is what the hand-over decides on (`PlanSlot::catch_up_ready`); `executed` is the state
+    /// itself (`PlanSlot::catch_up_seq`), written just after it. One block apart is the steady state;
+    /// a `fed` that stands still while the device renders is the catch-up thread falling behind.
+    uint64_t fed_seq = 0;
+    uint64_t executed_seq = 0;
   };
 
   /// \brief Start recording input for a catch-up, and work out nothing else: the job comes later.

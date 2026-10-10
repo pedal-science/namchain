@@ -302,6 +302,58 @@ TEST_CASE("every macro declares roles, ports and targets that exist")
   }
 }
 
+TEST_CASE("every value a macro parameter admits is one its targets admit")
+{
+  // A macro range wider than a target's is a value accepted on a knob and refused when the rig is next
+  // compiled: `fx.cab.ir`'s low cut took 10 Hz while the biquad it drives wanted more than 10, so a rig
+  // saved with the knob at its minimum stopped the engine starting.
+  const auto admits = [](const namchain::render::ParamDesc& p, double v) {
+    if (p.has_min && (p.min_inclusive ? v < p.min : v <= p.min))
+      return false;
+    if (p.has_max && (p.max_inclusive ? v > p.max : v >= p.max))
+      return false;
+    return true;
+  };
+  for (const MacroType* macro : namchain::graph::all_macro_types())
+  {
+    CAPTURE(macro->id);
+    for (int i = 0; i < macro->param_count; ++i)
+    {
+      const MacroParamDecl& param = macro->params[i];
+      if (param.desc.kind != namchain::render::ParamKind::Number)
+        continue;
+      CAPTURE(param.desc.id);
+      // The ends the macro itself admits (an open end is approached, not reached).
+      std::vector<double> ends;
+      if (param.desc.has_min)
+        ends.push_back(param.desc.min_inclusive ? param.desc.min : param.desc.min + std::abs(param.desc.min) * 1e-6 + 1e-9);
+      if (param.desc.has_max)
+        ends.push_back(param.desc.max_inclusive ? param.desc.max : param.desc.max - std::abs(param.desc.max) * 1e-6 - 1e-9);
+      for (int t = 0; t < param.target_count; ++t)
+      {
+        const namchain::graph::MacroTarget& target = param.targets[t];
+        CAPTURE(target.role);
+        const namchain::render::NodeType* target_type = nullptr;
+        for (int n = 0; n < macro->node_count; ++n)
+        {
+          if (std::string(macro->nodes[n].role) == target.role)
+            target_type = namchain::render::find_node_type(macro->nodes[n].type);
+        }
+        REQUIRE(target_type != nullptr);
+        const namchain::render::ParamDesc* driven = node_param(*target_type, target.param);
+        REQUIRE(driven != nullptr);
+        for (double end : ends)
+        {
+          const double value = namchain::graph::apply_transform(target.transform, end, target.scale);
+          CAPTURE(end);
+          CAPTURE(value);
+          CHECK(admits(*driven, value));
+        }
+      }
+    }
+  }
+}
+
 TEST_CASE("every declared macro parameter reaches the graph, and only through its targets")
 {
   // The consistency the param map exists to guarantee. Compile with the defaults, compile with one

@@ -1961,6 +1961,18 @@ void Daemon::service_catch_up_report()
   catch_up_report_.hold_abandoned = catch_up_hold_abandoned_.load(std::memory_order_relaxed);
   catch_up_report_.hold_exact_at = catch_up_hold_exact_at_.load(std::memory_order_relaxed);
   catch_up_report_.hold_abandoned_at = catch_up_hold_abandoned_at_.load(std::memory_order_relaxed);
+  // The newest plan the catch-up thread has fed, which is what says whether it is keeping up: read
+  // from the slots themselves rather than from a counter, because a plan is where the value lives.
+  for (std::size_t i = 0; i < published_slots_.size(); ++i)
+  {
+    const PlanSlot* slot = published_slots_[i];
+    if (slot == nullptr || !slot->catch_up.load(std::memory_order_acquire))
+      continue;
+    catch_up_report_.fed_seq = std::max(catch_up_report_.fed_seq,
+                                        slot->catch_up_ready.load(std::memory_order_relaxed));
+    catch_up_report_.executed_seq = std::max(catch_up_report_.executed_seq,
+                                             slot->catch_up_seq.load(std::memory_order_relaxed));
+  }
 
   if (want == 0)
     return;
@@ -2049,6 +2061,7 @@ nlohmann::json Daemon::catch_up_json() const
                   {"abandoned", catch_up_report_.hold_abandoned},
                   {"exact_at", catch_up_report_.hold_exact_at},
                   {"abandoned_at", catch_up_report_.hold_abandoned_at}};
+  json["seq"] = {{"fed", catch_up_report_.fed_seq}, {"executed", catch_up_report_.executed_seq}};
   return json;
 }
 

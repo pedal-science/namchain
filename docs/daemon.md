@@ -954,6 +954,10 @@ a counter with one writer, so a poll can be read as a delta across a press:
                                  // `exact` is the replay making the plan current, `abandoned` is its
                                  // patience running out. `catch_up.replay` alone cannot say -- a plan
                                  // taken over as exact is briefly reportable as abandoned too
+"seq":    { "fed": 49152, "executed": 49088 },  // the block the replay has fed the plan through,
+                                 // against the last block it has executed: one apart is the steady
+                                 // state, and a `fed` that stands still while the device renders is the
+                                 // catch-up thread falling behind
 "history_block_frames": 64,      // what the recording was sized for, against what the device renders:
 "device_period_size": 64,        //   a device whose period is not the one the history was sized for
 "period_mismatch": 0             //   records nothing, and this counter is the only trace that leaves
