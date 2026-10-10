@@ -5122,6 +5122,59 @@ TEST_CASE("the Lite a two-step publish stands in with is a state a client can po
   }
 }
 
+TEST_CASE("a Full that a later publish overtook is dropped, not published over it")
+{
+  // The Full is compiled in the background, so a client can publish something else while it is in
+  // flight. Installing the Full afterwards would undo that publish -- the one the client asked for
+  // *last* -- which is the one outcome a background publish must never have. The Full is dropped
+  // instead, and `catch_up.full` says so rather than leaving the stand-in unexplained.
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
+  write_file(dir.path / "rigs" / "slimmable.json", one_amp_rig("A2"));
+  write_file(dir.path / "rigs" / "after.json", one_amp_rig("A2-Full"));
+  const Config config = budget_config(dir);
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const auto lite = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.load","rig":"slimmable.json","lite_first":true})"));
+  REQUIRE_MESSAGE(lite["ok"] == true, lite.dump());
+  REQUIRE(lite["full"]["state"] == "compiling");
+
+  // The publish that overtakes it. It is an ordinary publish of another rig, so what is running when
+  // the dust settles is this one -- with no Full arriving behind it.
+  const auto after = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.load","rig":"after.json"})"));
+  REQUIRE_MESSAGE(after["ok"] == true, after.dump());
+  const uint64_t after_generation = after["generation"].get<uint64_t>();
+
+  const bool superseded = wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["catch_up"]["full"] == "superseded";
+  });
+  CHECK_MESSAGE(superseded, "the overtaken Full was not reported as dropped");
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["generation"] == after_generation);
+  CHECK(status["rig"].get<std::string>().find("after.json") != std::string::npos);
+  CHECK(status["cost"]["lite_first"] == false);
+  const auto running = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  CHECK(running["document"]["chains"][0]["nodes"][1]["model"] == "A2-Full");
+}
+
 TEST_CASE("a model with unbounded memory is refused a catch-up, in the reply and in the status")
 {
   // An LSTM's memory cannot be replayed exactly at any length (nam/lookback.h). The rule is that the

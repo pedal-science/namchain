@@ -872,6 +872,14 @@ else. `lite.adopted` is what the engine read back from the render thread after t
 wait's bound (no device is running, or the chain was still working through an earlier transition), and
 the Full is compiled and published after it anyway.
 
+**What a later publish does to a Full in flight.** The Full is compiled in the background, so a client
+can publish something else while it is being built. Installing it afterwards would undo that publish —
+the one the client asked for *last* — so a Full whose prepare no longer matches the engine's state is
+**dropped**, not installed: `catch_up.full` is `superseded`, the Lite (or whatever the later publish
+made audible) stands, and nothing is compiled in the control loop to paper over it. The check is the
+stamp a prepare produces: the resolved document, the budget's trimming, the warm charge and the
+generation it was built for.
+
 **The catch-up replay is in.** E1/E2 measured that replaying about 170 ms per model into a cold
 instance makes it bit-exact at depths 1–4, and that is what makes the Full's first 170 ms *correct*
 rather than merely faded in. It is here now, in four pieces:

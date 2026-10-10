@@ -1811,28 +1811,37 @@ void Daemon::service_async_full()
     return;
   }
 
-  // The stamp is the check that the compiled plans are still the ones this document asks for: the
+  // The stamp is the check that this Full is still the document that *would* be published now: the
   // library, the warm set, the budget's trimming and the generation all have to be what they were when
-  // the compile started. A mismatch is not a failure -- the publish compiles the chains itself, on this
-  // thread -- but it is worth saying, because it means the control loop spent the compile after all.
-  const bool usable = prepared.stamp == full->stamp;
-  if (!usable)
-    std::fprintf(stderr,
-                 "[namchaind] lite-first: the Full's prepared plans are stale (the library or the warm set "
-                 "moved); compiling it here\n");
+  // the compile started. **A mismatch means something else was published in the meantime, and that
+  // publish is the one the client asked for last** -- so the Full is dropped rather than installed
+  // over it. Publishing it anyway would undo somebody's newer rig, which is the one outcome a
+  // background publish must never have. The Lite stands, and `catch_up.full` says `superseded`.
+  if (prepared.stamp != full->stamp)
+  {
+    {
+      std::lock_guard<std::mutex> lock(catch_up_mutex_);
+      async_full_ = AsyncFull{};
+    }
+    catch_up_report_.full = "superseded";
+    catch_up_report_.detail =
+      "another publish landed while the Full was compiled; the Full was dropped rather than published over it";
+    catch_up_report_.replay = "none";
+    disarm_catch_up();
+    std::fprintf(stderr, "[namchaind] lite-first: the Full was superseded by a later publish; it was dropped\n");
+    return;
+  }
 
   CatchUpPlan catch_up_plan = full->catch_up;
   PrebuiltPlans prebuilt;
   {
     std::lock_guard<std::mutex> lock(catch_up_mutex_);
-    if (usable)
-      prebuilt = std::move(async_full_.prebuilt);
+    prebuilt = std::move(async_full_.prebuilt);
   }
 
   const uint64_t before = generation_;
   const bool published = publish_document(full->document, full->path, full->source, full->base_dir, error, &code,
-                                          full->admit_over_budget, /*lite_first=*/false, &catch_up_plan,
-                                          usable ? &prebuilt : nullptr);
+                                          full->admit_over_budget, /*lite_first=*/false, &catch_up_plan, &prebuilt);
   if (!published)
   {
     std::fprintf(stderr, "[namchaind] lite-first: the Full was refused (%s): %s\n", code.c_str(), error.c_str());
