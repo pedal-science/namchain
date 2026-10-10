@@ -103,6 +103,8 @@ public:
   void publish() noexcept
   {
     const uint64_t head = head_.load(std::memory_order_relaxed);
+    newest_seq_.store(seqs_[static_cast<std::size_t>(head) & mask_], std::memory_order_relaxed);
+    written_.fetch_add(1, std::memory_order_relaxed);
     head_.store(head + 1, std::memory_order_release);
   }
 
@@ -117,12 +119,14 @@ public:
     const std::size_t slot = static_cast<std::size_t>(tail) & mask_;
     data = storage_.data() + slot * floats_per_block();
     seq = seqs_[slot];
+    oldest_seq_.store(seq, std::memory_order_relaxed);
     return true;
   }
 
   void give_back() noexcept
   {
     const uint64_t tail = tail_.load(std::memory_order_relaxed);
+    consumed_.fetch_add(1, std::memory_order_relaxed);
     tail_.store(tail + 1, std::memory_order_release);
   }
 
@@ -136,6 +140,32 @@ public:
   /// Blocks the producer could not record because the consumer was behind by the whole ring.
   uint64_t dropped() const noexcept { return dropped_.load(std::memory_order_relaxed); }
 
+  // --- what the ring has done, for `engine.status` ---------------------------------------------
+  //
+  // Five counters and two indices, read by the control thread while the device thread writes and the
+  // catch-up thread drains. They are the difference between "the window never covered" and "the window
+  // was never fed", which nothing else in this engine reports and which is the whole diagnosis on a
+  // board with no debugger. Each is written by one thread, each read relaxed: they are a report, not
+  // synchronisation, and none of them is on the render path's critical work (one increment beside the
+  // store that was already there).
+  //
+  // Every counter is cumulative since \ref configure, so a client takes deltas across a press.
+
+  /// Blocks the device thread has published. Zero means the producer never recorded anything, whatever
+  /// the consumer did -- the first question to ask of a `no_input` replay.
+  uint64_t written() const noexcept { return written_.load(std::memory_order_relaxed); }
+  /// Blocks the catch-up thread has taken and given back.
+  uint64_t consumed() const noexcept { return consumed_.load(std::memory_order_relaxed); }
+  /// The block at the head (next to be written) and at the tail (oldest unread). Both monotonic:
+  /// `head - tail` is the backlog the consumer has not drained.
+  uint64_t head() const noexcept { return head_.load(std::memory_order_relaxed); }
+  uint64_t tail() const noexcept { return tail_.load(std::memory_order_relaxed); }
+  /// The `seq` of the newest block published, and of the oldest block taken. A `seq` that stands still
+  /// while \ref written climbs is a device whose block index is frozen; one that climbs by more than
+  /// one is a gap between what was written and what the plan will be told it rendered.
+  uint64_t newest_seq() const noexcept { return newest_seq_.load(std::memory_order_relaxed); }
+  uint64_t oldest_seq() const noexcept { return oldest_seq_.load(std::memory_order_relaxed); }
+
 private:
   std::vector<float> storage_;
   std::vector<uint64_t> seqs_;
@@ -147,6 +177,10 @@ private:
   std::atomic<uint64_t> head_{0};
   std::atomic<uint64_t> tail_{0};
   std::atomic<uint64_t> dropped_{0};
+  std::atomic<uint64_t> written_{0};
+  std::atomic<uint64_t> consumed_{0};
+  std::atomic<uint64_t> newest_seq_{0};
+  std::atomic<uint64_t> oldest_seq_{0};
 };
 
 /// \brief The catch-up thread's rolling copy of the newest input, in whole blocks.

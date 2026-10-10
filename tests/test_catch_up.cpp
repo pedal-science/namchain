@@ -12,6 +12,7 @@
 // nothing would pass just as well.
 #include <doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -30,6 +31,7 @@ namespace
 {
 
 using namchain::daemon::CatchUpPlan;
+using namchain::daemon::InputRing;
 using namchain::daemon::InputWindow;
 using namchain::daemon::ReplayResult;
 using namchain::graph::Graph;
@@ -242,6 +244,70 @@ TEST_CASE("a window with a hole in it is refused rather than replayed short")
   const ReplayResult replay = namchain::daemon::replay_window(*plan, window, 0, need, scratch.data());
   CHECK_FALSE(replay.covered);
   CHECK(replay.blocks == 0);
+}
+
+TEST_CASE("the ring's counters are what a no_input replay is read against")
+{
+  // `engine.status.catch_up.ring` carries these, and they are the only place the difference between an
+  // empty history, a dropped one and a merely uncovered one is visible (2026-10-10: on the pedal a
+  // `no_input` replay had `blocks: 0` and nothing else, and nothing outside the process could say
+  // which). Each counter has one writer, so this is what the report means: `written` climbs once per
+  // publish, `consumed` once per give_back, `dropped` once per refusal, and head/tail are the indices
+  // those happened at.
+  namchain::daemon::InputRing ring;
+  ring.configure(kQuantum, 1, 4);
+
+  // Unarmed: nothing is accepted, so a device thread that never armed records nothing and the ring
+  // says so rather than looking merely empty.
+  CHECK_FALSE(ring.armed());
+  CHECK(ring.acquire(1) == nullptr);
+  CHECK(ring.written() == 0);
+  CHECK(ring.dropped() == 0);
+
+  ring.arm();
+  CHECK(ring.armed());
+  const std::vector<float> block(static_cast<std::size_t>(kQuantum), 0.25f);
+  for (uint64_t seq = 1; seq <= 4; ++seq)
+  {
+    float* slot = ring.acquire(seq);
+    REQUIRE(slot != nullptr);
+    std::copy(block.begin(), block.end(), slot);
+    ring.publish();
+  }
+  CHECK(ring.written() == 4);
+  CHECK(ring.head() == 4);
+  CHECK(ring.tail() == 0);
+  CHECK(ring.newest_seq() == 4);
+  // Full: the producer refuses rather than blocking the render thread, and counts the hole.
+  CHECK(ring.acquire(5) == nullptr);
+  CHECK(ring.dropped() == 1);
+  CHECK(ring.written() == 4);
+  CHECK(ring.head() == 4);
+
+  const float* data = nullptr;
+  uint64_t seq = 0;
+  REQUIRE(ring.take(data, seq));
+  CHECK(seq == 1);
+  CHECK(ring.oldest_seq() == 1);
+  ring.give_back();
+  CHECK(ring.consumed() == 1);
+  CHECK(ring.tail() == 1);
+  // One in, one out: the producer's next block is accepted again, which is what makes `dropped` a
+  // count of *holes* rather than of a ring that is simply full.
+  CHECK(ring.acquire(5) != nullptr);
+  ring.publish();
+  CHECK(ring.written() == 5);
+  CHECK(ring.head() == 5);
+
+  // Disarmed, which is where the ring is once the catch-up is over: the counters stay where they are,
+  // so a status read after the job still says what the job had. This is the state a `no_input` with
+  // `period_mismatch` above zero leaves behind.
+  ring.disarm();
+  CHECK_FALSE(ring.armed());
+  CHECK(ring.acquire(6) == nullptr);
+  CHECK(ring.written() == 5);
+  CHECK(ring.consumed() == 1);
+  CHECK(ring.dropped() == 1);
 }
 
 TEST_CASE("what a document's catch-up is comes from lookback, per node")

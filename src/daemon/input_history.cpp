@@ -23,6 +23,10 @@ void InputRing::configure(int block_frames, unsigned channels, std::size_t block
   head_.store(0, std::memory_order_relaxed);
   tail_.store(0, std::memory_order_relaxed);
   dropped_.store(0, std::memory_order_relaxed);
+  written_.store(0, std::memory_order_relaxed);
+  consumed_.store(0, std::memory_order_relaxed);
+  newest_seq_.store(0, std::memory_order_relaxed);
+  oldest_seq_.store(0, std::memory_order_relaxed);
 }
 
 void InputWindow::configure(std::size_t frames, unsigned channels, int block_frames)

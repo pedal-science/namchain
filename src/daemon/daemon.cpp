@@ -75,6 +75,15 @@ std::array<level::Probe, N> probe_array(level::Probe::Publish mode)
   }(std::make_index_sequence<N>{});
 }
 
+/// \brief The catch-up thread's stage, as `catch_up.progress` spells it: written by that thread as a
+/// pointer to one of these literals, so the control thread's read cannot allocate and cannot see a
+/// half-built string. Index 0 is idle, and no job ever writes it.
+constexpr const char* kCatchUpProgress[] = {"idle", "filling", "replaying", "mirroring", "done"};
+
+/// \brief Why the fill loop stopped, as `catch_up.fill` spells it. `need_met` is the only one that
+/// leaves a replay possible; `drained_head` is the ring emptied without a window that covers.
+constexpr const char* kCatchUpFill[] = {"none", "need_met", "drained_head", "deadline", "unarmed", "quit"};
+
 /// \brief Whether this peer's messages carry a length prefix rather than being one datagram each.
 ///
 /// A TCP peer always does: a stream has no message boundaries of its own. A local peer does only
@@ -1648,6 +1657,19 @@ bool Daemon::arm_catch_up(const CatchUpPlan& plan, unsigned chains)
   catch_up_report_.running = true;
   catch_up_report_.replay.clear();
   catch_up_dropped_.store(0, std::memory_order_relaxed);
+  // The counters below belong to the job that is about to run: each is reset at the arm, so a client
+  // reads this press's numbers rather than the last one's -- except the ring's own `written`/
+  // `consumed`/`head`/`tail`, which are cumulative since the ring was sized and are meant to be (a
+  // second press on a sized ring must still show the producer writing).
+  catch_up_period_mismatch_.store(0, std::memory_order_relaxed);
+  catch_up_history_period_.store(catch_up_input_.block_frames(), std::memory_order_relaxed);
+  catch_up_device_period_.store(0, std::memory_order_relaxed);
+  catch_up_window_held_.store(0, std::memory_order_relaxed);
+  catch_up_window_contiguous_.store(0, std::memory_order_relaxed);
+  catch_up_window_blocks_.store(0, std::memory_order_relaxed);
+  catch_up_window_need_.store(0, std::memory_order_relaxed);
+  catch_up_progress_.store(nullptr, std::memory_order_relaxed);
+  catch_up_fill_.store(nullptr, std::memory_order_relaxed);
   return true;
 }
 
@@ -1909,6 +1931,24 @@ void Daemon::service_async_full()
 void Daemon::service_catch_up_report()
 {
   const uint64_t want = catch_up_job_id_.load(std::memory_order_acquire);
+
+  // The flight recorder is folded in on every pass, not only when the job is over: a catch-up that is
+  // still filling is exactly the one worth looking at, and `progress`/`fill`/`window` are what say
+  // which phase it is in and how far the window got.
+  const char* progress = catch_up_progress_.load(std::memory_order_relaxed);
+  const char* fill = catch_up_fill_.load(std::memory_order_relaxed);
+  catch_up_report_.progress = progress == nullptr ? "idle" : progress;
+  catch_up_report_.fill = fill == nullptr ? "none" : fill;
+  catch_up_report_.window_held = catch_up_window_held_.load(std::memory_order_relaxed);
+  catch_up_report_.window_contiguous = catch_up_window_contiguous_.load(std::memory_order_relaxed);
+  catch_up_report_.window_blocks = catch_up_window_blocks_.load(std::memory_order_relaxed);
+  catch_up_report_.window_need_blocks = catch_up_window_need_.load(std::memory_order_relaxed);
+  catch_up_report_.history_block_frames = catch_up_history_period_.load(std::memory_order_relaxed);
+  const int device_period = catch_up_device_period_.load(std::memory_order_relaxed);
+  catch_up_report_.device_period_size =
+    device_period != 0 ? device_period : static_cast<int>(active_period_.load(std::memory_order_relaxed));
+  catch_up_report_.period_mismatch = catch_up_period_mismatch_.load(std::memory_order_relaxed);
+
   if (want == 0)
     return;
   catch_up_report_.running = catch_up_busy_.load(std::memory_order_acquire) ||
@@ -1964,6 +2004,33 @@ nlohmann::json Daemon::catch_up_json() const
   json["running"] = catch_up_report_.running;
   if (!catch_up_report_.detail.empty())
     json["detail"] = catch_up_report_.detail;
+
+  // P8's flight recorder (2026-10-10): the input history as it stands, and what the catch-up thread
+  // last made of it. `replay: no_input` on its own cannot say whether the ring was never written,
+  // whether the window never covered it, or whether the replay refused the block size -- and the
+  // pedal has no debugger and no ptrace, so this object is the only place that question can be asked.
+  // Every field is a relaxed load of a counter that belongs to one thread.
+  json["ring"] = {{"armed", catch_up_input_.armed()},
+                  {"configured", catch_up_input_.configured()},
+                  {"block_frames", catch_up_input_.block_frames()},
+                  {"channels", catch_up_input_.channels()},
+                  {"blocks", catch_up_input_.blocks()},
+                  {"written", catch_up_input_.written()},
+                  {"consumed", catch_up_input_.consumed()},
+                  {"dropped", catch_up_input_.dropped()},
+                  {"head", catch_up_input_.head()},
+                  {"tail", catch_up_input_.tail()},
+                  {"newest_seq", catch_up_input_.newest_seq()},
+                  {"oldest_seq", catch_up_input_.oldest_seq()}};
+  json["window"] = {{"held", catch_up_report_.window_held},
+                    {"contiguous", catch_up_report_.window_contiguous},
+                    {"blocks", catch_up_report_.window_blocks},
+                    {"need", catch_up_report_.window_need_blocks}};
+  json["progress"] = catch_up_report_.progress;
+  json["fill"] = catch_up_report_.fill;
+  json["history_block_frames"] = catch_up_report_.history_block_frames;
+  json["device_period_size"] = catch_up_report_.device_period_size;
+  json["period_mismatch"] = catch_up_report_.period_mismatch;
   return json;
 }
 
@@ -1989,7 +2056,11 @@ void Daemon::write_input_history() noexcept
   {
     // A device whose period is not the one the history was sized for: the block cannot be recorded
     // without breaking the block alignment a replay depends on, so nothing is, and the catch-up will
-    // say it had no input rather than replaying a window with the wrong seams in it.
+    // say it had no input rather than replaying a window with the wrong seams in it. Counted, because
+    // a ring that is never written and a window that never covers look identical from a client, and
+    // this is the one cause of the first that leaves no trace anywhere else.
+    catch_up_period_mismatch_.fetch_add(1, std::memory_order_relaxed);
+    catch_up_device_period_.store(static_cast<int>(info.period_size), std::memory_order_relaxed);
     return;
   }
 
@@ -2125,6 +2196,23 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
   const auto deadline = now() + std::chrono::milliseconds(2000);
   float* scratch = catch_up_scratch_.data();
 
+  // The flight recorder: what the window came to, and why the loop below stopped. Written as the loop
+  // goes so a poll taken *while* a catch-up is stuck says which phase it is stuck in, not only what
+  // the outcome was. `need_blocks` is what `covers` asks for, and reporting it beside what the window
+  // actually held is the whole of "the window never covered" against "the window never filled".
+  const auto publish_window = [this, need, period] {
+    catch_up_window_held_.store(catch_up_window_.held(), std::memory_order_relaxed);
+    catch_up_window_contiguous_.store(catch_up_window_.contiguous_blocks(), std::memory_order_relaxed);
+    catch_up_window_blocks_.store(catch_up_window_.blocks(), std::memory_order_relaxed);
+    catch_up_window_need_.store(period == 0 ? 0 : (need + period - 1) / period, std::memory_order_relaxed);
+    catch_up_history_period_.store(catch_up_input_.block_frames(), std::memory_order_relaxed);
+    catch_up_device_period_.store(static_cast<int>(active_period_.load(std::memory_order_relaxed)),
+                                  std::memory_order_relaxed);
+  };
+  catch_up_progress_.store(kCatchUpProgress[1], std::memory_order_relaxed); // filling
+  catch_up_fill_.store(kCatchUpFill[0], std::memory_order_relaxed);
+  publish_window();
+
   // 1. Fill a window that covers what every chain needs, contiguously. The plan's state can only be
   //    made exact from a window with no holes in it, so a ring that dropped a block inside the
   //    window is waited out rather than papered over: the history rolls on and the next blocks are
@@ -2146,7 +2234,10 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
       if (catch_up_window_.covers(need))
       {
         if (++chased > 64 || !catch_up_input_.has_data())
+        {
+          catch_up_fill_.store(kCatchUpFill[1], std::memory_order_relaxed); // need_met
           break; // a full, contiguous window: this is the history the Full is caught up from
+        }
       }
       else
       {
@@ -2155,9 +2246,19 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
       continue;
     }
     if (catch_up_window_.covers(need))
-      break; // drained to the head, and what is held covers every chain
-    if (!catch_up_input_.armed() || catch_up_quit_.load(std::memory_order_acquire))
     {
+      catch_up_fill_.store(kCatchUpFill[1], std::memory_order_relaxed); // need_met
+      break; // drained to the head, and what is held covers every chain
+    }
+    if (!catch_up_input_.armed())
+    {
+      catch_up_fill_.store(kCatchUpFill[4], std::memory_order_relaxed); // unarmed
+      outcome = 3;
+      break;
+    }
+    if (catch_up_quit_.load(std::memory_order_acquire))
+    {
+      catch_up_fill_.store(kCatchUpFill[5], std::memory_order_relaxed); // quit
       outcome = 3;
       break;
     }
@@ -2165,12 +2266,15 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
     {
       // No device rendering, or one too slow to fill a window: say so and let the render thread fade
       // the Full in cold rather than holding the press on the Lite.
+      catch_up_fill_.store(kCatchUpFill[3], std::memory_order_relaxed); // deadline
       outcome = 3;
       break;
     }
+    publish_window(); // a poll during a fill that is not finishing says what it has
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-
+  publish_window();
+  catch_up_progress_.store(kCatchUpProgress[2], std::memory_order_relaxed); // replaying
   // 2. Replay it, oldest block first, one plan at a time. Each plan is claimed for the duration, so
   //    the render thread cannot take one over while it is being fed. A chain is judged against *its
   //    own* memory rather than the longest chain's -- they are replayed together but they do not need
@@ -2206,6 +2310,10 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
     outcome = all_covered ? 1 : 2;
   // Nothing replayed at all leaves `outcome` at "no input", which is what the fill loop decided.
 
+  // The window as the replay left it: the fill loop's last snapshot is taken before the replay runs,
+  // and what a `no_input` needs to be read against is what was held when it was refused.
+  publish_window();
+
   // The render thread is told what the replay was worth before the mirroring starts: the device's
   // hold on the Full is released by the plan's own sequence, and `engine.status` reports the outcome
   // from that point on.
@@ -2220,6 +2328,7 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
   //    it is about to render -- or until it gives up and takes them anyway. This is what closes the
   //    gap between the window that was replayed and the moment the crossfade starts, which is not a
   //    gap a replay of the past can close on its own.
+  catch_up_progress_.store(kCatchUpProgress[3], std::memory_order_relaxed); // mirroring
   std::size_t mirrored = 0;
   for (;;)
   {
@@ -2265,6 +2374,7 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
   catch_up_done_blocks_.store(blocks + mirrored, std::memory_order_relaxed);
   // The ring and the window are this thread's; `catch_up_report_` is the control thread's, and it
   // folds `catch_up_busy_` in on its own pass (service_catch_up_report).
+  catch_up_progress_.store(kCatchUpProgress[4], std::memory_order_relaxed); // done
   catch_up_input_.disarm();
   catch_up_window_.clear();
   catch_up_busy_.store(false, std::memory_order_release);

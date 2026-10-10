@@ -807,6 +807,37 @@ private:
     std::size_t frames = 0; ///< the window the document needs, in engine frames
     std::size_t blocks = 0; ///< blocks replayed (and mirrored) when the report was built
     bool running = false;   ///< a catch-up job is in flight
+    /// \brief Where the *catch-up thread* had got to when this report was folded in: `idle` (no job
+    /// yet), `filling` (draining the ring into a window that covers), `replaying` (feeding the plans),
+    /// `mirroring` (keeping them current until the render thread takes them over), `done`.
+    std::string progress = "idle";
+    /// Why the fill loop stopped: `need_met` (a window that covers, contiguous), `drained_head` (the
+    /// ring was drained and what is held does not cover), `deadline` (two seconds without a window),
+    /// `unarmed` (recording stopped under it), `quit`.
+    std::string fill = "none";
+    /// Which block size the recording was sized for, and what the device was actually rendering: a
+    /// mismatch means `write_input_history` recorded nothing at all, which is the one cause of an
+    /// empty ring that is invisible from outside the process.
+    int history_block_frames = 0;
+    int device_period_size = 0;
+    /// Blocks the device thread refused to record because the device's period was not the one the
+    /// history was sized for, since the last arm.
+    uint64_t period_mismatch = 0;
+    /// The window the catch-up thread had built when this was folded in: how many blocks it held and
+    /// how many of them were contiguous at the end (a replay needs `covers` worth of the second).
+    std::size_t window_held = 0;
+    std::size_t window_contiguous = 0;
+    std::size_t window_blocks = 0;
+    std::size_t window_need_blocks = 0;
+    /// The ring's own counters, read at the same moment.
+    uint64_t ring_armed = 0;
+    uint64_t ring_written = 0;
+    uint64_t ring_consumed = 0;
+    uint64_t ring_dropped = 0;
+    uint64_t ring_head = 0;
+    uint64_t ring_tail = 0;
+    uint64_t ring_newest_seq = 0;
+    uint64_t ring_oldest_seq = 0;
   };
 
   /// \brief Start recording input for a catch-up, and work out nothing else: the job comes later.
@@ -1218,6 +1249,36 @@ private:
   /// Blocks the ring has dropped since the last arm: a hole in the history, which is what makes a
   /// replay inexact rather than merely late.
   std::atomic<uint64_t> catch_up_dropped_{0};
+
+  // --- the catch-up thread's own progress, as `engine.status` reports it ------------------------
+  //
+  // The catch-up thread writes these as it goes; the control thread reads them when it builds a
+  // status. All relaxed, all one writer: they are a flight recorder, not a handshake, and nothing on
+  // the render path reads or writes any of them. They exist because a `no_input` replay on a board
+  // with no debugger is otherwise indistinguishable between "the ring was never written", "the window
+  // never covered" and "the window covered but the replay refused the block size".
+  /// \ref CatchUpReport::progress: a pointer to one of `kCatchUpProgress`'s literals, written by the
+  /// catch-up thread and read by the control thread. A pointer store is one relaxed store, and it
+  /// cannot be a torn string the way a `std::string` shared across the two would be. Null is "no job
+  /// has run".
+  std::atomic<const char*> catch_up_progress_{nullptr};
+  /// \ref CatchUpReport::fill, the same way: a pointer to one of `kCatchUpFill`'s literals.
+  std::atomic<const char*> catch_up_fill_{nullptr};
+  /// The window when the fill loop stopped: held blocks, the contiguous run at its end, and the
+  /// blocks it needed. `need` above `contiguous` is a history with a hole in it; `need` above `held`
+  /// is a history that never filled at all.
+  std::atomic<uint64_t> catch_up_window_held_{0};
+  std::atomic<uint64_t> catch_up_window_contiguous_{0};
+  std::atomic<uint64_t> catch_up_window_blocks_{0};
+  std::atomic<uint64_t> catch_up_window_need_{0};
+  /// The ring's block size at the last arm (what a replay is aligned to) against what the device was
+  /// rendering when the device thread last looked. A mismatch in the second is why a `no_input` has an
+  /// empty ring behind it.
+  std::atomic<int> catch_up_history_period_{0};
+  std::atomic<int> catch_up_device_period_{0};
+  /// Blocks the device thread refused to record since the last arm because `info.period_size` was not
+  /// the period the history was sized for.
+  std::atomic<uint64_t> catch_up_period_mismatch_{0};
 
   /// \brief The warm document as the control thread sees it: what it was compiled from, what it cost,
   /// and the plans it owns until the warm thread retires them.
