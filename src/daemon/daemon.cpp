@@ -730,6 +730,23 @@ bool cost_slimmed(const CostOutcome& cost)
   return false;
 }
 
+/// The models a cost outcome trimmed, in the shape every reply's `slimmed_models` uses (D6). Takes the
+/// outcome rather than reading `cost_`, because P8's Lite-first reply reports two of them: the Lite
+/// that is standing in and the Full behind it.
+nlohmann::json slimmed_models_json(const CostOutcome& cost)
+{
+  nlohmann::json list = nlohmann::json::array();
+  for (const CostedNode& node : cost.nodes)
+  {
+    if (!node.slimmed)
+      continue;
+    list.push_back({{"chain", node.chain}, {"node", node.node}, {"element", node.element},
+                    {"reference", node.reference}, {"cost", node.cost}, {"row", node.row},
+                    {"full_cost", node.cost_full}, {"working_set_bytes", node.working_set_bytes}});
+  }
+  return list;
+}
+
 void delete_plan_slot(void* object)
 {
   delete static_cast<PlanSlot*>(object);
@@ -1419,13 +1436,121 @@ bool Daemon::publish_param(const std::string& chain_id, const std::string& node,
 }
 
 bool Daemon::load_rig(const std::string& rig_path, std::string& error, std::string* error_code,
-                      bool admit_over_budget)
+                      bool admit_over_budget, bool lite_first, nlohmann::json* steps)
 {
   graph::Document document;
   if (!graph::load_document_json(rig_path, document, error))
     return false;
-  return publish_document(document, rig_path, "file", std::filesystem::path(rig_path).parent_path().string(),
-                          error, error_code, admit_over_budget);
+  const std::string base_dir = std::filesystem::path(rig_path).parent_path().string();
+  if (!lite_first)
+    return publish_document(document, rig_path, "file", base_dir, error, error_code, admit_over_budget);
+  return publish_lite_first(document, rig_path, "file", base_dir, error, error_code, admit_over_budget, steps);
+}
+
+bool Daemon::publish_lite_first(const graph::Document& document, const std::string& path, const std::string& source,
+                                const std::string& base_dir, std::string& error, std::string* error_code,
+                                bool admit_over_budget, nlohmann::json* report)
+{
+  // Step one: the Lite, whatever the budget says. It compiles in about a third of the time a Full
+  // takes, and E2's listening verdict is that a Lite standing in for a Full is not audible -- so this
+  // is the document that starts playing, and the Full is what is prepared behind it.
+  //
+  // A refusal here is the ordinary publish's refusal: a rig that is still over the headroom with
+  // everything trimmed is over, and nothing about it has changed. "Lite first" is a compile-time
+  // trick, not an exemption from D3.
+  if (!publish_document(document, path, source, base_dir, error, error_code, admit_over_budget,
+                        /*lite_first=*/true))
+    return false;
+
+  // The Lite's own outcome, taken before the Full's publish overwrites `cost_`: this is the
+  // temporary rig a client is told about (D6 -- a trimmed rig is a different rig, however much it
+  // may sound the same).
+  const CostOutcome lite = cost_;
+  const uint64_t lite_generation = generation_;
+
+  nlohmann::json lite_json;
+  lite_json["generation"] = lite_generation;
+  lite_json["cost"] = lite.cost;
+  lite_json["full_cost"] = lite.full_cost;
+  lite_json["verdict"] = lite.verdict;
+  lite_json["trimmed"] = lite.trimmed;
+  lite_json["slimmed_models"] = slimmed_models_json(lite);
+
+  // Nothing slimmable: the Lite document *is* the document as written, so there is no Full behind it
+  // to compile and this publish was an ordinary one in every respect (P8's second case). The cost
+  // outcome says `lite_first` because the *request* was for one, but nothing is standing in and
+  // nothing is on its way, so the engine stops reporting a temporary Lite it does not have -- D6 asks
+  // for the substitution to be visible, and there is no substitution here.
+  if (!lite.trimmed)
+  {
+    cost_.lite_first = false;
+    if (report != nullptr)
+    {
+      (*report)["lite_first"] = false;
+      (*report)["full"] = {{"state", "nothing_to_trim"}, {"generation", lite_generation}};
+    }
+    return true;
+  }
+
+  // Wait for the Lite to be what the device is playing before compiling the Full. Two publishes back
+  // to back would coalesce -- a plan that arrives while another is fading becomes `pending` and the
+  // newer one retires it (doc_runtime.h) -- and the Lite would never be heard, which is the one thing
+  // this request is for. Bounded, and no longer than the fade the Lite is already making: the same
+  // wait a local transition makes, and this thread also frees retired plans while it waits.
+  bool adopted = true;
+  for (std::size_t i = 0; i < document.chains.size(); ++i)
+  {
+    if (!wait_until_settled(i))
+    {
+      // A chain that did not settle inside the bound is one the Lite may not be audible through: say
+      // so and compile the Full rather than keeping a press waiting for longer than a fade.
+      adopted = false;
+      break;
+    }
+  }
+  lite_json["adopted"] = adopted;
+
+  // Step two: the Full. An ordinary publish of the same document -- resolved and trimmed by the
+  // budget rather than by the request -- compiled here on the control thread while the Lite plays,
+  // and crossfaded in by the existing transition machinery. It is the Lite -> Full crossfade that a
+  // listener hears, and with no catch-up replay the Full comes up cold (see the header).
+  nlohmann::json full_json;
+  std::string full_error;
+  std::string full_code = "compile_failed";
+  if (publish_document(document, path, source, base_dir, full_error, &full_code, admit_over_budget))
+  {
+    // `published` when the Full differs from the Lite -- which it does whenever the budget left
+    // anything untrimmed -- and `unchanged` when an ordinary publish of this rig trims exactly what the
+    // request trimmed, so the second publish legitimately had nothing to do. A publish that changes
+    // nothing does not advance the generation (publish_document), which is what tells the two apart.
+    full_json["state"] = generation_ == lite_generation ? "unchanged" : "published";
+    full_json["generation"] = generation_;
+    full_json["cost"] = cost_.cost;
+    full_json["full_cost"] = cost_.full_cost;
+    full_json["verdict"] = cost_.verdict;
+    full_json["trimmed"] = cost_.trimmed;
+  }
+  else
+  {
+    // The Lite is playing and the Full is not: the rig stands in until another publish replaces it.
+    // The publish the client did get is not rolled back -- a footswitch press never ends in silence --
+    // so this is a success with the Full's failure named in it, and `cost_.lite_first` stays true,
+    // which is what `engine.lite_pending` and the status's cost object go on reporting.
+    full_json["state"] = "refused";
+    full_json["generation"] = generation_;
+    full_json["error"] = full_error;
+    full_json["code"] = full_code;
+    std::fprintf(stderr, "[namchaind] lite-first: the Full did not publish (%s): %s\n", full_code.c_str(),
+                 full_error.c_str());
+  }
+
+  if (report != nullptr)
+  {
+    (*report)["lite_first"] = true;
+    (*report)["lite"] = std::move(lite_json);
+    (*report)["full"] = std::move(full_json);
+  }
+  return true;
 }
 
 void Daemon::load_cost_table()
@@ -1474,7 +1599,7 @@ void Daemon::republish_after_rescan()
 
 bool Daemon::publish_document(const graph::Document& document, const std::string& path, const std::string& source,
                               const std::string& base_dir, std::string& error, std::string* error_code,
-                              bool admit_over_budget)
+                              bool admit_over_budget, bool lite_first)
 {
   const graph::Validation validation = graph::validate(document);
   if (!validation.ok)
@@ -1518,8 +1643,12 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
   // admitted is the whole document against one core's headroom. Where the cost model's added-up
   // assumption is wrong -- two models crowding one core's cache cost more than either alone -- the
   // measurement is what knows, because a row's 1/n was measured at the fit point (D2).
+  //
+  // `lite_first` (P8) trims every slimmable model whatever the budget says, so this publish compiles
+  // in about a third of the time and starts playing; the Full is published over it afterwards
+  // (publish_lite_first). It is still admission: a rig that is over with everything trimmed is over.
   CostOutcome cost = apply_cost_table(resolved, cost_table_, units_, static_cast<double>(config_.sample_rate),
-                                      static_cast<int>(config_.period_size), warm_documents());
+                                      static_cast<int>(config_.period_size), warm_documents(), lite_first);
   {
     // The reference as the client wrote it, not this device's resolved path: a message that says
     // which block to swap has to name the block the user can see (docs/assets.md).
@@ -2186,7 +2315,7 @@ bool Daemon::cool_warm(const std::string& rig, std::string& error, std::string* 
 }
 
 bool Daemon::switch_to(const std::string& path, bool fallback, std::string& error, std::string* error_code,
-                       nlohmann::json& body)
+                       nlohmann::json& body, bool lite_first, nlohmann::json* steps)
 {
   if (!warm_enabled())
   {
@@ -2241,7 +2370,7 @@ bool Daemon::switch_to(const std::string& path, bool fallback, std::string& erro
         return false;
       }
       std::string code = "compile_failed";
-      if (!load_rig(path, error, &code))
+      if (!load_rig(path, error, &code, /*admit_over_budget=*/false, lite_first, steps))
       {
         if (error_code != nullptr)
           *error_code = code;
@@ -2255,6 +2384,11 @@ bool Daemon::switch_to(const std::string& path, bool fallback, std::string& erro
     }
 
     sync_warm_switch();
+    // A warm rig needs no Lite: it is compiled and rendering already, so the handover is faster than
+    // any two-step publish could be. The flag was asked for and is not what happened, which the reply
+    // says rather than leaving the client to guess.
+    if (lite_first)
+      body["lite_first"] = false;
     body["rig"] = current_rig_;
     body["generation"] = docs_[active_doc_.load(std::memory_order_relaxed)].content.load(std::memory_order_relaxed);
     body["doc"] = active_doc_.load(std::memory_order_relaxed);
@@ -2271,9 +2405,10 @@ bool Daemon::switch_to(const std::string& path, bool fallback, std::string& erro
   }
 
   // The cold path, which is `rig.load`: parse, compile, crossfade. Warmth is what makes a switch
-  // fast; it is not what makes it possible.
+  // fast; it is not what makes it possible. `lite_first` is the press that would rather hear the rig
+  // than wait for it (P8): the Lite plays while the Full is compiled behind it.
   std::string code = "compile_failed";
-  if (!load_rig(path, error, &code))
+  if (!load_rig(path, error, &code, /*admit_over_budget=*/false, lite_first, steps))
   {
     if (error_code != nullptr)
       *error_code = code;
@@ -4782,18 +4917,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
 
   // The models the cost table trimmed, beside the missing assets and for the same reason: the client
   // that sent the rig learns at once that a block plays a smaller model than it names (D6).
-  auto slimmed_json = [this]() {
-    nlohmann::json list = nlohmann::json::array();
-    for (const CostedNode& node : cost_.nodes)
-    {
-      if (!node.slimmed)
-        continue;
-      list.push_back({{"chain", node.chain}, {"node", node.node}, {"element", node.element},
-                      {"reference", node.reference}, {"cost", node.cost}, {"row", node.row},
-                      {"full_cost", node.cost_full}, {"working_set_bytes", node.working_set_bytes}});
-    }
-    return list;
-  };
+  auto slimmed_json = [this]() { return slimmed_models_json(cost_); };
 
   // One shape for the per-chain array wherever it appears, so a client can read the same entry from
   // `engine.status` and from `rig.get` and not learn two vocabularies for one thing.
@@ -5481,8 +5605,19 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     std::string error;
     if (!resolve_rig_name(config_, name, path, error))
       return error_response(id, "rig_not_found", error);
+    // P8's two-step publish: with `lite_first` the rig starts playing as soon as its Lite compiles,
+    // and the Full is compiled and crossfaded in behind it (publish_lite_first). `steps` is what that
+    // did, and is merged into the reply so the client sees the temporary Lite as well as the end state.
+    bool lite_first = false;
+    if (doc.contains("lite_first"))
+    {
+      if (!doc["lite_first"].is_boolean())
+        return error_response(id, "bad_request", "'lite_first' must be a boolean");
+      lite_first = doc["lite_first"].get<bool>();
+    }
+    nlohmann::json steps = nlohmann::json::object();
     std::string code = "compile_failed";
-    if (!load_rig(path, error, &code))
+    if (!load_rig(path, error, &code, /*admit_over_budget=*/false, lite_first, &steps))
       return error_response(id, code, error);
     nlohmann::json body;
     body["rig"] = path;
@@ -5490,6 +5625,8 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["missing_assets"] = missing_json();
     body["slimmed_models"] = slimmed_json();
     body["transitions"] = transitions_json();
+    if (lite_first)
+      body.update(steps);
     return ok_response(id, body);
   }
   if (method == "rig.apply")
@@ -5676,10 +5813,25 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
         return error_response(id, "bad_request", "'fallback' must be a boolean");
       fallback = doc["fallback"].get<bool>();
     }
+    // `lite_first` as for `rig.load`, and it matters most here: a press that cold-loads a rig makes
+    // the player wait for the whole compile, and the Lite is what they hear meanwhile. A warm rig
+    // ignores it -- the handover is faster than any Lite could be -- and the reply says so.
+    bool lite_first = false;
+    if (doc.contains("lite_first"))
+    {
+      if (!doc["lite_first"].is_boolean())
+        return error_response(id, "bad_request", "'lite_first' must be a boolean");
+      lite_first = doc["lite_first"].get<bool>();
+    }
     nlohmann::json body;
+    // An object rather than null, because it is merged into the reply: a warm switch fills nothing in
+    // and must not make that an error.
+    nlohmann::json steps = nlohmann::json::object();
     std::string code = "compile_failed";
-    if (!switch_to(path, fallback, error, &code, body))
+    if (!switch_to(path, fallback, error, &code, body, lite_first, &steps))
       return error_response(id, code, error);
+    if (lite_first)
+      body.update(steps);
     body["missing_assets"] = missing_json();
     body["slimmed_models"] = slimmed_json();
     body["transitions"] = transitions_json();

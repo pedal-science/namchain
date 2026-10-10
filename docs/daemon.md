@@ -381,13 +381,13 @@ One JSON object per message in each direction, over either transport above. A re
 | `engine.mute` | `{"mute": true\|false, "chain": "id"?}` | the new state; with `chain`, that chain alone is muted and the engine-wide flag is left alone |
 | `engine.panic` | — | mutes unconditionally (the only other route to silence) |
 | `engine.record` | `{"action": "start", "name": "…", "seconds": 600?}`, `{"action": "stop"}`, or `{}` | `record`: whether one is running, its name and path, periods and seconds so far, ring overflows, and the dropped/inserted/xrun totals. See "Recording what the device heard", below |
-| `rig.load` | `{"rig": "name.json"}` | compiled and published; returns `rig`, `generation` |
+| `rig.load` | `{"rig": "name.json"}`, with `{"lite_first": true}` to publish the rig's Lite first and its Full behind it | compiled and published; returns `rig`, `generation`. With `lite_first`, the reply also carries `lite_first`, `lite` and `full` — what each of the two publishes did — because the temporary Lite cannot be seen from a later poll ("Lite-first publishes", below) |
 | `rig.apply` | `{"document": { … }}` — a whole document, parsed by the same parser a rig file goes through | `name`, `chains`, `generation`; relative model paths resolve against the rigs root |
 | `rig.patch` | `{"ops": [...], "chain": "id"?}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass`. A target is named by `node`, or by `element` with an optional `role` (and `port` for a per-port parameter) | `kind` (`smooth` or `structural`), `applied`, `chain`, `generation` |
 | `rig.get` | — | the rig path (empty for an applied document), `source` (`file`/`applied`), `generation`, `loaded`, the current `document` as the engine parsed it, the `lowered` graph it became (macros expanded, with the engine-minted ids), and a per-chain summary |
 | `rig.warm` | `{"rig": "name.json"}`, or `{"document": { … }}`, with `{"replace": false}` to refuse rather than displace a warm rig | hold a rig ready to switch to: compiled, prewarmed and rendering on a warm core, without touching the audible document. Returns `rig`, `name`, `generation`, `doc`, `core`, `state` (`warming` until it has rendered a block, then `warm`), `replaced` (what it displaced, or null), the same `cost` object `rig.cost` returns, and `slimmed_models`/`missing_assets`. Refused as `warm_disabled`, `warm_full` (`replace` was false), `over_budget`, `asset_missing` or `compile_failed` |
 | `rig.cool` | `{"rig": "name.json"}`, or `{}` for whatever is warm | stop holding a rig ready. Returns `cooled` (the rigs that stopped being warm) and the `warm` object. `warm_disabled` when warmth is off, `warm_not_ready` when the named rig is not the warm one or the document has not been let go yet |
-| `rig.switch` | `{"rig": "name.json"}`, with `{"fallback": false}` to refuse instead of loading cold | make a rig audible: `switched` (`warm` when it was a handover, `cold` when it was a load), `rig`, `generation` (of the content now audible), `doc`, `core`, `handover_blocks`, `fade_ms`, `completed`, and `reason` when it was cold. A rig that is not warm is published exactly as `rig.load` does it, so a footswitch press never ends in silence; `fallback: false` turns that into `warm_not_ready` |
+| `rig.switch` | `{"rig": "name.json"}`, with `{"fallback": false}` to refuse instead of loading cold, and `{"lite_first": true}` for the same two-step publish on a cold switch | make a rig audible: `switched` (`warm` when it was a handover, `cold` when it was a load), `rig`, `generation` (of the content now audible), `doc`, `core`, `handover_blocks`, `fade_ms`, `completed`, and `reason` when it was cold. A rig that is not warm is published exactly as `rig.load` does it, so a footswitch press never ends in silence; `fallback: false` turns that into `warm_not_ready`. `lite_first` is ignored for a rig that *is* warm — a handover beats any Lite compile — and the reply says `lite_first: false` ("Lite-first publishes", below) |
 | `rig.cost` | `rig` (a name, as `rig.load` takes) or `document` (a whole document) | what that rig would cost on this device, and the verdict: the same table, trimming and `over` a publish would apply, on a copy that is thrown away. Nothing is published, compiled or loaded. `cost` is the object `engine.status` reports, and `slimmed_models`/`missing_assets` come with it, so a service can cost its whole bank without a second cost model of its own (D9) |
 
 Unknown fields are ignored; an unknown method is `unknown_method`. A malformed message never kills
@@ -775,6 +775,94 @@ second cost model of its own (D9).
 
 The document `rig.get` returns is the one written: trimming is the engine's choice about the copy it
 compiles, made afresh on every publish, so no document carries it and a stale choice never sticks.
+
+### Lite-first publishes: the Lite now, the Full behind it
+
+pedal.project `docs/managing-processing-power-and-optimising-for-fast-switching.md`, **P8**, settled
+2026-10-09 after the owner listened to E2's fixed audition set and **could not hear a Lite standing in
+for a Full**. That verdict is what licenses the substitution: a cold switch does not have to wait for
+the whole rig to compile, because the Lite — about a third of the work — is not something the player
+can tell from it. **The first increment of P8 is in the engine**; what it does not include is at the
+end of this section.
+
+`rig.load` and `rig.switch` take `"lite_first": true`. On a document with anything slimmable the
+publish becomes two publishes on the control thread:
+
+1. **The Lite.** The document is trimmed to Lite *whatever the budget says* (`CostOutcome::lite_first`)
+   and published as usual, so the rig starts playing about a third of the compile time sooner. Every
+   slimmable model goes to Lite, dearest first, whether or not it had to; a model whose Lite row is not
+   measured saves nothing and is not trimmed for show.
+2. **The Full.** The same document is published again as an ordinary publish — resolved and trimmed by
+   the budget rather than by the request — compiled while the Lite plays and crossfaded in by the
+   transition machinery every other publish uses (`transitions` in the reply says `crossfade`).
+
+Between the two, the control thread **waits for the Lite to be what the device is playing** (bounded
+by a fade; the same wait a local transition makes). Without that wait the second publish would arrive
+while the first was still fading, and a plan that arrives mid-fade becomes *pending* — the newer one
+retires it (`doc_runtime.h`) — so the Lite would be compiled, published and never heard, which is the
+one thing the request is for.
+
+**What the reply says.** `lite_first` is true when a temporary Lite was published, and then:
+
+```jsonc
+{ "ok": true, "rig": "…", "generation": 3,
+  "lite_first": true,
+  "lite": { "generation": 2, "adopted": true,          // the render thread settled on it
+            "cost": 0.17, "full_cost": 0.52, "verdict": "trimmed", "trimmed": true,
+            "slimmed_models": [ { "chain": "main", "node": "a1", "row": "NAM.WaveNet.lite", … } ] },
+  "full": { "state": "published", "generation": 3,     // the Full is what is running now
+            "cost": 0.52, "trimmed": false, "verdict": "fits" } }
+```
+
+`full.state` is `published`, `refused` (with `error`/`code`), `unchanged`, or `nothing_to_trim`. The
+cases worth knowing:
+
+- **Nothing slimmable.** The Lite *is* the document as written, so there is nothing behind it to
+  compile: one publish happens, not two, `lite_first` is false, `lite` is absent, and
+  `full.state` is `nothing_to_trim`. A `lite_first` request on such a rig behaves exactly as an
+  ordinary publish.
+- **The Lite is already the budget's answer.** A rig that is over the headroom and has one slimmable
+  model ends at the same document whether it was asked for a Lite or trimmed to fit, so the second
+  publish has nothing to do: `full.state` is `unchanged`, `full.generation` equals `lite.generation`
+  (a publish that changes nothing does not advance it), and the reply's `lite_first` is true because a
+  Lite *was* published first. The Lite that is left is not a temporary one, so `engine.status`'s
+  `cost.lite_first` reports false and `cost.trimmed` carries D6's warning instead — the difference
+  between "coming up to full" and "Lite: *blocks*", which are two different things to tell a player.
+- **Over the headroom at Lite.** Refused as `over_budget`, naming the total, the headroom and every
+  node, exactly as an ordinary publish refuses it: `lite_first` is a compile-time trick, not an
+  exemption from D3. Nothing is published and the running rig is untouched — the first step is the
+  only step that can succeed on its own, so it is the one that has to refuse.
+- **The Full does not publish.** The Lite is playing and the Full is not, so the reply is still `ok`
+  — what was published is not rolled back, a press never ends in silence — with `full.state` of
+  `refused` and the reason in `full.error`/`full.code`. `engine.status`'s `cost.lite_first` stays true
+  while that Lite stands in, which is the flag a panel shows.
+
+**What a client can and cannot see.** The temporary Lite is visible in the reply and nowhere else:
+both publishes happen on the control thread before the reply is written, so a poll of `engine.status`
+(or `engine.lite_pending` in the service) is answered after the Full has landed and can only ever
+describe the rig as it ends up. **Two questions, deliberately answered twice**: the reply's
+`lite_first` is about the publish that just happened — a Lite went first, so the rig started playing
+sooner — while `engine.status`'s `cost.lite_first` is about what is standing in *now*, which is true
+only while a Lite the request published is still what the device is playing on its way to a Full. They
+differ in the `unchanged` case above, and nowhere else. `cost.lite_first` is never true for a rig with
+nothing to trim. `lite.adopted` is what the engine read back from the render thread after that wait:
+**false** means the Lite was published but this thread did not see the device settle on it inside the
+wait's bound (no device is running, or the chain was still working through an earlier transition), and
+the Full went in after it anyway.
+
+**What is not implemented: the catch-up replay.** E1/E2 measured that replaying about 170 ms per model
+into a cold instance makes it bit-exact at depths 1–4, and that is what makes the Full's first 170 ms
+*correct* rather than merely faded in. It is not here, so the Full starts cold and a note that was
+already sounding is wrong through it for the length of its receptive field. `nam/lookback.cpp` already
+knows how much a model needs (`Ok` with a finite length, or `Unbounded` for an LSTM, which no replay
+can promise), but **the input to replay is not reachable from the publish path**: the warm set's pool
+holds `BlockPool::kBlocks` (four) blocks of decoded capture and *drops* what does not fit, so it is a
+hand-over buffer and not a history. A replay needs about 8 200 frames at 48 kHz per channel kept for
+the length of a compile — a new buffer written by the device thread on the render path, a size derived
+per model from `lookback`, and an owner for the replay itself (the Full's chains are not rendering
+anywhere until they are published, and running them on the control thread means running a plan nothing
+else owns yet). That is a render-path change and a new document-tier, and it is deliberately not
+invented here; the fade from Lite to Full is the ordinary one, unshaped.
 
 **What it does not do yet**, each with the remedy drafted:
 

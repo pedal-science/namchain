@@ -357,10 +357,41 @@ private:
   /// over.
   void close_transport();
   bool setup_signals(std::string& error);
-  /// Compile \p rig_path and publish it. Called for the startup rig, SIGHUP and `rig.load`.
+  /// Compile \p rig_path and publish it. Called for the startup rig, SIGHUP, `rig.load` and the cold
+  /// half of `rig.switch`.
   /// \param admit_over_budget passed on to \ref publish_document.
+  /// \param lite_first publish the document's **Lite** first and the Full behind it (P8), rather than
+  /// compiling the Full and leaving the player waiting for it.
+  /// \param steps receives what a `lite_first` publish did, for the reply to the client that asked:
+  /// `lite_first` (a Lite went first, so the rig started playing sooner), `lite` (that document) and
+  /// `full` (what became of the Full behind it). Untouched when \p lite_first is false, and may be
+  /// null.
   bool load_rig(const std::string& rig_path, std::string& error, std::string* error_code = nullptr,
-                bool admit_over_budget = false);
+                bool admit_over_budget = false, bool lite_first = false, nlohmann::json* steps = nullptr);
+  /// \brief P8's two-step publish: the Lite document first, the Full behind it. Control thread.
+  ///
+  /// The Lite compiles in about a third of the time, so the rig starts playing about that much
+  /// sooner; the Full is then compiled while the Lite plays and published as an ordinary second
+  /// publish, whose crossfade is the existing transition machinery. The pedal's owner listened to
+  /// the fixed E2 audition set and cannot hear a Lite standing in for a Full, which is what makes
+  /// the substitution legitimate -- and D6 keeps it visible.
+  ///
+  /// **There is no catch-up replay**: the Full's chains start from a cold state, so a note that was
+  /// already sounding is wrong through the Full for the length of its receptive field (P8's 170 ms).
+  /// `nam/lookback.cpp` knows how much to replay, but the input to replay it is not reachable from
+  /// this path -- the warm set's block pool holds four blocks of decoded capture and drops what does
+  /// not fit (docs/daemon.md, "Lite-first publishes").
+  ///
+  /// \param report filled on success only, and always with `lite_first` and `full`, plus `lite` when a
+  /// Lite really was published; may be null. `lite_first` there is about the publish that happened --
+  /// a Lite went first -- while `engine.status`'s `cost.lite_first` is about what is standing in now,
+  /// and the two differ only where the budget's own answer is the Lite (`full.state` `unchanged`).
+  /// A failure of the *second* publish is not a failure of this function: the Lite is playing and the
+  /// reply says the Full did not follow (`full.state` is `refused`, with `error`/`code`).
+  /// \return false only when the first publish was refused, in which case nothing changed at all.
+  bool publish_lite_first(const graph::Document& document, const std::string& path, const std::string& source,
+                          const std::string& base_dir, std::string& error, std::string* error_code,
+                          bool admit_over_budget, nlohmann::json* report);
   /// \brief Compile every chain of \p document, prewarm the plans, and publish them together.
   ///
   /// Control thread. All-or-nothing: if any chain fails to compile, or its channels are not available,
@@ -381,9 +412,13 @@ private:
   /// that can be trimmed trimmed, and report it as a `cost_over` warning, rather than refuse it. For
   /// the publishes nobody can be told "no" about: the configured rig at startup and on SIGHUP, and the
   /// running document again after a library rescan (docs/daemon.md, "Cost and admission").
+  /// \param lite_first trim every slimmable model, whatever the budget says, so this publish compiles
+  /// and starts playing sooner (\ref publish_lite_first is the whole of P8's first step; this is the
+  /// single publish underneath it).
   bool publish_document(const graph::Document& document, const std::string& path, const std::string& source,
                         const std::string& base_dir, std::string& error,
-                        std::string* error_code = nullptr, bool admit_over_budget = false);
+                        std::string* error_code = nullptr, bool admit_over_budget = false,
+                        bool lite_first = false);
   /// \brief Resolve a `set_param` against a chain's newest published plan and push it on the ring.
   ///
   /// \param chain_id the chain to resolve against, or empty to resolve by node id -- which is an error
@@ -417,8 +452,12 @@ private:
   bool cool_warm(const std::string& rig, std::string& error, std::string* error_code, nlohmann::json& cooled);
   /// \brief Make \p rig audible, as a handover when it is warm and as a publish when it is not.
   /// Control thread; blocks until the switch completes or its deadline passes.
+  /// \param lite_first asked for a two-step publish if this turns out to be a cold switch. A rig that
+  /// is *warm* is already compiled, so a handover beats any Lite compile: the flag is ignored and the
+  /// body says `switched: warm` with `lite_first: false`.
+  /// \param steps receives what the cold path's `lite_first` publish did (\ref publish_lite_first).
   bool switch_to(const std::string& rig, bool fallback, std::string& error, std::string* error_code,
-                 nlohmann::json& body);
+                 nlohmann::json& body, bool lite_first = false, nlohmann::json* steps = nullptr);
   /// \brief Catch the control thread's view up with a switch the render thread has performed.
   ///
   /// A warm switch changes which document is audible without a publish, so the fields that describe

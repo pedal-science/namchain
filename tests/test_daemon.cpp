@@ -2369,6 +2369,22 @@ Config budget_config(const TempDir& dir)
   return config;
 }
 
+/// One model between an input and an output: 0.52 of a core as `A2` (Full + 0.02 of nodes), 0.17 as
+/// its Lite. Under the headroom either way, so an ordinary publish never trims it -- which is the case
+/// P8 exists for: a Lite there is a *choice*, not a concession to the budget.
+std::string one_amp_rig(const char* model)
+{
+  return std::string(R"({
+    "nodes": [
+      { "id": "in", "type": "nc.input" },
+      { "id": "a1", "type": "nc.nam", "model": ")") +
+         model + R"(" },
+      { "id": "out", "type": "nc.output" }
+    ],
+    "connections": [ { "from": "in", "to": "a1" }, { "from": "a1", "to": "out" } ]
+  })";
+}
+
 } // namespace
 
 TEST_CASE("the cost table trims the model it can, says so, and refuses what still does not fit")
@@ -2483,6 +2499,256 @@ TEST_CASE("the cost table trims the model it can, says so, and refuses what stil
   CHECK(after["generation"] == before);
   CHECK(after["document"]["chains"][0]["nodes"][2]["model"] == "A2-Full");
   CHECK(after["document"]["chains"][0]["nodes"][1]["model"] == "A2");
+}
+
+TEST_CASE("a lite_first load publishes the Lite first and the Full behind it")
+{
+  // P8's first increment, end to end through a real daemon: the rig starts playing as soon as its
+  // Lite compiles -- about a third of the work -- and the Full is compiled while it plays and
+  // crossfaded in over it. The reply carries both publishes, because the Lite is the one thing a
+  // client cannot see afterwards: the control thread does both before it answers (docs/daemon.md,
+  // "Lite-first publishes").
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
+  write_file(dir.path / "rigs" / "slimmable.json", one_amp_rig("A2"));
+  const Config config = budget_config(dir);
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  // The baseline: 0.52 as written, so an ordinary load publishes the Full and trims nothing. The
+  // Lite-first load below must end in exactly this state.
+  const auto plain = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.load","rig":"slimmable.json"})"));
+  REQUIRE_MESSAGE(plain["ok"] == true, plain.dump());
+  const uint64_t plain_generation = plain["generation"].get<uint64_t>();
+  CHECK(plain["slimmed_models"].empty());
+  CHECK_FALSE(plain.contains("lite_first")); // nobody asked, so nothing about it is said
+
+  const auto loaded = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.load","rig":"slimmable.json","lite_first":true})"));
+  REQUIRE_MESSAGE(loaded["ok"] == true, loaded.dump());
+
+  // Step one: the Lite, published whatever the budget says (it would have fitted as a Full).
+  CHECK(loaded["lite_first"] == true);
+  CHECK(loaded["lite"]["trimmed"] == true);
+  CHECK(loaded["lite"]["verdict"] == "trimmed");
+  CHECK(loaded["lite"]["cost"] == doctest::Approx(0.17));
+  CHECK(loaded["lite"]["full_cost"] == doctest::Approx(0.52));
+  CHECK(loaded["lite"]["generation"] == plain_generation + 1);
+  REQUIRE(loaded["lite"]["slimmed_models"].size() == 1);
+  CHECK(loaded["lite"]["slimmed_models"][0]["chain"] == "main");
+  CHECK(loaded["lite"]["slimmed_models"][0]["node"] == "a1");
+  CHECK(loaded["lite"]["slimmed_models"][0]["reference"] == "A2");
+  CHECK(loaded["lite"]["slimmed_models"][0]["row"] == "NAM.WaveNet.lite");
+  CHECK(loaded["lite"]["slimmed_models"][0]["cost"] == doctest::Approx(0.15));
+  CHECK(loaded["lite"]["slimmed_models"][0]["full_cost"] == doctest::Approx(0.5));
+  // And the device is *playing* it: the control thread waited for the Lite's fade to finish before it
+  // compiled the Full, so this is the render thread's own state and not a plan sitting in a ring. Two
+  // publishes back to back would have coalesced the Lite away (the newer plan retires a pending one),
+  // which is exactly what this wait prevents -- and what can only be asserted if it happened.
+  CHECK(loaded["lite"]["adopted"] == true);
+
+  // Step two: the Full, as an ordinary publish -- the same route and the same crossfade as any load.
+  CHECK(loaded["full"]["state"] == "published");
+  CHECK(loaded["full"]["generation"] == plain_generation + 2);
+  CHECK(loaded["full"]["cost"] == doctest::Approx(0.52));
+  CHECK(loaded["full"]["verdict"] == "fits");
+  CHECK(loaded["full"]["trimmed"] == false);
+  CHECK(loaded["generation"] == plain_generation + 2);
+  CHECK(loaded["slimmed_models"].empty()); // the document that ended up running is the Full
+  REQUIRE(loaded["transitions"].size() == 1);
+  CHECK(loaded["transitions"][0]["chain"] == "main");
+  CHECK(loaded["transitions"][0]["kind"] == "crossfade");
+
+  const bool adopted = wait_for(config.socket_path, [plain_generation](const nlohmann::json& status) {
+    return status["state"] == "running" && status["adopted_generation"].get<uint64_t>() >= plain_generation + 2 &&
+           status["blocks"].get<uint64_t>() > 0;
+  });
+  CHECK_MESSAGE(adopted, "the Full never reached the device");
+
+  // What the engine reports is the Full: the temporary Lite lasted for the length of the Full's
+  // compile, and `lite_first` is false again once the rig is what the document asked for.
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["cost"]["cost"] == doctest::Approx(0.52));
+  CHECK(status["cost"]["trimmed"] == false);
+  CHECK(status["cost"]["lite_first"] == false);
+  CHECK(status["cost"]["verdict"] == "fits");
+  REQUIRE(status["cost"]["nodes"].size() == 3);
+  CHECK(status["cost"]["nodes"][1]["row"] == "NAM.WaveNet.full");
+  CHECK(status["cost"]["nodes"][1]["slimmed"] == false);
+  CHECK(status["chains"][0]["slimmed_models"].empty());
+  for (const auto& issue : status["issues"])
+    CHECK(issue["code"] != "model_slimmed");
+}
+
+TEST_CASE("a lite_first request on a rig with nothing to trim is an ordinary publish")
+{
+  // The other half of P8's flag: where there is nothing slimmable, the Lite *is* the document as
+  // written, so there is no second publish to make and nothing about the request is worth reporting
+  // as a standing-in Lite. One generation moves, not two.
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
+  write_file(dir.path / "rigs" / "full-only.json", one_amp_rig("A2-Full"));
+  const Config config = budget_config(dir);
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const auto loaded = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.load","rig":"full-only.json","lite_first":true})"));
+  REQUIRE_MESSAGE(loaded["ok"] == true, loaded.dump());
+  CHECK(loaded["generation"] == 1);
+  CHECK(loaded["lite_first"] == false);
+  CHECK_FALSE(loaded.contains("lite"));
+  CHECK(loaded["full"]["state"] == "nothing_to_trim");
+  CHECK(loaded["full"]["generation"] == 1);
+  CHECK(loaded["slimmed_models"].empty());
+
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["cost"]["cost"] == doctest::Approx(0.52));
+  CHECK(status["cost"]["trimmed"] == false);
+  CHECK(status["cost"]["lite_first"] == false);
+  CHECK(status["cost"]["verdict"] == "fits");
+  REQUIRE(status["cost"]["nodes"].size() == 3);
+  CHECK(status["cost"]["nodes"][1]["row"] == "NAM.WaveNet.full");
+}
+
+TEST_CASE("a lite_first publish is refused when the rig is over the headroom at Lite")
+{
+  // Lite-first is a compile-time trick, not an exemption from D3: a rig that is over with *everything*
+  // trimmed is refused exactly as an ordinary publish refuses it, and nothing about the running rig
+  // changes. The refusal has to happen on the first publish, because the second one never gets to run.
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
+  write_file(dir.path / "rigs" / "slimmable.json", one_amp_rig("A2"));
+  write_file(dir.path / "rigs" / "two-full.json", two_amp_rig("A2-Full", "A2-Full"));
+  const Config config = budget_config(dir);
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const auto playing = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.load","rig":"slimmable.json"})"));
+  REQUIRE_MESSAGE(playing["ok"] == true, playing.dump());
+  const uint64_t generation = playing["generation"].get<uint64_t>();
+
+  // Two Fulls and nothing slimmable: 1.020 of a core against the table's 0.800 headroom.
+  const auto refused = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.load","rig":"two-full.json","lite_first":true})"));
+  REQUIRE(refused["ok"] == false);
+  CHECK(refused["error"]["code"] == "over_budget");
+  const std::string why = refused["error"]["message"];
+  CHECK_MESSAGE(why.find("1.020 of a core") != std::string::npos, why);
+  CHECK_MESSAGE(why.find("0.800 a rig may have") != std::string::npos, why);
+  CHECK_MESSAGE(why.find("with every model that can be trimmed trimmed") != std::string::npos, why);
+
+  // Nothing was published, by either step: the rig that was playing still is, at its own generation.
+  const auto after = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  CHECK(after["generation"] == generation);
+  CHECK(after["rig"].get<std::string>().find("slimmable.json") != std::string::npos);
+  CHECK(after["slimmed_models"].empty());
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["cost"]["cost"] == doctest::Approx(0.52));
+  CHECK(status["cost"]["lite_first"] == false);
+
+  // A flag that is not a boolean is a bad request, not a silently ignored field.
+  const auto malformed = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.load","rig":"slimmable.json","lite_first":"yes"})"));
+  CHECK(malformed["ok"] == false);
+  CHECK(malformed["error"]["code"] == "bad_request");
+}
+
+TEST_CASE("a lite_first publish whose Lite is already the budget's answer reports so")
+{
+  // `A2` beside a Full that cannot be slimmed is over the headroom as written, so an ordinary publish
+  // trims the container to Lite -- and a Lite-first publish trims exactly the same node. The second
+  // publish therefore had nothing to do, which is not a failure and not a Full: the state says so, and
+  // `full.generation` stands still because a publish that changes nothing does not advance it.
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
+  write_file(dir.path / "rigs" / "trimmed.json", two_amp_rig("A2", "A2-Full"));
+  const Config config = budget_config(dir);
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const auto loaded = nlohmann::json::parse(
+    call(config.socket_path, R"({"method":"rig.load","rig":"trimmed.json","lite_first":true})"));
+  REQUIRE_MESSAGE(loaded["ok"] == true, loaded.dump());
+  CHECK(loaded["lite_first"] == true);
+  CHECK(loaded["lite"]["trimmed"] == true);
+  CHECK(loaded["lite"]["cost"] == doctest::Approx(0.67));
+  CHECK(loaded["lite"]["adopted"] == true);
+  CHECK(loaded["full"]["state"] == "unchanged");
+  CHECK(loaded["full"]["generation"] == loaded["lite"]["generation"]);
+  CHECK(loaded["generation"] == loaded["lite"]["generation"]);
+  // The state it ends in is the state an ordinary publish of this rig reaches, and the engine reports
+  // the Lite that is standing in, because for this rig the Lite *is* the answer (D6). The reply's
+  // `lite_first` is about the publish that happened -- a Lite went first -- while the status's is about
+  // what is standing in *now*: not a temporary Lite on its way to a Full, so false, with `trimmed`
+  // carrying the warning a panel shows.
+  REQUIRE(loaded["slimmed_models"].size() == 1);
+  CHECK(loaded["slimmed_models"][0]["node"] == "a1");
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["cost"]["cost"] == doctest::Approx(0.67));
+  CHECK(status["cost"]["trimmed"] == true);
+  CHECK(status["cost"]["lite_first"] == false);
+  CHECK(status["cost"]["verdict"] == "trimmed");
 }
 
 TEST_CASE("rig.cost answers what a rig would cost, without publishing or compiling it")
@@ -4251,6 +4517,69 @@ TEST_CASE("a switch to a rig that is not warm is a cold load, not a refusal")
   const auto no_warm_key = request(cold, R"({"method":"engine.status"})");
   CHECK_FALSE(no_warm_key["status"].contains("warm"));
   cold.request_stop();
+}
+
+TEST_CASE("a lite_first switch hears the Lite while the Full is compiled, and a warm rig ignores the flag")
+{
+  // The press is what P8 is for: a cold switch makes the player wait for the whole compile, and the
+  // Lite is what they hear meanwhile. Where the rig is warm there is nothing to wait for at all, so
+  // the flag has nothing to do -- and the reply says which of the two happened rather than leaving a
+  // client to guess.
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
+  write_file(dir.path / "rigs" / "slimmable.json", one_amp_rig("A2"));
+  Config config = budget_config(dir);
+  // `rig.switch` exists only where warmth does (warm_disabled otherwise), and warmth is what makes
+  // "this rig is already compiled" a case the flag has to answer for.
+  config.warm_cpus = {0};
+  config.warm_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  REQUIRE(wait_status(daemon, [](const nlohmann::json& s) { return s["blocks"].get<uint64_t>() > 0; }));
+
+  // Nothing is warm, so this is a cold switch -- two publishes, the Lite and then the Full.
+  const auto cold = request(daemon, R"({"id":"s","method":"rig.switch","rig":"slimmable.json","lite_first":true})");
+  REQUIRE_MESSAGE(cold["ok"] == true, cold.dump());
+  CHECK(cold["switched"] == "cold");
+  CHECK(cold["lite_first"] == true);
+  CHECK(cold["lite"]["trimmed"] == true);
+  CHECK(cold["lite"]["adopted"] == true);
+  CHECK(cold["lite"]["cost"] == doctest::Approx(0.17));
+  CHECK(cold["full"]["state"] == "published");
+  CHECK(cold["full"]["cost"] == doctest::Approx(0.52));
+  CHECK(cold["generation"] == cold["full"]["generation"]);
+  CHECK(cold["slimmed_models"].empty());
+  const auto after_cold = request(daemon, R"({"method":"engine.status"})");
+  CHECK(after_cold["status"]["rig"].get<std::string>().find("slimmable.json") != std::string::npos);
+  CHECK(after_cold["status"]["cost"]["cost"] == doctest::Approx(0.52));
+  CHECK(after_cold["status"]["cost"]["lite_first"] == false);
+  CHECK(after_cold["status"]["warm"]["cold_switches"] == 1);
+
+  // A switch that did not ask for a Lite says nothing about one: the flag is what puts the object in
+  // the reply, and a client that ignores it cannot be surprised by it.
+  const auto plain = request(daemon, R"({"id":"p","method":"rig.switch","rig":"slimmable.json"})");
+  REQUIRE(plain["ok"] == true);
+  CHECK_FALSE(plain.contains("lite_first"));
+  CHECK_FALSE(plain.contains("lite"));
+
+  // Now warm the rig and ask again: a handover beats any Lite compile, so the flag is reported false.
+  const auto warmed = request(daemon, R"({"id":"w","method":"rig.warm","rig":"slimmable.json"})");
+  REQUIRE_MESSAGE(warmed["ok"] == true, warmed.dump());
+  REQUIRE(wait_status(daemon, [](const nlohmann::json& s) {
+    const nlohmann::json entry = warm_entry(s);
+    return !entry.is_null() && entry["state"] == "warm" && entry["blocks"].get<uint64_t>() > 0;
+  }));
+
+  const auto warm_switch =
+    request(daemon, R"({"id":"sw","method":"rig.switch","rig":"slimmable.json","lite_first":true})");
+  REQUIRE_MESSAGE(warm_switch["ok"] == true, warm_switch.dump());
+  CHECK(warm_switch["switched"] == "warm");
+  CHECK(warm_switch["lite_first"] == false);
+  CHECK_FALSE(warm_switch.contains("lite"));
+  CHECK_FALSE(warm_switch.contains("full")); // no two-step publish happened to describe
 }
 
 TEST_CASE("a switch mid-render is continuous audio, and warmth off is bit-identical")
