@@ -4254,6 +4254,11 @@ TEST_CASE("levels_first_frame measures one frame per period, and the engine stil
   // (level.h), so a single read can legitimately land between two blocks and be empty. Polling until
   // one is not a race being papered over: it is what a meter does, and the deadline is generous
   // because the suite runs this beside other cases that are compiling rigs.
+  //
+  // The empty read is the one thing it must not assert *about*: `chains` is empty when the window is,
+  // so requiring a chain on every read made this case fail whenever the read landed between blocks --
+  // which in the board's build container it does (2026-10-10, and it blocks every deploy from there).
+  // The chain's contents are asserted where the samples are: inside the loop, once there are some.
   bool saw_one_frame = false;
   std::string last_seen;
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -4263,7 +4268,12 @@ TEST_CASE("levels_first_frame measures one frame per period, and the engine stil
     REQUIRE(reply["ok"] == true);
     const auto& levels = reply["levels"];
     CHECK(levels["cache"]["first_frame"] == true);
-    REQUIRE(levels["chains"].size() == 1);
+    CHECK(levels["chains"].size() <= 1);
+    if (levels["chains"].empty())
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      continue;
+    }
     for (const auto& node : levels["chains"][0]["nodes"])
     {
       const uint64_t frames = node["frames"].get<uint64_t>();
