@@ -206,9 +206,21 @@ struct PlanSlot
   /// when it takes the plan over. A plan marked this way is held in `ChainRuntime::pending` until
   /// \ref Daemon::advance_catch_up decides its state is exactly right, or gives up waiting.
   std::atomic<bool> catch_up{false};
+  /// \brief The sequence of the last block *fed* into this plan -- replayed or mirrored -- which is
+  /// what the render thread decides the hand-over on: it takes the plan over when this has reached the
+  /// block it just rendered, so the plan's state is the state a plan that had been running would have,
+  /// and it processes every block exactly once and in order.
+  ///
+  /// \ref catch_up_seq is the same number, but it is *not* what the decision reads. The two are written
+  /// by the catch-up thread either side of executing the plan, so a reader that compared the pair could
+  /// see a sequence whose block has not been executed yet; reading this one alone can only ever be one
+  /// block *behind* the truth, which delays a hand-over and never advances one (2026-10-10: comparing
+  /// the executed sequence cost the pedal every two-step publish, because it needed the hand-over to
+  /// win a race inside one 1.33 ms block, and on an unpaced producer the plan is always behind).
+  std::atomic<uint64_t> catch_up_ready{0};
   /// The input block sequence the plan's state is "as of": the last block replayed or mirrored into
-  /// it. The render thread takes the plan over only when this is one less than the block it is about
-  /// to render, so the plan processes every block exactly once and in order.
+  /// it. Written after the block has been executed, so this is the state, not the intent; the
+  /// hand-over reads \ref catch_up_ready rather than this.
   std::atomic<uint64_t> catch_up_seq{0};
   /// The catch-up could not be made exact (the render thread ran out of patience, or the history had
   /// a hole): take the plan over as soon as the catch-up thread is out of it, and say so.
@@ -1316,9 +1328,6 @@ private:
   std::atomic<uint64_t> catch_up_hold_abandoned_{0};
   std::atomic<uint64_t> catch_up_hold_exact_at_{0};
   std::atomic<uint64_t> catch_up_hold_abandoned_at_{0};
-  // TEMPORARY probe: how far the plan's own sequence is from the render thread's, per block.
-  std::atomic<uint64_t> catch_up_probe_checks_{0};
-  std::atomic<int64_t> catch_up_probe_lag_{0};
 
   /// \brief The warm document as the control thread sees it: what it was compiled from, what it cost,
   /// and the plans it owns until the warm thread retires them.

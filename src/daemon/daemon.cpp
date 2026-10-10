@@ -2045,8 +2045,6 @@ nlohmann::json Daemon::catch_up_json() const
   json["history_block_frames"] = catch_up_report_.history_block_frames;
   json["device_period_size"] = catch_up_report_.device_period_size;
   json["period_mismatch"] = catch_up_report_.period_mismatch;
-  json["probe"] = {{"checks", catch_up_probe_checks_.load(std::memory_order_relaxed)},
-                   {"lag", catch_up_probe_lag_.load(std::memory_order_relaxed)}};
   json["hold"] = {{"exact", catch_up_report_.hold_exact},
                   {"abandoned", catch_up_report_.hold_abandoned},
                   {"exact_at", catch_up_report_.hold_exact_at},
@@ -2327,9 +2325,10 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
       replay_window(*slot->plan, catch_up_window_, static_cast<unsigned>(job.channel[c]), job.frames[c], scratch);
     if (replay.covered)
     {
-      // The state is "as of" the last block replayed: one less than the block the render thread
-      // will render next, which is the condition it takes the plan over on.
+      // The state is "as of" the last block replayed, which is what the render thread's hand-over
+      // reads (`catch_up_ready`); `catch_up_seq` records the same block as the state itself.
       slot->catch_up_seq.store(replay.last_seq, std::memory_order_release);
+      slot->catch_up_ready.store(replay.last_seq, std::memory_order_release);
       slot->catch_up_blocks.fetch_add(replay.blocks, std::memory_order_relaxed);
       blocks = std::max(blocks, replay.blocks);
       frames = std::max(frames, replay.frames);
@@ -2398,6 +2397,10 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
         continue;
       const float* plane = data + static_cast<std::size_t>(channel) * period;
       slot->plan->execute(plane, scratch, static_cast<int>(period));
+      // Published after the block has been fed, so a render thread that reads it can only ever be told
+      // "not yet" for a block that is already there, never "yes" for one that is not. The two stores
+      // are in this order for the same reason the hand-over reads the first of them.
+      slot->catch_up_ready.store(seq, std::memory_order_release);
       slot->catch_up_seq.store(seq, std::memory_order_release);
       slot->catch_up_blocks.fetch_add(1, std::memory_order_relaxed);
       release_catch_up(slot->catch_up_owner);
@@ -2444,12 +2447,14 @@ void Daemon::advance_catch_up(DocRuntime& doc, int frames) noexcept
       }
     }
 
-    const uint64_t seen_seq = slot->catch_up_seq.load(std::memory_order_acquire);
-    // TEMPORARY probe: previous_block - seen_seq, the lag the render thread is looking at.
-    catch_up_probe_checks_.fetch_add(1, std::memory_order_relaxed);
-    catch_up_probe_lag_.store(static_cast<int64_t>(previous_block) - static_cast<int64_t>(seen_seq),
-                              std::memory_order_relaxed);
-    const bool exact = seen_seq == previous_block;
+    // The state is the state a plan that had been running would have when this has reached the block
+    // just rendered: the catch-up thread feeds whole blocks in order, so "fed through N" is "holds
+    // everything up to and including N" -- which is what the plan is about to be handed, with the
+    // current block still to come. A comparison, not an equality, because the catch-up thread may be
+    // behind rather than ahead (an unpaced producer runs the device far faster than the replay can
+    // feed it): behind means wait, and waiting is bounded by the patience above.
+    const uint64_t fed_through = slot->catch_up_ready.load(std::memory_order_acquire);
+    const bool exact = fed_through >= previous_block;
     const bool abandoned = slot->catch_up_abandoned.load(std::memory_order_acquire);
     // With nothing playing for this chain there is no continuity to get right -- the plan is the
     // first one it has -- so it goes in as soon as the catch-up thread is out of it.
