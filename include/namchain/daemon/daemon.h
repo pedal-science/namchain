@@ -1316,6 +1316,9 @@ private:
   std::atomic<uint64_t> catch_up_hold_abandoned_{0};
   std::atomic<uint64_t> catch_up_hold_exact_at_{0};
   std::atomic<uint64_t> catch_up_hold_abandoned_at_{0};
+  // TEMPORARY probe: how far the plan's own sequence is from the render thread's, per block.
+  std::atomic<uint64_t> catch_up_probe_checks_{0};
+  std::atomic<int64_t> catch_up_probe_lag_{0};
 
   /// \brief The warm document as the control thread sees it: what it was compiled from, what it cost,
   /// and the plans it owns until the warm thread retires them.

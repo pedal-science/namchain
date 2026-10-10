@@ -2045,6 +2045,8 @@ nlohmann::json Daemon::catch_up_json() const
   json["history_block_frames"] = catch_up_report_.history_block_frames;
   json["device_period_size"] = catch_up_report_.device_period_size;
   json["period_mismatch"] = catch_up_report_.period_mismatch;
+  json["probe"] = {{"checks", catch_up_probe_checks_.load(std::memory_order_relaxed)},
+                   {"lag", catch_up_probe_lag_.load(std::memory_order_relaxed)}};
   json["hold"] = {{"exact", catch_up_report_.hold_exact},
                   {"abandoned", catch_up_report_.hold_abandoned},
                   {"exact_at", catch_up_report_.hold_exact_at},
@@ -2442,7 +2444,12 @@ void Daemon::advance_catch_up(DocRuntime& doc, int frames) noexcept
       }
     }
 
-    const bool exact = slot->catch_up_seq.load(std::memory_order_acquire) == previous_block;
+    const uint64_t seen_seq = slot->catch_up_seq.load(std::memory_order_acquire);
+    // TEMPORARY probe: previous_block - seen_seq, the lag the render thread is looking at.
+    catch_up_probe_checks_.fetch_add(1, std::memory_order_relaxed);
+    catch_up_probe_lag_.store(static_cast<int64_t>(previous_block) - static_cast<int64_t>(seen_seq),
+                              std::memory_order_relaxed);
+    const bool exact = seen_seq == previous_block;
     const bool abandoned = slot->catch_up_abandoned.load(std::memory_order_acquire);
     // With nothing playing for this chain there is no continuity to get right -- the plan is the
     // first one it has -- so it goes in as soon as the catch-up thread is out of it.
