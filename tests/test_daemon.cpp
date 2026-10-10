@@ -32,6 +32,7 @@
 #include "namchain/daemon/config.h"
 #include "namchain/daemon/daemon.h"
 #include "namchain/graph/macro.h"
+#include "namchain/lookback.h"
 #include "namchain/wav.h"
 
 namespace
@@ -4771,4 +4772,239 @@ TEST_CASE("a starved warm thread is reported, and the audible audio is unaffecte
   REQUIRE(wait_status(daemon, [](const nlohmann::json& s) {
     return s["state"] == "closed" && s["blocks"].get<uint64_t>() > 0;
   }));
+}
+
+// ---------------------------------------------------------------------------
+// P8's catch-up replay, end to end
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+/// A deterministic two-tone-and-noise signal, written as the device's input. Deterministic because the
+/// comparison below is *bit-exact* between two runs of the daemon, and a random input would make a
+/// failure impossible to attribute.
+void write_signal_wav(const std::filesystem::path& path, unsigned frames, unsigned channels)
+{
+  std::vector<float> interleaved(static_cast<std::size_t>(frames) * channels);
+  unsigned state = 0x2468ace0u;
+  constexpr double kPi = 3.14159265358979323846;
+  for (unsigned i = 0; i < frames; ++i)
+  {
+    state = state * 1664525u + 1013904223u;
+    const double noise = (static_cast<double>((state >> 9) & 0xffffu) / 32768.0 - 1.0) * 0.02;
+    const double t = static_cast<double>(i) / 48000.0;
+    const double sample =
+        0.30 * std::sin(2.0 * kPi * 110.0 * t) + 0.18 * std::sin(2.0 * kPi * 311.0 * t) + noise;
+    for (unsigned c = 0; c < channels; ++c)
+      interleaved[static_cast<std::size_t>(i) * channels + c] =
+          static_cast<float>(c == 0 ? sample : sample * 0.5);
+  }
+  std::string error;
+  REQUIRE_MESSAGE(namchain::save_wav_float32(path.string(), interleaved.data(), frames, channels, 48000.0, error),
+                  error);
+}
+
+/// The `file` backend, a budget, and the pacing that lets the catch-up thread keep up with the render
+/// thread. The `file` backend renders as fast as it can otherwise, and a catch-up that has to be
+/// *current* before the crossfade starts needs the device to be paced like a device.
+Config catch_up_file_config(const TempDir& dir)
+{
+  Config config = file_backend_config(dir, 2, 2);
+  config.rigs_root = (dir.path / "rigs").string();
+  config.models_root = (dir.path / "models").string();
+  config.irs_root = (dir.path / "irs").string();
+  config.cost_table = (dir.path / "cost.json").string();
+  config.reclamation_timeout_ms = 5;
+  config.warm_test_pace_us = 2000;
+  return config;
+}
+
+/// The frames a document's models need replayed, in engine frames: what the daemon's own replay length
+/// arithmetic should arrive at.
+std::size_t expected_catch_up_frames(const std::string& model)
+{
+  const namchain::LookbackResult lookback = namchain::compute_lookback_from_file(model);
+  REQUIRE(lookback.ok());
+  const double rate = lookback.sample_rate > 0.0 ? lookback.sample_rate : 48000.0;
+  return static_cast<std::size_t>(std::ceil(static_cast<double>(lookback.samples) * 48000.0 / rate - 1e-9));
+}
+
+} // namespace
+
+TEST_CASE("a lite_first publish crossfades in a Full caught up with the input it missed")
+{
+  // The measurable claim of P8's replay, through the whole daemon: a rig loaded with `lite_first` while
+  // another rig is playing renders the *same samples* as a Full that has been running since the first
+  // block. Without the replay the Full starts from silence, so the blocks right after the hand-over are
+  // wrong for the length of its receptive field -- which is the window this compares, and the reason
+  // the comparison is anchored on the block the crossfade *closed* rather than on a fixed one.
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  write_file(dir.path / "cost.json", test_cost_table());
+  write_file(dir.path / "rigs" / "slimmable.json", one_amp_rig("A2"));
+  write_file(dir.path / "rigs" / "pass.json", kGainRig);
+
+  constexpr unsigned kQuantum = 64;
+  constexpr unsigned kBlocks = 512;
+  constexpr unsigned kFrames = kBlocks * kQuantum;
+  constexpr unsigned kPublishAt = 48; // the two-step publish, a few blocks in
+  // Compared blocks, counted from the block the crossfade closed on. Sixty blocks is 3840 frames, well
+  // inside the 6347-sample receptive field: a Full that started cold is still wrong across all of it,
+  // so a run without the replay cannot pass by converging before the window begins.
+  constexpr uint64_t kCompareBlocks = 60;
+  write_signal_wav(dir.path / "in.wav", kFrames, 2);
+
+  // The reference: the rig the player asked for, published once and played from the beginning.
+  {
+    Config config = catch_up_file_config(dir);
+    config.rig = (dir.path / "rigs" / "slimmable.json").string();
+    config.playback_path = (dir.path / "reference.wav").string();
+    Daemon daemon(config);
+    run_to_end(daemon);
+  }
+
+  // The same audio, but the rig is loaded two-step while a pass-through plays.
+  uint64_t full_generation = 0;
+  uint64_t crossfade_closed_at = 0;
+  {
+    Config config = catch_up_file_config(dir);
+    config.rig = (dir.path / "rigs" / "pass.json").string();
+    Daemon daemon(config);
+
+    std::string error;
+    REQUIRE_MESSAGE(daemon.start(error), error);
+    bool loaded = false;
+    const auto status_of = [&daemon] {
+      return nlohmann::json::parse(daemon.handle_request(R"({"method":"engine.status"})"))["status"];
+    };
+    for (int attempt = 0; attempt < 20000 && !loaded; ++attempt)
+    {
+      const auto status = status_of();
+      if (status["blocks"].get<uint64_t>() >= kPublishAt)
+      {
+        const auto load = nlohmann::json::parse(
+            daemon.handle_request(R"({"method":"rig.load","rig":"slimmable.json","lite_first":true})"));
+        REQUIRE_MESSAGE(load["ok"] == true, load.dump());
+        REQUIRE(load["lite_first"] == true);
+        CHECK(load["lite"]["adopted"] == true);
+        REQUIRE(load["full"]["state"] == "published");
+        // The Full's state was made current before it was crossfaded in, and the reply says so: the
+        // document's memory was sizeable, the window covered it, and the replay ran.
+        CHECK(load["full"]["catch_up"]["state"] == "exact");
+        CHECK(load["full"]["catch_up"]["replay"] == "exact");
+        CHECK(load["full"]["catch_up"]["frames"] ==
+              expected_catch_up_frames(std::string(NAMCHAIN_EXAMPLE_MODELS_DIR) + "/A2.nam"));
+        CHECK(load["full"]["catch_up"]["blocks"].get<uint64_t>() > 1);
+        full_generation = load["full"]["generation"].get<uint64_t>();
+        loaded = true;
+      }
+      else
+      {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+    REQUIRE_MESSAGE(loaded, "the two-step publish never happened");
+
+    // Wait for the crossfade to *close*: until then the device is hearing a mix of the Lite and the
+    // Full, which is a different signal from the reference by design.
+    for (int attempt = 0; attempt < 20000; ++attempt)
+    {
+      const auto status = status_of();
+      const auto& chain = status["chains"][0];
+      if (chain["audible_generation"].get<uint64_t>() >= full_generation &&
+          chain["transition_active"] == false)
+      {
+        crossfade_closed_at = status["blocks"].get<uint64_t>();
+        break;
+      }
+      if (status["state"] == "closed" && status["blocks"].get<uint64_t>() > 0)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(crossfade_closed_at > 0);
+
+    // Let the rest of the input play out.
+    for (int attempt = 0; attempt < 20000; ++attempt)
+    {
+      const auto status = status_of();
+      if (status["state"] == "closed" && status["blocks"].get<uint64_t>() > 0)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
+  unsigned reference_channels = 0;
+  unsigned played_channels = 0;
+  const std::vector<float> reference = read_wav(dir.path / "reference.wav", reference_channels);
+  const std::vector<float> played = read_wav(dir.path / "out.wav", played_channels);
+  REQUIRE(reference_channels == 2u);
+  REQUIRE(played_channels == 2u);
+  REQUIRE(reference.size() == played.size());
+
+  // One period was written per rendered block, from the first, so block N is frames [(N-1)*64, N*64).
+  // From the block *after* the one the crossfade closed on, the device is hearing the Full alone.
+  const std::size_t first_frame = static_cast<std::size_t>(crossfade_closed_at) * kQuantum;
+  const std::size_t last_frame = first_frame + kCompareBlocks * kQuantum;
+  REQUIRE(last_frame <= kFrames);
+  std::size_t differing = 0;
+  for (std::size_t frame = first_frame; frame < last_frame; ++frame)
+  {
+    if (reference[frame * 2] != played[frame * 2])
+      ++differing;
+  }
+  CHECK_MESSAGE(differing == 0, differing << " of " << (last_frame - first_frame)
+                                         << " samples differ from the Full that had been running");
+}
+
+TEST_CASE("a model with unbounded memory is refused a catch-up, in the reply and in the status")
+{
+  // An LSTM's memory cannot be replayed exactly at any length (nam/lookback.h). The rule is that the
+  // engine refuses to *promise* rather than approximating: the Full is published cold, and both the
+  // reply to the request and `engine.status` say which node and why -- never a silent cold Full.
+  TempDir dir;
+  write_budget_library(dir.path / "models");
+  std::filesystem::copy_file(std::string(NAMCHAIN_EXAMPLE_MODELS_DIR) + "/lstm.nam",
+                             dir.path / "models" / "lstm.nam");
+  write_file(dir.path / "cost.json", test_cost_table());
+  // Something slimmable *and* an LSTM in one chain, so a Lite really does go first and the Full really
+  // does have a catch-up that cannot be promised.
+  write_file(dir.path / "rigs" / "mixed.json", two_amp_rig("A2", "lstm"));
+  const Config config = budget_config(dir);
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const auto loaded = nlohmann::json::parse(
+      call(config.socket_path, R"({"method":"rig.load","rig":"mixed.json","lite_first":true})"));
+  REQUIRE_MESSAGE(loaded["ok"] == true, loaded.dump());
+  CHECK(loaded["lite_first"] == true);
+  CHECK(loaded["lite"]["trimmed"] == true);
+  REQUIRE(loaded["full"]["state"] == "published");
+  // No replay was done, and the reply says what stopped it -- naming the node, not just the verdict.
+  CHECK(loaded["full"]["catch_up"]["state"] == "unbounded");
+  CHECK(loaded["full"]["catch_up"]["replay"] == "none");
+  CHECK(loaded["full"]["catch_up"]["frames"] == 0);
+  const std::string detail = loaded["full"]["catch_up"]["detail"];
+  CHECK(detail.find("LSTM") != std::string::npos);
+  CHECK(detail.find("unbounded") != std::string::npos);
+
+  // And it is a state a client can poll, not only a line in one reply (D6).
+  const auto status = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"))["status"];
+  CHECK(status["catch_up"]["state"] == "unbounded");
+  CHECK(status["catch_up"]["replay"] == "none");
+  CHECK(status["catch_up"]["running"] == false);
 }

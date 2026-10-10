@@ -262,7 +262,12 @@ LookbackResult compute_lookback_from_json(const std::string& json_text)
   }
   try
   {
-    return compute_model(doc);
+    LookbackResult r = compute_model(doc);
+    // The model's own rate, when the file names one: `samples` is in the model's domain and the core
+    // resamples to it, so a replay measured in the engine's frames has to be scaled by the caller.
+    if (doc.is_object() && doc.contains("sample_rate") && doc["sample_rate"].is_number())
+      r.sample_rate = doc["sample_rate"].get<double>();
+    return r;
   }
   catch (const std::exception& e)
   {

@@ -13,17 +13,21 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "namchain/assets/registry.h"
 #include "namchain/daemon/config.h"
+#include "namchain/daemon/catch_up.h"
 #include "namchain/daemon/doc_runtime.h"
 #include "namchain/daemon/framing.h"
 #include "namchain/daemon/cost_table.h"
+#include "namchain/daemon/input_history.h"
 #include "namchain/daemon/recorder.h"
 #include "namchain/daemon/render_pool.h"
 #include "namchain/graph/plan.h"
@@ -121,6 +125,34 @@ inline uint64_t decay_recent_trouble(uint64_t value)
   return value == 0 ? 0 : value - (value / 8 > 1 ? value / 8 : 1);
 }
 
+/// \brief Who may run a plan that is being caught up (P8).
+///
+/// A plan that has not been rendering has no state, and the catch-up thread replays recent input into
+/// it to build one. That is the one time a plan is executed by a thread other than the one that will
+/// render it, so who is executing it has to be a fact both threads agree on rather than an assumption:
+/// the catch-up thread claims this before each block it replays and releases it after, and the render
+/// thread claims it before the crossfade that makes the plan audible. Exactly one of them can win, so
+/// a block is never run twice and the two never touch the plan at once.
+enum class CatchUpOwner : uint8_t
+{
+  Free = 0,    ///< nobody is in it: either thread may claim
+  CatchUp = 1, ///< the catch-up thread is replaying or keeping it current
+  Render = 2,  ///< the render thread has taken it over for the crossfade
+};
+
+/// Claim a catch-up plan for \p who. \return false when the other thread has it.
+inline bool claim_catch_up(std::atomic<CatchUpOwner>& owner, CatchUpOwner who) noexcept
+{
+  CatchUpOwner expected = CatchUpOwner::Free;
+  return owner.compare_exchange_strong(expected, who, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+/// Let go of a catch-up plan, after the block being run has finished.
+inline void release_catch_up(std::atomic<CatchUpOwner>& owner) noexcept
+{
+  owner.store(CatchUpOwner::Free, std::memory_order_release);
+}
+
 /// \brief One published chain plan and the arena its buffers live in.
 ///
 /// Owns both, so retiring a slot frees the plan and every intermediate buffer together. The control
@@ -165,6 +197,27 @@ struct PlanSlot
   /// last wrote, not anything in the node, so this is what carries a feedback loop across.
   std::vector<std::pair<const float*, float*>> on_adopt;
   std::vector<std::pair<const float*, float*>> on_then;
+
+  // --- P8's catch-up (docs/daemon.md, "Lite-first publishes") ---------------------------------
+  /// \brief This plan is being caught up: it must not be executed by the render thread until the
+  /// catch-up has made its state current.
+  ///
+  /// Set by the control thread on the Full of a `lite_first` publish, cleared by the render thread
+  /// when it takes the plan over. A plan marked this way is held in `ChainRuntime::pending` until
+  /// \ref Daemon::advance_catch_up decides its state is exactly right, or gives up waiting.
+  std::atomic<bool> catch_up{false};
+  /// The input block sequence the plan's state is "as of": the last block replayed or mirrored into
+  /// it. The render thread takes the plan over only when this is one less than the block it is about
+  /// to render, so the plan processes every block exactly once and in order.
+  std::atomic<uint64_t> catch_up_seq{0};
+  /// The catch-up could not be made exact (the render thread ran out of patience, or the history had
+  /// a hole): take the plan over as soon as the catch-up thread is out of it, and say so.
+  std::atomic<bool> catch_up_abandoned{false};
+  /// Who is executing it right now (\ref CatchUpOwner).
+  std::atomic<CatchUpOwner> catch_up_owner{CatchUpOwner::Free};
+  /// Blocks the catch-up thread has replayed or mirrored into this plan: what the replay cost and
+  /// what a report can show.
+  std::atomic<uint64_t> catch_up_blocks{0};
 };
 
 /// The widest device whose levels are measured, per direction. Eight is the pedal's stereo interface
@@ -415,10 +468,15 @@ private:
   /// \param lite_first trim every slimmable model, whatever the budget says, so this publish compiles
   /// and starts playing sooner (\ref publish_lite_first is the whole of P8's first step; this is the
   /// single publish underneath it).
+  /// \param catch_up when not null and replayable, this publish is the Full of a `lite_first`
+  /// request: every chain is compiled whole -- never as a local transition, because a local
+  /// transition *shares node instances* with the plan that is playing and the catch-up thread runs
+  /// the new plan beside it -- and every slot is marked `catch_up`, so the render thread holds it
+  /// until its state is current instead of crossfading it in cold (P8's catch-up replay).
   bool publish_document(const graph::Document& document, const std::string& path, const std::string& source,
                         const std::string& base_dir, std::string& error,
                         std::string* error_code = nullptr, bool admit_over_budget = false,
-                        bool lite_first = false);
+                        bool lite_first = false, const CatchUpPlan* catch_up = nullptr);
   /// \brief Resolve a `set_param` against a chain's newest published plan and push it on the ring.
   ///
   /// \param chain_id the chain to resolve against, or empty to resolve by node id -- which is an error
@@ -649,6 +707,83 @@ private:
   void retire_warm_content_of(DocRuntime& doc) noexcept;
   /// Retire content that was never installed -- a compiled document superseded before it landed.
   void retire_warm_content(const WarmContent& content) noexcept;
+
+  // --- the catch-up (P8's replay: pedal.project docs/…-fast-switching.md, "P8") ----------------
+  /// \brief What a catch-up is asked to do: catch these plans up to the input the device is playing.
+  ///
+  /// One job per `lite_first` publish, handed from the control thread to the catch-up thread. Plain
+  /// data: the plans are owned by the render thread's pending slots while this runs, and the job only
+  /// names them.
+  struct CatchUpJob
+  {
+    PlanSlot* slots[kMaxChains] = {};
+    /// The capture channel each chain reads, and the frames of input its state needs.
+    int channel[kMaxChains] = {};
+    std::size_t frames[kMaxChains] = {};
+    unsigned chain_count = 0;
+    std::size_t window_frames = 0;
+    uint64_t id = 0;
+  };
+
+  /// \brief What became of the last catch-up, for the reply and for `engine.status`. Control thread.
+  struct CatchUpReport
+  {
+    /// The document's own answer (`CatchUpPlan::state`): `exact`, `inexact`, `empty`, `unbounded`,
+    /// `unknown`, `too_long`. What the engine knows before it tries.
+    std::string state = "none";
+    /// What actually happened: `none` (not attempted), `exact` (the window covered and was
+    /// replayed), `gap` (the history had a hole), `no_input` (no window arrived in time), `busy`
+    /// (another catch-up was still running), `abandoned` (the render thread gave up waiting and
+    /// faded the Full in anyway). Empty until a catch-up has been tried or deliberately not tried.
+    std::string replay = "none";
+    std::string detail;
+    std::size_t frames = 0; ///< the window the document needs, in engine frames
+    std::size_t blocks = 0; ///< blocks replayed (and mirrored) when the report was built
+    bool running = false;   ///< a catch-up job is in flight
+  };
+
+  /// \brief Start recording input for a catch-up, and work out nothing else: the job comes later.
+  ///
+  /// Control thread. Sizes the ring and starts the device thread recording into it, so that the
+  /// history covers the Lite's compile, the wait for it to settle and the Full's compile -- the whole
+  /// of a two-step publish. False when a catch-up is already in flight (`busy`) or the plan needs no
+  /// replay.
+  bool arm_catch_up(const CatchUpPlan& plan, unsigned chains);
+  /// \brief What a document's models need replayed, from the document as written.
+  ///
+  /// Control thread: resolves a copy the way a publish does -- relative paths, then the library --
+  /// and asks `catch_up_plan` about the result. Never fails: a document that cannot be resolved gets
+  /// `unknown` with the reason, which is what the reply reports.
+  CatchUpPlan catch_up_plan_for(const graph::Document& document, const std::string& base_dir);
+  /// \brief Wait, briefly, for the catch-up's replay to have happened so the reply can report it.
+  ///
+  /// Control thread. It waits for the *replay*, not for the fade the render thread starts afterwards:
+  /// the answer to "was the state made exact" is known then, and the Lite is playing throughout.
+  void wait_for_catch_up_replay();
+  /// Stop recording, and clear what the last catch-up needed. Control thread; a no-op when nothing is
+  /// armed.
+  void disarm_catch_up() noexcept;
+  /// Hand \p job to the catch-up thread, starting it if this is the first. Control thread.
+  void start_catch_up_job(const CatchUpJob& job);
+  /// Join the catch-up thread. Called by `stop`, before anything it may be executing is freed.
+  void stop_catch_up_thread() noexcept;
+  /// The catch-up thread: take a job, drain the history, replay it, keep the plans current until the
+  /// render thread takes them over.
+  void catch_up_loop();
+  /// One job, on the catch-up thread.
+  void serve_catch_up(const CatchUpJob& job);
+  /// Render thread: record this block's decoded capture for a catch-up. One atomic load when none is
+  /// armed, which is every block of an ordinary run.
+  void write_input_history() noexcept;
+  /// \brief Render thread: advance every held catch-up plan by one block: take over the ones whose
+  /// state is exactly current, abandon the ones that have waited too long.
+  void advance_catch_up(DocRuntime& doc, int frames) noexcept;
+  /// How long a catch-up plan may be held before the render thread gives up, in frames.
+  int catch_up_hold_frames() const noexcept;
+  /// Build the `catch_up` object the reply and the status carry.
+  nlohmann::json catch_up_json() const;
+  /// The catch-up thread as the status reports it: whether it is running, and the ring's counters.
+  bool catch_up_thread_running() const noexcept { return catch_up_thread_.joinable(); }
 
   /// \brief One open control connection, on either transport.
   ///
@@ -921,6 +1056,43 @@ private:
   /// The warm thread's own reclaimer. A plan is retired by whichever thread owns the document it was
   /// playing in, so there are two producers and the control loop collects both.
   rt::Reclaimer warm_reclaimer_{2, 64};
+
+  // --- the catch-up (P8) -----------------------------------------------------------------------
+  //
+  // The device thread records the decoded capture into `catch_up_input_` while a two-step publish is
+  // in flight; the catch-up thread drains that into a window of its own, replays it into the Full's
+  // plans and then keeps them current until the render thread takes them over. Three threads, three
+  // disjoint pieces of state: the ring is the only thing shared, and it is single-producer,
+  // single-consumer.
+  InputRing catch_up_input_;
+  /// The catch-up thread. Started on the first catch-up and parked on a condition variable when
+  /// there is none -- a daemon that never publishes with `lite_first` never has it.
+  std::thread catch_up_thread_;
+  std::mutex catch_up_mutex_;
+  std::condition_variable catch_up_wake_;
+  bool catch_up_job_ready_ = false; ///< guarded by \ref catch_up_mutex_
+  CatchUpJob catch_up_job_;         ///< guarded by \ref catch_up_mutex_
+  std::atomic<bool> catch_up_quit_{false};
+  /// The catch-up thread's own memory: the window it replays from and the scratch the replay writes
+  /// its discarded output into. Touched by that thread alone.
+  InputWindow catch_up_window_;
+  std::vector<float> catch_up_scratch_;
+  /// What became of the last catch-up. Control thread.
+  CatchUpReport catch_up_report_;
+  /// Which job the fields below belong to, and the outcome the catch-up thread published for it.
+  std::atomic<uint64_t> catch_up_job_id_{0};
+  std::atomic<uint64_t> catch_up_done_id_{0};
+  std::atomic<uint64_t> catch_up_done_blocks_{0};
+  std::atomic<uint64_t> catch_up_done_frames_{0};
+  /// 0 none, 1 exact, 2 gap, 3 no input, 4 abandoned -- `CatchUpReport::replay`'s vocabulary, as a
+  /// number the catch-up thread can publish without a lock.
+  std::atomic<int> catch_up_done_outcome_{0};
+  /// True from the moment the catch-up thread picks a job up until it has finished with it: what
+  /// `engine.status` reports and what `arm_catch_up` refuses a second job against.
+  std::atomic<bool> catch_up_busy_{false};
+  /// Blocks the ring has dropped since the last arm: a hole in the history, which is what makes a
+  /// replay inexact rather than merely late.
+  std::atomic<uint64_t> catch_up_dropped_{0};
 
   /// \brief The warm document as the control thread sees it: what it was compiled from, what it cost,
   /// and the plans it owns until the warm thread retires them.

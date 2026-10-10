@@ -164,6 +164,10 @@ struct ChainRuntime
   /// Frames left before a local transition's final plan takes over from \ref current; 0 when no
   /// local transition is running.
   int local_remaining = 0;
+  /// \brief Frames a catch-up plan (P8) has been held in \ref pending, so a Full whose replay never
+  /// arrives is not waited for for ever: past the bound the render thread takes it over anyway and
+  /// says the catch-up was abandoned. Render thread.
+  int catch_up_frames_held = 0;
   rt::Crossfade crossfade{kMaxTransitionFrames};
   std::vector<float> in;
   std::vector<float> out;

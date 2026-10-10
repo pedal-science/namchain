@@ -850,19 +850,56 @@ nothing to trim. `lite.adopted` is what the engine read back from the render thr
 wait's bound (no device is running, or the chain was still working through an earlier transition), and
 the Full went in after it anyway.
 
-**What is not implemented: the catch-up replay.** E1/E2 measured that replaying about 170 ms per model
-into a cold instance makes it bit-exact at depths 1–4, and that is what makes the Full's first 170 ms
-*correct* rather than merely faded in. It is not here, so the Full starts cold and a note that was
-already sounding is wrong through it for the length of its receptive field. `nam/lookback.cpp` already
-knows how much a model needs (`Ok` with a finite length, or `Unbounded` for an LSTM, which no replay
-can promise), but **the input to replay is not reachable from the publish path**: the warm set's pool
-holds `BlockPool::kBlocks` (four) blocks of decoded capture and *drops* what does not fit, so it is a
-hand-over buffer and not a history. A replay needs about 8 200 frames at 48 kHz per channel kept for
-the length of a compile — a new buffer written by the device thread on the render path, a size derived
-per model from `lookback`, and an owner for the replay itself (the Full's chains are not rendering
-anywhere until they are published, and running them on the control thread means running a plan nothing
-else owns yet). That is a render-path change and a new document-tier, and it is deliberately not
-invented here; the fade from Lite to Full is the ordinary one, unshaped.
+**The catch-up replay is in.** E1/E2 measured that replaying about 170 ms per model into a cold
+instance makes it bit-exact at depths 1–4, and that is what makes the Full's first 170 ms *correct*
+rather than merely faded in. It is here now, in four pieces:
+
+1. **The input history.** The device thread records the decoded capture it is already rendering into a
+   ring (`InputRing`, `namchain/daemon/input_history.h`) — preallocated, single-producer, no lock and no
+   allocation on the render path, and *off* entirely (one relaxed load per block) unless a two-step
+   publish is in flight. The window it holds is sized per model from `nam/lookback.h`: `Ok` gives a
+   finite exact length; `Unbounded` (an LSTM), an architecture the calculator does not know, or a node
+   whose state a replay of input cannot restore (a biquad's IIR tail, a delay whose time may have moved)
+   is **refused rather than approximated**, and the reply says which node and why. The ring is not the
+   warm set's `BlockPool`, which holds four blocks and *drops* what does not fit: that is a hand-over
+   buffer, and this is history.
+2. **The replay.** A catch-up thread (started by the first two-step publish, parked when there is none)
+   drains the ring into a window of its own, and replays the newest whole blocks of it — oldest first,
+   in the device's own block alignment, so a block-delay node's buffer comes back the right length —
+   into the Full's plans, discarding the output. The measurement is in `tests/test_catch_up.cpp`: a plan
+   replayed this way produces the *same samples*, bit for bit, as one that has been running all along,
+   and one that was not replayed does not.
+3. **The hand-over.** The Full's plans are published marked `catch_up`, and the render thread holds them
+   in `ChainRuntime::pending` — running nothing — until their state is exactly one block behind the block
+   it is about to render. Until then the catch-up thread keeps feeding them every block the device
+   produces, so the gap the compile left is closed by the same input the device is hearing rather than
+   by a guess. A plan is only ever executed by one of the two: `PlanSlot::catch_up_owner` is claimed
+   before each block and released after, the render thread claims it before it crossfades. Patience is
+   bounded (`kCatchUpHoldFrames`, a quarter of a second): past it the Full is crossfaded in with
+   whatever state it has, and `catch_up.replay` says `abandoned`.
+4. **The fade is the ordinary one, and the ordinary one is compensated.** `rt::Crossfade` normalises its
+   equal-power weights by the correlation it measures from the first block, which is the law E2 measured
+   (bench `--fade-shape compensated`, the bench's default); the bench's *unshaped* shape is its
+   `equal-power` option, which is the one the engine does not use for this. So the Lite → Full crossfade
+   needed no new shape — the doc's earlier note that it was "unshaped" was wrong about which of the two
+   the engine implements.
+
+**What the reply says.** `full.catch_up` is an object beside `full.state`:
+
+```jsonc
+"catch_up": { "state": "exact",     // the document's own answer: exact, inexact, empty, unbounded,
+                                    // unknown or too_long
+              "replay": "exact",    // what happened: exact, gap, no_input, busy, abandoned or none
+              "frames": 6347,       // engine frames of input the models need replayed
+              "blocks": 101,        // blocks replayed and mirrored when the reply was written
+              "running": false, "detail": "…" }   // detail when something is not exact, or not exact enough
+```
+
+`engine.status` carries the same object as `catch_up`, which is what makes the stand-in and its outcome
+things a client can *poll* rather than read once in a reply — the same distinction D6 draws for the trim
+itself. A model that cannot be replayed at all is refused a catch-up with `state: "unbounded"` and the
+node named, and the Full is published cold *and says so*: the rule is that the engine does not promise
+what it cannot measure, never that it silently falls back.
 
 **What it does not do yet**, each with the remedy drafted:
 

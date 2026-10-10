@@ -23,6 +23,14 @@ struct LookbackResult
   /// `receptive_field + 1` (the sample being produced plus the samples it depends on).
   /// Valid only when status == Ok.
   int samples = 0;
+  /// \brief The rate the model declares, or 0 when the file names none.
+  ///
+  /// `samples` is in the model's own domain, and the core resamples the engine's input to it, so a
+  /// caller replaying *engine* samples has to scale: a 44.1 kHz model needs `samples * rate / 44100`
+  /// frames of 48 kHz input to have seen the same amount of music. Zero means "the same as the
+  /// engine", which is what a file written at the engine's rate means and what the engine assumed
+  /// before this field existed.
+  double sample_rate = 0.0;
   /// Architecture that produced the answer, or a human-readable reason on failure.
   std::string detail;
 

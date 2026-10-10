@@ -1447,10 +1447,48 @@ bool Daemon::load_rig(const std::string& rig_path, std::string& error, std::stri
   return publish_lite_first(document, rig_path, "file", base_dir, error, error_code, admit_over_budget, steps);
 }
 
+CatchUpPlan Daemon::catch_up_plan_for(const graph::Document& document, const std::string& base_dir)
+{
+  // The same resolution a publish does, on a copy, because the model paths the compile will load are
+  // what the lookback has to be asked about -- a library id ("A2") is not a file, and a node whose
+  // asset is missing plays as a bypass and has no memory at all.
+  graph::Document resolved = document;
+  graph::resolve_relative_paths(resolved, base_dir);
+  std::vector<assets::MissingAsset> missing;
+  std::string resolve_error;
+  if (!assets::resolve_document(resolved, assets_, base_dir, resolve_error, &missing))
+  {
+    CatchUpPlan plan;
+    plan.state = "unknown";
+    plan.detail = resolve_error;
+    return plan;
+  }
+  unsigned rate = active_rate_.load();
+  if (rate == 0)
+    rate = config_.sample_rate;
+  return catch_up_plan(resolved, static_cast<double>(rate), static_cast<int>(config_.period_size), &units_);
+}
+
 bool Daemon::publish_lite_first(const graph::Document& document, const std::string& path, const std::string& source,
                                 const std::string& base_dir, std::string& error, std::string* error_code,
                                 bool admit_over_budget, nlohmann::json* report)
 {
+  // What the Full's state will need, worked out before anything is published: the input to replay has
+  // to be recorded *while* the two compiles run, so the history covers the Lite's compile, the wait
+  // for it to settle and the Full's -- the whole of a two-step publish (P8).
+  const CatchUpPlan plan = catch_up_plan_for(document, base_dir);
+  catch_up_report_ = CatchUpReport{};
+  catch_up_report_.state = plan.state;
+  catch_up_report_.detail = plan.detail;
+  catch_up_report_.frames = plan.window_frames;
+
+  // Recording starts here and stops when the catch-up is over. A document whose memory cannot be
+  // replayed is not recorded for at all: nothing is promised about it, and the reply says why.
+  bool armed = plan.replayable && arm_catch_up(plan, static_cast<unsigned>(document.chains.size()));
+  if (!plan.replayable && plan.state != "empty")
+    std::fprintf(stderr, "[namchaind] lite-first: no catch-up replay (%s): %s\n", plan.state.c_str(),
+                 plan.detail.c_str());
+
   // Step one: the Lite, whatever the budget says. It compiles in about a third of the time a Full
   // takes, and E2's listening verdict is that a Lite standing in for a Full is not audible -- so this
   // is the document that starts playing, and the Full is what is prepared behind it.
@@ -1460,7 +1498,12 @@ bool Daemon::publish_lite_first(const graph::Document& document, const std::stri
   // trick, not an exemption from D3.
   if (!publish_document(document, path, source, base_dir, error, error_code, admit_over_budget,
                         /*lite_first=*/true))
+  {
+    if (armed)
+      disarm_catch_up();
+    catch_up_report_.replay = "none";
     return false;
+  }
 
   // The Lite's own outcome, taken before the Full's publish overwrites `cost_`: this is the
   // temporary rig a client is told about (D6 -- a trimmed rig is a different rig, however much it
@@ -1484,10 +1527,16 @@ bool Daemon::publish_lite_first(const graph::Document& document, const std::stri
   if (!lite.trimmed)
   {
     cost_.lite_first = false;
+    if (armed)
+      disarm_catch_up();
+    catch_up_report_.replay = "none";
+    catch_up_report_.detail = "nothing to trim: the Lite is the document as written, so there is no Full to catch up";
     if (report != nullptr)
     {
       (*report)["lite_first"] = false;
-      (*report)["full"] = {{"state", "nothing_to_trim"}, {"generation", lite_generation}};
+      (*report)["full"] = {{"state", "nothing_to_trim"},
+                           {"generation", lite_generation},
+                           {"catch_up", catch_up_json()}};
     }
     return true;
   }
@@ -1512,23 +1561,60 @@ bool Daemon::publish_lite_first(const graph::Document& document, const std::stri
 
   // Step two: the Full. An ordinary publish of the same document -- resolved and trimmed by the
   // budget rather than by the request -- compiled here on the control thread while the Lite plays,
-  // and crossfaded in by the existing transition machinery. It is the Lite -> Full crossfade that a
-  // listener hears, and with no catch-up replay the Full comes up cold (see the header).
+  // and crossfaded in by the existing transition machinery. **With a catch-up**: the plans are
+  // compiled whole and marked, so the render thread holds them until the catch-up thread has replayed
+  // the input that has just been playing into them (P8). Without one -- an LSTM, a node whose state a
+  // replay cannot restore, a history that never arrived -- the Full comes up cold and the reply says
+  // so rather than leaving it to be inferred from what the first blocks sound like.
   nlohmann::json full_json;
   std::string full_error;
   std::string full_code = "compile_failed";
-  if (publish_document(document, path, source, base_dir, full_error, &full_code, admit_over_budget))
+  const bool full_expected = armed;
+  if (publish_document(document, path, source, base_dir, full_error, &full_code, admit_over_budget,
+                       /*lite_first=*/false, full_expected ? &plan : nullptr))
   {
     // `published` when the Full differs from the Lite -- which it does whenever the budget left
     // anything untrimmed -- and `unchanged` when an ordinary publish of this rig trims exactly what the
     // request trimmed, so the second publish legitimately had nothing to do. A publish that changes
     // nothing does not advance the generation (publish_document), which is what tells the two apart.
-    full_json["state"] = generation_ == lite_generation ? "unchanged" : "published";
+    const bool changed = generation_ != lite_generation;
+    full_json["state"] = changed ? "published" : "unchanged";
     full_json["generation"] = generation_;
     full_json["cost"] = cost_.cost;
     full_json["full_cost"] = cost_.full_cost;
     full_json["verdict"] = cost_.verdict;
     full_json["trimmed"] = cost_.trimmed;
+
+    if (full_expected && changed)
+    {
+      // Hand the marked plans to the catch-up thread. It drains the history, replays it into them and
+      // then keeps them current until the render thread takes them over; the render thread holds them
+      // in `pending` until then, so the Lite is what plays for those few blocks.
+      CatchUpJob job;
+      job.window_frames = plan.window_frames;
+      for (std::size_t i = 0; i < published_slots_.size() && job.chain_count < kMaxChains; ++i)
+      {
+        PlanSlot* slot = published_slots_[i];
+        if (slot == nullptr || !slot->catch_up.load(std::memory_order_acquire))
+          continue;
+        job.slots[job.chain_count] = slot;
+        job.channel[job.chain_count] = slot->input_channel;
+        job.frames[job.chain_count] = i < plan.chains.size() ? plan.chains[i].frames : plan.window_frames;
+        ++job.chain_count;
+      }
+      if (job.chain_count > 0)
+        start_catch_up_job(job);
+      else
+        disarm_catch_up();
+    }
+    else if (armed)
+    {
+      // `unchanged`: the Full *is* the Lite, so there is no state to rebuild -- what is playing has
+      // been playing all along.
+      disarm_catch_up();
+      catch_up_report_.replay = "none";
+      catch_up_report_.detail = "an ordinary publish of this rig compiles the document that is already playing";
+    }
   }
   else
   {
@@ -1540,17 +1626,430 @@ bool Daemon::publish_lite_first(const graph::Document& document, const std::stri
     full_json["generation"] = generation_;
     full_json["error"] = full_error;
     full_json["code"] = full_code;
+    if (armed)
+      disarm_catch_up();
+    catch_up_report_.replay = "none";
     std::fprintf(stderr, "[namchaind] lite-first: the Full did not publish (%s): %s\n", full_code.c_str(),
                  full_error.c_str());
   }
 
+  // The reply says what became of the catch-up, so it waits for the *replay* -- a bounded wait for
+  // tens of milliseconds of work, not for the fade, which the render thread starts on its own once
+  // the state is current. Nothing here delays the Lite, which is already playing.
+  wait_for_catch_up_replay();
+
   if (report != nullptr)
   {
+    full_json["catch_up"] = catch_up_json();
     (*report)["lite_first"] = true;
     (*report)["lite"] = std::move(lite_json);
     (*report)["full"] = std::move(full_json);
   }
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// The catch-up (P8): the input history, the replay, and holding the Full until its state is right
+// ---------------------------------------------------------------------------
+
+bool Daemon::arm_catch_up(const CatchUpPlan& plan, unsigned chains)
+{
+  if (plan.window_frames == 0 || chains == 0)
+    return false;
+  if (catch_up_busy_.load(std::memory_order_acquire))
+  {
+    // One history, one job at a time: a second two-step publish while the first Full is still being
+    // caught up would need its own recording, and the honest answer is that this one gets no replay
+    // rather than that it shares a window that is not its own.
+    catch_up_report_.replay = "busy";
+    catch_up_report_.detail = "another catch-up was still running";
+    return false;
+  }
+
+  // The block size is the one the device is actually rendering: a replay is in whole blocks so that a
+  // block-delay node's buffer comes back the right length, and the plan's quantum is what it takes.
+  unsigned period = active_period_.load();
+  if (period == 0)
+    period = config_.period_size;
+  const unsigned channels_now = active_capture_channels_.load();
+  unsigned capture = channels_now != 0 ? channels_now : config_.capture_channels;
+  if (capture == 0)
+    capture = 1;
+
+  const std::size_t window_frames = std::min(plan.window_frames, kMaxCatchUpFrames);
+  const std::size_t want_blocks = (window_frames + kCatchUpSlackFrames + period - 1) / period + 1;
+  if (!catch_up_input_.configured() || catch_up_input_.block_frames() != static_cast<int>(period) ||
+      catch_up_input_.channels() < capture || catch_up_input_.blocks() < want_blocks)
+    catch_up_input_.configure(static_cast<int>(period), capture, want_blocks);
+
+  catch_up_input_.arm();
+  catch_up_report_.running = true;
+  catch_up_report_.replay.clear();
+  catch_up_dropped_.store(0, std::memory_order_relaxed);
+  return true;
+}
+
+void Daemon::disarm_catch_up() noexcept
+{
+  catch_up_input_.disarm();
+  catch_up_report_.running = false;
+}
+
+void Daemon::start_catch_up_job(const CatchUpJob& job)
+{
+  {
+    std::lock_guard<std::mutex> lock(catch_up_mutex_);
+    catch_up_job_ = job;
+    catch_up_job_.id = catch_up_job_id_.fetch_add(1, std::memory_order_relaxed) + 1;
+    catch_up_job_ready_ = true;
+  }
+  if (!catch_up_thread_.joinable())
+  {
+    catch_up_quit_.store(false, std::memory_order_release);
+    // A thread, not a pool member: it exists only for the length of a two-step publish, and it must
+    // never be a thread the render path shares a core with in a way it did not choose. It is born
+    // before the job is picked up (below), so nothing can miss it.
+    catch_up_thread_ = std::thread([this] { catch_up_loop(); });
+  }
+  catch_up_wake_.notify_one();
+}
+
+void Daemon::stop_catch_up_thread() noexcept
+{
+  {
+    std::lock_guard<std::mutex> lock(catch_up_mutex_);
+    catch_up_quit_.store(true, std::memory_order_release);
+    catch_up_input_.disarm();
+  }
+  catch_up_wake_.notify_all();
+  if (catch_up_thread_.joinable())
+    catch_up_thread_.join();
+}
+
+void Daemon::wait_for_catch_up_replay()
+{
+  const uint64_t want = catch_up_job_id_.load(std::memory_order_acquire);
+  if (want == 0 || catch_up_done_id_.load(std::memory_order_acquire) == want)
+  {
+    // Nothing was handed over, or it is already done.
+  }
+  else
+  {
+    // Bounded: the replay is one receptive field per chain, tens of milliseconds for the models on
+    // this pedal, and the Lite is playing whether or not it arrives. The reply says what happened
+    // either way rather than hanging on it.
+    for (int attempt = 0; attempt < 2000; ++attempt)
+    {
+      if (catch_up_done_id_.load(std::memory_order_acquire) == want)
+        break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+
+  catch_up_report_.running = catch_up_busy_.load(std::memory_order_acquire);
+  const int outcome = catch_up_done_outcome_.load(std::memory_order_relaxed);
+  switch (outcome)
+  {
+  case 1: catch_up_report_.replay = "exact"; break;
+  case 2: catch_up_report_.replay = "gap"; break;
+  case 3: catch_up_report_.replay = "no_input"; break;
+  case 4: catch_up_report_.replay = "abandoned"; break;
+  default: break;
+  }
+  if (catch_up_report_.replay.empty())
+    catch_up_report_.replay = catch_up_report_.running ? "running" : "none";
+  catch_up_report_.blocks = catch_up_done_blocks_.load(std::memory_order_relaxed);
+  if (catch_up_report_.frames == 0)
+    catch_up_report_.frames = static_cast<std::size_t>(catch_up_done_frames_.load(std::memory_order_relaxed));
+}
+
+nlohmann::json Daemon::catch_up_json() const
+{
+  nlohmann::json json;
+  json["state"] = catch_up_report_.state;
+  json["replay"] = catch_up_report_.replay.empty() ? "none" : catch_up_report_.replay;
+  json["frames"] = catch_up_report_.frames;
+  json["blocks"] = catch_up_report_.blocks;
+  json["running"] = catch_up_report_.running;
+  if (!catch_up_report_.detail.empty())
+    json["detail"] = catch_up_report_.detail;
+  return json;
+}
+
+int Daemon::catch_up_hold_frames() const noexcept
+{
+  unsigned period = active_period_.load();
+  if (period == 0)
+    period = config_.period_size;
+  const std::size_t blocks = std::max<std::size_t>(1, kCatchUpHoldFrames / std::max(1u, period));
+  return static_cast<int>(blocks * period);
+}
+
+void Daemon::write_input_history() noexcept
+{
+  // The one line an ordinary block pays for this feature: a relaxed load of a flag that is false
+  // unless a two-step publish is in flight.
+  if (!catch_up_input_.armed())
+    return;
+
+  const BackendInfo& info = device_->info();
+  const int block_frames = catch_up_input_.block_frames();
+  if (static_cast<int>(info.period_size) != block_frames)
+  {
+    // A device whose period is not the one the history was sized for: the block cannot be recorded
+    // without breaking the block alignment a replay depends on, so nothing is, and the catch-up will
+    // say it had no input rather than replaying a window with the wrong seams in it.
+    return;
+  }
+
+  float* block = catch_up_input_.acquire(input_sequence_);
+  if (block == nullptr)
+    return; // the ring is full: counted by the ring, and the catch-up will see the hole
+
+  const std::size_t width = info.bytes_per_sample;
+  const unsigned capture = info.capture_channels;
+  for (unsigned c = 0; c < catch_up_input_.channels(); ++c)
+  {
+    float* plane = block + static_cast<std::size_t>(c) * block_frames;
+    if (c >= capture)
+    {
+      std::fill(plane, plane + block_frames, 0.0f);
+      continue;
+    }
+    for (unsigned i = 0; i < static_cast<unsigned>(block_frames); ++i)
+      plane[i] = pcm_decode(capture_buffer_.data() +
+                              (static_cast<std::size_t>(i) * capture + c) * width,
+                            info.format);
+  }
+  catch_up_input_.publish();
+}
+
+void Daemon::catch_up_loop()
+{
+  for (;;)
+  {
+    CatchUpJob job;
+    {
+      std::unique_lock<std::mutex> lock(catch_up_mutex_);
+      catch_up_wake_.wait(lock, [this] {
+        return catch_up_job_ready_ || catch_up_quit_.load(std::memory_order_acquire);
+      });
+      if (catch_up_quit_.load(std::memory_order_acquire) && !catch_up_job_ready_)
+        return;
+      job = catch_up_job_;
+      catch_up_job_ready_ = false;
+    }
+    serve_catch_up(job);
+  }
+}
+
+void Daemon::serve_catch_up(const CatchUpJob& job)
+{
+  catch_up_busy_.store(true, std::memory_order_release);
+  const uint64_t id = job.id;
+  int outcome = 3; // "no_input" until a window is replayed
+  std::size_t blocks = 0;
+  std::size_t frames = 0;
+
+  // The window the job needs, and the blocks the ring holds beyond it. The ring has been filling
+  // since the request was armed -- through both compiles -- so the newest blocks are already history
+  // by the time the plans exist; what is drained here is the tail of that.
+  const std::size_t need = job.window_frames;
+  // The block the replay feeds is the block the device renders, which is what a block-delay node's
+  // state is pinned to; a plan compiled for a longer quantum still takes it.
+  const std::size_t period =
+    catch_up_input_.block_frames() > 0 ? static_cast<std::size_t>(catch_up_input_.block_frames()) : 64;
+  catch_up_window_.configure(need, catch_up_input_.channels(), static_cast<int>(period));
+  catch_up_scratch_.assign(period, 0.0f);
+
+  const auto now = [] { return std::chrono::steady_clock::now(); };
+  const auto deadline = now() + std::chrono::milliseconds(2000);
+  float* scratch = catch_up_scratch_.data();
+
+  // 1. Fill a window that covers what every chain needs, contiguously. The plan's state can only be
+  //    made exact from a window with no holes in it, so a ring that dropped a block inside the
+  //    window is waited out rather than papered over: the history rolls on and the next blocks are
+  //    contiguous again.
+  for (;;)
+  {
+    const float* data = nullptr;
+    uint64_t seq = 0;
+    if (catch_up_input_.take(data, seq))
+    {
+      catch_up_window_.append(data, seq);
+      catch_up_input_.give_back();
+      continue;
+    }
+    if (catch_up_window_.covers(need))
+      break; // a full, contiguous window: this is the history the Full is caught up from
+    if (!catch_up_input_.armed() || catch_up_quit_.load(std::memory_order_acquire))
+    {
+      outcome = 3;
+      break;
+    }
+    if (now() > deadline)
+    {
+      // No device rendering, or one too slow to fill a window: say so and let the render thread fade
+      // the Full in cold rather than holding the press on the Lite.
+      outcome = 3;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  // 2. Replay it, oldest block first, one plan at a time. Each plan is claimed for the duration, so
+  //    the render thread cannot take one over while it is being fed.
+  bool all_covered = catch_up_window_.covers(need);
+  if (all_covered)
+  {
+    for (unsigned c = 0; c < job.chain_count; ++c)
+    {
+      PlanSlot* slot = job.slots[c];
+      if (slot == nullptr || slot->plan == nullptr || slot->catch_up_abandoned.load(std::memory_order_acquire))
+        continue;
+      if (!claim_catch_up(slot->catch_up_owner, CatchUpOwner::CatchUp))
+        continue; // the render thread has it: it has given up waiting and taken it over
+      const ReplayResult replay =
+        replay_window(*slot->plan, catch_up_window_, static_cast<unsigned>(job.channel[c]), job.frames[c], scratch);
+      if (replay.covered)
+      {
+        // The state is "as of" the last block replayed: one less than the block the render thread
+        // will render next, which is the condition it takes the plan over on.
+        slot->catch_up_seq.store(replay.last_seq, std::memory_order_release);
+        slot->catch_up_blocks.fetch_add(replay.blocks, std::memory_order_relaxed);
+        blocks = std::max(blocks, replay.blocks);
+        frames = std::max(frames, replay.frames);
+      }
+      else
+      {
+        all_covered = false;
+      }
+      release_catch_up(slot->catch_up_owner);
+    }
+    outcome = all_covered ? 1 : 2;
+  }
+
+  // The render thread is told what the replay was worth before the mirroring starts: the reply to the
+  // request that caused all this waits on it, and the answer is settled the moment the window has been
+  // replayed.
+  catch_up_done_blocks_.store(blocks, std::memory_order_relaxed);
+  catch_up_done_frames_.store(frames, std::memory_order_relaxed);
+  catch_up_done_outcome_.store(outcome, std::memory_order_release);
+  catch_up_done_id_.store(id, std::memory_order_release);
+  catch_up_wake_.notify_all();
+
+  // 3. Keep them current. From here the plans are fed every block the device renders until the render
+  //    thread takes them over -- which it does when the plan's state is exactly one block behind what
+  //    it is about to render -- or until it gives up and takes them anyway. This is what closes the
+  //    gap between the window that was replayed and the moment the crossfade starts, which is not a
+  //    gap a replay of the past can close on its own.
+  std::size_t mirrored = 0;
+  for (;;)
+  {
+    bool wanted = false;
+    for (unsigned c = 0; c < job.chain_count; ++c)
+    {
+      PlanSlot* slot = job.slots[c];
+      if (slot != nullptr && slot->catch_up.load(std::memory_order_acquire) &&
+          !slot->catch_up_abandoned.load(std::memory_order_acquire))
+        wanted = true;
+    }
+    if (!wanted || catch_up_quit_.load(std::memory_order_acquire))
+      break;
+
+    const float* data = nullptr;
+    uint64_t seq = 0;
+    if (!catch_up_input_.take(data, seq))
+    {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    for (unsigned c = 0; c < job.chain_count; ++c)
+    {
+      PlanSlot* slot = job.slots[c];
+      if (slot == nullptr || slot->plan == nullptr || !slot->catch_up.load(std::memory_order_acquire) ||
+          slot->catch_up_abandoned.load(std::memory_order_acquire))
+        continue;
+      const unsigned channel = static_cast<unsigned>(job.channel[c]);
+      if (channel >= catch_up_input_.channels())
+        continue;
+      if (!claim_catch_up(slot->catch_up_owner, CatchUpOwner::CatchUp))
+        continue;
+      const float* plane = data + static_cast<std::size_t>(channel) * period;
+      slot->plan->execute(plane, scratch, static_cast<int>(period));
+      slot->catch_up_seq.store(seq, std::memory_order_release);
+      slot->catch_up_blocks.fetch_add(1, std::memory_order_relaxed);
+      release_catch_up(slot->catch_up_owner);
+      ++mirrored;
+    }
+    catch_up_input_.give_back();
+  }
+
+  catch_up_done_blocks_.store(blocks + mirrored, std::memory_order_relaxed);
+  catch_up_input_.disarm();
+  catch_up_window_.clear();
+  catch_up_busy_.store(false, std::memory_order_release);
+}
+
+void Daemon::advance_catch_up(DocRuntime& doc, int frames) noexcept
+{
+  const uint64_t previous_block = input_sequence_ > 0 ? input_sequence_ - 1 : 0;
+  for (int i = 0; i < doc.chain_count; ++i)
+  {
+    ChainRuntime& chain = doc.chains[i];
+    PlanSlot* slot = chain.pending;
+    if (slot == nullptr || !slot->catch_up.load(std::memory_order_acquire))
+      continue;
+
+    // Bounded patience: a catch-up that never arrives must not leave the player on the Lite for ever.
+    if (!slot->catch_up_abandoned.load(std::memory_order_relaxed))
+    {
+      chain.catch_up_frames_held += frames;
+      if (chain.catch_up_frames_held > catch_up_hold_frames())
+        slot->catch_up_abandoned.store(true, std::memory_order_release);
+    }
+
+    const bool exact = slot->catch_up_seq.load(std::memory_order_acquire) == previous_block;
+    const bool abandoned = slot->catch_up_abandoned.load(std::memory_order_acquire);
+    // With nothing playing for this chain there is no continuity to get right -- the plan is the
+    // first one it has -- so it goes in as soon as the catch-up thread is out of it.
+    const bool nothing_playing = chain.current == nullptr;
+    if (!exact && !abandoned && !nothing_playing)
+      continue; // still being caught up: the Lite plays on
+    if (doc.transitioning_chain >= 0 && !nothing_playing)
+      continue; // one structural transition at a time, as everywhere else
+
+    // The claim is what makes this safe rather than merely likely: while it succeeds, the catch-up
+    // thread is not inside the plan, and the last block it replayed is the one before this one.
+    if (!claim_catch_up(slot->catch_up_owner, CatchUpOwner::Render))
+      continue;
+    slot->catch_up.store(false, std::memory_order_release);
+    chain.pending = nullptr;
+    chain.catch_up_frames_held = 0;
+
+    if (chain.current == nullptr)
+    {
+      // The first plan of a chain, adopted rather than faded in -- the same path `drain_commands`
+      // takes for one, kept here because this plan may not be touched until the claim above.
+      PlanSlot* adopt = slot;
+      if (adopt->then != nullptr)
+      {
+        PlanSlot* final_slot = adopt->then;
+        adopt->then = nullptr;
+        reclaimer_.retire(adopt, &delete_plan_slot);
+        adopt = final_slot;
+      }
+      chain.next = nullptr;
+      chain.current = adopt;
+      chain.audible_generation.store(adopt->generation);
+      chain.adopted_generation.store(adopt->generation);
+      chain.target_generation.store(adopt->generation);
+      chain.transition_active.store(false);
+      update_aggregate_state(doc);
+      continue;
+    }
+    start_transition(doc, i, slot);
+  }
 }
 
 void Daemon::load_cost_table()
@@ -1599,8 +2098,11 @@ void Daemon::republish_after_rescan()
 
 bool Daemon::publish_document(const graph::Document& document, const std::string& path, const std::string& source,
                               const std::string& base_dir, std::string& error, std::string* error_code,
-                              bool admit_over_budget, bool lite_first)
+                              bool admit_over_budget, bool lite_first, const CatchUpPlan* catch_up)
 {
+  // A catch-up publish is the Full of a `lite_first` request: its plans are replayed into before they
+  // are heard (P8), which is only possible if they are the plan's own state to begin with.
+  const bool catching_up = catch_up != nullptr && catch_up->replayable;
   const graph::Validation validation = graph::validate(document);
   if (!validation.ok)
   {
@@ -1823,8 +2325,13 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
     // (docs/transitions.md, "Local transitions"). It shares instances with the plan the render thread is
     // playing for this chain, so it is planned only against that plan, settled, and only when it is the
     // same chain: a different chain in the same position is a different rig, and is crossfaded whole.
+    //
+    // A catch-up publish never takes this path: a shared instance would be run by the catch-up thread
+    // and the render thread at the same time, which is exactly what a plan's ownership exists to
+    // prevent. The whole chain is compiled fresh, and the catch-up replays into that.
     PlanSlot* base = i < published_slots_.size() ? published_slots_[i] : nullptr;
-    const bool same_chain = base != nullptr && base->plan != nullptr && i < current_resolved_.chains.size() &&
+    const bool same_chain = !catching_up && base != nullptr && base->plan != nullptr &&
+                            i < current_resolved_.chains.size() &&
                             current_resolved_.chains[i].id == chain.id &&
                             base->input_channel == chain.input_channel &&
                             base->output_channel == chain.output_channel;
@@ -1945,6 +2452,11 @@ bool Daemon::publish_document(const graph::Document& document, const std::string
       slot->input_channel = chain.input_channel;
       slot->output_channel = chain.output_channel;
       slot->generation = generation;
+      // P8: this plan has never rendered, so its state is silence. The catch-up thread replays the
+      // input the device has just been playing into it before the render thread is allowed to fade it
+      // in; until then the render thread holds it in `pending`.
+      if (catching_up)
+        slot->catch_up.store(true, std::memory_order_release);
       finals[i] = slot.get();
       built[i] = std::move(slot);
       ++plans_built;
@@ -2881,6 +3393,10 @@ void Daemon::stop()
 {
   stop_requested_.store(true);
   running_.store(false);
+  // The catch-up thread first: it may be inside a plan the render thread's `pending` slot owns, and
+  // every one of those is deleted below. It is told to quit and joined before anything it could be
+  // executing goes away.
+  stop_catch_up_thread();
   if (render_thread_.joinable())
   {
     // The render thread may be inside the backend's wait for the device's next period, which for a
@@ -3494,6 +4010,11 @@ void Daemon::start_queued_transition(DocRuntime& doc)
     ChainRuntime& chain = doc.chains[i];
     if (chain.pending == nullptr)
       continue;
+    // P8: a plan being caught up is not started here -- it may not be run until its state is exactly
+    // current, which is `advance_catch_up`'s question and is asked every block. It stays queued, and
+    // any other chain's queued plan is still started in this pass.
+    if (chain.pending->catch_up.load(std::memory_order_acquire))
+      continue;
     PlanSlot* pending = chain.pending;
     chain.pending = nullptr;
     if (pending->local)
@@ -3635,6 +4156,26 @@ void Daemon::drain_commands(DocRuntime& doc)
 
     const int index = static_cast<int>(command.chain);
     ChainRuntime& chain = doc.chains[index];
+
+    if (next->catch_up.load(std::memory_order_acquire))
+    {
+      // P8: a plan whose state is being rebuilt by the catch-up thread. It may not be executed here
+      // -- that would run it twice, against the catch-up thread's own replay -- so it waits in
+      // `pending` until `advance_catch_up` finds its state exactly current, or gives up waiting.
+      // That is true whether or not something is playing for the chain: the catch-up thread may be
+      // inside the plan right now, and only the claim that `advance_catch_up` takes can say it is not.
+      if (chain.pending != nullptr && chain.pending != next)
+      {
+        // Superseded before it landed: tell the catch-up thread to stop touching it before the
+        // reclaimer takes it (it stops within one block, and the grace window is longer than that).
+        chain.pending->catch_up_abandoned.store(true, std::memory_order_release);
+        reclaimer_.retire(chain.pending, &delete_plan_slot);
+      }
+      chain.pending = next;
+      chain.catch_up_frames_held = 0;
+      chain.target_generation.store(next->generation);
+      continue;
+    }
 
     if (chain.current == nullptr)
     {
@@ -3808,6 +4349,11 @@ void Daemon::render_loop()
       // if a switch takes the device thread somewhere else later in this same block.
       drain_commands(active);
 
+      // 0a. A catch-up plan (P8) whose state has become exactly current is taken over here: the same
+      //     block the Lite would otherwise play. Before the plans run, so a Full that is ready this
+      //     block is crossfaded this block.
+      advance_catch_up(active, static_cast<int>(info.period_size));
+
       const std::size_t width = info.bytes_per_sample;
       const int frames = static_cast<int>(info.period_size);
       std::fill(bus_.begin(), bus_.end(), 0.0f);
@@ -3823,6 +4369,12 @@ void Daemon::render_loop()
       //     Nothing is decoded when nothing is warm, which is what keeps the cost of the feature at
       //     zero until somebody uses it.
       publish_warm_input();
+
+      // 0c. The catch-up's input history (P8), for the same reason and with the same discipline: one
+      //     decoded copy of the capture into a ring, and nothing at all when no two-step publish is
+      //     in flight. This is the buffer that holds *history* -- the warm pool above is a hand-over
+      //     buffer that drops what does not fit, which is why the replay could not use it.
+      write_input_history();
 
       // 1. Every chain's input, on the coordinator. The decode is a per-sample conversion and a
       //    chain's plan cannot start before its input exists, so this is not worth sharing out.
@@ -5303,6 +5855,12 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
                                    {"IR", cost_table_.unknown_ir},
                                    {"node", cost_table_.unknown_node}}},
                       {"nodes", std::move(cost_nodes)}};
+
+    // P8's catch-up (2026-10-10): whether the Full behind a Lite-first publish was replayed up to the
+    // input being played before it was crossfaded in, and what the document's own memory needs. D6's
+    // rule is that a rig playing trimmed must be *visible*; this is the same rule one step further --
+    // a rig standing in while its Full is caught up says so, and says how it went.
+    status["catch_up"] = catch_up_json();
 
     // The library at a glance. The listing is `engine.assets`; this is the size of it, so a client
     // that shows a palette can tell "no models installed" from "not asked yet".
