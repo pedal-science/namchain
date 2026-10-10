@@ -802,7 +802,7 @@ while the first was still fading, and a plan that arrives mid-fade becomes *pend
 retires it (`doc_runtime.h`) — so the Lite would be compiled, published and never heard, which is the
 one thing the request is for.
 
-**What the reply says.** `lite_first` is true when a temporary Lite was published, and then:
+**What the reply says.** `lite_first` is true when a Lite was published first, and then:
 
 ```jsonc
 { "ok": true, "rig": "…", "generation": 3,
