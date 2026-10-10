@@ -1670,6 +1670,8 @@ bool Daemon::arm_catch_up(const CatchUpPlan& plan, unsigned chains)
   catch_up_window_need_.store(0, std::memory_order_relaxed);
   catch_up_progress_.store(nullptr, std::memory_order_relaxed);
   catch_up_fill_.store(nullptr, std::memory_order_relaxed);
+  catch_up_fed_seq_.store(0, std::memory_order_relaxed);
+  catch_up_executed_seq_.store(0, std::memory_order_relaxed);
   return true;
 }
 
@@ -1961,18 +1963,11 @@ void Daemon::service_catch_up_report()
   catch_up_report_.hold_abandoned = catch_up_hold_abandoned_.load(std::memory_order_relaxed);
   catch_up_report_.hold_exact_at = catch_up_hold_exact_at_.load(std::memory_order_relaxed);
   catch_up_report_.hold_abandoned_at = catch_up_hold_abandoned_at_.load(std::memory_order_relaxed);
-  // The newest plan the catch-up thread has fed, which is what says whether it is keeping up: read
-  // from the slots themselves rather than from a counter, because a plan is where the value lives.
-  for (std::size_t i = 0; i < published_slots_.size(); ++i)
-  {
-    const PlanSlot* slot = published_slots_[i];
-    if (slot == nullptr || !slot->catch_up.load(std::memory_order_acquire))
-      continue;
-    catch_up_report_.fed_seq = std::max(catch_up_report_.fed_seq,
-                                        slot->catch_up_ready.load(std::memory_order_relaxed));
-    catch_up_report_.executed_seq = std::max(catch_up_report_.executed_seq,
-                                             slot->catch_up_seq.load(std::memory_order_relaxed));
-  }
+  // The newest block the catch-up thread had fed and executed, from counters rather than from the
+  // slots: a slot stops being a catch-up slot the moment the render thread takes it over, and this
+  // report is built after that -- which is exactly when the numbers are worth reading.
+  catch_up_report_.fed_seq = catch_up_fed_seq_.load(std::memory_order_relaxed);
+  catch_up_report_.executed_seq = catch_up_executed_seq_.load(std::memory_order_relaxed);
 
   if (want == 0)
     return;
@@ -2342,6 +2337,8 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
       // reads (`catch_up_ready`); `catch_up_seq` records the same block as the state itself.
       slot->catch_up_seq.store(replay.last_seq, std::memory_order_release);
       slot->catch_up_ready.store(replay.last_seq, std::memory_order_release);
+      catch_up_fed_seq_.store(replay.last_seq, std::memory_order_relaxed);
+      catch_up_executed_seq_.store(replay.last_seq, std::memory_order_relaxed);
       slot->catch_up_blocks.fetch_add(replay.blocks, std::memory_order_relaxed);
       blocks = std::max(blocks, replay.blocks);
       frames = std::max(frames, replay.frames);
@@ -2414,7 +2411,9 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
       // "not yet" for a block that is already there, never "yes" for one that is not. The two stores
       // are in this order for the same reason the hand-over reads the first of them.
       slot->catch_up_ready.store(seq, std::memory_order_release);
+      catch_up_fed_seq_.store(seq, std::memory_order_relaxed);
       slot->catch_up_seq.store(seq, std::memory_order_release);
+      catch_up_executed_seq_.store(seq, std::memory_order_relaxed);
       slot->catch_up_blocks.fetch_add(1, std::memory_order_relaxed);
       release_catch_up(slot->catch_up_owner);
       ++mirrored;

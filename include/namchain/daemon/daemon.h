@@ -1335,6 +1335,11 @@ private:
   std::atomic<uint64_t> catch_up_hold_abandoned_{0};
   std::atomic<uint64_t> catch_up_hold_exact_at_{0};
   std::atomic<uint64_t> catch_up_hold_abandoned_at_{0};
+  /// The newest block the catch-up thread had fed, and executed, since the last arm: kept here rather
+  /// than read back from the slots, because a slot stops being a catch-up slot the moment the render
+  /// thread takes it over, and the report is read after that.
+  std::atomic<uint64_t> catch_up_fed_seq_{0};
+  std::atomic<uint64_t> catch_up_executed_seq_{0};
 
   /// \brief The warm document as the control thread sees it: what it was compiled from, what it cost,
   /// and the plans it owns until the warm thread retires them.
