@@ -5046,6 +5046,12 @@ TEST_CASE("the Lite a two-step publish stands in with is a state a client can po
 
   Config config = catch_up_file_config(dir);
   config.rig = (dir.path / "rigs" / "pass.json").string();
+  // The record this feature adds to the render path is a decode and a copy into a ring that was
+  // allocated before it was armed, so the interposer -- which counts allocations made inside the
+  // render loop's RtScope -- must see nothing at all across the whole two-step publish.
+  namchain::rt_reset_counters();
+  const bool instrumented = namchain::rt_check_available();
+
   Daemon daemon(config);
 
   std::string error;
@@ -5105,6 +5111,15 @@ TEST_CASE("the Lite a two-step publish stands in with is a state a client can po
   CHECK_MESSAGE(saw_compiling, "the Full's compile was never observable");
   CHECK_MESSAGE(saw_catching_up, "the Full's catch-up was never observable");
   CHECK_MESSAGE(saw_full, "the Full never landed");
+
+  // A run with no interposer must say "not measured" rather than "zero allocations": the difference
+  // between a clean measurement and no measurement (namchain/rt_check.h).
+  if (instrumented)
+  {
+    CHECK_MESSAGE(namchain::rt_allocation_count() == 0,
+                  namchain::rt_allocation_count() << " allocations on the render path");
+    CHECK(namchain::rt_deallocation_count() == 0);
+  }
 }
 
 TEST_CASE("a model with unbounded memory is refused a catch-up, in the reply and in the status")

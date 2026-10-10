@@ -133,14 +133,6 @@ public:
     return tail_.load(std::memory_order_relaxed) != head_.load(std::memory_order_acquire);
   }
 
-  /// Drop the consumer's position: everything already written is skipped, so a window taken next
-  /// starts from the newest block. Used when a catch-up begins and the ring's older content is not
-  /// wanted. Consumer only.
-  void skip_to_newest() noexcept
-  {
-    tail_.store(head_.load(std::memory_order_acquire), std::memory_order_release);
-  }
-
   /// Blocks the producer could not record because the consumer was behind by the whole ring.
   uint64_t dropped() const noexcept { return dropped_.load(std::memory_order_relaxed); }
 
