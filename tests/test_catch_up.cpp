@@ -112,7 +112,15 @@ TEST_CASE("a replayed plan is bit-identical to one that has been running")
   // 200 blocks of input: far longer than the model's receptive field, so the reference plan's state is
   // exactly what the input determines rather than what its own cold start left behind.
   constexpr std::size_t kBlocks = 200;
-  const std::vector<float> x = signal(kBlocks * kQuantum);
+  // The hand-over blocks are input the device has *not* played yet, so the signal carries them too.
+  // Reading them from past the end of the input is not a replay defect -- `execute` reads exactly
+  // `frames` samples from the pointer it is given, which is its contract -- but it silently makes the
+  // claim below unfalsifiable: the memory just after `x` is where the plans' own buffers land, so the
+  // first plan's run rewrites what the second one then reads, and the two plans are fed *different*
+  // audio. That is what turned this case red in the board's build, where the parity case's heap churn
+  // leaves the plans' buffers immediately behind `x`.
+  constexpr std::size_t kCompare = 8;
+  const std::vector<float> x = signal((kBlocks + kCompare) * kQuantum);
 
   namchain::rt::Arena reference_arena(kArenaBytes);
   namchain::rt::Arena cold_arena(kArenaBytes);
@@ -140,7 +148,7 @@ TEST_CASE("a replayed plan is bit-identical to one that has been running")
   // The claim: the next blocks are the same samples, not the same to within a tolerance.
   std::vector<float> expected(kQuantum, 0.0f);
   std::vector<float> replayed(kQuantum, 0.0f);
-  for (std::size_t b = 0; b < 8; ++b)
+  for (std::size_t b = 0; b < kCompare; ++b)
   {
     const float* in = x.data() + (kBlocks + b) * kQuantum;
     run(*reference, in, expected.data());
@@ -175,7 +183,10 @@ TEST_CASE("the replay runs whole blocks, so a block-delay node's state comes bac
   graph.connections = {{"in", 0, "d", 0}, {"d", 0, "amp", 0}, {"amp", 0, "out", 0}};
 
   constexpr std::size_t kBlocks = 200;
-  const std::vector<float> x = signal(kBlocks * kQuantum);
+  // As in the case above: the blocks compared after the hand-over must be real samples the test
+  // owns, not whatever the allocator left after the end of `x`.
+  constexpr std::size_t kCompare = 4;
+  const std::vector<float> x = signal((kBlocks + kCompare) * kQuantum);
 
   namchain::rt::Arena reference_arena(kArenaBytes);
   namchain::rt::Arena cold_arena(kArenaBytes);
@@ -197,7 +208,7 @@ TEST_CASE("the replay runs whole blocks, so a block-delay node's state comes bac
 
   std::vector<float> expected(kQuantum, 0.0f);
   std::vector<float> replayed(kQuantum, 0.0f);
-  for (std::size_t b = 0; b < 4; ++b)
+  for (std::size_t b = 0; b < kCompare; ++b)
   {
     const float* in = x.data() + (kBlocks + b) * kQuantum;
     run(*reference, in, expected.data());
