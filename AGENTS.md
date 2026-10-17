@@ -59,7 +59,8 @@ docker run --rm -v "$PWD:/src:ro" pedal-build:<snapshot> \
 - `plan.md` is the engine's own plan and history. It is long, so start at "How to resume".
 - `docs/`: `daemon.md` (run it, the protocol), `schema.md`, `rig-pipeline.md`,
   `transitions.md`, `assets.md`, `macros.md`, `tuning.md`, `sessions.md` (recording a client and
-  replaying it: `tools/session/`).
+  replaying it: `tools/session/`), `floweq.md` (`nc.eq.flow`: flowEQ's model, its design and its
+  report, and the BSD-3 provenance the generated weight table carries).
 - The CoreAudio and loop backends are on the `local-engine` branch, not `main`.
 
 System context (the pedal, how the repos fit together, the plan): `~/code.local/pedal/pedal.project`, starting at its `CLAUDE.md` and `docs/working-across-repos.md`.

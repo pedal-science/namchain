@@ -71,6 +71,8 @@ void print_usage(std::FILE* stream)
     "  assets [--refresh]     the model and impulse-response library as ids, optionally rescanning it\n"
     "                         first (the scan is cached by size and mtime, so this is cheap)\n"
     "  get                    the document the engine is running, as the engine parsed it\n"
+    "  state                  what the running nodes have derived: a flowEQ's bands and response\n"
+    "                         curve, and nothing for a node with no state of its own\n"
     "  cost NAME.json         what a rig would cost on this device, and whether it would be admitted:\n"
     "                         the daemon costs the document exactly as a publish would, then throws\n"
     "                         the copy away, so nothing plays and nothing changes\n"
@@ -305,6 +307,8 @@ const char* method_for(const std::string& command)
     return "engine.assets";
   if (command == "get")
     return "rig.get";
+  if (command == "state")
+    return "rig.state";
   if (command == "load")
     return "rig.load";
   if (command == "cost")
@@ -530,8 +534,8 @@ int main(int argc, char** argv)
   };
 
   if (options.command == "hello" || options.command == "status" || options.command == "schema" ||
-      options.command == "get" || options.command == "panic" || options.command == "assets" ||
-      options.command == "levels")
+      options.command == "get" || options.command == "state" || options.command == "panic" ||
+      options.command == "assets" || options.command == "levels")
   {
     // No arguments; the method is the whole request, except for `assets --refresh`, which asks the
     // daemon to look at the disk again rather than answer from its scan.

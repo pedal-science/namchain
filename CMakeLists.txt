@@ -155,6 +155,7 @@ add_library(namchain OBJECT
   src/latency/latency.cpp
   src/glitch/glitch.cpp
   src/nodes/builtin.cpp
+  src/nodes/floweq.cpp
   src/nodes/macros.cpp
   src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
@@ -326,6 +327,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_patch.cpp
     tests/test_guard.cpp
     tests/test_nodes.cpp
+    tests/test_floweq.cpp
     tests/test_rig.cpp
     tests/test_document.cpp
     tests/test_schema.cpp

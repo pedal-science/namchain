@@ -126,7 +126,7 @@ nlohmann::json protocol_features(bool measure_levels)
                                                    "smooth_params", "bypass", "guard",
                                                    "per_chain_mute", "schema", "tcp_transport",
                                                    "assets", "record", "local_transitions", "meta",
-                                                   "bypass_ramp", "cost"});
+                                                   "bypass_ramp", "cost", "node_state"});
   if (measure_levels)
     features.push_back("levels");
   return features;
@@ -6996,6 +6996,67 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       body["lowered"] = std::move(lowered);
       body["chains"] = chains_json();
     }
+    return ok_response(id, body);
+  }
+  if (method == "rig.state")
+  {
+    // What the running nodes have *derived* from their parameters: a decoder's mode, a filter's own
+    // coefficients, a gain that is being measured rather than set. A node type publishes it through
+    // NodeType::describe_state, and only the types that have something to say appear -- absence is
+    // the feature flag, as it is for `levels` (docs/daemon.md, "What a node has derived").
+    //
+    // Read from the *audible* plan, the one the render thread is running, not from the document: a
+    // value a client sees here is one it could hear. The state is a node's own, so this is a control
+    // thread question answered from whatever snapshot the node keeps (nc.eq.flow publishes one).
+    nlohmann::json nodes = nlohmann::json::array();
+    const DocRuntime& state_doc = active_document();
+    for (int c = 0; c < state_doc.chain_count && c < static_cast<int>(kMaxChains); ++c)
+    {
+      const ChainRuntime& chain = state_doc.chains[c];
+      if (chain.current == nullptr || chain.current->plan == nullptr)
+        continue;
+      const graph::RenderPlan& plan = *chain.current->plan;
+      const std::vector<std::string>& ids = plan.node_ids();
+      for (std::size_t n = 0; n < plan.nodes().size() && n < ids.size(); ++n)
+      {
+        const graph::PlanNode& node = plan.nodes()[n];
+        if (node.type == nullptr || node.type->describe_state == nullptr || node.state == nullptr)
+          continue;
+        std::string state;
+        try
+        {
+          state = node.type->describe_state(node.state);
+        }
+        catch (const std::exception& e)
+        {
+          // A node that cannot describe itself is not a reason to fail the request: the other
+          // nodes still have an answer, and this one is named in the log rather than dropped in
+          // silence.
+          std::fprintf(stderr, "[namchaind] rig.state: %s could not describe itself: %s\n",
+                       node.type->id.c_str(), e.what());
+          continue;
+        }
+        if (state.empty())
+          continue;
+        try
+        {
+          nodes.push_back({{"chain", current_document_.chains.size() > static_cast<std::size_t>(c)
+                                      ? current_document_.chains[static_cast<std::size_t>(c)].id : std::string()},
+                           {"node", ids[n]},
+                           {"element", node.element},
+                           {"role", node.role},
+                           {"type", node.type->id},
+                           {"state", nlohmann::json::parse(state)}});
+        }
+        catch (const std::exception&)
+        {
+          // The same rule as above for malformed JSON from a node: skip it, do not fail the read.
+        }
+      }
+    }
+    nlohmann::json body;
+    body["generation"] = generation_;
+    body["nodes"] = std::move(nodes);
     return ok_response(id, body);
   }
   if (method == "rig.patch")

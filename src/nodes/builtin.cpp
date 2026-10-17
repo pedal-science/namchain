@@ -25,6 +25,7 @@
 #include "dsp/Resample.h" // AudioDSPTools, as the vendored core pins it
 #include "json.hpp"
 
+#include "namchain/floweq.h"
 #include "namchain/wav.h"
 
 namespace namchain
@@ -1433,8 +1434,8 @@ const NodeType kXfade{.id = "nc.xfade", .name = "Transition crossfade", .categor
 
 /// Every registered type, in the order `engine.schema` reports them: the palette's order, grouped by
 /// what a player is looking for rather than by when each was written.
-const NodeType* const kNodeTypes[] = {&kInput,  &kOutput, &kGain,  &kBiquad, &kDelay, &kNam,
-                                      &kCabIr,  &kSplit,  &kMix,   &kBypass, &kUnitDelay};
+const NodeType* const kNodeTypes[] = {&kInput,  &kOutput, &kGain,  &kBiquad, &kFlowEq, &kDelay,
+                                      &kNam,    &kCabIr,  &kSplit, &kMix,    &kBypass, &kUnitDelay};
 
 /// Types only the engine places. Found by the compiler like any other, never listed in the catalogue.
 const NodeType* const kInternalNodeTypes[] = {&kXfade};

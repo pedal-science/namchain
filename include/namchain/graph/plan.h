@@ -240,6 +240,20 @@ struct NodeType
   /// flowed, so the transition was 3.7 ms of crossfade rather than the 5 ms it asked for, and the
   /// fade's correlation measurement saw silence instead of the two signals it is there to compare.
   bool skip_prewarm = false;
+  /// \brief Control thread: what this node has *derived* from its parameters, as a JSON object, or
+  /// an empty string when it has nothing to say.
+  ///
+  /// A node's parameters are its input; a decoder's thirteen EQ parameters, a filter's coefficients
+  /// or a measured gain are what the node made of them, and a client that wants to *draw* that --
+  /// flowEQ's response curve is the first -- should not have to run the model itself to find out.
+  /// `rig.state` serves this (docs/daemon.md); a node with nothing to report leaves it null and is
+  /// absent from that answer.
+  ///
+  /// Called on the control thread while the render thread is running the same state, so a node that
+  /// reports has to publish a snapshot the render thread writes and this reads without racing
+  /// (`nc.eq.flow` does it with an epoch). Nothing here may touch the render path's mutable state
+  /// directly.
+  std::string (*describe_state)(void* state) = nullptr;
 };
 
 /// \brief How a per-port parameter is encoded in the one integer a ramp dispatch carries.

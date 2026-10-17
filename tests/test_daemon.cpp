@@ -1730,6 +1730,103 @@ TEST_CASE("rig.apply takes a whole document and rig.get hands it back")
   }
 }
 
+TEST_CASE("rig.state reports what a node has derived, and only the nodes that do")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  std::filesystem::create_directories(root);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.capture_channels = 2;
+  config.playback_channels = 2;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  // Nothing running: an empty list rather than an error, like `rig.get`'s loaded:false.
+  {
+    const auto empty = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.state"})"));
+    REQUIRE(empty["ok"] == true);
+    CHECK(empty["nodes"].empty());
+  }
+
+  nlohmann::json document;
+  document["name"] = "flow";
+  {
+    nlohmann::json chain;
+    chain["id"] = "main";
+    chain["input_channel"] = 0;
+    chain["output_channel"] = 0;
+    chain["nodes"] = nlohmann::json::array({
+      {{"id", "in"}, {"type", "nc.input"}},
+      {{"id", "eq"}, {"type", "nc.eq.flow"}, {"x", 0.5}, {"strength", 0.5}},
+      {{"id", "level"}, {"type", "nc.gain"}, {"gain", 0.8}},
+      {{"id", "out"}, {"type", "nc.output"}},
+    });
+    chain["connections"] = nlohmann::json::array({
+      {{"from", "in"}, {"to", "eq"}},
+      {{"from", "eq"}, {"to", "level"}},
+      {{"from", "level"}, {"to", "out"}},
+    });
+    document["chains"] = nlohmann::json::array({chain});
+  }
+  {
+    nlohmann::json request;
+    request["method"] = "rig.apply";
+    request["document"] = document;
+    const auto reply = nlohmann::json::parse(call(config.socket_path, request.dump()));
+    REQUIRE_MESSAGE(reply["ok"] == true, reply.dump());
+  }
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() >= 1;
+  }));
+
+  const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.state"})"));
+  REQUIRE(reply["ok"] == true);
+  REQUIRE(reply["nodes"].size() == 1); // nc.gain has nothing derived to report
+  const nlohmann::json& entry = reply["nodes"][0];
+  CHECK(entry["chain"] == "main");
+  CHECK(entry["node"] == "eq");
+  CHECK(entry["element"] == "eq");
+  CHECK(entry["type"] == "nc.eq.flow");
+  const nlohmann::json& state = entry["state"];
+  CHECK(state["model"] == "vae3d_beta_0.0010");
+  CHECK(state["latent"][0] == doctest::Approx(0.5));
+  CHECK(state["strength"] == doctest::Approx(0.5));
+  REQUIRE(state["bands"].size() == 5);
+  CHECK(state["bands"][0]["type"] == "lowshelf");
+  REQUIRE(state["curve"]["points"].size() == 96);
+  CHECK(state["curve"]["f_max"] == doctest::Approx(20000.0));
+  // The one node that reports is the one with a `describe_state`; the engine does not invent a
+  // vocabulary for the others.
+  const auto schema = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.schema"})"));
+  bool found = false;
+  for (const auto& node : schema["nodes"])
+    if (node["id"] == "nc.eq.flow")
+      found = true;
+  CHECK(found);
+}
+
 TEST_CASE("an applied document resolves its relative paths against the rigs root")
 {
   TempDir dir;

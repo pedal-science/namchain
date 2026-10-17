@@ -62,6 +62,11 @@ std::string baseline_params(const std::string& type)
 {
   if (type == "nc.eq.biquad")
     return nlohmann::json{{"gain_db", 6.0}}.dump();
+  // flowEQ's `extend` doubles the latent values, so at the default (0, 0, 0) it changes nothing; a
+  // latent point away from the origin is what makes it and `strength` observable, in the same way
+  // the biquad's gain is what makes its frequency observable.
+  if (type == "nc.eq.flow")
+    return nlohmann::json{{"x", 1.0}}.dump();
   return required_params(type);
 }
 
@@ -132,6 +137,12 @@ nlohmann::json other_value(const std::string& type, const ParamDesc& param)
     return test_data("CabIR.nam");
   if (id == "mode")
     return "lowpass";
+  if (id == "strength")
+    return 0.5; // its range is 0..1, so "one more than the default" is outside the schema
+  if (id == "x")
+    return -1.0; // flowEQ's baseline is x = 1, which is what makes Extend observable
+  if (id == "auto_gain")
+    return 1.0;
   if (id == "freq")
     return 2500.0;
   if (id == "q")

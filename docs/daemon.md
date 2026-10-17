@@ -385,6 +385,7 @@ One JSON object per message in each direction, over either transport above. A re
 | `rig.apply` | `{"document": { … }}` — a whole document, parsed by the same parser a rig file goes through | `name`, `chains`, `generation`; relative model paths resolve against the rigs root |
 | `rig.patch` | `{"ops": [...], "chain": "id"?}` — `set_param`, `add_node`, `remove_node`, `connect`, `disconnect`, `rewire`, `swap_model`, `bypass`. A target is named by `node`, or by `element` with an optional `role` (and `port` for a per-port parameter) | `kind` (`smooth` or `structural`), `applied`, `chain`, `generation` |
 | `rig.get` | — | the rig path (empty for an applied document), `source` (`file`/`applied`), `generation`, `loaded`, the current `document` as the engine parsed it, the `lowered` graph it became (macros expanded, with the engine-minted ids), and a per-chain summary |
+| `rig.state` | — | what the running nodes have *derived* from their parameters, for the node types that report: `generation`, and a `nodes` array of `{chain, node, element, role, type, state}`, where `state` is the node type's own vocabulary. Empty when no node reports. See "What a node has derived", below |
 | `rig.warm` | `{"rig": "name.json"}`, or `{"document": { … }}`, with `{"replace": false}` to refuse rather than displace a warm rig | hold a rig ready to switch to: compiled, prewarmed and rendering on a warm core, without touching the audible document. Returns `rig`, `name`, `generation`, `doc`, `core`, `state` (`warming` until it has rendered a block, then `warm`), `replaced` (what it displaced, or null), the same `cost` object `rig.cost` returns, and `slimmed_models`/`missing_assets`. Refused as `warm_disabled`, `warm_full` (`replace` was false), `over_budget`, `asset_missing` or `compile_failed` |
 | `rig.cool` | `{"rig": "name.json"}`, or `{}` for whatever is warm | stop holding a rig ready. Returns `cooled` (the rigs that stopped being warm) and the `warm` object. `warm_disabled` when warmth is off, `warm_not_ready` when the named rig is not the warm one or the document has not been let go yet |
 | `rig.switch` | `{"rig": "name.json"}`, with `{"fallback": false}` to refuse instead of loading cold, and `{"lite_first": true}` for the same two-step publish on a cold switch | make a rig audible: `switched` (`warm` when it was a handover, `cold` when it was a load), `rig`, `generation` (of the content now audible), `doc`, `core`, `handover_blocks`, `fade_ms`, `completed`, and `reason` when it was cold. A rig that is not warm is published exactly as `rig.load` does it, so a footswitch press never ends in silence; `fallback: false` turns that into `warm_not_ready`. `lite_first` is ignored for a rig that *is* warm — a handover beats any Lite compile — and the reply says `lite_first: false` ("Lite-first publishes", below) |
@@ -437,6 +438,32 @@ It is also a **fixed point**: applying what `rig.get` returned changes nothing, 
 the generation. That is what makes the read-back usable for reconciliation rather than something to
 be careful with.
 
+**What a node has *derived* is `rig.state`.** `rig.get` says what the document asked for. Some node
+types compute something further from their parameters -- flowEQ decodes three latent values into the
+thirteen parameters of a five band EQ and then into a response curve -- and that is what a client
+draws, so the engine serves it rather than making every client re-run the model:
+
+```json
+{ "id": "s", "method": "rig.state" }
+```
+```jsonc
+{ "ok": true, "generation": 7,
+  "nodes": [ { "chain": "main", "node": "eq", "element": "eq", "role": "",
+               "type": "nc.eq.flow",
+               "state": { "model": "vae3d_beta_0.0010", "latent": [0.5, 0.0, 0.0],
+                          "strength": 0.5, "extend": false, "auto_gain": false,
+                          "in_db": 0.0, "out_db": 0.0, "gain_db": 0.0,
+                          "bands": [ { "type": "lowshelf", "gain_db": -0.25, "freq": 150.48, "q": 0.71 }, … ],
+                          "curve": { "f_min": 20.0, "f_max": 20000.0, "points": [ … ] } } } ] }
+```
+
+`nodes` holds one entry per node whose type reports and nothing else -- a node type with no state of
+its own is simply absent, and the array is empty when nothing in the rig reports. The values come
+from the **audible plan**, not from the document, so what a client sees is what it could hear; a
+node's `state` is its own vocabulary and its own documentation (docs/floweq.md for `nc.eq.flow`).
+It is not a document and cannot be applied back: `rig.get` stays the only read that is a fixed point.
+The `node_state` feature flag says the daemon serves the method at all.
+
 **A client's own data goes in `meta`.** The document, each chain and each node may carry a `meta`
 object, which the engine keeps exactly as written, returns from `rig.get` (and keeps through a
 `rig.patch`), and never reads. A version, a colour, a layout hint: whatever the client needs to find
@@ -450,7 +477,7 @@ chain quietly playing on channel 0.
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
 `bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`, `record`, `local_transitions`,
-`meta`, `bypass_ramp`, `cost`, `levels`. It grows as the slices land, and
+`meta`, `bypass_ramp`, `cost`, `node_state`, `levels`. It grows as the slices land, and
 absence is how a client degrades rather than guesses: a client that does not see `levels` hides its
 meters rather than drawing a floor.
 

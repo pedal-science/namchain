@@ -20,6 +20,21 @@ host numbers: every measurement carries the toolchain and kernel it was taken on
 
 ## How to resume
 
+**`nc.eq.flow` and `rig.state` (2026-10-17).** flowEQ — Christian Steinmetz's β-VAE over a five band
+parametric EQ — was added as a node: three latent values decode to the thirteen EQ parameters and
+then to five biquads (lowshelf, three peaks, highshelf) with Strength, Extend, In/Out gain and
+Auto Gain, which is the plugin's "lite" feature set. The decoder's weights were converted from the
+trained `.mat` by `tools/floweq/generate_model.py` into a checked-in table
+(`include/namchain/floweq/model.h`, 70 KB, BSD-3 provenance in the header and docs/floweq.md); the
+plugin's own coefficient formulas are re-implemented in `src/nodes/floweq.cpp`. A latent change is a
+`rt::Crossfade` between two five-section chains, and `strength = 0` is an exact identity with the
+filters skipped. The novel protocol piece is **`rig.state`**: a node type may now publish what it has
+*derived* from its parameters (`NodeType::describe_state`), and a client draws it instead of running
+the model itself — which is what rigpa's flowEQ panel does with the response curve. `tests/test_floweq.cpp`
+checks the decoder against the reference forward pass, the design against the plugin's formulas, the
+ramp's convergence, Auto Gain and the report; `tests/test_daemon.cpp` covers `rig.state`. The cost
+table has no row for the node yet, so it is charged `unknown.node` until `pedal-measure` measures it.
+
 **Environment verified and ready (2026-09-11).** Phase 0 is complete on this host and M0 has begun.
 §0 records the verified inventory, the corrections to what was previously believed about this box,
 and the commands that actually work.
