@@ -20,6 +20,23 @@ host numbers: every measurement carries the toolchain and kernel it was taken on
 
 ## How to resume
 
+**`nc.tuner` (2026-10-20).** Squatch-dsp's tuner — a strobe tuner that reads a string to a tenth of a
+cent — became a node: one input, one output, and the output is **exactly zero**, so a chain with one
+in it is silent while the node still hears the instrument. That is a pedal tuner, and it is the first
+node that is not a block: `engine.schema` publishes `flags.in_palette: false` for it, a palette leaves
+it out, and a document may still name it — because mounting it *is* how a client's tuner mutes the rig.
+The core is vendored verbatim from squatch-dsp (`third_party/squatch-tuner/`, MIT, pinned commit,
+`tools/vendor/fetch_squatch_tuner.py --check` verifies it) rather than re-implemented, since it is
+header-only and dependency-free. The node allocates nothing on the render path (the vendored core is
+fixed-size and `configure()` runs at build), and publishes its reading through the `rig.state` snapshot
+`nc.eq.flow` established — the first state in the engine derived from *audio* rather than from
+parameters, which `docs/daemon.md` now says. The node is the smallest half of the feature: the rest is
+the **ephemeral-node contract** in `docs/tuner.md` (a client splices one in after each chain's input,
+marks it `meta.ephemeral`, and strips it from anything it reads back), which rigpa's tuner main view
+and ljoss's tuner panel implement. `tests/test_tuner.cpp` covers the mute, the reading, silence, the
+counter and the allocation; `tests/test_daemon.cpp` covers mounting it and `rig.state` reporting it per
+chain. No cost row yet: `unknown.node` until `pedal-measure` measures it.
+
 **`nc.eq.flow` and `rig.state` (2026-10-17).** flowEQ — Christian Steinmetz's β-VAE over a five band
 parametric EQ — was added as a node: three latent values decode to the thirteen EQ parameters and
 then to five biquads (lowshelf, three peaks, highshelf) with Strength, Extend, In/Out gain and

@@ -1827,6 +1827,119 @@ TEST_CASE("rig.state reports what a node has derived, and only the nodes that do
   CHECK(found);
 }
 
+TEST_CASE("a document may mount a tuner, and rig.state reports it for each chain")
+{
+  // The ephemeral node of docs/tuner.md: a client mounts one after each chain's input, marked in
+  // `meta` so it can find its own node again. The engine has to accept it -- it is not internal --
+  // and report it, which is what this checks end to end through the socket.
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  std::filesystem::create_directories(root);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.capture_channels = 2;
+  config.playback_channels = 2;
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  const auto chain = [](const char* id, int channel) {
+    nlohmann::json out;
+    out["id"] = id;
+    out["input_channel"] = channel;
+    out["output_channel"] = channel;
+    out["nodes"] = nlohmann::json::array({
+      {{"id", "in"}, {"type", "nc.input"}},
+      {{"id", "tuner"}, {"type", "nc.tuner"}, {"meta", {{"ephemeral", "tuner"}}}},
+      {{"id", "level"}, {"type", "nc.gain"}, {"gain", 0.8}},
+      {{"id", "out"}, {"type", "nc.output"}},
+    });
+    out["connections"] = nlohmann::json::array({
+      {{"from", "in"}, {"to", "tuner"}},
+      {{"from", "tuner"}, {"to", "level"}},
+      {{"from", "level"}, {"to", "out"}},
+    });
+    return out;
+  };
+
+  nlohmann::json document;
+  document["name"] = "tuned";
+  document["chains"] = nlohmann::json::array({chain("a", 0), chain("b", 1)});
+
+  {
+    nlohmann::json request;
+    request["method"] = "rig.apply";
+    request["document"] = document;
+    const auto reply = nlohmann::json::parse(call(config.socket_path, request.dump()));
+    REQUIRE_MESSAGE(reply["ok"] == true, reply.dump());
+  }
+  REQUIRE(wait_for(config.socket_path, [](const nlohmann::json& status) {
+    return status["state"] == "running" && status["audible_generation"].get<uint64_t>() >= 1;
+  }));
+
+  // rig.get keeps the document as applied, `meta` and all: it is a diagnostic, and the marker is
+  // how a client recognises the node it mounted.
+  const auto got = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.get"})"));
+  REQUIRE(got["ok"] == true);
+  REQUIRE(got["document"]["chains"].size() == 2);
+  for (const auto& applied : got["document"]["chains"])
+  {
+    bool found = false;
+    for (const auto& node : applied["nodes"])
+      if (node["type"] == "nc.tuner")
+      {
+        found = true;
+        CHECK(node["meta"]["ephemeral"] == "tuner");
+      }
+    CHECK_MESSAGE(found, applied["id"]);
+  }
+
+  // One report per chain, each with the silence the null backend feeds it: a valid key that is
+  // false, no note keys at all, and the counter the render thread keeps.
+  const auto state = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.state"})"));
+  REQUIRE(state["ok"] == true);
+  REQUIRE(state["nodes"].size() == 2);
+  for (const auto& entry : state["nodes"])
+  {
+    CHECK(entry["type"] == "nc.tuner");
+    CHECK(entry["state"]["valid"] == false);
+    CHECK_FALSE(entry["state"].contains("hz"));
+    CHECK(entry["state"]["a4"] == doctest::Approx(440.0));
+    CHECK(entry["state"]["blocks"].get<uint64_t>() > 0);
+  }
+
+  // And the schema says a palette should leave it out, which is the flag a client reads.
+  const auto schema = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.schema"})"));
+  bool found = false;
+  for (const auto& node : schema["nodes"])
+    if (node["id"] == "nc.tuner")
+    {
+      found = true;
+      CHECK(node["flags"]["in_palette"] == false);
+    }
+  CHECK(found);
+}
+
 TEST_CASE("an applied document resolves its relative paths against the rigs root")
 {
   TempDir dir;

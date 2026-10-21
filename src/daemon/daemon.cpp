@@ -362,7 +362,11 @@ nlohmann::json node_type_schema(const render::NodeType& type, const assets::Regi
                     {"has_lookback", false},
                     {"has_tail", false},
                     {"bypassable", type.inputs == 1 && type.outputs == 1},
-                    {"block_delay", type.block_delay}};
+                    {"block_delay", type.block_delay},
+                    // A palette should leave an in_palette:false type out: it is a client's node,
+                    // mounted and removed around a view, not a block a player adds to a chain
+                    // (docs/schema.md, docs/tuner.md).
+                    {"in_palette", type.in_palette}};
   entry["latency_samples"] = 0;
   entry["tail_samples"] = 0;
 

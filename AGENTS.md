@@ -60,7 +60,10 @@ docker run --rm -v "$PWD:/src:ro" pedal-build:<snapshot> \
 - `docs/`: `daemon.md` (run it, the protocol), `schema.md`, `rig-pipeline.md`,
   `transitions.md`, `assets.md`, `macros.md`, `tuning.md`, `sessions.md` (recording a client and
   replaying it: `tools/session/`), `floweq.md` (`nc.eq.flow`: flowEQ's model, its design and its
-  report, and the BSD-3 provenance the generated weight table carries).
+  report, and the BSD-3 provenance the generated weight table carries), `tuner.md` (`nc.tuner`:
+  squatch-dsp's tuner as a node that mutes, its reading, and the ephemeral-node contract the two
+  front ends follow to mount one while a tuner is on screen; its headers are vendored in
+  `third_party/squatch-tuner/` and re-fetched with `tools/vendor/fetch_squatch_tuner.py`).
 - The CoreAudio and loop backends are on the `local-engine` branch, not `main`.
 
 System context (the pedal, how the repos fit together, the plan): `~/code.local/pedal/pedal.project`, starting at its `CLAUDE.md` and `docs/working-across-repos.md`.

@@ -26,6 +26,7 @@
 #include "json.hpp"
 
 #include "namchain/floweq.h"
+#include "namchain/tuner.h"
 #include "namchain/wav.h"
 
 namespace namchain
@@ -1433,9 +1434,12 @@ const NodeType kXfade{.id = "nc.xfade", .name = "Transition crossfade", .categor
 } // namespace
 
 /// Every registered type, in the order `engine.schema` reports them: the palette's order, grouped by
-/// what a player is looking for rather than by when each was written.
-const NodeType* const kNodeTypes[] = {&kInput,  &kOutput, &kGain,  &kBiquad, &kFlowEq, &kDelay,
-                                      &kNam,    &kCabIr,  &kSplit, &kMix,    &kBypass, &kUnitDelay};
+/// what a player is looking for rather than by when each was written. `nc.tuner` is last because it
+/// is the one type no palette offers (`in_palette = false`): a client mounts it while its tuner is on
+/// screen (docs/tuner.md), and a player never adds it to a chain.
+const NodeType* const kNodeTypes[] = {&kInput,  &kOutput, &kGain,   &kBiquad,   &kFlowEq, &kDelay,
+                                      &kNam,    &kCabIr,  &kSplit,  &kMix,      &kBypass, &kUnitDelay,
+                                      &kTuner};
 
 /// Types only the engine places. Found by the compiler like any other, never listed in the catalogue.
 const NodeType* const kInternalNodeTypes[] = {&kXfade};

@@ -174,7 +174,7 @@ Node type descriptor:
   "name": "Biquad EQ",
   "category": "eq",
   "flags": { "stateful": true, "has_tail": false, "has_lookback": false,
-             "bypassable": true, "block_delay": false },
+             "bypassable": true, "block_delay": false, "in_palette": true },
   "latency_samples": 0,
   "tail_samples": 0,
   "ports": {
@@ -194,6 +194,7 @@ Node type descriptor:
 | `flags.stateful` / `has_tail` | explains why bypass keeps a node running, and what a scene change would do to a reverb tail |
 | `flags.bypassable` | the compiler already refuses bypass on anything but 1→1; publishing it lets the UI grey the control instead of failing |
 | `flags.block_delay` | `nc.unit_delay` is a scheduling primitive; the UI should not offer it as a pedal |
+| `flags.in_palette` | false: the type is not a block. A client mounts it around a view of its own (`nc.tuner`, docs/tuner.md); a palette leaves it out, and a document may still name it |
 | `latency_samples`, `tail_samples` | what the UI will need for a total-latency readout and the deferred `tail_hold` |
 | `ports[].channels` | decision 4: declared, and the compiler refuses > 1 until stereo exists |
 | `ports[].optional` | an unconnected input is legal and is bound to silence |

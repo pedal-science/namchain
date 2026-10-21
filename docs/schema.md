@@ -22,7 +22,7 @@ returns
                           "out": [ {"name":"out0", "channels":1, "optional":false} ] },
                "arity": null,
                "flags": { "stateful": true, "has_lookback": false, "has_tail": false,
-                          "bypassable": true, "block_delay": false },
+                          "bypassable": true, "block_delay": false, "in_palette": true },
                "latency_samples": 0, "tail_samples": 0,
                "params": [ … ] } ] }
 ```
@@ -40,6 +40,7 @@ returns
 | `flags.stateful` | explains why bypass keeps the node running rather than removing it |
 | `flags.bypassable` | the compiler refuses bypass on anything but 1→1; publishing it lets a UI grey the control instead of finding out |
 | `flags.block_delay` | a scheduling primitive (`nc.unit_delay`), not a pedal: a palette should leave it out |
+| `flags.in_palette` | whether a palette should offer the type at all. False for a node a *client* places around a view rather than a player adding it to a chain: `nc.tuner` (docs/tuner.md). The distinction from `internal` is that a document may name an in-palette-false type — that is how it is mounted — and may not name an internal one |
 | `latency_samples`, `tail_samples` | 0 for every built-in today; what a total-latency readout and the deferred `tail_hold` will need |
 
 `stereo` at the top level is `false`, and it is the same decision as `ports[].channels` being 1

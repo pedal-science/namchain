@@ -157,6 +157,7 @@ add_library(namchain OBJECT
   src/nodes/builtin.cpp
   src/nodes/floweq.cpp
   src/nodes/macros.cpp
+  src/nodes/tuner.cpp
   src/soak/soak.cpp
   ${NAMCHAIN_AUDIODSPTOOLS_WAV}
   ${NAMC_CORE_SOURCES})
@@ -170,6 +171,11 @@ target_include_directories(namchain PRIVATE "${NAMCHAIN_AUDIODSPTOOLS_DIR}/dsp")
 # nc.cab.ir includes "dsp/Resample.h" from the same AudioDSPTools.
 target_include_directories(namchain SYSTEM PRIVATE "${NAMCHAIN_AUDIODSPTOOLS_DIR}")
 target_include_directories(namchain PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+# The vendored Squatch Tuner (third_party/squatch-tuner/README.md). SYSTEM, so its headers are
+# not held to -Wall -Wextra: it is third-party code, and src/nodes/tuner.cpp is the one file that
+# includes it.
+target_include_directories(namchain SYSTEM PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/squatch-tuner/include")
 target_compile_features(namchain PUBLIC cxx_std_20)
 target_compile_options(namchain PRIVATE ${NAMCHAIN_WARN_FLAGS})
 
@@ -328,6 +334,7 @@ if(NAMCHAIN_BUILD_TESTS)
     tests/test_guard.cpp
     tests/test_nodes.cpp
     tests/test_floweq.cpp
+    tests/test_tuner.cpp
     tests/test_rig.cpp
     tests/test_document.cpp
     tests/test_schema.cpp

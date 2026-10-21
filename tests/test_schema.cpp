@@ -517,3 +517,27 @@ TEST_CASE("a mixer's per-port parameters are declared once and every one of them
   CHECK(build("mute", 1.0) == doctest::Approx(0.5f).epsilon(0.01));
   CHECK(build("phase", 1.0) == doctest::Approx(0.0f).epsilon(0.01));
 }
+
+TEST_CASE("a type no palette offers is still one a document may name")
+{
+  // `in_palette = false` is about palettes, not about documents. A client mounts the tuner node by
+  // naming it in the document it publishes, which is the whole difference between this flag and
+  // `internal` -- an internal type is the engine's to place and a document may not name it at all
+  // (docs/schema.md, docs/tuner.md).
+  const NodeType* tuner = namchain::render::find_node_type("nc.tuner");
+  REQUIRE(tuner != nullptr);
+  CHECK_FALSE(tuner->in_palette);
+  CHECK_FALSE(tuner->internal);
+
+  // A document naming it parses, validates and renders -- and renders silence.
+  const std::vector<float> output = render(one_node("nc.tuner", nlohmann::json::object()));
+  REQUIRE(output.size() > 0u);
+  for (const float value : output)
+    CHECK(value == 0.0f);
+
+  // Every other type is one a palette may offer, so the flag's default is the answer for all of
+  // them and a client never needs a list of its own.
+  for (const NodeType* type : namchain::render::all_node_types())
+    if (type->id != "nc.tuner")
+      CHECK_MESSAGE(type->in_palette, type->id);
+}

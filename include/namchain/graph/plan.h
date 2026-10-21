@@ -231,6 +231,18 @@ struct NodeType
   /// `engine.schema` leaves it out and a document may not name it; only the engine places one, as
   /// the crossfade inside a local transition (docs/transitions.md, "Local transitions").
   bool internal = false;
+  /// \brief Whether a palette should offer this type.
+  ///
+  /// `nc.tuner` is compiled like any other node and a document may name it -- it has to be nameable,
+  /// because mounting it is how a client's tuner mutes the rig -- but it is not a block a player
+  /// adds to a chain. A client places one while its tuner is on screen and removes it after
+  /// (docs/tuner.md, "The ephemeral node"). False is the schema saying so, published as
+  /// `flags.in_palette`, rather than every client keeping its own list of exclusions, which is a
+  /// list that goes stale silently (docs/schema.md).
+  ///
+  /// The distinction from \ref internal: an internal type is the engine's to place and a document
+  /// may not name it at all; this one is a client's to place and a palette must not offer it.
+  bool in_palette = true;
   /// \brief Leave this node out of prewarming: neither \ref graph::RenderPlan::prewarm_fresh nor
   /// the silent block \ref graph::RenderPlan::prewarm runs.
   ///
