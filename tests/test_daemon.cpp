@@ -1928,6 +1928,39 @@ TEST_CASE("a document may mount a tuner, and rig.state reports it for each chain
     CHECK(entry["state"]["blocks"].get<uint64_t>() > 0);
   }
 
+  // The switch, through the path a UI takes: one `rig.patch` addressed by node id, answered
+  // `smooth` rather than `structural` -- the node ramps it, so no rebuild, no crossfade and no gap
+  // in the reading -- and `rig.state` then reports the switch as off for both chains.
+  for (const char* chain_id : {"a", "b"})
+  {
+    nlohmann::json request;
+    request["method"] = "rig.patch";
+    // A patch names the chain it applies to, so a client with a node in every chain sends one per
+    // chain -- the injected id is the same in each.
+    request["chain"] = chain_id;
+    request["ops"] = nlohmann::json::array(
+      {{{"op", "set_param"}, {"node", "tuner"}, {"param", "mute"}, {"value", 0.0}}});
+    const auto reply = nlohmann::json::parse(call(config.socket_path, request.dump()));
+    REQUIRE_MESSAGE(reply["ok"] == true, reply.dump());
+    CHECK_MESSAGE(reply["kind"] == "smooth", reply.dump());
+    CHECK(reply["applied"] == 1);
+  }
+  // The report is published once per block, so the switch shows up in `rig.state` on the block after
+  // the patch rather than in the same instant. Poll until it does, the way a UI does.
+  bool reported = false;
+  for (int attempt = 0; attempt < 200 && !reported; ++attempt)
+  {
+    const auto state_now = nlohmann::json::parse(call(config.socket_path, R"({"method":"rig.state"})"));
+    if (state_now["nodes"].size() != 2)
+      break;
+    reported = true;
+    for (const auto& entry : state_now["nodes"])
+      reported = reported && entry["state"]["mute"] == false;
+    if (!reported)
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  CHECK_MESSAGE(reported, "rig.state still reports the switch as on after the patch");
+
   // And the schema says a palette should leave it out, which is the flag a client reads.
   const auto schema = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.schema"})"));
   bool found = false;
@@ -1936,6 +1969,13 @@ TEST_CASE("a document may mount a tuner, and rig.state reports it for each chain
     {
       found = true;
       CHECK(node["flags"]["in_palette"] == false);
+      // The switch is declared where a client builds its control from, and it is rampable: that is
+      // what makes the patch above `smooth` rather than a rebuild.
+      REQUIRE(node["params"].size() == 1);
+      CHECK(node["params"][0]["id"] == "mute");
+      CHECK(node["params"][0]["kind"] == "flag");
+      CHECK(node["params"][0]["default"] == doctest::Approx(1.0));
+      CHECK(node["params"][0]["rampable"] == true);
     }
   CHECK(found);
 }

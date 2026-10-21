@@ -16,10 +16,17 @@
 //    control thread reads for `rig.state`. The render thread never hands a pointer to anything it
 //    is still writing: nc.eq.flow's publish/read_report is the pattern, and this is the same one.
 //
-// The node has no parameters on purpose. A4 is the fixed 440 Hz a guitar pedal tunes to; the note
-// range covers a 5-string bass on the way up and a 24th-fret high E on the way down. A reference
-// pitch control is a parameter and a UI, not an engine default, and when someone wants one it
-// arrives as `a4` with the schema's range around it (docs/tuner.md).
+// The node has one parameter, `mute`, and it is what a pedal tuner's switch does: on (the default),
+// the output is silence; off, the input passes through unchanged, and the tuner keeps listening so
+// its display carries on. It is a *rampable* flag, as nc.mix's lane mutes are, so a client's toggle
+// is one `rig.patch` -- a smooth op that ramps the pass-through inside the node over a few
+// milliseconds, with no rebuild, no crossfade and no gap in the reading. A rebuild there would be
+// visible as the strobe restarting, which is the one thing a player is watching.
+//
+// A4 is the fixed 440 Hz a guitar pedal tunes to; the note range covers a 5-string bass on the way
+// up and a 24th-fret high E on the way down. A reference pitch control would be another parameter
+// and a UI, not an engine default, and when someone wants one it arrives as `a4` with the schema's
+// range around it (docs/tuner.md).
 
 #include "namchain/tuner.h"
 
@@ -58,6 +65,20 @@ constexpr float kMaxHz = 1400.0f;
 /// The level published when the tuner has heard nothing, and the floor a level readout shows.
 constexpr float kFloorDb = -120.0f;
 
+/// The parameters, in id order: `params[i]` has id `i + 1` (plan.h).
+constexpr uint32_t kTunerParamMute = 1;
+
+const ParamDesc kTunerParams[] = {
+  // A flag with a rampable change is a switch, not a structural edit: `set_param_tuner` writes the
+  // target and `process_tuner` ramps to it, so unmuting the rig is a fade rather than a rebuild
+  // (nc.mix's lane mutes are the same shape).
+  {.id = "mute", .name = "Mute", .kind = ParamKind::Flag, .default_value = 1.0, .rampable = true},
+};
+
+/// How long the pass-through takes to open or close. Long enough to be a fade rather than a click,
+/// short enough that a player hears the switch act.
+constexpr double kMuteRampSeconds = 0.005;
+
 /// \brief What the render thread has heard, as the control thread may read it.
 ///
 /// Plain values, copied out of the atomics in one epoch-guarded read (see read_report), so the
@@ -74,6 +95,9 @@ struct Report
   int partials = 0;
   uint32_t blocks = 0;
   bool valid = false;
+  /// The switch as the client set it, not the value a ramp is passing through: a toggle that
+  /// reported the in-flight fade would flicker back on the way.
+  bool muted = true;
 };
 
 struct TunerState
@@ -86,6 +110,17 @@ struct TunerState
   /// Blocks processed since the node was built. Only the render thread writes it; the published
   /// copy is what a client sees, and it is what lets a client tell a held reading from a live one.
   uint32_t blocks = 0;
+
+  /// The pass-through, as a gain of `1 - mute` applied to the output. Written by `set_param_tuner`
+  /// on the control thread and read here per block, which is the same contract nc.gain's ramp has:
+  /// one writer, one reader, and a ramp that restarts from wherever the last one had got to.
+  float mute = 1.0f;
+  float mute_from = 1.0f;
+  float mute_to = 1.0f;
+  int mute_pos = 0;
+  int mute_len = 0;
+  /// The length `set_param_tuner` gives a new ramp, from the plan's sample rate.
+  int mute_ramp_samples = 0;
 
   /// \brief The epoch: odd while the render thread is writing the fields below, even when settled.
   std::atomic<uint32_t> published{0};
@@ -141,7 +176,10 @@ void publish(TunerState& state) noexcept
   state.report_midi.store(reading.midi, std::memory_order_relaxed);
   state.report_partials.store(reading.partials, std::memory_order_relaxed);
   state.report_blocks.store(state.blocks, std::memory_order_relaxed);
-  state.report_flags.store(reading.valid ? 1u : 0u, std::memory_order_relaxed);
+  // Bit 0: the reading is trustworthy. Bit 1: the output is silent, which is the switch's target
+  // rather than the ramp's current value.
+  state.report_flags.store((reading.valid ? 1u : 0u) | (state.mute_to != 0.0f ? 2u : 0u),
+                           std::memory_order_relaxed);
   std::atomic_thread_fence(std::memory_order_release);
   state.published.store(epoch + 2, std::memory_order_relaxed); // even: settled
 }
@@ -164,7 +202,9 @@ bool read_report(const TunerState& state, Report& out) noexcept
     out.midi = state.report_midi.load(std::memory_order_relaxed);
     out.partials = state.report_partials.load(std::memory_order_relaxed);
     out.blocks = state.report_blocks.load(std::memory_order_relaxed);
-    out.valid = (state.report_flags.load(std::memory_order_relaxed) & 1u) != 0u;
+    const uint32_t flags = state.report_flags.load(std::memory_order_relaxed);
+    out.valid = (flags & 1u) != 0u;
+    out.muted = (flags & 2u) != 0u;
     std::atomic_thread_fence(std::memory_order_acquire);
     if (before == state.published.load(std::memory_order_relaxed))
       return true;
@@ -179,7 +219,13 @@ double round_to(double value, double places)
   return std::round(value * places) / places;
 }
 
-void* create_tuner(const graph::NodeSpec&, const CompileOptions& options, std::string& error)
+double number_param(const graph::NodeSpec& spec, const std::string& name, double fallback)
+{
+  const auto it = spec.params.find(name);
+  return it == spec.params.end() ? fallback : it->second;
+}
+
+void* create_tuner(const graph::NodeSpec& spec, const CompileOptions& options, std::string& error)
 {
   if (!(options.sample_rate > 0.0))
   {
@@ -195,6 +241,13 @@ void* create_tuner(const graph::NodeSpec&, const CompileOptions& options, std::s
   // configure() is where the core builds its tables and its decimation filter; it is not real-time
   // safe, which is why it happens here, on the control thread, and never again.
   state->tuner.configure(config);
+  state->mute_ramp_samples =
+    std::max(1, static_cast<int>(std::lround(kMuteRampSeconds * options.sample_rate)));
+  // A document may mount the node already open — `"mute": 0` — which is how a client that remembers
+  // "tuning with sound on" mounts it, and what the schema's honesty test renders against the
+  // default. It starts settled rather than ramping: there is nothing to fade from at build time.
+  const bool muted = number_param(spec, "mute", 1.0) >= 0.5;
+  state->mute = state->mute_from = state->mute_to = muted ? 1.0f : 0.0f;
   publish(*state);
   return state.release();
 }
@@ -202,6 +255,25 @@ void* create_tuner(const graph::NodeSpec&, const CompileOptions& options, std::s
 void destroy_tuner(void* raw)
 {
   delete static_cast<TunerState*>(raw);
+}
+
+/// The switch. Called on the control thread against the live plan's state, so it only ever writes a
+/// target and a ramp: nothing here allocates, locks or throws, and a second toggle mid-ramp starts
+/// from wherever the first had got to rather than from its own endpoint (nc.gain's rule).
+bool set_param_tuner(void* raw, uint32_t param_id, float value) noexcept
+{
+  auto* state = static_cast<TunerState*>(raw);
+  if (state == nullptr || !std::isfinite(value))
+    return false;
+  if (param_id != kTunerParamMute)
+    return false;
+  // A flag is 0 or 1, and a value in between is a client bug rather than a half-muted rig. The
+  // ramp is what makes the change a fade, not the number.
+  state->mute_from = state->mute;
+  state->mute_to = value >= 0.5f ? 1.0f : 0.0f;
+  state->mute_pos = 0;
+  state->mute_len = state->mute_ramp_samples;
+  return true;
 }
 
 void process_tuner(void* raw, const float* const* in, float* const* out, int frames) noexcept
@@ -214,9 +286,43 @@ void process_tuner(void* raw, const float* const* in, float* const* out, int fra
   const float* input = (frames > 0 && in != nullptr) ? in[0] : nullptr;
   if (input != nullptr)
     state->tuner.process(input, frames);
-  // Silence, whatever the input was. This is the whole of the node's audio behaviour.
+  // The output: silence while the switch is on, the input unchanged while it is off, and a fade
+  // between the two for as long as a ramp lasts. The tuner above ran either way -- that is what
+  // makes "unmute to hear yourself, keep reading" one switch rather than two.
   if (frames > 0 && out != nullptr)
-    std::fill_n(out[0], frames, 0.0f);
+  {
+    float* dst = out[0];
+    if (state->mute_pos >= state->mute_len)
+    {
+      // Settled, which is the usual block: exact, and the cheap path for both ends.
+      if (state->mute_to != 0.0f)
+        std::fill_n(dst, frames, 0.0f);
+      else if (input != nullptr)
+        std::copy_n(input, frames, dst);
+      else
+        std::fill_n(dst, frames, 0.0f);
+      state->mute = state->mute_to;
+    }
+    else
+    {
+      const float from = state->mute_from;
+      const float to = state->mute_to;
+      const float span = static_cast<float>(state->mute_len);
+      int pos = state->mute_pos;
+      float mute = state->mute;
+      for (int i = 0; i < frames; ++i)
+      {
+        if (pos < state->mute_len)
+          mute = from + (to - from) * (static_cast<float>(++pos) / span);
+        else
+          mute = to;
+        const float gain = 1.0f - mute;
+        dst[i] = (input != nullptr) ? input[i] * gain : 0.0f;
+      }
+      state->mute = mute;
+      state->mute_pos = pos;
+    }
+  }
   ++state->blocks;
   publish(*state);
 }
@@ -236,6 +342,9 @@ std::string describe_tuner(void* raw)
 
   nlohmann::json json;
   json["a4"] = kA4;
+  // The switch as it was set, which is what a toggle binds to. A client that mounts the node gets
+  // the default (muted) from the schema and reads the truth from here, so the two cannot drift.
+  json["mute"] = report.muted;
   // The counter wraps (a uint32 at 750 blocks a second is 66 days); a client compares two reads of
   // it to tell a live reading from a frozen one, so a wrap is not a problem, a stall is.
   json["blocks"] = report.blocks;
@@ -272,6 +381,9 @@ const NodeType kTuner{.id = "nc.tuner",
                       .create = create_tuner,
                       .destroy = destroy_tuner,
                       .process = process_tuner,
+                      .params = kTunerParams,
+                      .param_count = 1,
+                      .set_param = set_param_tuner,
                       .in_palette = false,
                       .describe_state = describe_tuner};
 

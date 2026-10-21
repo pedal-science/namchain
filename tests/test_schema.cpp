@@ -158,6 +158,11 @@ nlohmann::json other_value(const std::string& type, const ParamDesc& param)
   if (id == "inputs" || id == "outputs")
     return 3.0; // a third port, left unconnected: see the exception table for why this proves nothing
   (void)type;
+  // A flag has two values and nothing else, so "one more than the default" is not the other one: for
+  // a flag that defaults to on (nc.tuner's mute), default + 1 is still on, and the loop below would
+  // report the switch as a knob that does nothing.
+  if (param.kind == namchain::render::ParamKind::Flag)
+    return param.default_value == 1.0 ? 0.0 : 1.0;
   return param.default_value + 1.0;
 }
 

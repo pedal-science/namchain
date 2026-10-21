@@ -29,9 +29,9 @@ checkout beside it — the same rule flowEQ's model table lives by. The node its
 | | |
 |---|---|
 | Ports | one in, one out |
-| Output | **silence** — every sample is exactly `0.0f`, whatever came in |
-| Input | read in full; it is what the tuner listens to |
-| Parameters | none |
+| Output | **silence** while `mute` is on (the default) — every sample is exactly `0.0f`; the input unchanged while it is off |
+| Input | read in full, either way; it is what the tuner listens to |
+| Parameters | `mute`, a rampable flag, default on |
 | State | ~128 kB of fixed buffers, allocated at build, never touched by the allocator afterwards |
 | Cost | squatch-dsp measures 158.9 ns per 48 kHz sample while a note sounds (0.76 % of one M1 Max core) and 7.2 ns quiet. The pedal's own row is `unknown.node` until `pedal-measure` has measured it |
 
@@ -41,11 +41,56 @@ samples is audible when the rig behind the tuner has gain. `process()` calls the
 compiler binds an unconnected input port to the plan's silence buffer, so a tuner with nothing
 feeding it is legal and hears silence.
 
-There are **no parameters**. A4 is the 440 Hz a guitar pedal tunes to, and the search covers 38 Hz
-(a 5-string bass's low B) to 1400 Hz (the 24th fret of the high E) — both in `src/nodes/tuner.cpp`
-as `kA4`, `kMinHz`, `kMaxHz`. A reference-pitch control is a parameter and a UI; when it is wanted it
-arrives as `a4` with a range around it, and the schema test that every declared parameter changes a
-render gets its exception with a reason.
+A4 is the 440 Hz a guitar pedal tunes to, and the search covers 38 Hz (a 5-string bass's low B) to
+1400 Hz (the 24th fret of the high E) — both in `src/nodes/tuner.cpp` as `kA4`, `kMinHz`, `kMaxHz`.
+A reference-pitch control is another parameter and a UI; when it is wanted it arrives as `a4` with a
+range around it.
+
+## The switch: `mute`
+
+A pedal tuner's switch, and the one thing this node does that is not silence: with `mute` off, the
+input reaches the output **unchanged** — the same samples, not a copy scaled by a gain that happens
+to be one — and the tuner keeps listening, so a player can hear themselves and watch the display at
+the same time. That is the whole point of it: tuning with the rig audible, which some players do on
+stage and most do in a quiet room.
+
+It is a **flag**, and a **rampable** one, which is `nc.mix`'s lane mute's shape rather than a normal
+flag's. That is what makes it a switch a client can stream:
+
+- `{"op": "set_param", "node": "tuner", "param": "mute", "value": 0}` in a `rig.patch` is answered
+  `"kind": "smooth"` — the node ramps the change over 5 ms (`kMuteRampSeconds`) inside `process`, so
+  there is **no rebuild, no crossfade and no gap in the reading**. A rebuild would restart the node,
+  and the strobe would visibly jump back to nothing while the player is watching it.
+- A patch names its **chain**, so a client with a tuner in every chain sends one patch per chain.
+- The ramp restarts from wherever the last one had got to (`nc.gain`'s rule), so toggling twice
+  quickly is a shorter fade rather than a jump.
+- Settled, both ends are exact: `mute` on writes `0.0f`, `mute` off copies the block.
+
+A document may also mount the node with `"mute": 0`, which is how a client that remembers "tuning
+with the rig audible" mounts it: the node is built already open, with no fade to wait for.
+
+The switch is reported in `rig.state` as `"mute": true | false` — the value the client set, not the
+value a ramp is passing through, so a toggle does not flicker on the way out. Both clients read it
+back rather than keeping their own idea of the state, so a refused patch shows as a switch that did
+not move.
+
+## The strobe: what a client draws from `cents`
+
+Nothing about the strobe is in the engine: it is the same `cents` that a needle uses, drawn as
+moving bands, and both clients port it from squatch-tuner's reference implementation
+(`hosts/web/strobe.js`):
+
+- three rows, for partials **1, 2 and 4** of the note, labelled `1×`, `2×`, `4×`;
+- row *k* drifts *k* times as fast as the fundamental: `speed = 0.5 · cents · k` band periods per
+  second, clamped to ±12 so it cannot alias at 60 fps;
+- sharp drifts right, flat drifts left, **in tune stands still** — which is the reading a player
+  actually tunes to, because a band that is merely a little slow is much easier to see than a needle
+  that is a little off centre;
+- with no note there is nothing to drift, so the bands settle (speed 0) and fade.
+
+The law is small enough to be worth writing down once here: a client that computes it differently
+from another will disagree about how fast a cent is, and the row labels are what make the three
+answers comparable at a glance.
 
 ## The reading: `rig.state`
 
@@ -60,15 +105,16 @@ derived"). A client draws it; it never runs a tuner of its own.
 { "ok": true, "generation": 3,
   "nodes": [ { "chain": "main", "node": "tuner", "element": "", "role": "",
                "type": "nc.tuner",
-               "state": { "a4": 440.0, "blocks": 1450, "valid": true, "level_db": -17.2,
-                          "midi": 45, "note": "A", "octave": 2, "cents": -1.73,
-                          "hz": 109.56, "steady_hz": 109.98, "clarity": 0.93,
-                          "uncertainty_cents": 0.08, "partials": 5 } } ] }
+               "state": { "a4": 440.0, "mute": true, "blocks": 1450, "valid": true,
+                          "level_db": -17.2, "midi": 45, "note": "A", "octave": 2,
+                          "cents": -1.73, "hz": 109.56, "steady_hz": 109.98,
+                          "clarity": 0.93, "uncertainty_cents": 0.08, "partials": 5 } } ] }
 ```
 
 | field | meaning |
 |---|---|
 | `a4` | the reference the note and cents are read against |
+| `mute` | the switch as it was set (`true` = the output is silence). Always present, so a client's toggle binds to the engine's answer rather than to its own last click |
 | `blocks` | blocks rendered since the node was built. It wraps (a uint32 at 750 blocks a second is 66 days), and a client compares two reads of it to tell a live reading from one the render thread stopped updating |
 | `valid` | whether the rest is a reading to trust |
 | `level_db` | the input's RMS at the tuner's work rate, floored at −120. Always present, so a client can show "something is plugged in but nothing is ringing" |

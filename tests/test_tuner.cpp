@@ -106,6 +106,55 @@ nlohmann::json report_after(const std::vector<float>& input, int quantum = kQuan
   return nlohmann::json::parse(text);
 }
 
+/// Render `input` through the node, flipping the switch to `mute` after `after_frames`, and return
+/// what the chain output. `set_param` is called the way the daemon calls it: against the live plan.
+/// The same one-node graph, with `mute` given in the document rather than after it.
+std::vector<float> render_mounted_unmuted(const std::vector<float>& input, int quantum = kQuantum)
+{
+  namchain::rt::Arena arena(1u << 22);
+  Graph graph = one_node();
+  graph.nodes[1].params["mute"] = 0.0;
+  auto plan = compile_plan(graph, arena, quantum);
+  std::vector<float> output(input.size(), 0.0f);
+  for (std::size_t offset = 0; offset < input.size(); offset += static_cast<std::size_t>(quantum))
+  {
+    const int frames =
+      static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(quantum), input.size() - offset));
+    plan->execute(input.data() + offset, output.data() + offset, frames);
+  }
+  return output;
+}
+
+std::vector<float> render_flipping(const std::vector<float>& input, bool mute, std::size_t after_frames,
+                                   int quantum = kQuantum,
+                                   std::vector<float>* gain_trace = nullptr)
+{
+  namchain::rt::Arena arena(1u << 22);
+  auto plan = compile_plan(one_node(), arena, quantum);
+  const int index = plan->index_of("n");
+  REQUIRE(index >= 0);
+  std::vector<float> output(input.size(), 0.0f);
+  bool flipped = false;
+  for (std::size_t offset = 0; offset < input.size(); offset += static_cast<std::size_t>(quantum))
+  {
+    if (!flipped && offset >= after_frames)
+    {
+      REQUIRE(plan->set_param(static_cast<std::size_t>(index), 1, mute ? 1.0f : 0.0f));
+      flipped = true;
+    }
+    const int frames =
+      static_cast<int>(std::min<std::size_t>(static_cast<std::size_t>(quantum), input.size() - offset));
+    plan->execute(input.data() + offset, output.data() + offset, frames);
+    if (gain_trace != nullptr)
+      for (int i = 0; i < frames; ++i)
+      {
+        const float x = input[offset + static_cast<std::size_t>(i)];
+        gain_trace->push_back(x != 0.0f ? output[offset + static_cast<std::size_t>(i)] / x : -1.0f);
+      }
+  }
+  return output;
+}
+
 bool all_zero(const std::vector<float>& samples)
 {
   return std::all_of(samples.begin(), samples.end(), [](float value) { return value == 0.0f; });
@@ -137,6 +186,65 @@ TEST_CASE("nc.tuner mutes whatever it is given")
   {
     CHECK(all_zero(render(std::vector<float>(4096, 0.0f), kQuantum)));
   }
+}
+
+TEST_CASE("nc.tuner passes the input through when the switch is off")
+{
+  // The other half of a pedal tuner: with the switch off, the rig is audible and the tuner is still
+  // reading. "Unchanged" is literal -- the output is the input, sample for sample, once the fade is
+  // over.
+  const std::vector<float> tone = sine(440.0, 16384, 0.5f);
+  // The fade is 5 ms (240 frames at 48 kHz), so eight blocks is past it whatever the block size.
+  const std::size_t settled = 8 * kQuantum;
+  SUBCASE("the settled switch copies the input")
+  {
+    const std::vector<float> out = render_flipping(tone, false, 0);
+    CHECK(std::equal(tone.begin() + settled, tone.end(), out.begin() + settled));
+  }
+  SUBCASE("and closes back to silence")
+  {
+    const std::vector<float> out = render_flipping(tone, true, 8192);
+    CHECK(all_zero(std::vector<float>(out.begin() + 8192 + settled, out.end())));
+  }
+  SUBCASE("the fade is a ramp, not a step")
+  {
+    // A mis-signed or mis-scaled ramp shows up as a gain above one or below zero, or as a jump at
+    // the first sample; a correct one rises from 0 to 1 over the fade.
+    std::vector<float> trace;
+    const std::vector<float> out = render_flipping(tone, false, 0, kQuantum, &trace);
+    REQUIRE(out.size() == tone.size());
+    for (std::size_t i = 1; i < trace.size(); ++i)
+    {
+      if (trace[i] < 0.0f)
+        continue; // a zero crossing of the tone: the ratio says nothing
+      CHECK(trace[i] <= 1.0f + 1e-6f);
+      CHECK(trace[i] >= -1e-6f);
+      if (trace[i - 1] >= 0.0f && i < 2 * static_cast<std::size_t>(kQuantum))
+        CHECK(trace[i] >= trace[i - 1] - 1e-6f); // monotone across the fade
+    }
+    CHECK(std::abs(out[kQuantum - 1]) < std::abs(out[3 * kQuantum]));
+  }
+}
+
+TEST_CASE("a document may mount the switch already open")
+{
+  // How a client that remembers "tuning with the rig audible" mounts it: `"mute": 0` in the node's
+  // own parameters, no patch needed and no fade to wait for. The schema's honesty test depends on
+  // this too -- a declared parameter the node ignores at build is the silent-knob bug.
+  const std::vector<float> tone = sine(440.0, 4096, 0.5f);
+  const std::vector<float> out = render_mounted_unmuted(tone);
+  CHECK(std::equal(tone.begin(), tone.end(), out.begin()));
+}
+
+TEST_CASE("nc.tuner's reading carries on while the switch is open")
+{
+  // The switch changes the audio and nothing else: the note, its cents and the level are the same
+  // whether the rig is muted or not, which is what "unmute to hear yourself, keep reading" means.
+  const std::vector<float> tone = sine(440.0, static_cast<std::size_t>(kRate));
+  const nlohmann::json muted = report_after(tone);
+  REQUIRE(muted.contains("mute"));
+  CHECK(muted["mute"] == true);
+  CHECK(muted["valid"] == true);
 }
 
 TEST_CASE("nc.tuner reads a steady tone as its note")
@@ -204,9 +312,15 @@ TEST_CASE("nc.tuner is a node a document may name, and not one a palette offers"
   CHECK(type->describe_state != nullptr);
   CHECK(type->inputs == 1);
   CHECK(type->outputs == 1);
-  // No parameters: A4 and the note range are the engine's, and a tuner's parameters would change a
-  // reading rather than the audio (docs/tuner.md).
-  CHECK(type->param_count == 0);
+  // One parameter, and it is the switch, not a reading: a flag whose change ramps inside the node
+  // (the `smooth` op class) rather than rebuilding, so a client's toggle never restarts the strobe.
+  REQUIRE(type->param_count == 1);
+  CHECK(std::string_view(type->params[0].id) == "mute");
+  CHECK(type->params[0].kind == namchain::render::ParamKind::Flag);
+  CHECK(type->params[0].default_value == 1.0); // a tuner comes up muted
+  CHECK(type->params[0].rampable);
+  CHECK(type->params[0].patchable);
+  CHECK(type->set_param != nullptr);
   // Every other built-in is a block a palette may offer.
   for (const namchain::render::NodeType* other : namchain::render::all_node_types())
     if (other->id != "nc.tuner")
