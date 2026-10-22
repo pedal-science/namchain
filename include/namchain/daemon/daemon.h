@@ -232,14 +232,18 @@ struct PlanSlot
   std::atomic<uint64_t> catch_up_blocks{0};
   /// \brief How long the render thread will hold this plan in `pending` before it takes it over
   /// anyway, in frames. Set by the control thread when the catch-up job is handed over, and read by
-  /// the render thread every block: a plain `int` because it is written before the plan is published
-  /// and never again, so the publication is the barrier (the same reason \ref input_channel is).
+  /// the render thread every block.
+  ///
+  /// Atomic rather than a plain `int`: the slot may already be published when the control thread
+  /// writes this (a catch-up Full waits in `pending` while its window fills), so the render thread
+  /// can be reading it at the same time. Relaxed, because the value is a bound on a wait rather than
+  /// a message -- a block that sees the old one waits for the floor instead of the chain's own.
   ///
   /// This is the chain's own memory plus \ref kCatchUpHoldMarginFrames, floored at
   /// \ref kCatchUpHoldFrames: a window that covers a model's receptive field is filled at the speed
   /// of the audio clock, so a fixed hold shorter than the field expires before there is anything to
   /// replay (2026-10-10, and the reason every pedal `lite_first` press reported `no_input`).
-  int catch_up_hold_frames = 0;
+  std::atomic<int> catch_up_hold_frames{0};
 };
 
 /// The widest device whose levels are measured, per direction. Eight is the pedal's stereo interface
@@ -1112,7 +1116,16 @@ private:
   /// the configuration asks for more; stopped with the render thread.
   RenderPool render_pool_;
 
-  // Render-thread-owned state. Only the render thread touches these.
+  // Render-thread-owned state. Only the render thread creates, starts, stops or destroys these.
+  //
+  // `device_` is the exception to "owned" in the sense that matters here: the control thread reads
+  // it to report the backend's diagnostics and to interrupt a wait during `stop()`, while the render
+  // thread is the one that resets it. The pointer (and the object behind it) is therefore shared,
+  // and the mutex below is what makes the sharing defined -- a reader either holds the device for
+  // the length of its call, or sees null. It is taken by the render thread only when it opens,
+  // finishes or closes the backend, which is the device-recovery path and already a syscall path,
+  // never inside an `RtScope`.
+  std::mutex device_mutex_;
   std::unique_ptr<AudioBackend> device_;
   bool device_started_ = false;
   /// Whether \ref finish_device has already run for this open. A `file` backend writes its WAV there,
@@ -1174,10 +1187,11 @@ private:
   std::vector<float> warm_input_planes_;
   unsigned warm_input_channels_ = 0;
   /// The input sequence number of the block being rendered: the warm thread's `behind_blocks` is this
-  /// minus the sequence of the last block it rendered.
-  uint64_t input_sequence_ = 0;
-  /// The same number, published for the control thread's status: a plain member would be a race with
-  /// a reader that is not on the render path.
+  /// minus the sequence of the last block it rendered. Atomic because the warm thread reads it too
+  /// (it is the same number in both threads' accounting), and a plain member would be a race with a
+  /// reader that is not the render thread.
+  std::atomic<uint64_t> input_sequence_{0};
+  /// The same number, published for the control thread's status, which is not on the render path.
   std::atomic<uint64_t> input_sequence_published_{0};
 
   // --- the warm set (docs/warm-set.md) ---------------------------------------------------------

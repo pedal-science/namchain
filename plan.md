@@ -20,6 +20,44 @@ host numbers: every measurement carries the toolchain and kernel it was taken on
 
 ## How to resume
 
+**CI red for three weeks: the switch hand-over was stealing a document the warm thread was rendering
+(2026-10-22).** The four failing jobs were not a bit-exact-audio problem — the golden comparison and
+the A2 planar parity gate were passing throughout, and the tolerance table in §10.2 stands. They were
+three test assumptions and one real race:
+
+* **`linux-x86_64 (TSan)`** reported 30–83 data races in the daemon. The root cause was an **empty
+  `if` body** in `Daemon::switch_begin`'s `AwaitingRelease` branch: when `claim_document` failed
+  because the warm thread had not let go yet, execution fell through anyway — it released the incoming
+  document, made it audible and started the fade while the warm thread was still rendering its bus.
+  The second half was that the warm thread only honoured a release request at the top of
+  `warm_service`, so a warm thread that was *behind* (the starved-warm test holds every block) never
+  got back there and never let go. It now yields in the render loop as soon as `take_request_` names
+  its document. With that fixed, the daemon's shared state was made properly atomic where a report
+  reads the owner's: `device_` is guarded by a mutex for the control thread's diagnostics/interrupt,
+  `DocRuntime::chain_count`, `PlanSlot::catch_up_hold_frames` and `input_sequence_` are atomics, and
+  `engine.levels`/`rig.state` read a `reported_slot` the owner publishes per block instead of the live
+  `current` pointer. **TSan is clean** (0 warnings, 391 cases, three consecutive runs) and so is the
+  suite in Release.
+* **`linux-x86_64 (RTSan)`** failed one assertion: `rt_check_available()`. A sanitizer build disables
+  the allocation interposer on purpose (its runtime owns `operator new`), so the honest report there
+  is "not measured" — which is what `rt_check.h` says and what the other test using it already did.
+  The test now skips the counts and says so; RTSan itself is the instrument on that job.
+* **aarch64/armv7 qemu** failed on wall-clock assumptions. `levels_first_frame` asserted `frames <= 1`,
+  which holds only while a poll keeps up with a 1.33 ms period — under qemu a socket round trip spans
+  a hundred periods, so it saw 95. It now compares against the reply's own `blocks` (fresh windows
+  only; an unchanged `blocks` is the cache answering again). The daemon waits were attempt counts
+  (200 × 5 ms, 400 × 2 ms) and are now one `kWaitBudget` deadline (120 s); the 5 s socket timeout is
+  the same budget. The two file-backed catch-up tests choose their device pace from a measured
+  reference run (or a throwaway compile), with a ceiling of `1.5 s / need_blocks` so the window can
+  still fill inside `serve_catch_up`'s two seconds; a host where that ceiling leaves the run shorter
+  than the compile (qemu, at ~100×) skips them with a message rather than asserting a real-time
+  premise it cannot meet. The long-memory hold test asserts the exact hand-over where the host can
+  replay it inside the margin, and the documented `hold.abandoned` alternative where it cannot.
+
+The one thing to re-check when next on piv: nothing here is a performance number, but the switch path
+changed, so a `--tests` run on the board and one switch under the soak are worth having before the
+next deploy.
+
 **`nc.tuner` (2026-10-20).** Squatch-dsp's tuner — a strobe tuner that reads a string to a tenth of a
 cent — became a node: one input, one output, and the output is **exactly zero**, so a chain with one
 in it is silent while the node still hears the instrument. That is a pedal tuner, and it is the first

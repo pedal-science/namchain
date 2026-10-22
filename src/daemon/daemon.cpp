@@ -842,7 +842,9 @@ void Daemon::publish_level_windows() noexcept
   for (unsigned c = 0; c < playback && c < output_levels_.size(); ++c)
     output_levels_[c].publish_window();
   const DocRuntime& active = active_document();
-  for (int c = 0; c < active.chain_count && c < static_cast<int>(chain_levels_.size()); ++c)
+  for (int c = 0; c < active.chain_count.load(std::memory_order_relaxed) &&
+                  c < static_cast<int>(chain_levels_.size());
+       ++c)
     chain_levels_[static_cast<std::size_t>(c)].publish_window();
 }
 
@@ -1917,10 +1919,12 @@ void Daemon::service_async_full()
     // P8's patience, per chain, before the render thread gives up on the replay (2026-10-10). The
     // window that covers a model's receptive field is filled at the speed of the audio clock, so the
     // hold has to be at least that long -- a fixed quarter second expired first on the pedal, and the
-    // plan was taken over cold with the window one block short. Written here, before the job is handed
-    // over, so the render thread's publication of the slot is the only barrier needed.
-    slot->catch_up_hold_frames = catch_up_hold_budget_frames(job.frames[job.chain_count]);
-    hold_frames = std::max<std::size_t>(hold_frames, static_cast<std::size_t>(slot->catch_up_hold_frames));
+    // plan was taken over cold with the window one block short. Written atomically: the slot may
+    // already be published and waiting, so the render thread can be reading this field as it is set.
+    slot->catch_up_hold_frames.store(catch_up_hold_budget_frames(job.frames[job.chain_count]),
+                                     std::memory_order_relaxed);
+    hold_frames = std::max<std::size_t>(
+        hold_frames, static_cast<std::size_t>(slot->catch_up_hold_frames.load(std::memory_order_relaxed)));
     ++job.chain_count;
   }
   if (job.chain_count == 0)
@@ -2109,7 +2113,7 @@ void Daemon::write_input_history() noexcept
     return;
   }
 
-  float* block = catch_up_input_.acquire(input_sequence_);
+  float* block = catch_up_input_.acquire(input_sequence_.load(std::memory_order_relaxed));
   if (block == nullptr)
     return; // the ring is full: counted by the ring, and the catch-up will see the hole
 
@@ -2436,8 +2440,9 @@ void Daemon::serve_catch_up(const CatchUpJob& job)
 
 void Daemon::advance_catch_up(DocRuntime& doc, int frames) noexcept
 {
-  const uint64_t previous_block = input_sequence_ > 0 ? input_sequence_ - 1 : 0;
-  for (int i = 0; i < doc.chain_count; ++i)
+  const uint64_t sequence = input_sequence_.load(std::memory_order_relaxed);
+  const uint64_t previous_block = sequence > 0 ? sequence - 1 : 0;
+  for (int i = 0; i < doc.chain_count.load(std::memory_order_relaxed); ++i)
   {
     ChainRuntime& chain = doc.chains[i];
     PlanSlot* slot = chain.pending;
@@ -2453,7 +2458,8 @@ void Daemon::advance_catch_up(DocRuntime& doc, int frames) noexcept
     if (!slot->catch_up_abandoned.load(std::memory_order_relaxed))
     {
       chain.catch_up_frames_held += frames;
-      const int budget = slot->catch_up_hold_frames > 0 ? slot->catch_up_hold_frames : catch_up_hold_frames();
+      const int hold = slot->catch_up_hold_frames.load(std::memory_order_relaxed);
+      const int budget = hold > 0 ? hold : catch_up_hold_frames();
       if (chain.catch_up_frames_held > budget)
       {
         slot->catch_up_abandoned.store(true, std::memory_order_release);
@@ -3951,11 +3957,15 @@ void Daemon::stop()
   {
     // The render thread may be inside the backend's wait for the device's next period, which for a
     // device paced at a large buffer is as long as that buffer. Asked to cut it short, so a daemon
-    // answers a signal in its own quantum rather than in a second. Read without a lock: `device_` is
-    // only ever replaced by the render thread, which is the thread being joined, and never by this
-    // one -- so this can either see the backend or a null, and both are safe.
-    if (device_ != nullptr)
-      device_->interrupt();
+    // answers a signal in its own quantum rather than in a second. Under the device lock, because
+    // the render thread being joined is also the thread that closes and resets the backend: the
+    // pointer cannot go away underneath this call. Released before the join, since the join is what
+    // waits for that thread and the render thread takes the same lock on its way out.
+    {
+      std::lock_guard<std::mutex> lock(device_mutex_);
+      if (device_ != nullptr)
+        device_->interrupt();
+    }
     render_thread_.join();
   }
   // After the join, so nothing can be pushing; the files are closed properly on a clean shutdown.
@@ -3988,7 +3998,7 @@ void Daemon::stop()
         *slot = nullptr;
       }
     }
-    doc.chain_count = 0;
+    doc.chain_count.store(0, std::memory_order_relaxed);
     doc.transitioning_chain = -1;
     doc.transition_active.store(false);
     doc.audible_generation.store(0);
@@ -4043,7 +4053,12 @@ bool Daemon::open_device(std::string& error)
   backend.output_path = config_.playback_path;
   backend.capture_device_path = config_.capture_device_path;
 
-  device_ = open_backend(backend, config_.backend, error);
+  {
+    // Published under the lock the control thread reads it with. The backend is fully constructed
+    // before the assignment, so a reader either sees the new one or null -- never one being built.
+    std::lock_guard<std::mutex> lock(device_mutex_);
+    device_ = open_backend(backend, config_.backend, error);
+  }
   if (device_ == nullptr)
     return false;
 
@@ -4295,18 +4310,23 @@ nlohmann::json Daemon::build_levels_json()
   constexpr std::size_t kMaxLevelNodes = 2000;
   bool truncated = false;
   const DocRuntime& level_doc = active_document();
-  for (int c = 0; c < level_doc.chain_count && c < kMaxChains; ++c)
+  for (int c = 0; c < level_doc.chain_count.load(std::memory_order_relaxed) && c < kMaxChains; ++c)
   {
     const ChainRuntime& chain = level_doc.chains[c];
-    if (chain.current == nullptr)
+    // The plan the render thread last described, not the live `current` pointer: this walk is the
+    // one report that reads the document's own state, and the owner may be changing `current` while
+    // it runs (a transition, or a switch). Reading the copy the owner published is the difference
+    // between a report and a data race (TSan, 2026-10-22).
+    const PlanSlot* slot = chain.reported_slot.load(std::memory_order_acquire);
+    if (slot == nullptr)
       continue;
-    const graph::RenderPlan& plan = *chain.current->plan;
+    const graph::RenderPlan& plan = *slot->plan;
     nlohmann::json entry;
     entry["id"] = current_document_.chains.size() > static_cast<std::size_t>(c)
                     ? current_document_.chains[static_cast<std::size_t>(c)].id : std::string();
     entry["name"] = current_document_.chains.size() > static_cast<std::size_t>(c)
                       ? current_document_.chains[static_cast<std::size_t>(c)].name : std::string();
-    entry["output_channel"] = chain.current->output_channel;
+    entry["output_channel"] = slot->output_channel;
     entry["muted"] = chain.mute.load(std::memory_order_relaxed);
     {
       const level::Probe::Reading r = chain_levels_[c].take();
@@ -4388,6 +4408,9 @@ void Daemon::end_recording()
 
 void Daemon::finish_device(std::string& /*error*/)
 {
+  // Under the lock for the same reason `close_device` is: a `file` backend writes its output here,
+  // and the control thread may be asking it for diagnostics at the same moment.
+  std::lock_guard<std::mutex> lock(device_mutex_);
   if (device_ == nullptr || device_finished_)
     return;
   device_finished_ = true;
@@ -4412,6 +4435,10 @@ void Daemon::close_device()
     probe.take();
   for (level::Probe& probe : chain_levels_)
     probe.take();
+  // Held across the stop and the reset, so a control thread that is reading the backend's diagnostics
+  // or asking it to interrupt either finishes first or finds null afterwards -- never a half-destroyed
+  // backend. The render thread is between blocks here, outside the `RtScope`.
+  std::lock_guard<std::mutex> lock(device_mutex_);
   if (device_started_)
   {
     device_->stop();
@@ -4555,7 +4582,7 @@ void Daemon::start_queued_transition(DocRuntime& doc)
 {
   if (doc.transitioning_chain >= 0)
     return;
-  for (int i = 0; i < doc.chain_count; ++i)
+  for (int i = 0; i < doc.chain_count.load(std::memory_order_relaxed); ++i)
   {
     ChainRuntime& chain = doc.chains[i];
     if (chain.pending == nullptr)
@@ -4618,7 +4645,7 @@ void Daemon::update_aggregate_state(DocRuntime& doc)
   // every chain has settled at it, and the previous one while a staggered apply is still working.
   bool moving = false;
   unsigned fading = 0;
-  for (int i = 0; i < doc.chain_count; ++i)
+  for (int i = 0; i < doc.chain_count.load(std::memory_order_relaxed); ++i)
   {
     if (doc.chains[i].transition_active.load())
       ++fading;
@@ -4701,7 +4728,7 @@ void Daemon::drain_commands(DocRuntime& doc)
       doc.content.store(next->generation, std::memory_order_release);
     }
     if (command.chain_count > 0 && command.chain_count <= static_cast<uint32_t>(kMaxChains))
-      doc.chain_count = static_cast<int>(command.chain_count);
+      doc.chain_count.store(static_cast<int>(command.chain_count), std::memory_order_relaxed);
     published = true;
 
     const int index = static_cast<int>(command.chain);
@@ -4773,7 +4800,7 @@ void Daemon::drain_commands(DocRuntime& doc)
   // still arriving.
   if (published)
   {
-    for (int i = doc.chain_count; i < kMaxChains; ++i)
+    for (int i = doc.chain_count.load(std::memory_order_relaxed); i < kMaxChains; ++i)
       drop_chain(doc, i);
   }
   update_aggregate_state(doc);
@@ -4907,8 +4934,9 @@ void Daemon::render_loop()
       const std::size_t width = info.bytes_per_sample;
       const int frames = static_cast<int>(info.period_size);
       std::fill(bus_.begin(), bus_.end(), 0.0f);
-      input_sequence_ = blocks_.load(std::memory_order_relaxed) + 1;
-      input_sequence_published_.store(input_sequence_, std::memory_order_relaxed);
+      input_sequence_.store(blocks_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+      input_sequence_published_.store(input_sequence_.load(std::memory_order_relaxed),
+                                      std::memory_order_relaxed);
 
       // 0. A switch that is waiting for the warm thread to let go of the incoming document, or for
       //    its own fade, advances here -- before the plans run, so a document taken over this block
@@ -4926,7 +4954,7 @@ void Daemon::render_loop()
       {
         if (doc.owner.load(std::memory_order_acquire) != DocOwner::Device)
           continue;
-        for (int c = 0; c < doc.chain_count; ++c)
+        for (int c = 0; c < doc.chain_count.load(std::memory_order_relaxed); ++c)
         {
           ChainRuntime& chain = doc.chains[c];
           if (chain.current == nullptr)
@@ -5029,7 +5057,7 @@ void Daemon::render_loop()
       unsigned failed = 0;
       uint64_t trips = 0;
       DocRuntime& guard_doc = active_document();
-      for (int c = 0; c < guard_doc.chain_count; ++c)
+      for (int c = 0; c < guard_doc.chain_count.load(std::memory_order_relaxed); ++c)
       {
         ChainRuntime& chain = guard_doc.chains[c];
         if (chain.current == nullptr)
@@ -5143,7 +5171,8 @@ void Daemon::run_document_chains(DocRuntime& doc, unsigned participant, unsigned
   // Every `participants`-th chain. Nothing here may touch another participant's chain, and nothing
   // here may touch the transition bookkeeping: `current` and `next` are read, never written, and the
   // coordinator does not move them until every participant has finished this block.
-  for (int c = static_cast<int>(participant); c < doc.chain_count; c += static_cast<int>(participants))
+  for (int c = static_cast<int>(participant); c < doc.chain_count.load(std::memory_order_relaxed);
+       c += static_cast<int>(participants))
   {
     ChainRuntime& chain = doc.chains[c];
     if (chain.current == nullptr)
@@ -5170,12 +5199,16 @@ void Daemon::finish_document_block(DocRuntime& doc, int frames) noexcept
   // has always run, in the order it has always run.
   const bool audible = &doc == &active_document();
   std::fill(doc.bus.begin(), doc.bus.end(), 0.0f);
-  for (int c = 0; c < doc.chain_count; ++c)
+  for (int c = 0; c < doc.chain_count.load(std::memory_order_relaxed); ++c)
   {
     ChainRuntime& chain = doc.chains[c];
     if (chain.current == nullptr)
       continue;
     const PlanSlot* source = chain.next != nullptr ? chain.next : chain.current;
+    // What `engine.levels` will describe: published here, by the owner, so the control thread reads
+    // a pointer that is not moving under it. The slot outlives this by the reclaimer's grace window,
+    // which is what makes the reader's copy usable after it is taken.
+    chain.reported_slot.store(chain.current, std::memory_order_relaxed);
 
     if (chain.next != nullptr)
     {
@@ -5220,7 +5253,7 @@ void Daemon::finish_document_block(DocRuntime& doc, int frames) noexcept
   // from here before a fade has published anything, and the fade itself reads the pool below.
   doc.published_bus = doc.bus;
   doc.blocks.fetch_add(1, std::memory_order_relaxed);
-  doc.input_seq.store(input_sequence_, std::memory_order_relaxed);
+  doc.input_seq.store(input_sequence_.load(std::memory_order_relaxed), std::memory_order_relaxed);
   if (doc.owner.load(std::memory_order_relaxed) == DocOwner::Warm)
     doc.warm_blocks.fetch_add(1, std::memory_order_relaxed);
 }
@@ -5262,7 +5295,7 @@ void Daemon::publish_warm_input() noexcept
 
   const BackendInfo& info = device_->info();
   uint32_t index = 0;
-  float* block = warm_.inputs.acquire(input_sequence_, index);
+  float* block = warm_.inputs.acquire(input_sequence_.load(std::memory_order_relaxed), index);
   if (block == nullptr)
   {
     // Every block is in flight: the warm thread is behind by the whole pool. Counted against the
@@ -5339,7 +5372,15 @@ void Daemon::switch_begin() noexcept
   {
     DocRuntime& incoming = docs_[switch_incoming_];
     if (!claim_document(incoming.owner, DocOwner::Device))
-
+    {
+      // Still the warm thread's. It lets go in `warm_service`'s second step, which runs between
+      // passes -- and a warm block can be held for milliseconds (`warm_test_hold_ms` is the test
+      // that asks what a starved warm thread does) -- so the answer is to wait a block and ask
+      // again, not to take the document anyway. Falling through here released a document another
+      // thread was still rendering, then made it audible and faded it in underneath that thread:
+      // both wrote the same bus (TSan, 2026-10-22), and the switch raced the warm set.
+      return;
+    }
 
     // Content, not owner, is what the request named: if the document was warmed with something else
     // between the request and this claim, this is a different rig and the request is withdrawn.
@@ -5593,7 +5634,7 @@ void Daemon::warm_service() noexcept
       {
         if (ours)
           retire_warm_content_of(doc);
-        doc.chain_count = static_cast<int>(command.chain_count);
+        doc.chain_count.store(static_cast<int>(command.chain_count), std::memory_order_relaxed);
         doc.transitioning_chain = -1;
         doc.rendered_generation = command.generation;
         doc.previous_generation = command.generation;
@@ -5635,7 +5676,7 @@ void Daemon::warm_service() noexcept
   const float* planes = nullptr;
   while (warm_.inputs.take(index, seq, planes))
   {
-    if (doc != nullptr && doc->chain_count > 0)
+    if (doc != nullptr && doc->chain_count.load(std::memory_order_relaxed) > 0)
       render_warm_document(*doc, planes, seq);
     // A test hook, never parsed from a configuration file: a warm thread that cannot keep up is the
     // failure T8 falsifies, and an engineered one is the only way to test that it is *reported*
@@ -5643,6 +5684,18 @@ void Daemon::warm_service() noexcept
     if (config_.warm_test_hold_ms != 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(config_.warm_test_hold_ms));
     warm_.inputs.give_back(index);
+    // A switch has asked for this document: let go of it now, even mid-drain. The request is
+    // otherwise only read at the top of `warm_service`, and a warm thread that is behind never gets
+    // back there -- it always has another input to render -- so the device thread would wait for a
+    // release that only arrives when the audio stops. That is the starvation this path exists for,
+    // and the device cannot take the document from under this thread instead: both render its bus.
+    const int held = doc != nullptr ? static_cast<int>(doc - docs_) : -1;
+    if (held >= 0 && take_request_.load(std::memory_order_acquire) == held)
+    {
+      release_warm_document(*doc, /*retire=*/false);
+      doc = nullptr;
+      continue;
+    }
     // A document taken over by the device thread mid-drain is not ours to render any more.
     if (doc != nullptr && doc->owner.load(std::memory_order_acquire) != DocOwner::Warm)
     {
@@ -5660,7 +5713,7 @@ void Daemon::render_warm_document(DocRuntime& doc, const float* planes, uint64_t
 
   // Each chain's input, from the decoded planes the device thread published -- the same samples, from
   // the same decode, that the audible document is being fed.
-  for (int c = 0; c < doc.chain_count; ++c)
+  for (int c = 0; c < doc.chain_count.load(std::memory_order_relaxed); ++c)
   {
     ChainRuntime& chain = doc.chains[c];
     if (chain.current == nullptr)
@@ -5674,7 +5727,7 @@ void Daemon::render_warm_document(DocRuntime& doc, const float* planes, uint64_t
 
   // One plan per chain: no crossfade and no transition bookkeeping, because a document that is not
   // audible has nothing to fade between -- warming a rig replaces its content whole.
-  for (int c = 0; c < doc.chain_count; ++c)
+  for (int c = 0; c < doc.chain_count.load(std::memory_order_relaxed); ++c)
   {
     ChainRuntime& chain = doc.chains[c];
     if (chain.current == nullptr)
@@ -5683,7 +5736,7 @@ void Daemon::render_warm_document(DocRuntime& doc, const float* planes, uint64_t
   }
 
   std::fill(doc.bus.begin(), doc.bus.end(), 0.0f);
-  for (int c = 0; c < doc.chain_count; ++c)
+  for (int c = 0; c < doc.chain_count.load(std::memory_order_relaxed); ++c)
   {
     ChainRuntime& chain = doc.chains[c];
     if (chain.current == nullptr || chain.mute.load())
@@ -5711,7 +5764,8 @@ void Daemon::render_warm_document(DocRuntime& doc, const float* planes, uint64_t
   doc.blocks.fetch_add(1, std::memory_order_relaxed);
   doc.warm_blocks.fetch_add(1, std::memory_order_relaxed);
   doc.input_seq.store(seq, std::memory_order_relaxed);
-  const uint64_t seen = input_sequence_ - (seq > input_sequence_ ? 0 : seq);
+  const uint64_t sequence = input_sequence_.load(std::memory_order_relaxed);
+  const uint64_t seen = sequence - (seq > sequence ? 0 : seq);
   if (seen > doc.worst_behind.load(std::memory_order_relaxed))
     doc.worst_behind.store(seen, std::memory_order_relaxed);
   if (doc.first_block_ns.load(std::memory_order_relaxed) == 0)
@@ -5787,7 +5841,7 @@ void Daemon::retire_warm_content_of(DocRuntime& doc) noexcept
     warm_reclaimer_.retire(slot, &delete_plan_slot);
     slot = nullptr;
   }
-  doc.chain_count = 0;
+  doc.chain_count.store(0, std::memory_order_relaxed);
   doc.content.store(0, std::memory_order_release);
   doc.publish_wanted.store(false, std::memory_order_relaxed);
 }
@@ -6283,13 +6337,18 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["xruns"] = xruns_.load();
     // Whatever the backend can say about itself, in its own words. Empty for most, and additive, so
     // a client that has never heard of a key keeps working — the same rule every response follows.
-    if (device_ != nullptr)
+    // The lock is what makes the pointer's lifetime defined: the render thread may be closing the
+    // backend while this status is being built (a device that has failed does exactly that).
     {
-      nlohmann::json backend_diagnostics = nlohmann::json::object();
-      for (const auto& [name, value] : device_->diagnostics())
-        backend_diagnostics[name] = value;
-      if (!backend_diagnostics.empty())
-        status["backend_diagnostics"] = std::move(backend_diagnostics);
+      std::lock_guard<std::mutex> lock(device_mutex_);
+      if (device_ != nullptr)
+      {
+        nlohmann::json backend_diagnostics = nlohmann::json::object();
+        for (const auto& [name, value] : device_->diagnostics())
+          backend_diagnostics[name] = value;
+        if (!backend_diagnostics.empty())
+          status["backend_diagnostics"] = std::move(backend_diagnostics);
+      }
     }
     status["device_lost"] = device_lost_.load();
     status["device_restored"] = device_restored_.load();
@@ -7014,12 +7073,17 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // thread question answered from whatever snapshot the node keeps (nc.eq.flow publishes one).
     nlohmann::json nodes = nlohmann::json::array();
     const DocRuntime& state_doc = active_document();
-    for (int c = 0; c < state_doc.chain_count && c < static_cast<int>(kMaxChains); ++c)
+    for (int c = 0; c < state_doc.chain_count.load(std::memory_order_relaxed) &&
+                    c < static_cast<int>(kMaxChains);
+         ++c)
     {
       const ChainRuntime& chain = state_doc.chains[c];
-      if (chain.current == nullptr || chain.current->plan == nullptr)
+      // The plan the owner last rendered, published for reports -- `current` belongs to the render
+      // thread, for the same reason `engine.levels` reads the copy.
+      const PlanSlot* slot = chain.reported_slot.load(std::memory_order_acquire);
+      if (slot == nullptr || slot->plan == nullptr)
         continue;
-      const graph::RenderPlan& plan = *chain.current->plan;
+      const graph::RenderPlan& plan = *slot->plan;
       const std::vector<std::string>& ids = plan.node_ids();
       for (std::size_t n = 0; n < plan.nodes().size() && n < ids.size(); ++n)
       {

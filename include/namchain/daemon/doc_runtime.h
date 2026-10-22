@@ -174,6 +174,11 @@ struct ChainRuntime
   std::vector<float> old;
   std::vector<float> incoming;
 
+  /// The plan the owner last rendered through this chain, published for `engine.levels`: the report
+  /// walks the live document, and the live `current` pointer belongs to the owner and moves under a
+  /// transition or a switch. Read by the control thread, written by the owner once per block.
+  std::atomic<const PlanSlot*> reported_slot{nullptr};
+
   std::atomic<bool> mute{false};
   std::atomic<bool> transition_active{false};
   std::atomic<uint64_t> audible_generation{0};
@@ -192,7 +197,11 @@ struct DocRuntime
 {
   // --- the owning thread's state, and nobody else's ------------------------------------------
   ChainRuntime chains[kMaxChains];
-  int chain_count = 0;
+  /// How many of \ref chains the owner has published. Written by the owner, and read by the control
+  /// thread when it builds `engine.levels` -- the one place a report walks the live document rather
+  /// than a counter, so it is the one field above the line that has to be atomic as well. Relaxed:
+  /// it is a bound, and every plan it indexes is published with its own release/acquire.
+  std::atomic<int> chain_count{0};
   /// The chain whose crossfade is in flight, or -1. One at a time, which is what bounds the peak
   /// cost of a document apply to two of the largest chain rather than two of the whole document.
   int transitioning_chain = -1;
