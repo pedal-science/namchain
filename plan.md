@@ -68,15 +68,17 @@ The one thing to re-check when next on piv: nothing here is a performance number
 changed, so a `--tests` run on the board and one switch under the soak are worth having before the
 next deploy.
 
-**One unexplained TSan report, not reproducible (2026-10-22).** The first Linux TSan run at commit
-72f58d0 reported a single heap-use-after-free: the test at `test_daemon.cpp` reading a `role` field
-of its own `rig.get` reply, against a free by the daemon thread's JSON destructor in
-`handle_request`. All 395 cases passed in that run, and the report did not reproduce: six more full
-suite runs locally under TSan, and a CI rerun of the same commit, were clean, and the job is green.
-A test's own parsed reply cannot legitimately be freed by the daemon's reply JSON, so the two
-explanations left are heap corruption from elsewhere (ASan's own sweep did not find one in the
-daemon tests) and a TSan/libstdc++ false positive. Keep an eye on it; the code is otherwise clean
-under TSan.
+**One unexplained TSan report, not yet reproducible (2026-10-22).** Two of three Linux TSan runs at
+72f58d0/1435425 reported a single heap-use-after-free, always the same read: the macros test's
+`node["role"]` on its own `rig.get` reply, against a free by the daemon thread's JSON destructor in
+`handle_request`. All 395 cases pass, and the report does not reproduce on this Mac in ten full
+suite runs under TSan (libc++), nor in a CI rerun. The evidence is internally inconsistent: the
+freed block's last *allocation* is on the daemon thread's own reply tree, which the test cannot
+share across a socket, and copying the array in the test changes nothing. The two explanations left
+are a sanitizer/libstdc++ allocator artefact and heap corruption from elsewhere (ASan's sweep found
+no corruption in the daemon tests; the one ASan report was in the vendored WAV loader's error path,
+unrelated). Open, not yet explained; the code is otherwise clean under TSan and green on the other
+five jobs.
 
 **`nc.tuner` (2026-10-20).** Squatch-dsp's tuner — a strobe tuner that reads a string to a tenth of a
 cent — became a node: one input, one output, and the output is **exactly zero**, so a chain with one
