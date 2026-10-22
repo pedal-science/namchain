@@ -3175,7 +3175,6 @@ TEST_CASE("a model whose memory outlasts the old fixed hold is still caught up e
   CHECK(status["catch_up"]["state"] == "exact");
   CHECK(status["catch_up"]["hold_frames"].get<std::size_t>() >=
         static_cast<std::size_t>(lookback.samples));
-  CHECK(status["catch_up"]["ring"]["dropped"] == 0);
   CHECK(status["catch_up"]["period_mismatch"] == 0);
   CHECK(status["cost"]["lite_first"] == false);
   // The plan's own sequences: what the hand-over reads is written after what has been executed, so it
@@ -3202,9 +3201,12 @@ TEST_CASE("a model whose memory outlasts the old fixed hold is still caught up e
     CHECK(status["catch_up"]["progress"] == "done");
     CHECK(status["catch_up"]["fill"] == "need_met");
     // The history was fed and drained: a window with a hole would have been reported as `gap` rather
-    // than `exact`, but saying the ring did its job is the point of the report.
+    // than `exact`, but saying the ring did its job is the point of the report. `dropped` is only
+    // meaningful on this branch -- a host slow enough to overflow the ring never gets here, and there
+    // the drops are the reason why, not a second failure.
     CHECK(status["catch_up"]["ring"]["written"].get<uint64_t>() > 0);
     CHECK(status["catch_up"]["ring"]["consumed"].get<uint64_t>() > 0);
+    CHECK(status["catch_up"]["ring"]["dropped"] == 0);
     CHECK(status["catch_up"]["window"]["contiguous"].get<std::size_t>() >=
           status["catch_up"]["window"]["need"].get<std::size_t>());
     CHECK(held_exact > 0);
@@ -4726,10 +4728,13 @@ TEST_CASE("a plan's prewarm is not part of the first window a level meter sees")
   }
   REQUIRE(levels["blocks"].get<uint64_t>() == 8u);
 
-  // Every node measured the eight periods and nothing else. The prewarm's quantum of silence used to
-  // sit in each node's probe and nowhere else: one period longer than the audio, with the mean diluted
-  // by a signal that never reached the device -- -6.5 dBFS for the input node rather than the -6.0 it
-  // is at.
+  // Every node measured at most the eight periods and nothing else. The prewarm's quantum of silence
+  // used to sit in each node's probe and nowhere else: one period *longer* than the audio, with the
+  // mean diluted by a signal that never reached the device -- -6.5 dBFS for the input node rather than
+  // the -6.0 it is at. That is the direction the bound guards; it is an upper bound rather than an
+  // equality because a host slow enough to start rendering before the plan is adopted (qemu) can
+  // legitimately measure fewer blocks, and the exact count is then the device's startup order rather
+  // than the probe's.
   //
   // The device's and the chain's own probes are compared against the period count rather than each
   // other because `Daemon::close_device` empties those on purpose: a window spanning a device restart
@@ -4740,7 +4745,9 @@ TEST_CASE("a plan's prewarm is not part of the first window a level meter sees")
   {
     if (node["element"] == "out") // no output port: nothing is measured there
       continue;
-    CHECK(node["frames"].get<uint64_t>() == 8u * 64u);
+    const uint64_t frames = node["frames"].get<uint64_t>();
+    CHECK_MESSAGE(frames <= 8u * 64u, frames << " frames: more than the eight periods the input holds");
+    CHECK(frames > 0);
     if (node["element"] == "in")
     {
       saw_input = true;
@@ -4927,7 +4934,12 @@ TEST_CASE("a warmed rig renders beside the audible one, and a switch makes it au
   const uint64_t audible_doc = before["status"]["warm"]["active_doc"].get<uint64_t>();
   const auto warmed = request(daemon, R"({"id":"w","method":"rig.warm","rig":"quarter.json"})");
   REQUIRE(warmed["ok"] == true);
-  CHECK(warmed["state"] == "warming"); // compiled, not yet rendered
+  // Compiled, and either not yet rendered ("warming") or already rendering on the warm thread
+  // ("warm") -- which of the two the reply catches is the warm thread's startup against the control
+  // thread's reply, and asserting one of them turns that race into a failure. The state the test is
+  // about is the *audible* document, below: warming does not change it.
+  const bool warming = warmed["state"] == "warming" || warmed["state"] == "warm";
+  CHECK_MESSAGE(warming, "rig.warm reported " << warmed["state"]);
   CHECK(warmed["cost"]["cost"].get<double>() > 0.0);
 
   const auto still = request(daemon, R"({"method":"engine.status"})");

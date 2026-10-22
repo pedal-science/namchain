@@ -5406,9 +5406,11 @@ void Daemon::switch_begin() noexcept
     // from `Free` and keeps it current, which is what the rest of the fade is mixed against. It has
     // to be told: nothing else about this block looks like work to it.
     release_document(outgoing.owner);
-    wake_warm_thread();
-
+    // The new active document *before* the wake: a warm thread woken between the release and the
+    // store would see the outgoing document still marked audible, decline to claim it, and -- since
+    // the device publishes no warm input while nothing is warm -- never be woken again.
     active_doc_.store(switch_incoming_, std::memory_order_release);
+    wake_warm_thread();
 
     take_request_.store(-1, std::memory_order_release);
     const int fade = transition_frames();
@@ -5566,6 +5568,29 @@ void Daemon::warm_loop()
     }
     if (warm_quit_.load(std::memory_order_acquire))
       return;
+
+    // Before sleeping, look at the state a wake would have been about: a document this thread can
+    // pick up. A wake that arrives while `warm_service` is running above is *consumed* by the
+    // `seen` load -- that pass has already run and did not act on it -- and nothing wakes this
+    // thread again until an input arrives for a document it holds. If it holds none, that never
+    // happens: the device stops publishing warm input while no document is warm, so there is no
+    // second wake. Claiming here also gives the device somebody to feed on its next block.
+    //
+    // The check has to come after `seen` is read, not before: a state change before the read is in
+    // `seen` and would otherwise sleep through it. One that happens after the read bumps the
+    // sequence, and `wait(seen)` then returns at once -- which is why the check is repeated just
+    // before the wait.
+    const auto claim_if_any = [this] {
+      if (warm_doc_ >= 0 && docs_[warm_doc_].owner.load(std::memory_order_acquire) == DocOwner::Warm)
+        return false; // already ours; with no input there is nothing to do
+      return claim_warm_document(warm_doc_) != nullptr;
+    };
+    if (claim_if_any())
+    {
+      warm_.parked.store(false, std::memory_order_release);
+      continue;
+    }
+
     unsigned spins = 0;
     while (spins < 20000 && warm_.sequence.load(std::memory_order_acquire) == seen &&
            !warm_quit_.load(std::memory_order_acquire))
@@ -5574,7 +5599,14 @@ void Daemon::warm_loop()
       ++spins;
     }
     if (warm_.sequence.load(std::memory_order_acquire) == seen && !warm_quit_.load(std::memory_order_acquire))
+    {
+      if (claim_if_any())
+      {
+        warm_.parked.store(false, std::memory_order_release);
+        continue;
+      }
       warm_.sequence.wait(seen, std::memory_order_acquire);
+    }
     warm_.parked.store(false, std::memory_order_release);
   }
 }
@@ -5693,6 +5725,10 @@ void Daemon::warm_service() noexcept
     if (held >= 0 && take_request_.load(std::memory_order_acquire) == held)
     {
       release_warm_document(*doc, /*retire=*/false);
+      // The request this answered is spent. Clearing it keeps the next pass -- or whatever holds
+      // that index next -- from reading a stale release as a fresh one.
+      if (warm_release_.load(std::memory_order_acquire) == static_cast<unsigned>(held + 1))
+        warm_release_.store(0, std::memory_order_release);
       doc = nullptr;
       continue;
     }

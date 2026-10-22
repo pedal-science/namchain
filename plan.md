@@ -32,8 +32,13 @@ three test assumptions and one real race:
   The second half was that the warm thread only honoured a release request at the top of
   `warm_service`, so a warm thread that was *behind* (the starved-warm test holds every block) never
   got back there and never let go. It now yields in the render loop as soon as `take_request_` names
-  its document. With that fixed, the daemon's shared state was made properly atomic where a report
-  reads the owner's: `device_` is guarded by a mutex for the control thread's diagnostics/interrupt,
+  its document. There was a second, quieter concurrency bug behind the qemu warm-set failures: a
+  wake that arrived while the warm thread was inside `warm_service` was *consumed* by the `seen`
+  load, and since the device publishes no warm input while no document is warm, nothing woke it
+  again -- the outgoing document was never picked up and the switch's other half never rendered.
+  The loop now claims a free document before it parks (and again just before the wait), and the
+  switch stores `active_doc_` before waking. With that fixed, the daemon's shared state was made
+  properly atomic where a report reads the owner's: `device_` is guarded by a mutex for the control thread's diagnostics/interrupt,
   `DocRuntime::chain_count`, `PlanSlot::catch_up_hold_frames` and `input_sequence_` are atomics, and
   `engine.levels`/`rig.state` read a `reported_slot` the owner publishes per block instead of the live
   `current` pointer. **TSan is clean** (0 warnings, 391 cases, three consecutive runs) and so is the
@@ -52,7 +57,12 @@ three test assumptions and one real race:
   still fill inside `serve_catch_up`'s two seconds; a host where that ceiling leaves the run shorter
   than the compile (qemu, at ~100×) skips them with a message rather than asserting a real-time
   premise it cannot meet. The long-memory hold test asserts the exact hand-over where the host can
-  replay it inside the margin, and the documented `hold.abandoned` alternative where it cannot.
+  replay it inside the margin, and the documented `hold.abandoned` alternative where it cannot -- and
+  its `ring.dropped` claim moved onto that branch, where it means something. Two more qemu-shaped
+  claims were relaxed to bounds that keep the regression they exist for: the prewarm-window test
+  asserts `frames <= 8 x 64` (the bug was one period *more*, not fewer), and `rig.warm`'s reply may
+  say `warming` or `warm` because which one it catches is the warm thread's startup against the
+  control thread's reply.
 
 The one thing to re-check when next on piv: nothing here is a performance number, but the switch path
 changed, so a `--tests` run on the board and one switch under the soak are worth having before the
