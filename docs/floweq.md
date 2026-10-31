@@ -43,7 +43,9 @@ whose unused axes have no meaning, which is a UI question before it is an engine
 z (3) ──► Dense 1024, ReLU ──► Dense 13, sigmoid ──► 0…1 ──► gains, frequencies, Qs
 ```
 
-`models/20261017-090756/` in the flowEQ checkout holds the trained Keras models and
+The flowEQ checkout is `third-party/flowEQ` in this repository, gitignored (`git clone
+https://github.com/csteinmetz1/flowEQ third-party/flowEQ`; the clone here is at `aedd107`).
+`models/20261017-090756/` in it holds the trained Keras models and
 `plugin/assets/vae3d_beta_0.0010.mat` the decoder converted for the plugin. That `.mat` is the source
 of `include/namchain/floweq/model.h`:
 

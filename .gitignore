@@ -25,3 +25,7 @@ bench-results/*.watch
 # symbol tables in bench-results/rt-piv-profile.txt are the evidence that is kept)
 bench-results/*.data
 __pycache__/
+
+# Other people's repositories, cloned for reference and never committed: flowEQ, the source of
+# include/namchain/floweq/model.h (docs/floweq.md). third_party/ is the committed vendor tree.
+third-party/

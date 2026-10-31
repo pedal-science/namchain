@@ -44,8 +44,9 @@ docker run --rm -v "$PWD:/src:ro" pedal-build:<snapshot> \
   allocator to catch it, and there are RTSan and TSan builds (`NAMCHAIN_RTSAN`, `NAMCHAIN_TSAN`).
 - **The vendored NAM core is `rikkus/OptimisationWorkOnNeuralAmpModelerCore`, branch
   `all-optimisations`** (`vendor/NeuralAmpModelerCore`, a submodule): it carries the A2 planar
-  kernels and the IR optimisations in `NAM/linear.*`. `vendor/patches/` remains the mechanism for
-  upstream-PR-shaped changes and is empty today; change patches, not vendored files.
+  kernels and the IR optimisations in `NAM/linear.*`. Change the core on that branch and bump the
+  submodule. CMake still applies any `vendor/patches/*.patch` (`NAMCHAIN_APPLY_VENDOR_PATCHES`), but
+  the directory is absent today.
 - **`nc.cab.ir` convolves with the core's `nam::Linear`** (the `Auto` implementation from that
   branch: direct to 512 taps, partitioned FFT above), and resamples with the AudioDSPTools the core
   vendors (sdatkinson's). rikkus's AudioDSPTools fork is deprecated; don't bring it back.
@@ -66,4 +67,4 @@ docker run --rm -v "$PWD:/src:ro" pedal-build:<snapshot> \
   `third_party/squatch-tuner/` and re-fetched with `tools/vendor/fetch_squatch_tuner.py`).
 - The CoreAudio and loop backends are on the `local-engine` branch, not `main`.
 
-System context (the pedal, how the repos fit together, the plan): `~/code.local/pedal/pedal.project`, starting at its `CLAUDE.md` and `docs/working-across-repos.md`.
+System context (the pedal, how the repos fit together, the plan): `~/code.local/pedal/pedal.project`, starting at its `AGENTS.md` and `docs/working-across-repos.md`.
