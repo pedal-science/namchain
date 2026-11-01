@@ -42,7 +42,10 @@ using Clock = std::chrono::steady_clock;
 class NullBackend final : public AudioBackend
 {
 public:
-  explicit NullBackend(const BackendConfig& config) : paced_(config.realtime_paced)
+  explicit NullBackend(const BackendConfig& config)
+    : paced_(config.realtime_paced),
+      xruns_at_start_(config.test_xruns_at_start),
+      fail_read_at_(config.test_fail_read_at_period)
   {
     const unsigned periods = config.periods == 0 ? 4 : config.periods;
     info_.period_size = config.period_size;
@@ -75,6 +78,10 @@ public:
     period_ = 0;
     info_.capture_exhausted = false;
     running_ = true;
+    // Starting a stream cost this much, says the test hook. Set here rather than in the constructor so
+    // it is a property of the stream, which is what a startup artefact is: a backend that is stopped
+    // and started again pays it again.
+    driver_xruns_ = xruns_at_start_;
     return true;
   }
 
@@ -106,8 +113,16 @@ public:
     return true;
   }
 
-  int read_capture(void* dst, unsigned frames, int /*timeout_ms*/, std::string& /*error*/) override
+  int read_capture(void* dst, unsigned frames, int /*timeout_ms*/, std::string& error) override
   {
+    // A test hook, and nothing but a test sets it (BackendConfig). Checked against the period the wait
+    // has already counted, so the failure happens once, at a period a test can name.
+    if (fail_read_at_ != 0 && period_ == fail_read_at_ && !failed_once_)
+    {
+      failed_once_ = true;
+      error = "null backend: engineered read failure at period " + std::to_string(period_);
+      return -1;
+    }
     // Silence, and silence is the honest thing for a device with no input: the engine cannot tell
     // this apart from an interface with nothing plugged into it.
     std::memset(dst, 0, static_cast<size_t>(frames) * info_.capture_bytes_per_frame);
@@ -119,12 +134,16 @@ public:
     return static_cast<int>(frames);
   }
 
-  uint64_t driver_xruns() const override { return 0; }
+  uint64_t driver_xruns() const override { return driver_xruns_; }
 
 private:
   BackendInfo info_;
   bool paced_ = true;
   bool running_ = false;
+  unsigned xruns_at_start_ = 0;
+  unsigned fail_read_at_ = 0;
+  bool failed_once_ = false;
+  uint64_t driver_xruns_ = 0;
   uint64_t period_ = 0;
   std::chrono::nanoseconds period_ns_{0};
   Clock::time_point origin_{};

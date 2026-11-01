@@ -72,6 +72,18 @@ struct BackendConfig
   /// `null` only: pace against the wall clock the way a device would. False runs flat out, which is
   /// what a throughput measurement wants and a lateness measurement cannot use.
   bool realtime_paced = true;
+  /// \brief Test hook, `null` only: report N driver xruns from `start`. Never parsed, 0 is off.
+  ///
+  /// A stream that costs something to start is what the paced backend cannot otherwise be: it has no
+  /// rings, so it has no first period to fill and never xruns. That leaves the accounting around a
+  /// startup artefact -- which count it lands in, and which it must not -- testable on hardware only.
+  /// This models the artefact itself rather than a device's way of producing one.
+  unsigned test_xruns_at_start = 0;
+  /// \brief Test hook, `null` only: fail `read_capture` once at period N. Never parsed, 0 is off.
+  ///
+  /// A device loss the daemon recovers from by reopening, which is the path the startup accounting has
+  /// to survive: a reopened stream has a bring-up of its own, and what it cost is a fact about *it*.
+  unsigned test_fail_read_at_period = 0;
   /// Refuse a period size other than the one requested. On a device this is the guard against the
   /// silent rounding measured in §9.5.
   bool require_exact_period = true;

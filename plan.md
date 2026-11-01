@@ -1005,6 +1005,36 @@ START is an artefact of filling an empty ring, and running that "bring-up" cycle
 rings writes a silent period to the output WAV. That bug is why the file backend's output was one
 period longer than the renderer's before it was found.
 
+**The bring-up is the engine's, not just the harness's (2026-11-01).** Both of the above were soak
+capabilities, and the daemon had neither: `render_loop` went from `device_->start` straight to
+`Running`, with no untimed cycle, no `prefill_output_queue`, and no separation of what starting a
+stream costs from what running it costs. `namchaind` now does all three in `Daemon::bring_stream_up`,
+called once per open at the end of it — after the warm thread and `mlockall`, which a soak does before
+`start` and a long-lived daemon cannot. `engine.status` grew `startup_xruns` beside `xruns`: the
+startup count is *reported*, which is this project's habit with an artefact, and excluded from `xruns`,
+from the recent-trouble bucket and from the health `warn` they feed. The pedal is the reason it matters
+there rather than on the bench — it resumes its rig at power-up, so starting a stream is the normal
+case, and an artefact banked into `xruns` would raise a warning at every power-on, on the one number a
+player is meant to be able to trust.
+
+Worth recording with it: **the daemon was not in fact banking one on pro**, measured before the change
+rather than after (`bench-results/2026-11-01-daemon-startup-xruns.md`). Ten fresh starts of the
+deployed `namchaind` against a UMC202HD at 48 kHz / 64 frames reported `xruns 0` and `health ok` at
+every sample, and five soak runs on the same device reported `startup_xruns` 0. The reason is in the
+journal: the daemon publishes the resumed rig — model, IR, plan and all — *before* the device is
+opened, which is the ordering this section's own note credits with removing the overrun. So the change
+is insurance on that device and a correction of the accounting everywhere: what it guarantees is that
+a startup artefact, where a device does produce one, is named rather than charged to the render path.
+A device that does produce one is still unmeasured, vip included.
+
+The change was then deployed to pro and measured again: ten more fresh starts, 40 samples, `xruns 0`
+and `startup_xruns 0` throughout, with the blocks counted half a second in unchanged to within the
+restart's own scatter. The one thing that did move is the queue, and it is the part that acts on every
+device: `engine.status`'s new `queue.prefill_frames` reads **8** on that interface — 0.167 ms of output
+latency paid once at open, the same eight frames the soak reports — where before the change the daemon
+never called `prefill_output_queue` at all and so ran a period short of its own configured cushion for
+the life of the stream.
+
 The **multichannel WAV reader** (`namchain::load_wav`, `src/io/wav.cpp`) came with this: the core's own
 loader refuses anything but mono (`ERROR_NOT_MONO`), and a device capture that is going to be replayed
 through the engine usually is not. It handles 16/24/32-bit PCM and 32-bit float, any channel count, and
@@ -1486,6 +1516,12 @@ number:
    timed loop, because the bring-up path spends a period of the primed queue and the ring's contents
    are conserved: a queue that starts a period short stays a period short for the whole run, which is
    why `AudioBackend::prefill_output_queue` exists and why `prefill_frames` is reported.
+
+   Both of those were the harness's alone until 2026-11-01, when `namchaind` was given the same
+   bring-up and the same prefill (`Daemon::bring_stream_up`, §M-notes above): the daemon opened a
+   device, went straight to `Running`, and so ran its whole life a period short of the target it had
+   configured. It also counted whatever starting the stream cost as a missed deadline, which
+   `engine.status` now separates into `startup_xruns`.
 9. **The occupancy distribution, and a floor the loop can hold** (2026-09-15). Item 8 ended on a missing
    instrument and an open mechanism, and this is both.
 
