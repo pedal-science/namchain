@@ -1005,6 +1005,57 @@ START is an artefact of filling an empty ring, and running that "bring-up" cycle
 rings writes a silent period to the output WAV. That bug is why the file backend's output was one
 period longer than the renderer's before it was found.
 
+**The bring-up is the engine's, not just the harness's (2026-11-01).** Both of the above were soak
+capabilities, and the daemon had neither: `render_loop` went from `device_->start` straight to
+`Running`, with no untimed cycle, no `prefill_output_queue`, and no separation of what starting a
+stream costs from what running it costs. `namchaind` now does all three in `Daemon::bring_stream_up`,
+called once per open at the end of it — after the warm thread and `mlockall`, which a soak does before
+`start` and a long-lived daemon cannot. `engine.status` grew `startup_xruns` beside `xruns`: the
+startup count is *reported*, which is this project's habit with an artefact, and excluded from `xruns`,
+from the recent-trouble bucket and from the health `warn` they feed. The pedal is the reason it matters
+there rather than on the bench — it resumes its rig at power-up, so starting a stream is the normal
+case, and an artefact banked into `xruns` would raise a warning at every power-on, on the one number a
+player is meant to be able to trust.
+
+**Measured, and the condition is the output-queue prime** (`bench-results/2026-11-01-daemon-startup-xruns.md`).
+`AlsaRawDuplex::prime_playback` primes one period by default and the *whole target* when one is set
+(`queue_prime_frames` is `period_frames * max(1, queue_periods)`), so:
+
+- **With no target** — the daemon's own default, `Config::output_queue_periods = 0` — one period is
+  primed, the device eats it during the bring-up cycle, and the ring runs dry. Old binary against new
+  on pro, three rounds each in that configuration: **before, `xruns 1`; after, `xruns 0` with
+  `startup_xruns 1`**, the same `playback_underruns: 1` underneath both. The artefact is attributed,
+  not prevented, which is the whole intent.
+- **With the four-period target every pedal host configures** (`devices/{vip,piv,pro}`'s
+  `namchaind.json`), there are three periods of cushion and nothing underruns: ten fresh starts of the
+  deployed daemon, 40 samples, `xruns 0` and `startup_xruns 0` throughout. So on the hosts as
+  configured today this changes nothing, and the value is that the artefact is named if a device ever
+  does charge for it.
+
+Two things were corrected in the course of measuring it, and both belong in the record rather than in a
+tidier story. The brief that asked for this said the reopen path was dropping xruns; it was not —
+`last_xruns_` is assigned every block regardless of the comparison above it, so a stale baseline could
+only ever have cost the first block after a reopen. And an earlier draft of this note claimed the
+daemon "ran its whole life a period short of its configured output-queue target" because it never
+called `prefill_output_queue`; it did not, because the prime already establishes the target inside
+`start()`. The prefill is needed *because* the bring-up cycle spends part of that primed queue — the
+two go together, and `engine.status`'s new `queue.prefill_frames` reads 8 on the UMC202HD, 0.167 ms of
+output latency paid once, not a period.
+
+One narrowing worth keeping, since "a warning at every power-up" was the motivation: the health `warn` a
+startup xrun raises lasts **one decay step, measured at 0.16 s** (`recent_xruns_` is drained every 100
+blocks and `decay_recent_trouble(1)` is 0). No player would see it. What a startup xrun does leave is
+`status.xruns == 1` for the life of the process — cumulative and never cleared, which is what
+`scripts/status` and any diagnostic report, and that is what this fixes. It also rules the startup xrun
+out as the cause of the `Health warn` in the 2026-10-13 two-rig playtest.
+
+Finally, a gap this exposed between the harness and the engine: `soak.sh` in `pedal.project` passes no
+`--output-queue-periods`, so the nine committed soak arms on pro all characterise a one-period prime
+while every host runs a four-period one. The soak's `bring-up xruns: 1` has never described the
+configuration the engine plays in. Adding an arm with the daemon's queue settings — rather than
+re-flagging the existing one, which is the RT work's baseline — is the suggestion; the bench note says
+why.
+
 The **multichannel WAV reader** (`namchain::load_wav`, `src/io/wav.cpp`) came with this: the core's own
 loader refuses anything but mono (`ERROR_NOT_MONO`), and a device capture that is going to be replayed
 through the engine usually is not. It handles 16/24/32-bit PCM and 32-bit float, any channel count, and
@@ -1486,6 +1537,14 @@ number:
    timed loop, because the bring-up path spends a period of the primed queue and the ring's contents
    are conserved: a queue that starts a period short stays a period short for the whole run, which is
    why `AudioBackend::prefill_output_queue` exists and why `prefill_frames` is reported.
+
+   Both of those were the harness's alone until 2026-11-01, when `namchaind` was given the same
+   bring-up and the same prefill (`Daemon::bring_stream_up`, the note above): the daemon opened a
+   device and went straight to `Running`, counting whatever starting the stream cost as a missed
+   deadline — `xruns 1` from the first block, measured, in the configuration where the prime is one
+   period. `engine.status` now separates that into `startup_xruns`. Note that the daemon was *not*
+   short of its queue target before this: `prime_playback` establishes it inside `start()`, and the
+   prefill is there because the bring-up cycle spends part of what the prime laid down.
 9. **The occupancy distribution, and a floor the loop can hold** (2026-09-15). Item 8 ended on a missing
    instrument and an open mechanism, and this is both.
 

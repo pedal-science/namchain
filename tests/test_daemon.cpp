@@ -761,6 +761,16 @@ TEST_CASE("the daemon runs the null backend and serves the control socket")
   CHECK(render["worst_us"].get<double>() > 0.0);
   CHECK(render["over_deadline"].get<uint64_t>() <= render["over_90_percent"].get<uint64_t>());
 
+  // Starting a stream costs something, and what it costs is reported rather than charged to the
+  // render path: `xruns` counts from the baseline the open took, `startup_xruns` is that baseline, and
+  // the health `warn` is fed by the first and not the second. On the paced backend both are zero and
+  // the point is that the field exists and the two are separate -- a device is where the number can be
+  // anything but zero, and a pedal that resumes its rig at power-up is why it must not land in
+  // `xruns`.
+  CHECK(status["status"]["startup_xruns"].get<uint64_t>() == 0);
+  CHECK(status["status"]["xruns"].get<uint64_t>() == 0);
+  CHECK(status["status"]["health"] == "ok");
+
   // The `smooth` op class, end to end: the control thread resolves the vtable dispatch, the render
   // thread drains it and applies it, and the status counter proves it happened rather than assuming.
   const auto patch = nlohmann::json::parse(call(
@@ -2298,6 +2308,93 @@ TEST_CASE("a daemon with nothing wrong reports health ok and no issues")
   // that was asked not to lock memory, are doing exactly what they were told.
   CHECK(status["rt_priority"] == 0);
   CHECK(status["memory_locked"] == false);
+}
+
+/// Whether the `xruns` health issue is being raised, which is the recent-trouble bucket speaking.
+bool warns_about_xruns(const nlohmann::json& status)
+{
+  for (const auto& issue : status["issues"])
+    if (issue["code"] == "xruns")
+      return true;
+  return false;
+}
+
+TEST_CASE("what starting a stream costs is reported as its own number, and retaken on every open")
+{
+  TempDir dir;
+  const auto root = dir.path / "rigs";
+  write_file(root / "gain.json", kGainRig);
+
+  Config config;
+  config.backend = BackendKind::Null;
+  config.socket_path = (dir.path / "namchaind.sock").string();
+  config.rigs_root = root.string();
+  config.rig = (root / "gain.json").string();
+  config.device_retry_ms = 20;
+  config.reclamation_timeout_ms = 5;
+  config.lock_memory = false;
+  config.rt_priority = 0;
+  // Starting this stream costs three driver xruns, and the read fails once at period 120 so the daemon
+  // loses the device and brings a second stream up -- which pays its own three. Nothing xruns while
+  // either stream runs, so every xrun in this case is the cost of starting one and nothing else.
+  config.test_xruns_at_start = 3;
+  config.test_fail_read_at_period = 120;
+
+  Daemon daemon(config);
+  std::string error;
+  REQUIRE_MESSAGE(daemon.start(error), error);
+  std::thread loop([&daemon] { daemon.run(); });
+  struct Guard
+  {
+    Daemon& daemon;
+    std::thread& thread;
+    ~Guard()
+    {
+      daemon.request_stop();
+      if (thread.joinable())
+        thread.join();
+    }
+  } guard{daemon, loop};
+
+  REQUIRE_MESSAGE(wait_for(config.socket_path,
+                           [](const nlohmann::json& status) {
+                             return status["state"] == "running" && status["blocks"].get<uint64_t>() > 4;
+                           }),
+                  "the render thread never reached running");
+
+  // The whole point, on the first stream. What bring-up cost is published as what it is, and the
+  // number a player's panel reads is zero -- because nothing has missed a deadline. Before this, the
+  // three landed in `xruns` and raised the health `warn`, which on the pedal would mean a warning at
+  // every power-up: it resumes its rig as it boots, so starting the stream *is* the normal case.
+  {
+    const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+    const auto& status = reply["status"];
+    CHECK(status["startup_xruns"].get<uint64_t>() == 3);
+    CHECK(status["xruns"].get<uint64_t>() == 0);
+    CHECK(status["health"] == "ok");
+    CHECK_FALSE(warns_about_xruns(status));
+  }
+
+  // And again across a reopen, which is why the baseline is retaken by the open rather than taken once
+  // when the daemon starts. The second stream's bring-up cost three of its own; a baseline taken
+  // *before* `start`, or never taken, charges them to the render path and this case fails -- both were
+  // checked by making the change and watching it fail. What it cannot tell apart is a baseline that is
+  // correct but computed only on the first open, because both streams here cost the same to start, and
+  // nothing a backend can see differs between the two opens to make them cost differently.
+  REQUIRE_MESSAGE(wait_for(config.socket_path,
+                           [](const nlohmann::json& status) {
+                             return status["device_lost"].get<uint64_t>() >= 1u &&
+                                    status["device_restored"].get<uint64_t>() >= 1u &&
+                                    status["state"] == "running" && status["blocks"].get<uint64_t>() > 130;
+                           }),
+                  "the daemon never lost the device and brought a second stream up");
+  {
+    const auto reply = nlohmann::json::parse(call(config.socket_path, R"({"method":"engine.status"})"));
+    const auto& status = reply["status"];
+    CHECK(status["startup_xruns"].get<uint64_t>() == 3);
+    CHECK(status["xruns"].get<uint64_t>() == 0);
+    CHECK_FALSE(warns_about_xruns(status));
+  }
 }
 
 TEST_CASE("a device that cannot be opened is an error issue, not just a counter")

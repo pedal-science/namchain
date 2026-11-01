@@ -4052,6 +4052,8 @@ bool Daemon::open_device(std::string& error)
   backend.device_buffer_frames = config_.device_buffer_frames;
   backend.output_path = config_.playback_path;
   backend.capture_device_path = config_.capture_device_path;
+  backend.test_xruns_at_start = config_.test_xruns_at_start;
+  backend.test_fail_read_at_period = config_.test_fail_read_at_period;
 
   {
     // Published under the lock the control thread reads it with. The backend is fully constructed
@@ -4150,6 +4152,85 @@ bool Daemon::open_device(std::string& error)
   // priority was asked for or the platform ignores the period (Linux).
   if (config_.rt_priority > 0)
     promote_render_thread(static_cast<double>(info.period_size) / static_cast<double>(info.sample_rate));
+  return true;
+}
+
+namespace
+{
+/// The bring-up's wait for its one period. Longer than the render loop's own wait, because this is
+/// the first poll of a stream that has just been told to run and a device is entitled to take a
+/// moment over it; the soak harness uses the same number for the same reason.
+constexpr int kBringUpWaitMs = 2000;
+/// The bring-up's read and write timeouts, once `wait_capture` says a period is there.
+constexpr int kBringUpIoMs = 1000;
+} // namespace
+
+/// \brief Spend the artefact of starting the stream, then take the baseline later counts are against.
+///
+/// Called once per open, with the device started and everything it renders already in memory. Three
+/// steps, in this order, for the reasons the soak harness records (`src/soak/soak.cpp`, plan.md §9.5
+/// items 6 and 7 and §10.5.1).
+///
+/// One **bring-up cycle**, deliberately untimed and not counted as a block: `wait_capture`, a read and
+/// a write of silence, no render. The first period after START fills an empty capture ring, so its
+/// cost is a property of starting rather than of the render path -- every soak configuration,
+/// passthrough included, showed exactly one overrun and it was always block 0. Gated on
+/// \ref BackendInfo::needs_bringup_cycle, because a backend with no rings has nothing to bring up and
+/// running the cycle on one writes a period of silence nobody asked for: that is the bug that left the
+/// `file` backend's output one period longer than the renderer's.
+///
+/// The **baseline**. What the bring-up accounted for is published as `startup_xruns` and subtracted
+/// from everything after it, so `engine.status`'s `xruns`, the recent-trouble bucket and the health
+/// `warn` it feeds describe the render path and nothing else. The pedal is the reason: it resumes its
+/// rig at power-up, so without this every power-on could bank the cost of starting into the one number
+/// a player is meant to be able to trust. Ignored, in the sense that matters -- not called a fault --
+/// and still reported, because this project reports an artefact rather than hiding it.
+///
+/// Retaken by **every** open, not once per process, which is what makes `startup_xruns` a fact about
+/// the stream that is running rather than about the first one this daemon ever had. A daemon survives
+/// device loss and reopens (`DeviceState::Lost` and the retry path), and the stream it brings up then
+/// has a bring-up of its own to pay for. `open_device` says the same of the queue stats -- "a new
+/// backend counts from zero, as its xruns do" -- and this is the other half of it. The recent-trouble
+/// bucket needs no help here beyond that: `last_xruns_` is assigned every block regardless of the
+/// comparison above it, so a stale value could only ever have cost the first block after a reopen.
+///
+/// The **output queue**, last. The bring-up above spends a period of whatever `start` primed without
+/// writing one back, and a ring's contents are otherwise conserved: a queue that begins a period short
+/// stays a period short for the whole run. It cannot be established any earlier than this.
+///
+/// \return false only when the queue could not be brought to its target, which is a real error. A
+/// bring-up cycle that does not complete is not: the render loop's own `wait_capture` is where a
+/// device that has stopped answering is diagnosed, so this leaves it to say so.
+bool Daemon::bring_stream_up(std::string& error)
+{
+  const BackendInfo& info = device_->info();
+  if (info.needs_bringup_cycle)
+  {
+    // A longer wait than the loop's own: this is the first poll of a stream that has only just been
+    // told to run. Its outcome is not acted on here, so its error goes nowhere -- see the note above.
+    std::string ignored;
+    if (device_->wait_capture(kBringUpWaitMs, ignored))
+    {
+      // Silence out, and nothing rendered: the block this stands in for is an artefact of starting,
+      // and putting audio through it would make the first real block the second one the player hears.
+      // Both buffers were sized by `open_device` for the configured period, which the device's own
+      // period cannot exceed, and neither this nor the two calls below allocates.
+      std::fill(playback_buffer_.begin(), playback_buffer_.end(), 0);
+      device_->read_capture(capture_buffer_.data(), info.period_size, kBringUpIoMs, ignored);
+      device_->write_playback(playback_buffer_.data(), info.period_size, kBringUpIoMs, ignored);
+    }
+  }
+  const uint64_t startup = device_->driver_xruns();
+  startup_xruns_.store(startup);
+  last_xruns_ = startup;
+  xruns_.store(0);
+
+  const uint64_t before = device_->queue_stats().prefill_frames;
+  if (!device_->prefill_output_queue(error))
+    return false;
+  // What the cushion cost, in the one place it can be measured: the difference across the call, not
+  // the backend's running total, so a reopen reports what *this* stream paid.
+  prefill_frames_.store(device_->queue_stats().prefill_frames - before);
   return true;
 }
 
@@ -4869,6 +4950,15 @@ void Daemon::render_loop()
         if (!memory_locked && config_.verbose)
           std::fprintf(stderr, "[namchaind] mlockall(MCL_CURRENT) refused; the run is not pinned\n");
       }
+      // Last of all, so the bring-up absorbs everything an open does with the stream already
+      // running: the warm thread's start and `mlockall` both happen after `start`, and neither of
+      // them is the render path's fault.
+      if (!bring_stream_up(error))
+      {
+        fail_device(error);
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::max(1u, config_.device_retry_ms)));
+        continue;
+      }
     }
 
     const BackendInfo& info = device_->info();
@@ -5084,7 +5174,10 @@ void Daemon::render_loop()
     reclaimer_.advance_epoch();
     blocks_.fetch_add(1);
     const uint64_t xruns = device_->driver_xruns();
-    xruns_.store(xruns);
+    // Steady-state only: what bring-up accounted for is reported as `startup_xruns` and is not a
+    // missed deadline. Without the subtraction a pedal that resumes its rig at power-up banks the
+    // artefact of starting into the number a player is meant to be able to trust.
+    xruns_.store(xruns - std::min(xruns, startup_xruns_.load(std::memory_order_relaxed)));
 
     // The recent-trouble buckets: what arrived since the last block, drained periodically so the
     // number means "lately" rather than "ever".
@@ -6371,6 +6464,10 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     status["adopted_generation"] = active_document().adopted_generation.load();
     status["blocks"] = blocks_.load();
     status["xruns"] = xruns_.load();
+    // The artefact of starting the stream, separately: a startup overrun is reported, not hidden, and
+    // not counted as a real-time fault. Rewritten by every open, so it describes the stream that is
+    // running rather than every stream this daemon has had.
+    status["startup_xruns"] = startup_xruns_.load();
     // Whatever the backend can say about itself, in its own words. Empty for most, and additive, so
     // a client that has never heard of a key keeps working — the same rule every response follows.
     // The lock is what makes the pointer's lifetime defined: the render thread may be closing the
@@ -6437,7 +6534,8 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
                        {"output_drops", output_drops_.load()},
                        {"output_target_drops", output_target_drops_.load()},
                        {"floor_insertions", floor_insertions_.load()},
-                       {"capture_bursts", capture_bursts_.load()}};
+                       {"capture_bursts", capture_bursts_.load()},
+                       {"prefill_frames", prefill_frames_.load()}};
     status["record"] = recording_json();
     // Each block's time from its capture read to its playback write, against the period's deadline.
     // `load_histogram` is [percent, blocks] for the buckets that have any; 100 is "at or past it".

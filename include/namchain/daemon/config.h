@@ -173,6 +173,13 @@ struct Config
   /// drive a switch mid-render through the real protocol needs the device thread to spend wall time
   /// on a block. Zero is off.
   unsigned warm_test_pace_us = 0;
+  /// \brief Test hooks on the `null` backend: N driver xruns charged to `start`, and one read failure
+  /// at period N. Never parsed, 0 is off; see BackendConfig for why each exists.
+  ///
+  /// Together they make the startup accounting testable without hardware: the first gives a stream a
+  /// bring-up that cost something, the second loses the device so the daemon brings a second one up.
+  unsigned test_xruns_at_start = 0;
+  unsigned test_fail_read_at_period = 0;
   /// mlockall(MCL_CURRENT) once the plan and the stream buffers exist (never MCL_FUTURE, §14.10).
   bool lock_memory = true;
   /// Output-queue cap and floor, in periods; see BackendConfig. 0 disables each.

@@ -711,6 +711,9 @@ private:
   static void run_chains_entry(void* context, unsigned participant, unsigned participants,
                                int frames) noexcept;
   bool open_device(std::string& error);
+  /// \brief Spend the artefact of starting a stream and take the baseline later xruns are counted
+  /// against: one untimed bring-up cycle, \ref startup_xruns_, then the output queue's target.
+  bool bring_stream_up(std::string& error);
   /// Give the backend its chance to flush what it accumulated, before the object is destroyed: a
   /// `file` backend writes its output WAV here, and a device backend has nothing to do.
   void finish_device(std::string& error);
@@ -1175,7 +1178,8 @@ private:
   uint64_t switch_started_block_ = 0;
   uint64_t switch_seen_seq_ = 0; ///< the last switch request this thread acted on
   /// The driver's xrun counter as of the last block, so the recent-trouble bucket can be fed the
-  /// delta rather than the total.
+  /// delta rather than the total. Set to \ref startup_xruns_ when a device opens, so the first block of
+  /// a stream is a delta against its own bring-up and not against the device lost before it.
   uint64_t last_xruns_ = 0;
   std::vector<unsigned char> capture_buffer_;
   std::vector<unsigned char> playback_buffer_;
@@ -1392,7 +1396,18 @@ private:
 
   std::atomic<int> device_state_{static_cast<int>(DeviceState::Closed)};
   std::atomic<uint64_t> blocks_{0};
+  /// Driver xruns since bring-up: the real-time ones. \ref startup_xruns_ is subtracted, so the
+  /// artefact of starting a stream is not reported as a missed deadline.
   std::atomic<uint64_t> xruns_{0};
+  /// \brief Driver xruns the stream's bring-up accounted for, and the baseline every later count is
+  /// taken against.
+  ///
+  /// The first period after START fills an empty capture ring, and on the way there a device waits out
+  /// the warm thread's start and `mlockall`. That cost is a property of starting, not of the render
+  /// path, and every soak configuration showed exactly one overrun at block 0 because of it
+  /// (`src/soak/soak.cpp`). Reported rather than discarded, and rewritten by every open, since a
+  /// daemon survives device loss and brings a new stream up with its own counter starting at zero.
+  std::atomic<uint64_t> startup_xruns_{0};
   std::atomic<uint64_t> device_lost_{0};
   std::atomic<uint64_t> device_restored_{0};
   std::atomic<uint64_t> render_errors_{0};
@@ -1514,6 +1529,12 @@ private:
   std::atomic<uint64_t> output_target_drops_{0};
   std::atomic<uint64_t> floor_insertions_{0};
   std::atomic<uint64_t> capture_bursts_{0};
+  /// \brief Frames of silence \ref bring_stream_up wrote to bring the output queue to its target.
+  ///
+  /// Output latency, paid once per open and reported for the same reason the soak harness reports it
+  /// (`prefill_frames`): it is the price of the cushion the queue was configured for, and a number
+  /// nobody can see is a number nobody can trade against. Zero for a backend with no ring.
+  std::atomic<uint64_t> prefill_frames_{0};
   /// Render thread: the counters as of the last block, so a recording can be given the deltas.
   StreamQueueStats last_queue_{};
 
