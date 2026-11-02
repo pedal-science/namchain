@@ -1,9 +1,24 @@
-// Bit-identity gate for the planar NEON A2 kernels (vendor/patches/0001, see plan.md §7.8).
+// Parity gate for the planar A2 kernels (see plan.md §7.8).
 //
-// The kernels claim something stronger than "close enough": for the A2 nano (3ch) and A2
-// standard (8ch) shapes they produce the *same float32 bits* as the portable A2FastModel.
+// On ARM the kernels claim something stronger than "close enough": for the A2 nano (3ch) and
+// A2 standard (8ch) shapes they produce the *same float32 bits* as the portable A2FastModel.
 // This asserts exactly that with memcmp, against real .nam model data, across block sizes
 // that exercise the partial-tile and single-frame tails.
+//
+// ON x86_64 THE CLAIM IS WEAKER, AND DELIBERATELY SO
+// --------------------------------------------------
+// The core widened the planar gate to x86_64 AVX2+FMA (NAM_A2_PLANAR_AVX2). There the match
+// is *not* bit-identical, and the core's own header says why: the AVX2 kernels share the
+// per-tap FMA order of the NEON path ("order A"), while the reference a2_fast is backed by
+// Eigen, whose AVX2 gebp kernel packs differently for N>=4. The documented figure is ~133 dB
+// (C=8) and ~139 dB (C=3) below the signal — a library-packing difference, not a promotion
+// bug, and within the core's X64 lab the same kernels are bit-identical to that lab's own
+// order-A baseline.
+//
+// So this file asserts bit-identity where bit-identity is claimed and an error floor where it
+// is not, rather than relaxing one test until it passes everywhere. The AVX2 bound is set
+// with margin below the documented figure (kAvx2FloorDb), and the measured value is reported
+// on every comparison so a regression shows up as a number rather than as a pass.
 //
 // WHY THIS FILE IS NOT PART OF run_tests UPSTREAM
 // ----------------------------------------------
@@ -26,13 +41,15 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
 
-// These must be included BEFORE the guard below: a2_planar.h is what defines NAM_A2_PLANAR,
-// and it only does so where the kernels exist (AArch64, or ARMv7 with NEON + FMA). Both
-// headers are empty no-ops when NAM_ENABLE_A2_FAST is undefined.
+// These must be included BEFORE the guard below: a2_planar.h is what defines NAM_A2_PLANAR
+// and NAM_A2_PLANAR_AVX2, and it only does so where the kernels exist (AArch64, ARMv7 with
+// NEON + FMA, or x86_64 with AVX2 + FMA). Both headers are empty no-ops when
+// NAM_ENABLE_A2_FAST is undefined.
 #include "NAM/wavenet/a2_fast.h"
 #include "NAM/wavenet/a2_planar.h"
 
@@ -72,9 +89,39 @@ std::vector<NAM_SAMPLE> render(nam::DSP& dsp, const std::vector<NAM_SAMPLE>& inp
   return out;
 }
 
+#if defined(NAM_A2_PLANAR_AVX2)
+
+// The error floor the AVX2 kernels are held to, relative to the signal. The core documents
+// ~133 dB (C=8) and ~139 dB (C=3) against Eigen-backed a2_fast; 120 dB keeps a margin below
+// the worse of the two so toolchain-to-toolchain wobble is not a failure, while still being
+// far tighter than anything an actual kernel bug would produce.
+constexpr double kAvx2FloorDb = -120.0;
+
+// 20*log10(rms(error) / rms(reference)), accumulated in double whatever NAM_SAMPLE is. Returns
+// -infinity for an exact match so the bit-identical case reads as "better than the floor".
+double error_db(const std::vector<NAM_SAMPLE>& reference, const std::vector<NAM_SAMPLE>& actual)
+{
+  double err = 0.0;
+  double sig = 0.0;
+  for (size_t i = 0; i < reference.size(); ++i)
+  {
+    const double r = static_cast<double>(reference[i]);
+    const double d = static_cast<double>(actual[i]) - r;
+    sig += r * r;
+    err += d * d;
+  }
+  if (err == 0.0)
+    return -std::numeric_limits<double>::infinity();
+  REQUIRE(sig > 0.0); // a silent reference would make the ratio meaningless
+  return 20.0 * std::log10(std::sqrt(err / sig));
+}
+
+#endif
+
 } // namespace
 
-TEST_CASE("planar A2 kernels are bit-identical to the reference A2FastModel")
+TEST_CASE("planar A2 kernels match the reference A2FastModel (bit-identical on ARM, at the "
+          "documented floor on AVX2)")
 {
 #if !defined(NAMCHAIN_A2_PARITY_O3)
   // Bit-identity is specifically an -O3 property, not merely "an optimised build": at -O2 the
@@ -87,7 +134,7 @@ TEST_CASE("planar A2 kernels are bit-identical to the reference A2FastModel")
   FAIL("the A2 planar parity gate is being required on a build that is not -O3, where the "
        "comparison is not meaningful; configure CMAKE_BUILD_TYPE=Release (see this file's header)");
   #else
-  MESSAGE("skipped: the planar bit-identity gate requires -O3; see this file's header");
+  MESSAGE("skipped: the planar parity gate requires -O3; see this file's header");
   #endif
   return;
 #else
@@ -125,6 +172,13 @@ TEST_CASE("planar A2 kernels are bit-identical to the reference A2FastModel")
       const auto actual = render(*planar, input, block_size);
       REQUIRE(expected.size() == actual.size());
 
+#if defined(NAM_A2_PLANAR_AVX2)
+      // Not bit-identical here, by the core's own account: hold the error to the documented
+      // floor instead, and print it either way so the margin is visible rather than implied.
+      const double db = error_db(expected, actual);
+      MESSAGE("channels=", channels, " block=", block_size, " error ", db, " dB");
+      CHECK(db <= kAvx2FloorDb);
+#else
       const bool identical = std::memcmp(expected.data(), actual.data(), expected.size() * sizeof(NAM_SAMPLE)) == 0;
       if (!identical)
       {
@@ -134,6 +188,7 @@ TEST_CASE("planar A2 kernels are bit-identical to the reference A2FastModel")
         MESSAGE("channels=", channels, " block=", block_size, " first difference at sample ", first);
       }
       CHECK(identical);
+#endif
     }
   }
 #endif
