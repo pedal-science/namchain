@@ -230,5 +230,7 @@ selects the planar kernels, because `a2_planar.h` gates its ARMv7 arm on
   do it, because the kernel selection is a compile-time macro.
 - **Check the configure summary against reality.** `NAMCHAIN_A2_PLANAR_ACTIVE` comes from a
   compile check that mirrors the header's gate (`CMakeLists.txt`), so an armv7 NEON build must
-  print "A2 planar NEON: ON". If it does not, the planar kernels are not in the binary whatever
-  the CPU is.
+  print "A2 planar: ON (NEON)". If it does not, the planar kernels are not in the binary whatever
+  the CPU is — on a build configured after 2026-11-03. Before that the check mirrored an ARM-only
+  gate and said `OFF` on x86-64 with the AVX2 kernels in the binary. The paths, the gate and the
+  rest of that story are in [a2-kernels.md](a2-kernels.md).

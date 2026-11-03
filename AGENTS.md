@@ -59,6 +59,9 @@ docker run --rm -v "$PWD:/src:ro" pedal-build:<snapshot> \
 
 - `plan.md` is the engine's own plan and history. It is long, so start at "How to resume".
 - `docs/`: `daemon.md` (run it, the protocol), `schema.md`, `rig-pipeline.md`,
+  `a2-kernels.md` (the two code paths that can render an A2 model — Eigen's GEMM and the planar
+  NEON/AVX2 kernels — which one a set of flags gives you, how to tell from a built tree, and why a
+  cost figure without its build is not a cost figure),
   `transitions.md`, `assets.md`, `macros.md`, `tuning.md`, `sessions.md` (recording a client and
   replaying it: `tools/session/`), `floweq.md` (`nc.eq.flow`: flowEQ's model, its design and its
   report, and the BSD-3 provenance the generated weight table carries), `tuner.md` (`nc.tuner`:

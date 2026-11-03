@@ -473,22 +473,44 @@ endif()
 # Summary
 # ---------------------------------------------------------------------------
 # Mirror the preprocessor gate in NAM/wavenet/a2_planar.h rather than guessing from the
-# processor name: armv7 builds get the planar kernels only with NEON and FMA enabled.
+# processor name: armv7 builds get the planar kernels only with NEON and FMA enabled, and x86-64
+# builds only with AVX2 and FMA.
 #
 # The kernels come from the vendored core itself (rikkus/OptimisationWorkOnNeuralAmpModelerCore,
 # branch all-optimisations), not from a vendor patch, so this is gated on NAMCHAIN_A2_FAST alone.
+#
+# The AVX2 arm was missing here from 2026-11-02, when core 97d7cd4 added it to the header, until
+# 2026-11-03: an x86-64 build reported "A2 planar: OFF" while the AVX2 kernels were in the binary
+# and running, and docs/tuning.md tells the reader to trust this summary. The check's cache
+# variable is renamed with it, because check_cxx_source_compiles caches by variable name and an
+# existing build tree would otherwise keep its answer to the old question.
 set(NAMCHAIN_A2_PLANAR_ACTIVE OFF)
+set(NAMCHAIN_A2_PLANAR_ISA "")
 if(NAMCHAIN_A2_FAST)
   include(CheckCXXSourceCompiles)
   check_cxx_source_compiles("
 #if defined(__aarch64__)
 #elif defined(__arm__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA)
+#elif defined(__AVX2__) && defined(__FMA__)
 #else
 #error no planar kernels
 #endif
-int main() { return 0; }" NAMCHAIN_A2_PLANAR_TARGET)
-  if(NAMCHAIN_A2_PLANAR_TARGET)
+int main() { return 0; }" NAMCHAIN_A2_PLANAR_KERNEL_TARGET)
+  if(NAMCHAIN_A2_PLANAR_KERNEL_TARGET)
     set(NAMCHAIN_A2_PLANAR_ACTIVE ON)
+    # Which body is compiled, so the summary names it: a2_planar.cpp (NEON) or
+    # a2_planar_avx2.cpp. Worth one more compile, because "ON" alone was what made the stale
+    # check above hard to notice.
+    check_cxx_source_compiles("
+#if !defined(__AVX2__) || !defined(__FMA__)
+#error not avx2
+#endif
+int main() { return 0; }" NAMCHAIN_A2_PLANAR_IS_AVX2)
+    if(NAMCHAIN_A2_PLANAR_IS_AVX2)
+      set(NAMCHAIN_A2_PLANAR_ISA " (AVX2)")
+    else()
+      set(NAMCHAIN_A2_PLANAR_ISA " (NEON)")
+    endif()
   endif()
 endif()
 
@@ -504,6 +526,6 @@ endif()
 message(STATUS "namchain ${PROJECT_VERSION}")
 message(STATUS "  NAM core:        ${NAMCHAIN_NAM_CORE_DIR}")
 message(STATUS "  A2 fast path:    ${NAMCHAIN_A2_FAST}")
-message(STATUS "  A2 planar NEON:  ${NAMCHAIN_A2_PLANAR_ACTIVE}")
+message(STATUS "  A2 planar:       ${NAMCHAIN_A2_PLANAR_ACTIVE}${NAMCHAIN_A2_PLANAR_ISA}")
 message(STATUS "  float samples:   ${NAMCHAIN_SAMPLE_FLOAT}")
 message(STATUS "  RTSan:           ${NAMCHAIN_RTSAN}")
