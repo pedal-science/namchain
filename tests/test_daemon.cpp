@@ -4649,9 +4649,14 @@ TEST_CASE("levels_first_frame measures one frame per period, and the engine stil
   // `frames <= 1` was the earlier form of that claim, and it was a claim about the *reader* as much
   // as the engine: it holds only while a poll keeps up with a 1.33 ms period. A read that lands after
   // two periods has two frames in it, and under qemu -- where a socket round trip can span a hundred
-  // periods -- it has a hundred. The reply's own `blocks` is the number to compare against, and it
-  // is the same snapshot as `frames`: both are read by the control thread in `build_levels_json`.
-  // An unchanged `blocks` means the 8 Hz cache answered again with the window already checked.
+  // periods -- it has a hundred. So the replies' `blocks` are the numbers to compare against, but not
+  // the reply's own alone. `build_levels_json` reads `blocks` just before it drains the window, and the
+  // render thread does not stop in between, so a window can honestly hold more frames than its own
+  // reply's `blocks` moved by: 3 against 2, under qemu on a busy runner (2026-11-03). What holds exactly
+  // is one read wider on each side. A window began no earlier than the previous reply's `blocks`, and
+  // ended no later than the next one's, which was read after this window was drained. So each window is
+  // checked when the next arrives. An unchanged `blocks` means the 8 Hz cache answered again with the
+  // window already checked.
   //
   // The read also has to be *taken* when a window has samples in it, and every read empties the
   // probes (level.h), so a single read can legitimately land between two blocks and be empty.
@@ -4663,7 +4668,15 @@ TEST_CASE("levels_first_frame measures one frame per period, and the engine stil
   // The chain's contents are asserted where the samples are: inside the loop, once there are some.
   bool saw_frames = false;
   std::string last_seen;
-  uint64_t blocks_at_last_read = 0;
+  uint64_t blocks_before_last_window = 0;
+  uint64_t blocks_of_last_window = 0;
+  uint64_t frames_of_last_window = 0;
+  const auto bound_last_window = [&](const uint64_t blocks) {
+    CHECK(frames_of_last_window <= blocks - blocks_before_last_window);
+    blocks_before_last_window = blocks_of_last_window;
+    blocks_of_last_window = blocks;
+    frames_of_last_window = 0;
+  };
   const auto deadline = std::chrono::steady_clock::now() + kWaitBudget;
   while (!saw_frames && std::chrono::steady_clock::now() < deadline)
   {
@@ -4673,8 +4686,9 @@ TEST_CASE("levels_first_frame measures one frame per period, and the engine stil
     CHECK(levels["cache"]["first_frame"] == true);
     CHECK(levels["chains"].size() <= 1);
     const uint64_t blocks = levels["blocks"].get<uint64_t>();
-    const uint64_t elapsed = blocks > blocks_at_last_read ? blocks - blocks_at_last_read : 0;
-    blocks_at_last_read = blocks;
+    const bool new_window = blocks != blocks_of_last_window;
+    if (new_window)
+      bound_last_window(blocks);
     if (levels["chains"].empty())
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -4685,10 +4699,9 @@ TEST_CASE("levels_first_frame measures one frame per period, and the engine stil
       const uint64_t frames = node["frames"].get<uint64_t>();
       // The output node has no output port, so nothing is measured at it and it stays 0. A measured
       // node folds one frame per block, so its window cannot be longer than the blocks the device
-      // rendered since the previous window was drained. When `blocks` did not move, the cache
-      // answered with the window already checked, and there is nothing new to compare.
-      if (elapsed > 0)
-        CHECK(frames <= elapsed);
+      // rendered across it (bound_last_window, on the next read).
+      if (new_window)
+        frames_of_last_window = std::max(frames_of_last_window, frames);
       if (frames > 0)
         saw_frames = true;
     }
@@ -4699,6 +4712,13 @@ TEST_CASE("levels_first_frame measures one frame per period, and the engine stil
     }
   }
   CHECK_MESSAGE(saw_frames, "no window ever reported the sparse frames this mode measures; last: " << last_seen);
+
+  // The window that ended the loop is the one with frames in it, and bounding it takes one more read.
+  const auto next = nlohmann::json::parse(call(config.socket_path, R"({"id":"l","method":"engine.levels"})"));
+  REQUIRE(next["ok"] == true);
+  const uint64_t blocks_after = next["levels"]["blocks"].get<uint64_t>();
+  if (blocks_after != blocks_of_last_window)
+    bound_last_window(blocks_after);
 
   // The engine is otherwise untouched: it is running, with its rig, and the device is still moving
   // audio through it. Turning the measurement down must not turn the pedal down.
