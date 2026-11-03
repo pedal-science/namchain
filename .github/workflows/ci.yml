@@ -32,6 +32,25 @@ jobs:
         # (Eigen path) is visible.
         run: ctest --test-dir build -R golden_a2_lite -V
 
+  # With assertions on. A bad nlohmann::json lookup, a missing key on a const object, is undefined
+  # behaviour in Release: a read past the map, and an intermittent failure in the sanitizer jobs
+  # that took weeks to name. Here it aborts at the same line every time.
+  debug-assertions:
+    name: linux-x86_64 (Debug, assertions on)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: cmake -S . -B build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build-debug --target namchain-tests -j"$(nproc)"
+      - name: Test
+        run: ./build-debug/namchain-tests
+
   # RealtimeSanitizer flags allocations/locks/syscalls on the render path (plan.md §10.4).
   # It requires clang >= 20: Ubuntu 24.04's default clang 18 rejects -fsanitize=realtime
   # with "unsupported argument 'realtime' to option '-fsanitize='".

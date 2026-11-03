@@ -68,7 +68,14 @@ The one thing to re-check when next on piv: nothing here is a performance number
 changed, so a `--tests` run on the board and one switch under the soak are worth having before the
 next deploy.
 
-**One unexplained TSan report, not yet reproducible (2026-10-22).** Two of three Linux TSan runs at
+**One unexplained TSan report (2026-10-22), explained 2026-11-03: a bug in the test, not the engine.**
+`node["role"]` on a `const` JSON object with no such key is undefined behaviour in nlohmann's
+`operator[]`: an assertion when assertions are on, and in Release a read past the end of the map, of
+whatever memory lies beyond it. That is why the "freed block" was the daemon thread's, which the test
+could not share. In the end it was a neighbour on the heap; the bug became a segfault under RTSan on
+2026-11-01. In a Debug build it aborts every time, at that line. The same test's `node["bypass"]` had
+the same fault. With both fixed the whole suite passes with assertions on, and CI now has a job that
+runs it that way. What follows is what was known at the time. Two of three Linux TSan runs at
 72f58d0/1435425 reported a single heap-use-after-free, always the same read: the macros test's
 `node["role"]` on its own `rig.get` reply, against a free by the daemon thread's JSON destructor in
 `handle_request`. All 395 cases pass, and the report does not reproduce on this Mac in ten full

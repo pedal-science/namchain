@@ -1,0 +1,15 @@
+# What a push adds must not name a private network detail. The rule and the patterns are in
+# pedal.project: scripts/public-check, and the workflow this calls.
+name: public-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  public-check:
+    uses: pedal-science/pedal.project/.github/workflows/public-check.yml@main

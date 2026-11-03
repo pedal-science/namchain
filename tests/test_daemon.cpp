@@ -3537,7 +3537,10 @@ TEST_CASE("a document with macros renders, reports both views, and is patched by
   bool saw_minted_id = false;
   for (const auto& node : lowered)
   {
-    saw_role = saw_role || node["role"] == "line";
+    // Not every node has a role, and operator[] on a const json with a missing key is undefined
+    // behaviour: it reads past the map, which is what the sanitizer jobs reported as a heap-use-after-free
+    // and a segfault in this test, intermittently, whenever the memory beyond it had been freed.
+    saw_role = saw_role || node.value("role", std::string{}) == "line";
     saw_minted_id = saw_minted_id || node["id"] == "dly:line";
   }
   CHECK(saw_role);
@@ -3622,7 +3625,7 @@ TEST_CASE("a document with macros renders, reports both views, and is patched by
   CHECK(bypassed["document"]["chains"][0]["nodes"][1]["bypass"] == true); // the eq rig: nodes[1] is the macro
   bool every_band_bypassed = true;
   for (const auto& node : bypassed["lowered"][0]["nodes"])
-    every_band_bypassed = every_band_bypassed && (node["bypass"] == true || node["type"] == "nc.input" ||
+    every_band_bypassed = every_band_bypassed && (node.value("bypass", false) || node["type"] == "nc.input" ||
                                                   node["type"] == "nc.output");
   CHECK(every_band_bypassed);
 

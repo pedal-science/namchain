@@ -1,0 +1,13 @@
+# Paths pedal.project/scripts/public-check leaves alone, each with its reason. Anything else that
+# matches stops a push. Prefer masking a value to adding a line here.
+
+# Logs from before the check, which record the board's MAC address. They stay as they are: the
+# owner's decision, 2026-11-03.
+bench-results/host-confine-*
+bench-results/host-slim-*
+bench-results/piv-ab-*
+bench-results/piv-cab-*
+bench-results/piv-cx-*
+bench-results/piv-d3*
+bench-results/piv-vm*
+bench-results/rt-piv-*
