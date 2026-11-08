@@ -29,6 +29,9 @@ Then point ljoss at `127.0.0.1:47811` with the device's usual token, edit, and p
   never written.** `engine.hello` isn't recorded at all, since the replay does its own.
 - Replies pass back unchanged. The file keeps only a summary of each: `ok`, `kind`, `generation`,
   the error code, and how long it took.
+- Event frames (a client that subscribed, docs/daemon.md "Events") pass back unchanged too, and are
+  not recorded: they answer no request, so they are told apart by `event` and never paired with one.
+  A replay does not subscribe.
 - The file is written a line at a time, so a recording that is interrupted is still a session.
 - A client that reconnects is recorded on the same timeline, with its connection number (`conn`).
   A replay sends everything on one connection.

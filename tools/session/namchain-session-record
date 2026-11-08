@@ -133,6 +133,12 @@ class Recorder:
                 await client_writer.drain()
                 if not pending:
                     continue
+                try:  # an event frame answers no request (docs/daemon.md, "Events")
+                    message = json.loads(body)
+                    if "event" in message and "id" not in message:
+                        continue
+                except Exception:
+                    pass
                 method, sent, recorded = pending.pop(0)
                 if method == "engine.hello":
                     try:

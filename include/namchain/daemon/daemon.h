@@ -15,6 +15,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -84,7 +85,35 @@ struct Session
   bool authorized = true;
   /// Failed authentications on this connection. The transport closes it at \ref kMaxAuthFailures.
   unsigned auth_failures = 0;
+  /// This connection's number, handed back by `engine.hello` and named in the `origin` of every event
+  /// it causes. 0 is the engine itself (a reload, the startup rig), so a real connection starts at 1.
+  uint64_t id = 0;
+  /// What the client called itself in `engine.hello`: for an event's `origin`, and for a person
+  /// reading a log. Never trusted for anything.
+  std::string client_name;
+  std::string client_version;
+  std::string client_instance;
+
+  /// \brief What this connection asked to be told (docs/daemon.md, "Events").
+  struct Subscription
+  {
+    bool rig = false;    ///< rig.replaced, rig.patched
+    bool params = false; ///< rig.params
+    bool state = false;  ///< engine.state, engine.mute
+    bool assets = false; ///< engine.assets
+    bool echo = true;    ///< also the events this connection caused
+    bool documents = true;
+    unsigned min_interval_ms = 50;
+    bool any() const { return rig || params || state || assets; }
+  } subscription;
 };
+
+/// A connection's unsent events are capped here; past it they are dropped until it drains below
+/// \ref kEventLowWaterBytes, when it is sent one `resync`.
+inline constexpr std::size_t kEventHighWaterBytes = 256u * 1024;
+inline constexpr std::size_t kEventLowWaterBytes = 64u * 1024;
+/// How often the engine's state is compared for an `engine.state` event.
+inline constexpr unsigned kStateEventIntervalMs = 100;
 
 /// Failed authentications one connection is allowed before the daemon closes it.
 ///
@@ -609,7 +638,8 @@ private:
   /// A warm switch changes which document is audible without a publish, so the fields that describe
   /// "the running document" -- its rig, its chains, its cost, its plans -- have to move with it. The
   /// two compiled contents swap; nothing is recompiled and nothing is freed. Control thread.
-  void sync_warm_switch();
+  /// \return true when it caught up with a switch (the running document changed).
+  bool sync_warm_switch();
   /// \brief The warm set, as `engine.status` reports it. Control thread.
   nlohmann::json warm_json() const;
   /// Which document holds \p content, or -1. Read by either thread: the lookup a control-thread
@@ -1024,7 +1054,55 @@ private:
     /// that reply has drained, so the peer is told *why* rather than seeing a bare hangup.
     bool close_after_flush = false;
     std::string peer; ///< for logging: `unix`, or `127.0.0.1:41234`
+
+    // --- events (docs/daemon.md, "Events") ---------------------------------
+    /// Event frames made but not yet moved into `out`. A queue of whole messages rather than bytes,
+    /// because on the datagram transport each one has to be its own send.
+    std::deque<std::string> events;
+    std::size_t event_bytes = 0;
+    /// Past the high-water mark: events are being dropped, and a `resync` is owed once it drains.
+    bool overflowed = false;
+    /// Ramped values waiting to be coalesced into one `rig.params` frame, in the order they first
+    /// moved; `param_slots` finds a value's entry by its chain, address and parameter.
+    std::vector<nlohmann::json> params;
+    std::vector<std::string> param_keys;
+    std::chrono::steady_clock::time_point params_sent{};
   };
+  /// \name Events
+  /// Control thread only, like everything else about connections.
+  /// @{
+  /// Who caused what \p session is doing now: its number, its name, and the request's tag.
+  nlohmann::json origin_of(const Session& session, const std::string& tag) const;
+  /// Send \p frame to every connection subscribed to \p kind ("rig", "state", "assets"), except the
+  /// one numbered \p origin when it asked not to be echoed. \p without_document is the same frame
+  /// for a connection that said `documents: false`; empty means the frame has no document.
+  void emit_event(const char* kind, const nlohmann::json& frame, uint64_t origin,
+                  const nlohmann::json& without_document = nlohmann::json());
+  /// Queue one ramped value for every `params` subscriber; it is sent coalesced.
+  void emit_param(const nlohmann::json& value, const std::string& key, uint64_t origin);
+  /// Queue one frame on \p connection, minding the cap.
+  void enqueue_event(Connection& connection, std::string frame);
+  /// Turn \p connection's waiting values into one `rig.params` frame, now.
+  void flush_params(Connection& connection);
+  /// Move queued events into the outbox as far as the socket takes them. \return false when the
+  /// peer has gone.
+  bool pump_events(Connection& connection);
+  /// The loop's half: send values that are due, owe `resync`s, compare the state, pump.
+  void flush_subscriptions();
+  /// How long the loop may sleep before a waiting value is due, capped at \p cap.
+  int subscription_timeout(int cap) const;
+  /// The fields of `engine.state`, without the counters that move every block.
+  nlohmann::json state_snapshot();
+  /// What identifies the running document for "did anything change": its path, source and contents.
+  std::string document_identity() const;
+  /// After a replacement: if the document is not what it was (\p before), move `seq` and say so.
+  void note_replaced(const char* why, const std::string& before, const nlohmann::json& origin,
+                     uint64_t origin_id);
+  /// The `engine.assets` event, after a rescan.
+  void note_assets(const nlohmann::json& origin, uint64_t origin_id);
+  /// The health issues: stable codes, severities and counts (engine.status's `issues`).
+  nlohmann::json issues_json();
+  /// @}
 
   Config config_;
   /// The device's model and IR library (slice D). Control thread only: it is read when a document is
@@ -1101,6 +1179,13 @@ private:
   /// Every open control connection, on both transports. A vector rather than a fixed array because a
   /// connection is created and destroyed at runtime and nothing on the render path ever sees it.
   std::vector<Connection> clients_;
+  /// The next connection's number (Session::id). 0 is the engine itself.
+  uint64_t next_connection_id_ = 1;
+  /// The document sequence: one per change to the running document (docs/daemon.md, `seq`).
+  uint64_t doc_seq_ = 0;
+  /// The last `engine.state` sent, and when it was last compared.
+  nlohmann::json last_state_;
+  std::chrono::steady_clock::time_point state_checked_{};
   std::string current_rig_;
   /// How the running document arrived: `"file"`, `"applied"`, or empty before anything is loaded.
   std::string current_source_;

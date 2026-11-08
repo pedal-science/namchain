@@ -126,7 +126,8 @@ nlohmann::json protocol_features(bool measure_levels)
                                                    "smooth_params", "bypass", "guard",
                                                    "per_chain_mute", "schema", "tcp_transport",
                                                    "assets", "record", "local_transitions", "meta",
-                                                   "bypass_ramp", "cost", "node_state"});
+                                                   "bypass_ramp", "cost", "node_state", "events",
+                                                   "client_name", "op_tag", "if_seq"});
   if (measure_levels)
     features.push_back("levels");
   return features;
@@ -1131,6 +1132,7 @@ void Daemon::accept_connections(int listener, PeerKind peer)
         connection.has_auth_deadline = true;
       }
     }
+    connection.session.id = next_connection_id_++;
     clients_.push_back(std::move(connection));
   }
 }
@@ -1176,6 +1178,300 @@ bool Daemon::write_connection(Connection& connection)
   connection.out.clear();
   connection.out_sent = 0;
   return !connection.close_after_flush;
+}
+
+// --- events (docs/daemon.md, "Events") -------------------------------------
+//
+// Everything here runs on the control thread, after the change it describes has been made: an event
+// is a report, never part of the change, so a slow or absent subscriber can delay nothing but its own
+// events. The render thread is not involved at all.
+
+nlohmann::json Daemon::origin_of(const Session& session, const std::string& tag) const
+{
+  nlohmann::json origin;
+  origin["connection"] = session.id;
+  origin["client"] = session.id == 0 ? std::string("namchaind") : session.client_name;
+  if (!tag.empty())
+    origin["tag"] = tag;
+  return origin;
+}
+
+void Daemon::enqueue_event(Connection& connection, std::string frame)
+{
+  if (connection.overflowed)
+    return; // dropped until it drains; a resync is owed (flush_subscriptions)
+  const std::size_t unsent = connection.out.size() - connection.out_sent;
+  if (unsent + connection.event_bytes + frame.size() > kEventHighWaterBytes)
+  {
+    // What is waiting is dropped with it: a client that missed one event cannot use the ones after it
+    // without reading the state again, and holding them would only cost this daemon the memory.
+    connection.events.clear();
+    connection.event_bytes = 0;
+    connection.params.clear();
+    connection.param_keys.clear();
+    connection.overflowed = true;
+    return;
+  }
+  connection.event_bytes += frame.size();
+  connection.events.push_back(std::move(frame));
+}
+
+void Daemon::flush_params(Connection& connection)
+{
+  if (connection.params.empty())
+    return;
+  nlohmann::json frame;
+  frame["event"] = "rig.params";
+  uint64_t seq = 0;
+  for (const nlohmann::json& value : connection.params)
+    seq = std::max<uint64_t>(seq, value.value("seq", uint64_t{0}));
+  frame["seq"] = seq;
+  frame["values"] = std::move(connection.params);
+  connection.params.clear();
+  connection.param_keys.clear();
+  connection.params_sent = std::chrono::steady_clock::now();
+  enqueue_event(connection, frame.dump());
+}
+
+void Daemon::emit_event(const char* kind, const nlohmann::json& frame, uint64_t origin,
+                        const nlohmann::json& without_document)
+{
+  const std::string k = kind;
+  std::string full;
+  std::string slim;
+  for (Connection& connection : clients_)
+  {
+    const Session::Subscription& sub = connection.session.subscription;
+    const bool wanted = (k == "rig" && sub.rig) || (k == "state" && sub.state) || (k == "assets" && sub.assets);
+    if (!wanted)
+      continue;
+    if (!sub.echo && origin != 0 && connection.session.id == origin)
+      continue;
+    // Values waiting to be coalesced go first: a value must never arrive after the document it
+    // belonged to has been replaced.
+    flush_params(connection);
+    if (!sub.documents && !without_document.is_null())
+    {
+      if (slim.empty())
+        slim = without_document.dump();
+      enqueue_event(connection, slim);
+    }
+    else
+    {
+      if (full.empty())
+        full = frame.dump();
+      enqueue_event(connection, full);
+    }
+  }
+}
+
+void Daemon::emit_param(const nlohmann::json& value, const std::string& key, uint64_t origin)
+{
+  for (Connection& connection : clients_)
+  {
+    const Session::Subscription& sub = connection.session.subscription;
+    if (!sub.params || connection.overflowed)
+      continue;
+    if (!sub.echo && origin != 0 && connection.session.id == origin)
+      continue;
+    // The value waiting under the same key is replaced in place, so the order a value first moved in
+    // is the order it is sent in, and only the newest of a stream is ever sent.
+    bool replaced = false;
+    for (std::size_t i = 0; i < connection.param_keys.size(); ++i)
+    {
+      if (connection.param_keys[i] == key)
+      {
+        connection.params[i] = value;
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced)
+    {
+      // A bounded wait list: past this many distinct values it is sent now rather than grown.
+      if (connection.params.size() >= 256)
+        flush_params(connection);
+      connection.params.push_back(value);
+      connection.param_keys.push_back(key);
+    }
+  }
+}
+
+bool Daemon::pump_events(Connection& connection)
+{
+  const bool framed = peer_is_framed(connection.session.peer);
+  while (!connection.events.empty())
+  {
+    // One datagram per message: an event waits until the one before it (or the reply) has gone.
+    if (!framed && connection.out_sent < connection.out.size())
+      return true;
+    if (!framed)
+    {
+      connection.out.clear();
+      connection.out_sent = 0;
+    }
+    std::string frame = std::move(connection.events.front());
+    connection.events.pop_front();
+    connection.event_bytes -= frame.size();
+    if (framed)
+      append_frame(connection.out, frame);
+    else
+      connection.out.assign(frame.begin(), frame.end());
+    if (!write_connection(connection))
+      return false;
+  }
+  return true;
+}
+
+void Daemon::flush_subscriptions()
+{
+  const auto now = std::chrono::steady_clock::now();
+
+  bool anyone_watches_state = false;
+  for (const Connection& connection : clients_)
+    anyone_watches_state = anyone_watches_state || connection.session.subscription.state;
+  if (anyone_watches_state && now - state_checked_ >= std::chrono::milliseconds(kStateEventIntervalMs))
+  {
+    state_checked_ = now;
+    nlohmann::json snapshot = state_snapshot();
+    if (snapshot != last_state_)
+    {
+      last_state_ = snapshot;
+      nlohmann::json frame = snapshot;
+      frame["event"] = "engine.state";
+      emit_event("state", frame, 0);
+    }
+  }
+
+  std::vector<std::size_t> dead;
+  for (std::size_t i = 0; i < clients_.size(); ++i)
+  {
+    Connection& connection = clients_[i];
+    if (!connection.session.subscription.any() && connection.events.empty())
+      continue;
+    if (connection.overflowed)
+    {
+      const std::size_t unsent = connection.out.size() - connection.out_sent;
+      if (unsent < kEventLowWaterBytes)
+      {
+        connection.overflowed = false;
+        enqueue_event(connection, nlohmann::json({{"event", "resync"}, {"seq", doc_seq_}}).dump());
+      }
+    }
+    if (!connection.params.empty() &&
+        now - connection.params_sent >= std::chrono::milliseconds(connection.session.subscription.min_interval_ms))
+      flush_params(connection);
+    if (!pump_events(connection))
+      dead.push_back(i);
+  }
+  for (std::size_t i = dead.size(); i-- > 0;)
+    close_connection(dead[i]);
+}
+
+int Daemon::subscription_timeout(int cap) const
+{
+  const auto now = std::chrono::steady_clock::now();
+  int timeout = cap;
+  for (const Connection& connection : clients_)
+  {
+    if (connection.params.empty())
+      continue;
+    const auto due = connection.params_sent +
+                     std::chrono::milliseconds(connection.session.subscription.min_interval_ms);
+    const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(due - now).count();
+    timeout = std::min<int>(timeout, static_cast<int>(std::max<long long>(0, wait)));
+  }
+  return timeout;
+}
+
+nlohmann::json Daemon::state_snapshot()
+{
+  nlohmann::json state;
+  state["state"] = device_state_name(device_state());
+  nlohmann::json issues = nlohmann::json::array();
+  const char* health = "ok";
+  for (const nlohmann::json& issue : issues_json())
+  {
+    // The counts move with every dropout; what a light binds to is which issues there are.
+    nlohmann::json entry;
+    entry["code"] = issue["code"];
+    entry["severity"] = issue["severity"];
+    if (issue.contains("chain"))
+      entry["chain"] = issue["chain"];
+    if (issue.contains("node"))
+      entry["node"] = issue["node"];
+    issues.push_back(std::move(entry));
+    if (issue["severity"] == "error")
+      health = "error";
+    else if (issue["severity"] == "warn" && std::string(health) != "error")
+      health = "warn";
+  }
+  state["health"] = health;
+  state["issues"] = std::move(issues);
+  state["rig"] = current_rig_;
+  state["name"] = current_name_;
+  state["generation"] = generation_;
+  state["audible_generation"] = active_document().adopted_generation.load();
+  state["mute"] = mute_.load();
+  if (warm_enabled())
+  {
+    const nlohmann::json warm = warm_json();
+    nlohmann::json set = nlohmann::json::array();
+    for (const nlohmann::json& entry : warm["set"])
+    {
+      set.push_back({{"rig", entry.value("rig", std::string())},
+                     {"name", entry.value("name", std::string())},
+                     {"state", entry["state"]},
+                     {"verdict", entry.value("verdict", std::string())}});
+    }
+    state["warm"] = {{"set", std::move(set)}, {"pressure_holding", warm["pressure_holding"]}};
+  }
+  state["cost"] = {{"cost", cost_.cost},
+                   {"effective", cost_.cost * cost_table_.coexistence_factor(warm_documents())},
+                   {"over", cost_.over},
+                   {"verdict", cost_.verdict},
+                   {"lite_first", cost_.lite_first}};
+  return state;
+}
+
+std::string Daemon::document_identity() const
+{
+  if (current_document_.chains.empty())
+    return current_rig_ + "\n" + current_source_;
+  return current_rig_ + "\n" + current_source_ + "\n" + graph::document_to_json(current_document_);
+}
+
+void Daemon::note_replaced(const char* why, const std::string& before, const nlohmann::json& origin,
+                           uint64_t origin_id)
+{
+  if (!before.empty() && before == document_identity())
+    return; // a fixed point: nothing changed, so nothing moves and nobody is told
+  ++doc_seq_;
+  nlohmann::json frame;
+  frame["event"] = "rig.replaced";
+  frame["seq"] = doc_seq_;
+  frame["generation"] = generation_;
+  frame["why"] = why;
+  frame["origin"] = origin;
+  frame["rig"] = current_rig_;
+  frame["source"] = current_source_;
+  frame["name"] = current_name_;
+  nlohmann::json slim = frame;
+  frame["document"] = current_document_.chains.empty()
+                        ? nlohmann::json()
+                        : nlohmann::json::parse(graph::document_to_json(current_document_));
+  emit_event("rig", frame, origin_id, slim);
+}
+
+void Daemon::note_assets(const nlohmann::json& origin, uint64_t origin_id)
+{
+  nlohmann::json frame;
+  frame["event"] = "engine.assets";
+  frame["origin"] = origin;
+  frame["models"] = assets_.of_kind(assets::Kind::Model).size();
+  frame["irs"] = assets_.of_kind(assets::Kind::Ir).size();
+  frame["scan"] = assets_.scans();
+  emit_event("assets", frame, origin_id);
 }
 
 void Daemon::close_connection(std::size_t index)
@@ -3587,12 +3883,12 @@ bool Daemon::warm_pressure_holds() const
   return warm_pressure_cools_ > 0 && std::chrono::steady_clock::now() < warm_pressure_until_;
 }
 
-void Daemon::sync_warm_switch()
+bool Daemon::sync_warm_switch()
 {
   const int audible = active_doc_.load(std::memory_order_acquire);
   const uint64_t audible_content = docs_[audible].content.load(std::memory_order_acquire);
   if (!warm_entry_.present || audible_content == 0 || audible_content != warm_entry_.generation)
-    return;
+    return false;
 
   // A warm switch changes which document is audible without a publish, so everything that describes
   // "the running document" moves with it: the rig, its document, its plans, its cost. The two
@@ -3629,6 +3925,7 @@ void Daemon::sync_warm_switch()
   // `generation_` is deliberately not moved: it is the last content *allocated*, and a switch does
   // not allocate. What the device is hearing is `audible_generation`, and `rig.switch`'s reply
   // carries the content id a client should use.
+  return true;
 }
 
 nlohmann::json Daemon::warm_json() const
@@ -3937,6 +4234,7 @@ bool Daemon::start(std::string& error)
       close_transport();
       return false;
     }
+    note_replaced("startup", std::string(), origin_of(Session{}, std::string()), 0);
   }
 
   running_.store(true);
@@ -5993,6 +6291,189 @@ void Daemon::run_chains_entry(void* context, unsigned participant, unsigned part
 // Control loop and protocol
 // ---------------------------------------------------------------------------
 
+// The health summary, as engine.status reports it and engine.state compares it.
+// The health summary: one field for a light to bind to, and the reasons behind it as stable codes a
+// client maps to its own words rather than parsing (docs/ui-integration-plan.md §1.6). Issues are
+// *current state*: one that stops being true disappears, which is why the cumulative counters are
+// not what this reads.
+nlohmann::json Daemon::issues_json()
+{
+  nlohmann::json issues = nlohmann::json::array();
+  const auto add = [&issues](const char* code, const char* severity, std::string message, uint64_t count,
+                             const std::string& chain = std::string(), const std::string& node = std::string()) {
+    nlohmann::json issue;
+    issue["code"] = code;
+    issue["severity"] = severity;
+    issue["message"] = std::move(message);
+    issue["count"] = count;
+    if (!chain.empty())
+      issue["chain"] = chain;
+    if (!node.empty())
+      issue["node"] = node;
+    issues.push_back(std::move(issue));
+  };
+
+  if (device_state() == DeviceState::Lost)
+  {
+    add("device_lost", "error",
+        "the audio device is not open; the render thread is retrying every " +
+          std::to_string(config_.device_retry_ms) + " ms",
+        device_lost_.load());
+  }
+  for (std::size_t i = 0; i < current_document_.chains.size() && i < static_cast<std::size_t>(kMaxChains); ++i)
+  {
+    if (active_document().chains[i].failed_nodes.load() == 0)
+      continue;
+    std::string node;
+    if (published_slots_[i] != nullptr && published_slots_[i]->plan != nullptr)
+    {
+      const std::vector<std::string>& ids = published_slots_[i]->plan->node_ids();
+      for (std::size_t n = 0; n < ids.size() && n < active_document().chains[i].failed_nodes.load(); ++n)
+      {
+        // The first failed node is the useful one to name; the counters carry the rest.
+        if (published_slots_[i]->plan->node_failed(n))
+        {
+          node = ids[n];
+          break;
+        }
+      }
+    }
+    add("node_failed", "error",
+        "a node returned a non-finite sample and has been taken out of the signal path",
+        active_document().chains[i].guard_trips.load(), current_document_.chains[i].id, node);
+  }
+  // The warm set's own state: a rig nobody is hearing yet is not trouble, but a rig that is not
+  // current is exactly the thing the player would notice on the next press.
+  if (warm_enabled())
+  {
+    const uint64_t device_seq = input_sequence_published_.load(std::memory_order_relaxed);
+    for (int i = 0; i < kMaxDocuments; ++i)
+    {
+      const DocRuntime& doc = docs_[i];
+      if (doc.content.load(std::memory_order_acquire) == 0)
+        continue;
+      if (i == active_doc_.load(std::memory_order_acquire))
+        continue;
+      if (doc.warm_blocks.load(std::memory_order_relaxed) == 0)
+      {
+        add("warm_not_ready", "info", "a warmed rig has not rendered a block yet", 1);
+        continue;
+      }
+      const uint64_t rendered = doc.input_seq.load(std::memory_order_relaxed);
+      const uint64_t behind = device_seq > rendered ? device_seq - rendered : 0;
+      if (behind > config_.warm_max_behind_blocks)
+      {
+        add("warm_behind", "warn",
+            "the warm rig is " + std::to_string(behind) + " blocks behind the audible one, so a "
+            "switch to it would not be current",
+            behind);
+      }
+    }
+  }
+  if (recent_xruns_.load() > 0)
+    add("xruns", "warn", "the device has missed deadlines recently", recent_xruns_.load());
+  if (recent_render_errors_.load() > 0)
+    add("render_errors", "warn", "the render thread has reported errors recently", recent_render_errors_.load());
+  if (!rt_realtime_.load() && config_.rt_priority > 0)
+  {
+    add("not_realtime", "warn",
+        "the render thread is not running under the real-time policy that was asked for", 1);
+  }
+  if (config_.lock_memory && !memory_locked_.load() && device_state() != DeviceState::Closed)
+    add("memory_not_locked", "warn", "mlockall was refused, so the run is not pinned in memory", 1);
+  if (active_document().transition_active.load())
+    add("transition", "info", "a structural change is being crossfaded", 1);
+
+  // A block whose model or IR is not in the library plays as if bypassed. A warning, one per block,
+  // naming the block's element so a client can mark it: the rig plays, just not as written.
+  for (const assets::MissingAsset& miss : missing_assets_)
+  {
+    add("asset_missing", "warn", "node '" + miss.node + "' plays as if bypassed: " + miss.message, 1, miss.chain,
+        miss.node);
+    nlohmann::json& issue = issues.back();
+    issue["element"] = miss.element;
+    issue["param"] = miss.param;
+    issue["kind"] = assets::kind_name(miss.kind);
+    issue["reference"] = miss.reference;
+  }
+
+  // The cost table (docs/daemon.md, "Cost and admission"). A trimmed model is the table doing what
+  // it was configured to do -- a two-amp rig on a small core is not a fault -- so it is
+  // informational, but it names the block, because it sounds different from the model the rig names
+  // (D6). A document admitted over the headroom, and a unit charged `unknown`, are warnings: either
+  // may miss deadlines, and the second is what D8 says an unmeasured unit costs.
+  for (const CostedNode& node : cost_.nodes)
+  {
+    if (!node.slimmed && node.measured)
+      continue;
+    bool named = false;
+    if (node.slimmed)
+    {
+      add("model_slimmed", "info",
+          "node '" + node.node + "' plays its Lite model to fit the cost table: " + format_cost(node.cost) +
+            " of a core instead of " + format_cost(node.cost_full) + " (" + node.row + ")",
+          1, node.chain, node.node);
+      named = true;
+    }
+    else if (cost_.has_table)
+    {
+      // One warning per node with no row -- but only when the *device* has a table. A device with
+      // no table at all is one condition, not one per node, and `cost_table_missing` below already
+      // says it: a pedal whose light is amber for every rig it plays is a pedal whose light says
+      // nothing. With no table, `status.cost.nodes[].measured` is still false for every node, so
+      // the per-node truth is not lost, it is just not repeated.
+      add("cost_unknown", "warn",
+          "node '" + node.node + "' is charged the unknown cost " + format_cost(node.cost) +
+            " of a core: this device has no measured row for it (" + node.row +
+            "), so admission is guessing in the expensive direction (D8)",
+          1, node.chain, node.node);
+      named = true;
+    }
+    // Only this node's issue is annotated: a node that added none (an unmeasured unit on a device
+    // with no table) would otherwise annotate whatever issue happened to be last.
+    if (named)
+    {
+      issues.back()["element"] = node.element;
+      issues.back()["reference"] = node.reference;
+      issues.back()["row"] = node.row;
+    }
+  }
+  if (cost_.over)
+  {
+    add("cost_over", "warn",
+        "the document's units cost " + format_cost(cost_.cost) + " of a core together, over the " +
+          format_cost(cost_.headroom) + " a rig may have, so the render may miss deadlines: " +
+          describe_costs(cost_, current_document_.chains.size() > 1),
+        1);
+  }
+  if (!cost_.has_table)
+  {
+    // Informational, not a warning: D8 makes an unmeasured device safe (every unit is charged its
+    // unknown, expensive value and a rig that does not fit is refused), so a pedal with no table
+    // plays and does not miss deadlines -- it just cannot play what it has not measured.
+    add("cost_table_missing", "info",
+        "there is no readable cost table at '" + cost_.table +
+          "', so every unit is charged its unknown cost: measure this device (scripts/measure-core) and "
+          "install devices/<host>/cost.json",
+        0);
+  }
+
+  // A library root that is configured and not there is worth saying out loud: the palette is empty,
+  // and "no amps installed" and "the amps directory moved" look identical from a client otherwise.
+  // Informational, not a warning: a device with no IRs is a device with no IRs.
+  for (const assets::Kind kind : {assets::Kind::Model, assets::Kind::Ir})
+  {
+    const assets::Root& root = assets_.root(kind);
+    if (root.readable || root.path.empty())
+      continue;
+    add(kind == assets::Kind::Model ? "models_root_missing" : "irs_root_missing", "info",
+        "the " + std::string(assets::kind_name(kind)) +
+          " library is empty because its directory is not there: " + root.error + " (" + root.path + ")",
+        0);
+  }
+  return issues;
+}
+
 std::string Daemon::handle_request(const std::string& request)
 {
   Session session;
@@ -6009,186 +6490,6 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
   service_async_full();
   service_catch_up_report();
   clear_lite_first_when_adopted();
-  // The health summary: one field for a light to bind to, and the reasons behind it as stable codes a
-  // client maps to its own words rather than parsing (docs/ui-integration-plan.md §1.6). Issues are
-  // *current state*: one that stops being true disappears, which is why the cumulative counters are
-  // not what this reads.
-  auto issues_json = [this]() {
-    nlohmann::json issues = nlohmann::json::array();
-    const auto add = [&issues](const char* code, const char* severity, std::string message, uint64_t count,
-                               const std::string& chain = std::string(), const std::string& node = std::string()) {
-      nlohmann::json issue;
-      issue["code"] = code;
-      issue["severity"] = severity;
-      issue["message"] = std::move(message);
-      issue["count"] = count;
-      if (!chain.empty())
-        issue["chain"] = chain;
-      if (!node.empty())
-        issue["node"] = node;
-      issues.push_back(std::move(issue));
-    };
-
-    if (device_state() == DeviceState::Lost)
-    {
-      add("device_lost", "error",
-          "the audio device is not open; the render thread is retrying every " +
-            std::to_string(config_.device_retry_ms) + " ms",
-          device_lost_.load());
-    }
-    for (std::size_t i = 0; i < current_document_.chains.size() && i < static_cast<std::size_t>(kMaxChains); ++i)
-    {
-      if (active_document().chains[i].failed_nodes.load() == 0)
-        continue;
-      std::string node;
-      if (published_slots_[i] != nullptr && published_slots_[i]->plan != nullptr)
-      {
-        const std::vector<std::string>& ids = published_slots_[i]->plan->node_ids();
-        for (std::size_t n = 0; n < ids.size() && n < active_document().chains[i].failed_nodes.load(); ++n)
-        {
-          // The first failed node is the useful one to name; the counters carry the rest.
-          if (published_slots_[i]->plan->node_failed(n))
-          {
-            node = ids[n];
-            break;
-          }
-        }
-      }
-      add("node_failed", "error",
-          "a node returned a non-finite sample and has been taken out of the signal path",
-          active_document().chains[i].guard_trips.load(), current_document_.chains[i].id, node);
-    }
-    // The warm set's own state: a rig nobody is hearing yet is not trouble, but a rig that is not
-    // current is exactly the thing the player would notice on the next press.
-    if (warm_enabled())
-    {
-      const uint64_t device_seq = input_sequence_published_.load(std::memory_order_relaxed);
-      for (int i = 0; i < kMaxDocuments; ++i)
-      {
-        const DocRuntime& doc = docs_[i];
-        if (doc.content.load(std::memory_order_acquire) == 0)
-          continue;
-        if (i == active_doc_.load(std::memory_order_acquire))
-          continue;
-        if (doc.warm_blocks.load(std::memory_order_relaxed) == 0)
-        {
-          add("warm_not_ready", "info", "a warmed rig has not rendered a block yet", 1);
-          continue;
-        }
-        const uint64_t rendered = doc.input_seq.load(std::memory_order_relaxed);
-        const uint64_t behind = device_seq > rendered ? device_seq - rendered : 0;
-        if (behind > config_.warm_max_behind_blocks)
-        {
-          add("warm_behind", "warn",
-              "the warm rig is " + std::to_string(behind) + " blocks behind the audible one, so a "
-              "switch to it would not be current",
-              behind);
-        }
-      }
-    }
-    if (recent_xruns_.load() > 0)
-      add("xruns", "warn", "the device has missed deadlines recently", recent_xruns_.load());
-    if (recent_render_errors_.load() > 0)
-      add("render_errors", "warn", "the render thread has reported errors recently", recent_render_errors_.load());
-    if (!rt_realtime_.load() && config_.rt_priority > 0)
-    {
-      add("not_realtime", "warn",
-          "the render thread is not running under the real-time policy that was asked for", 1);
-    }
-    if (config_.lock_memory && !memory_locked_.load() && device_state() != DeviceState::Closed)
-      add("memory_not_locked", "warn", "mlockall was refused, so the run is not pinned in memory", 1);
-    if (active_document().transition_active.load())
-      add("transition", "info", "a structural change is being crossfaded", 1);
-
-    // A block whose model or IR is not in the library plays as if bypassed. A warning, one per block,
-    // naming the block's element so a client can mark it: the rig plays, just not as written.
-    for (const assets::MissingAsset& miss : missing_assets_)
-    {
-      add("asset_missing", "warn", "node '" + miss.node + "' plays as if bypassed: " + miss.message, 1, miss.chain,
-          miss.node);
-      nlohmann::json& issue = issues.back();
-      issue["element"] = miss.element;
-      issue["param"] = miss.param;
-      issue["kind"] = assets::kind_name(miss.kind);
-      issue["reference"] = miss.reference;
-    }
-
-    // The cost table (docs/daemon.md, "Cost and admission"). A trimmed model is the table doing what
-    // it was configured to do -- a two-amp rig on a small core is not a fault -- so it is
-    // informational, but it names the block, because it sounds different from the model the rig names
-    // (D6). A document admitted over the headroom, and a unit charged `unknown`, are warnings: either
-    // may miss deadlines, and the second is what D8 says an unmeasured unit costs.
-    for (const CostedNode& node : cost_.nodes)
-    {
-      if (!node.slimmed && node.measured)
-        continue;
-      bool named = false;
-      if (node.slimmed)
-      {
-        add("model_slimmed", "info",
-            "node '" + node.node + "' plays its Lite model to fit the cost table: " + format_cost(node.cost) +
-              " of a core instead of " + format_cost(node.cost_full) + " (" + node.row + ")",
-            1, node.chain, node.node);
-        named = true;
-      }
-      else if (cost_.has_table)
-      {
-        // One warning per node with no row -- but only when the *device* has a table. A device with
-        // no table at all is one condition, not one per node, and `cost_table_missing` below already
-        // says it: a pedal whose light is amber for every rig it plays is a pedal whose light says
-        // nothing. With no table, `status.cost.nodes[].measured` is still false for every node, so
-        // the per-node truth is not lost, it is just not repeated.
-        add("cost_unknown", "warn",
-            "node '" + node.node + "' is charged the unknown cost " + format_cost(node.cost) +
-              " of a core: this device has no measured row for it (" + node.row +
-              "), so admission is guessing in the expensive direction (D8)",
-            1, node.chain, node.node);
-        named = true;
-      }
-      // Only this node's issue is annotated: a node that added none (an unmeasured unit on a device
-      // with no table) would otherwise annotate whatever issue happened to be last.
-      if (named)
-      {
-        issues.back()["element"] = node.element;
-        issues.back()["reference"] = node.reference;
-        issues.back()["row"] = node.row;
-      }
-    }
-    if (cost_.over)
-    {
-      add("cost_over", "warn",
-          "the document's units cost " + format_cost(cost_.cost) + " of a core together, over the " +
-            format_cost(cost_.headroom) + " a rig may have, so the render may miss deadlines: " +
-            describe_costs(cost_, current_document_.chains.size() > 1),
-          1);
-    }
-    if (!cost_.has_table)
-    {
-      // Informational, not a warning: D8 makes an unmeasured device safe (every unit is charged its
-      // unknown, expensive value and a rig that does not fit is refused), so a pedal with no table
-      // plays and does not miss deadlines -- it just cannot play what it has not measured.
-      add("cost_table_missing", "info",
-          "there is no readable cost table at '" + cost_.table +
-            "', so every unit is charged its unknown cost: measure this device (scripts/measure-core) and "
-            "install devices/<host>/cost.json",
-          0);
-    }
-
-    // A library root that is configured and not there is worth saying out loud: the palette is empty,
-    // and "no amps installed" and "the amps directory moved" look identical from a client otherwise.
-    // Informational, not a warning: a device with no IRs is a device with no IRs.
-    for (const assets::Kind kind : {assets::Kind::Model, assets::Kind::Ir})
-    {
-      const assets::Root& root = assets_.root(kind);
-      if (root.readable || root.path.empty())
-        continue;
-      add(kind == assets::Kind::Model ? "models_root_missing" : "irs_root_missing", "info",
-          "the " + std::string(assets::kind_name(kind)) +
-            " library is empty because its directory is not there: " + root.error + " (" + root.path + ")",
-          0);
-    }
-    return issues;
-  };
 
   // The recording, as `engine.record` and `engine.status` both describe it.
   auto recording_json = [this]() {
@@ -6334,6 +6635,32 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
                                           "transport token first");
   }
 
+  // --- who is asking, and against what (docs/daemon.md, "Events") ---------
+  //
+  // `tag` is the client's own reason, returned in every event this request causes and never read.
+  // `if_seq` makes a change conditional on the document being the one the client last saw, so two
+  // views editing one pedal cannot silently overwrite each other.
+  std::string tag;
+  if (doc.contains("tag"))
+  {
+    if (!doc["tag"].is_string() || doc["tag"].get<std::string>().size() > 128)
+      return error_response(id, "bad_request", "'tag' must be a string of at most 128 bytes");
+    tag = doc["tag"].get<std::string>();
+  }
+  const nlohmann::json origin = origin_of(session, tag);
+  const bool changes_document =
+    method == "rig.load" || method == "rig.apply" || method == "rig.switch" || method == "rig.patch";
+  if (changes_document && doc.contains("if_seq"))
+  {
+    if (!doc["if_seq"].is_number_unsigned() && !doc["if_seq"].is_number_integer())
+      return error_response(id, "bad_request", "'if_seq' must be a sequence number");
+    const uint64_t expected = doc["if_seq"].get<uint64_t>();
+    if (expected != doc_seq_)
+      return error_response(id, "conflict",
+                            "the document has moved on: it is at seq " + std::to_string(doc_seq_) +
+                              ", and this request was made against " + std::to_string(expected));
+  }
+
   // --- engine.hello: authenticate, then negotiate the protocol version -----
   if (method == "engine.hello")
   {
@@ -6382,6 +6709,126 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // nowhere else, which is what makes a client able to tell "wrong token" from "wrong method".
     body["transport"] = session.peer == PeerKind::Remote ? "tcp" : "unix";
     body["authenticated"] = session.authorized;
+
+    // What the client calls itself, for the origin of the events it causes. Bounded and optional:
+    // a name is for a person reading a log, and nothing is decided by it.
+    if (doc.contains("client"))
+    {
+      const nlohmann::json& client = doc["client"];
+      const auto text = [&client](const char* key, std::string& out) {
+        if (!client.contains(key))
+          return true;
+        if (!client[key].is_string() || client[key].get<std::string>().size() > 64)
+          return false;
+        out = client[key].get<std::string>();
+        return true;
+      };
+      if (!client.is_object() || !text("name", session.client_name) || !text("version", session.client_version) ||
+          !text("instance", session.client_instance))
+        return error_response(id, "bad_request", "'client' is an object of strings of at most 64 bytes: "
+                                                 "name, version, instance");
+    }
+    body["connection"] = session.id;
+    return ok_response(id, body);
+  }
+
+  // --- engine.subscribe / engine.unsubscribe --------------------------------
+  if (method == "engine.subscribe" || method == "engine.unsubscribe")
+  {
+    Connection* self = nullptr;
+    for (Connection& connection : clients_)
+    {
+      if (connection.session.id == session.id && session.id != 0)
+        self = &connection;
+    }
+    if (self == nullptr)
+      return error_response(id, "bad_request", "only a connection can subscribe");
+
+    Session::Subscription subscription;
+    if (method == "engine.subscribe")
+    {
+      std::vector<std::string> kinds = {"rig", "params", "state", "assets"};
+      if (doc.contains("events"))
+      {
+        if (!doc["events"].is_array())
+          return error_response(id, "bad_request", "'events' is an array of rig, params, state, assets");
+        kinds.clear();
+        for (const nlohmann::json& kind : doc["events"])
+        {
+          const std::string name = kind.is_string() ? kind.get<std::string>() : std::string();
+          if (name != "rig" && name != "params" && name != "state" && name != "assets")
+            return error_response(id, "bad_request", "unknown event kind " + kind.dump() +
+                                                       "; the kinds are rig, params, state, assets");
+          kinds.push_back(name);
+        }
+      }
+      for (const std::string& kind : kinds)
+      {
+        subscription.rig = subscription.rig || kind == "rig";
+        subscription.params = subscription.params || kind == "params";
+        subscription.state = subscription.state || kind == "state";
+        subscription.assets = subscription.assets || kind == "assets";
+      }
+      for (const char* flag : {"echo", "documents"})
+      {
+        if (doc.contains(flag) && !doc[flag].is_boolean())
+          return error_response(id, "bad_request", std::string("'") + flag + "' must be a boolean");
+      }
+      subscription.echo = doc.value("echo", true);
+      subscription.documents = doc.value("documents", true);
+      if (doc.contains("min_interval_ms"))
+      {
+        if (!doc["min_interval_ms"].is_number_integer() || doc["min_interval_ms"].get<int>() < 0 ||
+            doc["min_interval_ms"].get<int>() > 1000)
+          return error_response(id, "bad_request", "'min_interval_ms' is a whole number from 0 to 1000");
+        subscription.min_interval_ms = doc["min_interval_ms"].get<unsigned>();
+      }
+    }
+    session.subscription = subscription;
+    self->session.subscription = subscription;
+    if (!subscription.params)
+    {
+      self->params.clear();
+      self->param_keys.clear();
+    }
+    if (!subscription.any())
+    {
+      self->events.clear();
+      self->event_bytes = 0;
+      self->overflowed = false;
+    }
+    nlohmann::json kinds = nlohmann::json::array();
+    for (const auto& [name, on] : {std::pair<const char*, bool>{"rig", subscription.rig},
+                                   {"params", subscription.params},
+                                   {"state", subscription.state},
+                                   {"assets", subscription.assets}})
+    {
+      if (on)
+        kinds.push_back(name);
+    }
+    // A new state subscriber starts from the state as it is, sent after this reply. If that is news to
+    // the others too, they all hear it now, so the comparison in the loop does not send it twice.
+    if (subscription.state)
+    {
+      nlohmann::json snapshot = state_snapshot();
+      nlohmann::json frame = snapshot;
+      frame["event"] = "engine.state";
+      if (snapshot != last_state_)
+      {
+        last_state_ = std::move(snapshot);
+        emit_event("state", frame, 0);
+      }
+      else
+      {
+        enqueue_event(*self, frame.dump());
+      }
+    }
+    nlohmann::json body;
+    body["subscribed"] = std::move(kinds);
+    body["min_interval_ms"] = subscription.min_interval_ms;
+    body["echo"] = subscription.echo;
+    body["documents"] = subscription.documents;
+    body["seq"] = doc_seq_;
     return ok_response(id, body);
   }
 
@@ -6419,6 +6866,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       {
         assets_.refresh();
         republish_after_rescan();
+        note_assets(origin, session.id);
       }
     }
 
@@ -6800,10 +7248,13 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
       active_document().chains[static_cast<std::size_t>(index)].mute.store(muted);
       body["mute"] = muted;
       body["chain"] = doc["chain"];
+      emit_event("state", {{"event", "engine.mute"}, {"mute", muted}, {"chain", doc["chain"]}, {"origin", origin}},
+                 session.id);
       return ok_response(id, body);
     }
     mute_.store(muted);
     body["mute"] = muted;
+    emit_event("state", {{"event", "engine.mute"}, {"mute", muted}, {"origin", origin}}, session.id);
     return ok_response(id, body);
   }
   if (method == "engine.panic")
@@ -6814,6 +7265,8 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     nlohmann::json body;
     body["mute"] = true;
     body["panic"] = true;
+    emit_event("state", {{"event", "engine.mute"}, {"mute", true}, {"panic", true}, {"origin", origin}},
+               session.id);
     return ok_response(id, body);
   }
 
@@ -6941,11 +7394,14 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     }
     nlohmann::json steps = nlohmann::json::object();
     std::string code = "compile_failed";
+    const std::string before = document_identity();
     if (!load_rig(path, error, &code, /*admit_over_budget=*/false, lite_first, &steps))
       return error_response(id, code, error);
+    note_replaced("load", before, origin, session.id);
     nlohmann::json body;
     body["rig"] = path;
     body["generation"] = generation_;
+    body["seq"] = doc_seq_;
     body["missing_assets"] = missing_json();
     body["slimmed_models"] = slimmed_json();
     body["transitions"] = transitions_json();
@@ -6982,11 +7438,14 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     }
 
     std::string code = "compile_failed";
+    const std::string before = document_identity();
     if (!publish_document(document, /*path=*/"", "applied", config_.rigs_root, error, &code))
       return error_response(id, code, error);
+    note_replaced("apply", before, origin, session.id);
     nlohmann::json body;
     body["name"] = document.name;
     body["generation"] = generation_;
+    body["seq"] = doc_seq_;
     body["missing_assets"] = missing_json();
     body["slimmed_models"] = slimmed_json();
     body["chains"] = document.chains.size();
@@ -7152,8 +7611,11 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     // and must not make that an error.
     nlohmann::json steps = nlohmann::json::object();
     std::string code = "compile_failed";
+    const std::string before = document_identity();
     if (!switch_to(path, fallback, error, &code, body, lite_first, &steps))
       return error_response(id, code, error);
+    note_replaced("switch", before, origin, session.id);
+    body["seq"] = doc_seq_;
     if (lite_first)
       body.update(steps);
     body["missing_assets"] = missing_json();
@@ -7167,6 +7629,7 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     body["rig"] = current_rig_;
     body["source"] = current_source_;
     body["generation"] = generation_;
+    body["seq"] = doc_seq_;
     body["missing_assets"] = missing_json();
     body["slimmed_models"] = slimmed_json();
     body["loaded"] = current_document_.chains.empty() ? false : true;
@@ -7376,8 +7839,33 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
         }
       }
 
+      // One change to the document, whatever the batch held, and each value to whoever follows them:
+      // named by the document node it landed on, so a macro addressed by element reports its node.
+      ++doc_seq_;
+      for (std::size_t i = 0; i < edits.size(); ++i)
+      {
+        const ResolvedEdit& edit = edits[i];
+        const nlohmann::json& op = doc["ops"][i];
+        nlohmann::json address = nlohmann::json::object();
+        for (const char* key : {"node", "element", "role", "port"})
+        {
+          if (op.contains(key))
+            address[key] = op[key];
+        }
+        nlohmann::json value;
+        value["chain"] = chain_id;
+        value["node"] = edit.document_node.empty() ? nlohmann::json() : nlohmann::json(edit.document_node);
+        value["param"] = op["param"];
+        value["value"] = edit.is_text ? nlohmann::json(edit.text) : nlohmann::json(edit.value);
+        value["address"] = address;
+        value["origin"] = origin;
+        value["seq"] = doc_seq_;
+        emit_param(value, chain_id + "\n" + address.dump() + "\n" + op["param"].get<std::string>(), session.id);
+      }
+
       nlohmann::json body;
       body["kind"] = "smooth";
+      body["seq"] = doc_seq_;
       body["applied"] = edits.size();
       body["chain"] = chain_id;
       body["generation"] = generation_;
@@ -7397,11 +7885,27 @@ std::string Daemon::handle_request(const std::string& request, Session& session)
     if (!graph::apply_patch(patched.chains[chain_index].graph, doc["ops"].dump(), patch_context, error))
       return error_response(id, "patch_rejected", error);
     std::string code = "compile_failed";
+    const std::string before = document_identity();
     if (!publish_document(patched, current_rig_, current_source_, current_base_dir_, error, &code))
       return error_response(id, code, error);
+    if (before != document_identity())
+    {
+      ++doc_seq_;
+      nlohmann::json frame;
+      frame["event"] = "rig.patched";
+      frame["seq"] = doc_seq_;
+      frame["generation"] = generation_;
+      frame["chain"] = chain_id;
+      frame["ops"] = doc["ops"];
+      frame["origin"] = origin;
+      nlohmann::json slim = frame;
+      frame["document"] = nlohmann::json::parse(graph::document_to_json(current_document_));
+      emit_event("rig", frame, session.id, slim);
+    }
 
     nlohmann::json body;
     body["kind"] = "structural";
+    body["seq"] = doc_seq_;
     body["applied"] = static_cast<unsigned>(doc["ops"].size());
     body["chain"] = chain_id;
     body["generation"] = generation_;
@@ -7436,11 +7940,15 @@ int Daemon::run()
     const std::size_t first_client = fds.size();
     for (const Connection& connection : clients_)
     {
-      const short events = static_cast<short>(POLLIN | (connection.out_sent < connection.out.size() ? POLLOUT : 0));
+      // While a connection owes its peer bytes it is not read: a reply or an event is still on its way,
+      // and on the datagram transport a reply cannot be queued behind one (each is its own send).
+      const bool owes = connection.out_sent < connection.out.size();
+      const short events = static_cast<short>(owes ? POLLOUT : POLLIN);
       fds.push_back(pollfd{connection.fd, events, 0});
     }
 
-    const int timeout = std::max(1, config_.reclamation_timeout_ms);
+    // A value waiting to be coalesced may be due before the reclamation window ends.
+    const int timeout = subscription_timeout(std::max(1, config_.reclamation_timeout_ms));
     const int ready = ::poll(fds.data(), fds.size(), timeout);
     if (ready < 0)
     {
@@ -7466,12 +7974,16 @@ int Daemon::run()
           // palette -- and a re-measured cost table to take effect -- so both are re-read.
           load_cost_table();
           assets_.refresh();
+          const nlohmann::json engine_origin = origin_of(Session{}, std::string());
+          note_assets(engine_origin, 0);
           std::string path;
           std::string error;
+          const std::string before = document_identity();
           // The configured rig again, under the startup's rule: admitted over the headroom.
           if (!config_.rig.empty() && resolve_startup_rig(config_, config_.rig, path, error) &&
               load_rig(path, error, nullptr, /*admit_over_budget=*/true))
           {
+            note_replaced("reload", before, engine_origin, 0);
             if (config_.verbose)
               std::fprintf(stderr, "[namchaind] SIGHUP: reloaded %s\n", path.c_str());
           }
@@ -7538,8 +8050,11 @@ int Daemon::run()
     warm_reclaimer_.collect();
 
     // A warm switch moves which document is audible without a publish, so this is where the control
-    // thread's view of "the running document" catches up with it. Cheap when nothing moved.
-    sync_warm_switch();
+    // thread's view of "the running document" catches up with it. Cheap when nothing moved. One caught
+    // here is one no request is waiting for -- the switch completed after its request gave up -- so
+    // the engine is its origin.
+    if (sync_warm_switch())
+      note_replaced("switch", std::string(), origin_of(Session{}, std::string()), 0);
 
     // P8's Full, on its way in without this thread having compiled it: install it when the catch-up
     // thread has finished, fold in what the replay did, and end `cost.lite_first` once the render
@@ -7559,6 +8074,9 @@ int Daemon::run()
     // is reclamation latency, and a meter's freshness is not worth a slower reclaim.
     if (levels_enabled_)
       collect_levels_if_due();
+
+    // Events last, so everything this pass changed is reported in this pass.
+    flush_subscriptions();
   }
 
   stop();

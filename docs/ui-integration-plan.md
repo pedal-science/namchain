@@ -105,6 +105,11 @@ One JSON document is one rig. It carries rig metadata and **N chains**, each cha
   extends naturally).
 - **The document is the unit of atomicity and the unit of a generation.** A publish advances one
   document generation; each chain also has its own `audible_generation` during a staggered fade.
+- **Who owns the document changed on 2026-11-07** (pedal.project D17): the pedal owns its rigs, and
+  ljoss and rigpa are views of it. The engine's side of that is events — `engine.subscribe`, `seq`,
+  `tag` and `if_seq` (docs/daemon.md, "Events") — so a view follows changes it did not make instead
+  of polling `rig.get`. What this section says about the document's shape still holds; where it says
+  the app owns the document, read "the pedal".
 
 ### 1.2 Identity: three spaces, none of them composed
 

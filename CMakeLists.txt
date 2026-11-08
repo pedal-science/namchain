@@ -352,7 +352,7 @@ if(NAMCHAIN_BUILD_TESTS)
     # The daemon's socket/signal control loop and its config/rig-resolution surface, and the TCP
     # transport (framing, the token, the caps: tests/test_tcp.cpp). These are also what says whether
     # a port of the control transport is sound, so they run wherever the daemon is built.
-    target_sources(namchain-tests PRIVATE tests/test_daemon.cpp tests/test_tcp.cpp)
+    target_sources(namchain-tests PRIVATE tests/test_daemon.cpp tests/test_tcp.cpp tests/test_events.cpp)
   endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     # The CoreAudio backend's refusals, plus one opt-in case that plays a short blip on the default

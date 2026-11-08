@@ -62,6 +62,10 @@ void print_usage(std::FILE* stream)
     "  --token TOKEN          the transport token a TCP daemon requires\n"
     "  --token-file FILE      read the token from FILE (first line); preferred, because a token on\n"
     "                         the command line is visible to every local user in `ps`\n"
+    "  --client NAME          what to call this connection in the events it causes (default\n"
+    "                         namchainctl)\n"
+    "  --tag TAG              a reason to send with a change, returned in its events' origin\n"
+    "  --if-seq N             refuse the change (conflict) unless the document is still at seq N\n"
     "\n"
     "commands:\n"
     "  hello                  negotiate the protocol and print what the daemon offers\n"
@@ -90,6 +94,9 @@ void print_usage(std::FILE* stream)
     "                         the common case: one parameter, one commit\n"
     "  mute [on|off] [--chain C]   mute the engine, or one chain\n"
     "  panic                  mute unconditionally\n"
+    "  watch [rig|params|state|assets ...] [--count N] [--interval MS] [--no-documents]\n"
+    "                         subscribe and print every event as one line of JSON, until Ctrl-C or\n"
+    "                         N events (docs/daemon.md, \"Events\")\n"
     "  record [start NAME [--seconds S] | stop]\n"
     "                         record the device's capture and the engine's playback, a period at a\n"
     "                         time, into the daemon's record_dir/NAME (default 600 s, at most 3600);\n"
@@ -329,6 +336,8 @@ const char* method_for(const std::string& command)
     return "engine.panic";
   if (command == "record")
     return "engine.record";
+  if (command == "watch")
+    return "engine.subscribe";
   return nullptr;
 }
 
@@ -367,6 +376,12 @@ struct Options
   std::string document;
   bool no_replace = false;
   bool no_fallback = false;
+  std::string client = "namchainctl";
+  std::string tag;
+  std::string if_seq;
+  long count = -1;
+  std::string interval;
+  bool no_documents = false;
 };
 
 } // namespace
@@ -466,6 +481,35 @@ int main(int argc, char** argv)
     }
     else if (word == "--no-replace")
       options.no_replace = true;
+    else if (word == "--no-documents")
+      options.no_documents = true;
+    else if (word == "--client")
+    {
+      if (!value_of(options.client))
+        return kExitUsage;
+    }
+    else if (word == "--tag")
+    {
+      if (!value_of(options.tag))
+        return kExitUsage;
+    }
+    else if (word == "--if-seq")
+    {
+      if (!value_of(options.if_seq))
+        return kExitUsage;
+    }
+    else if (word == "--interval")
+    {
+      if (!value_of(options.interval))
+        return kExitUsage;
+    }
+    else if (word == "--count")
+    {
+      std::string text;
+      if (!value_of(text))
+        return kExitUsage;
+      options.count = std::strtol(text.c_str(), nullptr, 10);
+    }
     else if (word == "--no-fallback")
       options.no_fallback = true;
     else if (word == "--node-port")
@@ -726,11 +770,32 @@ int main(int argc, char** argv)
       request["seconds"] = seconds;
     }
   }
+  else if (options.command == "watch")
+  {
+    // Which events; none named means all of them. The daemon names a kind it does not know.
+    if (!options.positional.empty())
+    {
+      nlohmann::json kinds = nlohmann::json::array();
+      for (const std::string& kind : options.positional)
+        kinds.push_back(kind);
+      request["events"] = std::move(kinds);
+    }
+    if (!options.interval.empty())
+      request["min_interval_ms"] = std::atoi(options.interval.c_str());
+    if (options.no_documents)
+      request["documents"] = false;
+  }
   else
   {
     std::fprintf(stderr, "namchainctl: unknown command '%s' (try --help)\n", options.command.c_str());
     return kExitUsage;
   }
+
+  // Why, and against what: carried by any change, and ignored by the daemon on a read.
+  if (!options.tag.empty())
+    request["tag"] = options.tag;
+  if (!options.if_seq.empty())
+    request["if_seq"] = std::strtoull(options.if_seq.c_str(), nullptr, 10);
 
   // --- connect, negotiate, run ---------------------------------------------
   Transport transport;
@@ -753,6 +818,8 @@ int main(int argc, char** argv)
   hello["protocol"] = 2;
   if (!options.token.empty())
     hello["token"] = options.token;
+  if (!options.client.empty())
+    hello["client"] = {{"name", options.client}};
 
   const bool asked_for_hello = options.command == "hello";
   if (asked_for_hello)
@@ -801,5 +868,20 @@ int main(int argc, char** argv)
   }
   if (!options.quiet)
     std::cout << response.dump(options.compact ? -1 : 2) << "\n";
+  if (options.command != "watch")
+    return kExitOk;
+
+  // Every frame from here on is an event: one line each, so the output can be piped into `jq` or
+  // read by a person watching a footswitch change the rig.
+  for (long seen = 0; options.count < 0 || seen < options.count; ++seen)
+  {
+    if (!transport.receive_message(reply, error))
+    {
+      std::fprintf(stderr, "namchainctl: %s\n", error.c_str());
+      return kExitUsage;
+    }
+    const nlohmann::json event = nlohmann::json::parse(reply, nullptr, false);
+    std::cout << (event.is_discarded() ? reply : event.dump()) << std::endl;
+  }
   return kExitOk;
 }

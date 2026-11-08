@@ -276,6 +276,39 @@ if(NOT _rc EQUAL 0 OR NOT _out MATCHES "\"ok\":true")
   _fail("`apply` of a document naming a model by id failed (${_rc}): ${_out} ${_err}")
 endif()
 
+# --- watch: events, with the change's origin -----------------------------------
+# A watcher in the background that prints the next two events and exits, then a tagged change and a
+# mute from another connection: the watcher must see who did it and why.
+execute_process(
+  COMMAND sh -c "exec \"${NAMCHAINCTL}\" --socket \"${_socket}\" --quiet watch rig state --count 2 \
+      > \"${_work}/watch.out\" 2> \"${_work}/watch.err\" & echo $!"
+  OUTPUT_VARIABLE _watch_pid OUTPUT_STRIP_TRAILING_WHITESPACE)
+# The first event is the state a watcher starts from; then the change.
+execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 0.5)
+execute_process(COMMAND "${NAMCHAINCTL}" --socket "${_socket}" --client pedald --tag footswitch:81
+                        load gain.json --compact
+                RESULT_VARIABLE _rc OUTPUT_VARIABLE _out ERROR_VARIABLE _err)
+if(NOT _rc EQUAL 0 OR NOT _out MATCHES "\"seq\":")
+  _fail("a tagged `load` failed or carried no seq (${_rc}): ${_out} ${_err}")
+endif()
+set(_watched "")
+foreach(_attempt RANGE 60)
+  execute_process(COMMAND kill -0 ${_watch_pid} RESULT_VARIABLE _alive ERROR_QUIET)
+  if(NOT _alive EQUAL 0)
+    break()
+  endif()
+  execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 0.05)
+endforeach()
+execute_process(COMMAND kill -TERM ${_watch_pid} ERROR_QUIET)
+file(READ "${_work}/watch.out" _watched)
+if(NOT _watched MATCHES "\"event\":\"engine.state\"")
+  _fail("`watch` did not start from the engine's state: ${_watched}")
+endif()
+if(NOT _watched MATCHES "\"event\":\"rig.replaced\"" OR NOT _watched MATCHES "\"tag\":\"footswitch:81\""
+   OR NOT _watched MATCHES "\"client\":\"pedald\"")
+  _fail("`watch` did not see the tagged load and who made it: ${_watched}")
+endif()
+
 # --- the daemon stops when it is asked to ------------------------------------
 _kill_daemon()
 execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 0.2)

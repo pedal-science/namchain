@@ -373,7 +373,7 @@ One JSON object per message in each direction, over either transport above. A re
 
 | method | request | response |
 |---|---|---|
-| `engine.hello` | `{"protocol": 2, "token": "…"?}` | `role`, `version`, `protocol` (what the server speaks), `features`, `transport` (`unix`/`tcp`) and `authenticated`; anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol`. On TCP the token is required and is checked **before** the version, so a peer without it learns nothing else |
+| `engine.hello` | `{"protocol": 2, "token": "…"?, "client": {"name": "pedald", "version": "…"?, "instance": "…"?}?}` | `role`, `version`, `protocol` (what the server speaks), `features`, `transport` (`unix`/`tcp`), `authenticated` and `connection` (this connection's number, which every event's `origin` uses); anything from 1 to the server's version is accepted, and anything else is `unsupported_protocol`. On TCP the token is required and is checked **before** the version, so a peer without it learns nothing else |
 | `engine.schema` | — | the catalogue: every node type **and every macro** in one array, told apart by `kind` (`primitive`/`macro`), with ports, flags, arity and parameters — kinds, units, defaults, bounds and whether each can be ramped. A macro additionally carries the `roles` it lowers to and, per parameter, the `targets` it drives. A parameter whose choices live in the library carries them, resolved from the same scan `engine.assets` reports. See docs/schema.md and docs/macros.md |
 | `engine.assets` | `{"refresh": true?}` | the model and impulse-response library: an entry per file with its `id`, where it is, its size and mtime, and the rate/architecture/length when the file's own header says so. See docs/assets.md |
 | `engine.status` | — | device state, backend, channels, rig/generation, blocks, `xruns` (since the stream came up) and `startup_xruns` (what starting it cost, reported separately so it is not charged to the render path and does not raise the `xruns` health warning; rewritten by every open, since a reopened device's counter starts at zero), a `queue` object (the output queue's cap and floor, and its `output_drops`, `output_target_drops`, `floor_insertions`, `capture_bursts` and `prefill_frames` — the silence written at open to bring the queue to its target, which is output latency paid once), a `record` object (as `engine.record`), a `render` object (each block's time from its capture read to its playback write against the period's deadline: `deadline_us`, `worst_us`, `worst_percent`, `over_90_percent`, `over_deadline`, and `load_histogram` as `[percent, blocks]` pairs for the non-empty 1% buckets, 100 meaning at or past the deadline; all cumulative, so a poller takes deltas), device lost/restored counts, mute, RT state, retired-pending, `params_applied`/`params_stale`, `failed_nodes`/`guard_trips`, a `chains` array (below), a `control` object (the transports, above), a `cost` object ("Cost and admission", below), `health`/`issues` (below), the PCM `format` the device was opened with, the audio `levels` ("Levels", below, with the same shape `engine.levels` returns), and — for ALSA — a `backend_diagnostics` object that splits the one `xruns` number into `capture_overruns` and `playback_underruns` beside `recoveries`, `gate_capture_xruns`, `floor_inserted_frames`, `settle_discarded_frames`, `occupancy_mismatches` and `period_exact` |
@@ -390,6 +390,8 @@ One JSON object per message in each direction, over either transport above. A re
 | `rig.cool` | `{"rig": "name.json"}`, or `{}` for whatever is warm | stop holding a rig ready. Returns `cooled` (the rigs that stopped being warm) and the `warm` object. `warm_disabled` when warmth is off, `warm_not_ready` when the named rig is not the warm one or the document has not been let go yet |
 | `rig.switch` | `{"rig": "name.json"}`, with `{"fallback": false}` to refuse instead of loading cold, and `{"lite_first": true}` for the same two-step publish on a cold switch | make a rig audible: `switched` (`warm` when it was a handover, `cold` when it was a load), `rig`, `generation` (of the content now audible), `doc`, `core`, `handover_blocks`, `fade_ms`, `completed`, and `reason` when it was cold. A rig that is not warm is published exactly as `rig.load` does it, so a footswitch press never ends in silence; `fallback: false` turns that into `warm_not_ready`. `lite_first` is ignored for a rig that *is* warm — a handover beats any Lite compile — and the reply says `lite_first: false` ("Lite-first publishes", below) |
 | `rig.cost` | `rig` (a name, as `rig.load` takes) or `document` (a whole document) | what that rig would cost on this device, and the verdict: the same table, trimming and `over` a publish would apply, on a copy that is thrown away. Nothing is published, compiled or loaded. `cost` is the object `engine.status` reports, and `slimmed_models`/`missing_assets` come with it, so a service can cost its whole bank without a second cost model of its own (D9) |
+| `engine.subscribe` | `{"events": ["rig", "params", "state", "assets"]?, "min_interval_ms": 50?, "echo": true?, "documents": true?}` | the subscription as it now stands, and `seq`. From here on the connection also receives **event frames** ("Events", below). Subscribing again replaces the subscription |
+| `engine.unsubscribe` | — | `subscribed: []`; nothing unsolicited is sent on this connection again, and whatever was waiting is dropped |
 
 Unknown fields are ignored; an unknown method is `unknown_method`. A malformed message never kills
 the connection or the daemon.
@@ -411,6 +413,21 @@ An op names its target one of three ways (`docs/ui-integration-plan.md` §1.3):
 and an address that names nothing is refused with what exists — no op ever silently does nothing. A
 value may be a number or, for an option parameter, a string.
 
+**Every request that changes the document** (`rig.load`, `rig.apply`, `rig.switch`, `rig.patch`) may
+also carry:
+
+- `tag`, a string of at most 128 bytes the engine never reads. It comes back in the `origin` of every
+  event the request causes, which is how a service says *why* it asked: pedald sends
+  `"tag": "footswitch:81"` with the `rig.switch` a press became, and a view shows "footswitch → Crunch".
+- `if_seq`, the document sequence the client last saw. If the document has moved on since, the request
+  is refused as `conflict` and nothing changes; the client reads again and decides.
+
+Their replies, `rig.get` and `engine.subscribe` carry **`seq`**: a counter of changes to the running
+document, one per request that changed it (a patch of ten knob values is one), per replacement, and per
+warm switch. It is not the generation: a ramped parameter changes the document without compiling
+anything, so it moves `seq` and leaves `generation` alone. A request that changes nothing — applying
+what `rig.get` returned — moves neither.
+
 ### Where a document comes from, and what a client can read back
 
 Two ways in, and they differ only in where the bytes live:
@@ -429,10 +446,12 @@ document) and `rig_name` (the document's own name) beside it.
 
 **`rig.get` hands back the engine's parse of the document it is running**: every chain with its id,
 name and channels, and every node with its `id`, `element`, `role`, `type`, `bypass` and parameters —
-including the node ids the engine *minted*, which is the only place a client can learn them. It is a
-**diagnostic, not a document store** (docs/ui-integration-plan.md §1.1): the app owns the document,
-and nothing should be rehydrated from this. But it makes two things answerable that otherwise are
-not — "did my edit land, and where did it go", and "is the engine still running what I think it is".
+including the node ids the engine *minted*, which is the only place a client can learn them. It is
+**what is playing**, kept exactly: every ramped value a client turned is in it, and with `seq` and the
+events below it is what a view of the pedal starts from and then follows. It is still not the rig
+*library* — which rigs exist, which is saved, what undo remembers belong to the pedal service
+(pedal.project, D17) — but a client that wants to know what the engine is running reads it here rather
+than trusting its own copy.
 
 It is also a **fixed point**: applying what `rig.get` returned changes nothing, so it does not advance
 the generation. That is what makes the read-back usable for reconciliation rather than something to
@@ -487,13 +506,14 @@ chain quietly playing on channel 0.
 `features` in `engine.hello` and `engine.status` is the list of what a client can rely on:
 `multi_chain`, `documents`, `rig_apply`, `rig_get_document`, `structural_crossfade`, `smooth_params`,
 `bypass`, `guard`, `per_chain_mute`, `schema`, `tcp_transport`, `assets`, `record`, `local_transitions`,
-`meta`, `bypass_ramp`, `cost`, `node_state`, `levels`. It grows as the slices land, and
+`meta`, `bypass_ramp`, `cost`, `node_state`, `events`, `client_name`, `op_tag`, `if_seq`, `levels`. It grows as the slices land, and
 absence is how a client degrades rather than guesses: a client that does not see `levels` hides its
 meters rather than drawing a floor.
 
 The error codes a client may have to act on are `bad_json`, `bad_request`, `unknown_method`,
 `unknown_chain`, `rig_not_found`, `patch_rejected`, `compile_failed`, `asset_missing`, `over_budget`,
-`path_refused`, `unauthorized`, `message_too_large`, `too_many_connections` and `unsupported_protocol`. A refusal is a normal answer:
+`path_refused`, `unauthorized`, `message_too_large`, `too_many_connections`, `unsupported_protocol`
+and `conflict`. A refusal is a normal answer:
 the connection stays open (except after a framing error, a third failed authentication, or a full
 connection table) and the running plan is untouched.
 
@@ -502,6 +522,56 @@ patch time alike: `node 'g' (nc.gain) has no parameter 'gainz'; it takes 'gain_d
 (alias)`. The catalogue those names come from is `engine.schema`, and docs/schema.md is the reference
 for it — including which parameters a client may stream (a slider) and which it must commit on release
 (a structural edit).
+
+### Events: what changed, and who changed it
+
+A connection that sends `engine.subscribe` is told about changes as they happen, instead of polling
+`rig.get` to find out. An **event frame** is a message the client did not ask for: it has `event` and
+no `id`, and it travels on the same connection, in the same framing, as the replies. A client tells
+the two apart by that, and nothing else changes for it: a reply still answers its request, in order.
+
+```jsonc
+{ "event": "rig.replaced", "seq": 12, "generation": 5, "why": "switch",
+  "origin": { "connection": 3, "client": "pedald", "tag": "footswitch:81" },
+  "rig": "/var/lib/pedal/rigs/crunch.json", "source": "file", "name": "Crunch",
+  "document": { … } }
+```
+
+| event | subscription | when, and what it carries |
+|---|---|---|
+| `rig.replaced` | `rig` | the running document was replaced: `why` is `load`, `apply`, `switch`, `reload` (SIGHUP) or `startup`. `rig`, `source`, `name`, `generation`, `seq`, and the whole `document` as `rig.get` would return it |
+| `rig.patched` | `rig` | a structural or bypass patch landed: `chain`, the `ops` as sent, `generation`, `seq`, and the whole `document` after it |
+| `rig.params` | `params` | ramped values moved: `values`, one entry per parameter, each `{chain, node, param, value, origin, seq}` plus `address` (the op's own `node`/`element`/`role`/`port`). `node` is the **document node the value landed on** — a macro addressed by `element` names the macro's node — and is null when the value is runtime state that is not in the document (a per-port setting, or one primitive inside a macro). Coalesced: see below |
+| `engine.mute` | `state` | the engine, or one `chain`, was muted or unmuted (`mute`, and `panic: true` for `engine.panic`) |
+| `engine.state` | `state` | something a status light binds to changed: `state`, `health`, `issues` (code, severity, chain, node: no counts), `rig`, `name`, `generation`, `audible_generation`, `mute`, `warm` (each document's rig, name, state and verdict, and `pressure_holding`) and `cost` (`cost`, `effective`, `over`, `verdict`, `lite_first`). Compared at most every 100 ms, sent only when it differs, and once straight after subscribing so a client starts from something. **DSP load and levels are not in it**: they move every block, and a meter polls `engine.levels` |
+| `engine.assets` | `assets` | the library was rescanned (`engine.assets` with `refresh`, or SIGHUP): `models`, `irs` (counts) and `scan`. Read `engine.assets` for the list |
+| `resync` | always | this connection missed events (below). Read `rig.get` and `engine.status` again |
+
+**`origin`** is who caused it: the `connection` number `engine.hello` returned, the `client` name it
+gave (or `""`), and the request's `tag` when there was one. A change nobody asked for — a SIGHUP
+reload, the startup rig, a warm switch that completed after its request gave up — has
+`{"connection": 0, "client": "namchaind"}`.
+
+**`echo: false`** leaves out every event this connection caused itself: a knob it is turning does not
+come back to it. The default is to echo, which is what a client that wants one code path for every
+change wants. **`documents: false`** leaves `document` out of `rig.replaced` and `rig.patched`, for a
+client that only shows names (a status light, a log).
+
+**Parameter values are coalesced** per connection: a value that moves again before it has been sent
+replaces the one waiting, and a connection is sent at most one `rig.params` frame per
+`min_interval_ms` (default 50, 0 to 1000). The first change after a quiet spell goes at once. A knob
+streamed at 100 Hz therefore reaches a 50 ms subscriber as about 20 frames a second, each with the
+latest value, and the last value is always sent. **Order holds**: a connection's waiting values are
+sent before any `rig.patched` or `rig.replaced`, so a value is never applied to a document that has
+already gone.
+
+**A slow reader cannot cost the engine memory.** Each connection's unsent events are capped at 256 KiB;
+past that, what is waiting is dropped and so is everything after it, until the connection has drained
+below 64 KiB, when it gets one `resync` and events start again. The render thread never sees any of
+this: events are made and sent on the control thread, after the change they describe.
+
+A subscriber is a connection, and connections are counted: the pedal holds pedald's two, rigpa's
+one, one per ljoss, and `namchainctl watch`. A pedal's `tcp_max_connections` should be at least 8.
 
 ### One document, several chains
 
@@ -1362,7 +1432,7 @@ Not built, named in docs/rig-pipeline.md §7 so it is not mistaken for present:
 - no write path to the library and no `model.load`/`model.unload`/`model.list`: it is what the
   operator put on the device, listed by `engine.assets` (docs/assets.md §"What is not here");
 - no presets, tags or favourites, and no amp/cab metadata beyond the directory tree;
-- no *telemetry subscription* and no `scene.*`, `model.*`, `bench.run` methods. Levels are the one
-  thing a client polls rather than subscribes to (`engine.levels`, at whatever rate it likes; see
-  "Levels"), which is enough for a meter and is deliberately not the beginning of an event stream;
+- no `scene.*`, `model.*`, `bench.run` methods. Changes are pushed ("Events", above), but levels and
+  DSP load are not: a meter polls `engine.levels` at whatever rate it draws, because a value that
+  moves every block is not an event;
 - no state-accurate NAM warm start (M3), so `swap_model` crossfades rather than replaying history.
