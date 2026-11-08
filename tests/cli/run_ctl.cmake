@@ -277,13 +277,20 @@ if(NOT _rc EQUAL 0 OR NOT _out MATCHES "\"ok\":true")
 endif()
 
 # --- watch: events, with the change's origin -----------------------------------
-# A watcher in the background that prints the next two events and exits, then a tagged change and a
-# mute from another connection: the watcher must see who did it and why.
+# A state watcher hears where the engine is the moment it subscribes, and stops there.
+execute_process(COMMAND "${NAMCHAINCTL}" --socket "${_socket}" --quiet watch state --count 1
+                RESULT_VARIABLE _rc OUTPUT_VARIABLE _watched ERROR_VARIABLE _err TIMEOUT 10)
+if(NOT _rc EQUAL 0 OR NOT _watched MATCHES "\"event\":\"engine.state\"")
+  _fail("`watch state` did not start from the engine's state (${_rc}): ${_watched} ${_err}")
+endif()
+
+# A rig watcher in the background, then a tagged change from another connection: the watcher must
+# see who made it and why. Only `rig`, so a state change that happens to land first (a transition
+# ending) cannot use up its count.
 execute_process(
-  COMMAND sh -c "exec \"${NAMCHAINCTL}\" --socket \"${_socket}\" --quiet watch rig state --count 2 \
+  COMMAND sh -c "exec \"${NAMCHAINCTL}\" --socket \"${_socket}\" --quiet watch rig --no-documents --count 1 \
       > \"${_work}/watch.out\" 2> \"${_work}/watch.err\" & echo $!"
   OUTPUT_VARIABLE _watch_pid OUTPUT_STRIP_TRAILING_WHITESPACE)
-# The first event is the state a watcher starts from; then the change.
 execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 0.5)
 execute_process(COMMAND "${NAMCHAINCTL}" --socket "${_socket}" --client pedald --tag footswitch:81
                         load gain.json --compact
@@ -291,8 +298,7 @@ execute_process(COMMAND "${NAMCHAINCTL}" --socket "${_socket}" --client pedald -
 if(NOT _rc EQUAL 0 OR NOT _out MATCHES "\"seq\":")
   _fail("a tagged `load` failed or carried no seq (${_rc}): ${_out} ${_err}")
 endif()
-set(_watched "")
-foreach(_attempt RANGE 60)
+foreach(_attempt RANGE 100)
   execute_process(COMMAND kill -0 ${_watch_pid} RESULT_VARIABLE _alive ERROR_QUIET)
   if(NOT _alive EQUAL 0)
     break()
@@ -301,12 +307,9 @@ foreach(_attempt RANGE 60)
 endforeach()
 execute_process(COMMAND kill -TERM ${_watch_pid} ERROR_QUIET)
 file(READ "${_work}/watch.out" _watched)
-if(NOT _watched MATCHES "\"event\":\"engine.state\"")
-  _fail("`watch` did not start from the engine's state: ${_watched}")
-endif()
 if(NOT _watched MATCHES "\"event\":\"rig.replaced\"" OR NOT _watched MATCHES "\"tag\":\"footswitch:81\""
-   OR NOT _watched MATCHES "\"client\":\"pedald\"")
-  _fail("`watch` did not see the tagged load and who made it: ${_watched}")
+   OR NOT _watched MATCHES "\"client\":\"pedald\"" OR _watched MATCHES "\"document\"")
+  _fail("`watch rig` did not see the tagged load and who made it: ${_watched}")
 endif()
 
 # --- the daemon stops when it is asked to ------------------------------------
