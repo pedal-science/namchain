@@ -68,7 +68,7 @@ boot guard would take the failed engine for a broken system (pedal.project, vip'
 2026-09-30).
 
 When the library changes, a rig with stand-ins is re-resolved: `engine.assets` with `refresh` (what
-the pedal's `sync-library` sends) and SIGHUP both republish it, so a model copied in afterwards
+pedald sends after an upload) and SIGHUP both republish it, so a model copied in afterwards
 replaces its stand-in without anyone touching the rig. Whether a chain changed is decided on the
 resolved document, so this is a new generation for exactly the chains it affects.
 
