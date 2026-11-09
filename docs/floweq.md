@@ -155,6 +155,9 @@ admitted against that until `pedal-measure` measures the row on the device.
 - `include/namchain/floweq/model.h` — **generated**, the trained weights and their normalisation.
 - `src/nodes/floweq.cpp` — `nc.eq.flow`: parameters, render path, auto gain, report.
 - `tools/floweq/generate_model.py` — the converter, and `--golden` for the test's fixtures.
+- `tools/floweq-eq/` — the offline renderer (`floweq-eq`): one WAV in, the block's parameters on the
+  command line, one WAV and the node's `describe_state` out. For listening to and measuring the block
+  in isolation; its README has the build and usage.
 - `tests/test_floweq.cpp` — the decoder against its reference, the response against the plugin's
   formulas, the ramps, auto gain and the report.
 - `../rigpa/docs/floweq.md` — the panel that draws it on the pedal.

@@ -243,6 +243,12 @@ if(NAMCHAIN_BUILD_TOOLS)
   target_link_libraries(namchain-wavcmp PRIVATE namchain)
   target_compile_options(namchain-wavcmp PRIVATE ${NAMCHAIN_WARN_FLAGS})
 
+  # Offline render of the nc.eq.flow block: one graph, one node, a WAV in and a WAV out. A test
+  # instrument for listening to what flowEQ is doing in isolation (tools/floweq-eq/).
+  add_executable(floweq-eq tools/floweq-eq/floweq-eq.cpp)
+  target_link_libraries(floweq-eq PRIVATE namchain)
+  target_compile_options(floweq-eq PRIVATE ${NAMCHAIN_WARN_FLAGS})
+
   # The M1 acceptance harness (plan.md §1 criterion 3, §10.5).
   add_executable(namchain-soak tools/soak/namchain-soak.cpp)
   target_link_libraries(namchain-soak PRIVATE namchain)
