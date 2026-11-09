@@ -17,18 +17,16 @@ coefficient crossfade and Auto Gain's BS.1770 loudness meter. The report is the 
 
 ## Build
 
-This lived in a git worktree of `namchain` (branch `floweq-eq-cli`) so the working checkout was
-not touched. From the tree containing this directory:
+From the repository root:
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DNAMCHAIN_BUILD_TESTS=OFF
 cmake --build build --target floweq-eq
 ```
 
-The target is in `CMakeLists.txt` under `NAMCHAIN_BUILD_TOOLS`. A fresh worktree has no NAM
-submodule checked out; either run `git submodule update --init --recursive` there or point
-`-DNAMCHAIN_NAM_CORE_DIR` at another checkout's `vendor/NeuralAmpModelerCore` (this worktree's
-build uses the main checkout's).
+The target is in `CMakeLists.txt` under `NAMCHAIN_BUILD_TOOLS`. It was developed in a worktree
+with the NAM core supplied by `-DNAMCHAIN_NAM_CORE_DIR`; a tree with its submodules initialized
+needs no such flag.
 
 ## Use
 
