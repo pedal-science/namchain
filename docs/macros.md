@@ -72,6 +72,9 @@ two levels:
 // the macro's own parameter: one knob, and the engine works out what it drives
 { "op": "set_param", "element": "b3", "param": "feedback", "value": 0.6 }
 
+// the same parameter by the macro node's id, which `rig.get` shows: the same ramp, the same record
+{ "op": "set_param", "node": "b3", "param": "feedback", "value": 0.6 }
+
 // one node of the lowering: the escape hatch, for poking a primitive inside a macro
 { "op": "set_param", "element": "b3", "role": "line", "param": "ms", "value": 250 }
 

@@ -84,6 +84,11 @@ struct Config
   std::string socket_path = "/run/namchain/namchaind.sock";
   /// Permission bits for the socket node, as an octal string in the config file.
   unsigned socket_mode = 0660;
+  /// The `SO_SNDBUF` asked for on an accepted local connection, where each reply is one datagram and a
+  /// datagram can be no larger than the send buffer. The kernel doubles it and clamps it to
+  /// `net.core.wmem_max`, so what a connection gets is read back rather than assumed (docs/daemon.md).
+  /// Not a config file key: only the tests have a reason to shrink it.
+  int local_send_buffer_bytes = 2 * 1024 * 1024;
 
   // --- the TCP control transport (slice C; docs/ui-integration-plan.md §1.8) ------------------
   //

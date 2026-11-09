@@ -1058,6 +1058,9 @@ private:
     // --- events (docs/daemon.md, "Events") ---------------------------------
     /// Event frames made but not yet moved into `out`. A queue of whole messages rather than bytes,
     /// because on the datagram transport each one has to be its own send.
+    /// The largest datagram this connection's socket will take, read back from the kernel at accept.
+    /// 0 where replies are framed: a stream has no such limit.
+    std::size_t datagram_limit = 0;
     std::deque<std::string> events;
     std::size_t event_bytes = 0;
     /// Past the high-water mark: events are being dropped, and a `resync` is owed once it drains.

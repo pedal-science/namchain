@@ -663,7 +663,8 @@ TEST_CASE("events: a connection that never subscribed hears only its replies, an
 
 TEST_CASE("events: a reader that stops reading is bounded, then resynchronised")
 {
-  Running running;
+  // A send buffer as small as the document, so what the kernel will hold doesn't hide the bound.
+  Running running([](Config& config, const std::filesystem::path&) { config.local_send_buffer_bytes = 32 * 1024; });
   // A small receive buffer, so the daemon's side fills quickly when this client does not read.
   Client slow(running.config.socket_path, 4096);
   Client actor(running.config.socket_path);
@@ -708,4 +709,87 @@ TEST_CASE("events: a reader that stops reading is bounded, then resynchronised")
   // After the resync, events flow again.
   REQUIRE(actor.call({{"method", "rig.load"}, {"rig", "crunch.json"}})["ok"] == true);
   CHECK_FALSE(slow.wait_event("rig.replaced").is_null());
+}
+
+TEST_CASE("a macro addressed by its node id ramps, as by element")
+{
+  Running running([](Config& config, const std::filesystem::path& root) { config.rig = (root / "macros.json").string(); });
+  Client actor(running.config.socket_path);
+  running.wait_running(actor);
+  Client viewer(running.config.socket_path);
+  REQUIRE(viewer.call({{"method", "engine.subscribe"}, {"events", {"params", "rig"}}, {"min_interval_ms", 0}})["ok"] == true);
+
+  std::string macro_node;
+  const auto before = actor.call({{"method", "rig.get"}});
+  for (const auto& node : before["document"]["chains"][0]["nodes"])
+    if (node.value("element", "") == "dly")
+      macro_node = node["id"].get<std::string>();
+  REQUIRE_FALSE(macro_node.empty());
+
+  const auto reply = actor.call(
+    {{"method", "rig.patch"}, {"ops", {{{"op", "set_param"}, {"node", macro_node}, {"param", "mix"}, {"value", 0.25}}}}});
+  REQUIRE(reply["ok"] == true);
+  CHECK(reply["kind"] == "smooth");
+
+  const auto params = viewer.wait_event("rig.params");
+  REQUIRE_FALSE(params.is_null());
+  CHECK(params["values"][0]["node"] == macro_node);
+  CHECK(params["values"][0]["address"]["node"] == macro_node);
+  CHECK(params["values"][0]["seq"].get<uint64_t>() > before["seq"].get<uint64_t>());
+
+  // Recorded on the macro, so a later structural edit doesn't revert it.
+  bool recorded = false;
+  const auto after = actor.call({{"method", "rig.get"}});
+  for (const auto& node : after["document"]["chains"][0]["nodes"])
+    if (node["id"] == macro_node)
+      recorded = node["mix"] == 0.25;
+  CHECK(recorded);
+
+  // A parameter the macro doesn't have is still the structural path's to refuse.
+  const auto wrong = actor.call(
+    {{"method", "rig.patch"}, {"ops", {{{"op", "set_param"}, {"node", macro_node}, {"param", "nonsense"}, {"value", 1}}}}});
+  CHECK(wrong["ok"] == false);
+}
+
+TEST_CASE("a large reply over the local socket arrives whole")
+{
+  // Larger than the kernel's default send buffer (208 KiB), which used to close the connection.
+  const std::string padding(300 * 1024, 'x');
+  Running running([&padding](Config& config, const std::filesystem::path& root) {
+    nlohmann::json document = nlohmann::json::parse(gain_rig("Big", 0.5));
+    document["meta"] = {{"padding", padding}};
+    write_file(root / "big.json", document.dump());
+    config.rig = (root / "big.json").string();
+  });
+  Client client(running.config.socket_path);
+  running.wait_running(client);
+  const auto reply = client.call({{"method", "rig.get"}});
+  REQUIRE(reply["ok"] == true);
+  CHECK(reply["document"]["meta"]["padding"].get<std::string>().size() == padding.size());
+}
+
+TEST_CASE("a reply or event too large for the socket is refused in words, and the connection stays")
+{
+  if (platform::local_transport_is_stream)
+    return; // a stream has no datagram limit, and this is the case it never reaches
+
+  const std::string padding(64 * 1024, 'x');
+  Running running([](Config& config, const std::filesystem::path&) { config.local_send_buffer_bytes = 16 * 1024; });
+  Client client(running.config.socket_path);
+  running.wait_running(client);
+  Client viewer(running.config.socket_path);
+  REQUIRE(viewer.call({{"method", "engine.subscribe"}, {"events", {"rig"}}})["ok"] == true);
+
+  nlohmann::json document = nlohmann::json::parse(gain_rig("Big", 0.5));
+  document["meta"] = {{"padding", padding}};
+  REQUIRE(client.call({{"method", "rig.apply"}, {"document", document}})["ok"] == true);
+
+  // The event couldn't fit: the subscriber is told it missed something.
+  CHECK_FALSE(viewer.wait_event("resync").is_null());
+
+  // The reply can't fit: it says so, under the request's id (call() matches it), and carries on.
+  const auto reply = client.call({{"method", "rig.get"}});
+  CHECK(reply["ok"] == false);
+  CHECK(reply["error"]["code"] == "reply_too_large");
+  CHECK(client.call({{"method", "engine.status"}})["ok"] == true);
 }

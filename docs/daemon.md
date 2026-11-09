@@ -256,12 +256,14 @@ transport is a detail it picks at startup.
 | Bind | `socket` | `tcp_address`/`tcp_port`, **loopback by default** |
 
 **On Linux, the Unix socket carries each reply as one datagram.** A datagram can be no larger than
-the socket's send buffer, about 208 KiB with the kernel's default `net.core.wmem_default`. So a larger
-reply can't be sent there, and `namchainctl` reports "the daemon closed the connection". That includes
-`engine.assets` or `engine.schema` for a library of more than a few hundred impulse responses. TCP
-has no such limit, so ask over it instead, on the device itself if need be:
-`namchainctl --host 127.0.0.1 --token-file /etc/namchain/token assets`. On macOS the local socket is
-a stream with the length prefix, so the limit doesn't apply there.
+the socket's send buffer, so namchaind asks for 2 MiB on each local connection. The kernel doubles
+that and clamps it to `net.core.wmem_max`: about 426 KiB on a stock kernel, 4 MiB on vip. A reply that
+still doesn't fit is answered `reply_too_large`, saying the size and the limit, and the connection
+stays open; ask over TCP instead, on the device itself if need be:
+`namchainctl --host 127.0.0.1 --token-file /etc/namchain/token assets`. An event that doesn't fit is
+dropped and the subscriber is sent `resync`. A client must read with a buffer as large as the largest
+reply it wants, because a short read of a datagram loses the rest. On macOS the local socket is a
+stream with the length prefix, so none of this applies there.
 
 TCP is off unless an operator turns it on, and the daemon **refuses to start** with `tcp_listen` set
 and no token: an unauthenticated control port that can rewrite the rig and mute the output is worse
@@ -512,7 +514,7 @@ meters rather than drawing a floor.
 
 The error codes a client may have to act on are `bad_json`, `bad_request`, `unknown_method`,
 `unknown_chain`, `rig_not_found`, `patch_rejected`, `compile_failed`, `asset_missing`, `over_budget`,
-`path_refused`, `unauthorized`, `message_too_large`, `too_many_connections`, `unsupported_protocol`
+`path_refused`, `unauthorized`, `message_too_large`, `reply_too_large`, `too_many_connections`, `unsupported_protocol`
 and `conflict`. A refusal is a normal answer:
 the connection stays open (except after a framing error, a third failed authentication, or a full
 connection table) and the running plan is untouched.
@@ -721,7 +723,7 @@ primitives when a chain is compiled, so nothing on the render path — and no no
 macros exist. `rig.get` returns both views: the document with its macros, and the primitives they
 became.
 
-A macro is addressed by `element` (its own parameters) or `element` + `role` (one node inside it), and
+A macro is addressed by `element` or its node's `id` (its own parameters), or `element` + `role` (one node inside it), and
 `engine.schema` publishes both its parameter map and its roles. docs/macros.md is the reference,
 including what a macro-level `set_param` records and the two bypass rules.
 

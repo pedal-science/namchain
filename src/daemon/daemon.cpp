@@ -515,10 +515,22 @@ bool resolve_smooth_edit(const EditContext& context, const nlohmann::json& op, R
   const graph::Chain& chain = *context.chain;
   const std::vector<std::string>& node_ids = slot->plan->node_ids();
 
-  // (a) `element` alone naming a macro: the macro-level parameter, mapped onto every node it drives.
+  // (a) A macro: the macro-level parameter, mapped onto every node it drives. Named by `element` alone,
+  //     or by the macro node's own id, which says the same thing: `rig.get` hands a client both, and
+  //     the answer should not be a recompile for one and a ramp for the other.
   //     Tried before the plan lookup, because a macro node is not *in* the plan -- it was lowered.
-  if (!element.empty() && role.empty() && !has_node)
+  std::string macro_element = has_node ? std::string() : element;
+  if (has_node && role.empty() && port < 0)
   {
+    const nlohmann::json& named = op.contains("node") ? op["node"] : op["id"];
+    if (named.is_string())
+      for (const graph::NodeSpec& spec : chain.graph.nodes)
+        if (spec.id == named.get<std::string>() && graph::find_macro_type(spec.type) != nullptr)
+          macro_element = spec.element;
+  }
+  if (!macro_element.empty() && role.empty())
+  {
+    const std::string& element = macro_element;
     const graph::MacroType* macro = nullptr;
     const graph::NodeSpec* macro_spec = nullptr;
     for (const graph::NodeSpec& spec : chain.graph.nodes)
@@ -1132,6 +1144,19 @@ void Daemon::accept_connections(int listener, PeerKind peer)
         connection.has_auth_deadline = true;
       }
     }
+    else if (!peer_is_framed(peer))
+    {
+      // Each reply is one datagram, and the kernel refuses a datagram larger than the send buffer. The
+      // default is about 208 KiB, smaller than engine.schema on a real library, so ask for more, and
+      // read back what was given: the request is clamped to net.core.wmem_max. The kernel keeps 32
+      // bytes of the buffer for itself (unix_dgram_sendmsg).
+      int send_buffer = config_.local_send_buffer_bytes;
+      ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
+      int given = 0;
+      socklen_t given_size = sizeof(given);
+      if (::getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &given, &given_size) == 0 && given > 32)
+        connection.datagram_limit = static_cast<std::size_t>(given) - 32;
+    }
     connection.session.id = next_connection_id_++;
     clients_.push_back(std::move(connection));
   }
@@ -1139,6 +1164,20 @@ void Daemon::accept_connections(int listener, PeerKind peer)
 
 void Daemon::queue_reply(Connection& connection, std::string reply)
 {
+  // A reply that cannot be one datagram is refused in words, on a connection that stays open. Sending
+  // it anyway gets EMSGSIZE, which is indistinguishable from a client being hung up on.
+  if (connection.datagram_limit != 0 && reply.size() > connection.datagram_limit)
+  {
+    const nlohmann::json original = nlohmann::json::parse(reply, nullptr, false);
+    const std::string id = original.is_object() && original.contains("id") && original["id"].is_string()
+                             ? original["id"].get<std::string>()
+                             : std::string();
+    reply = error_response(id, "reply_too_large",
+                           "the reply is " + std::to_string(reply.size()) + " bytes and this socket's limit is " +
+                             std::to_string(connection.datagram_limit) +
+                             " (net.core.wmem_max); ask over TCP, which has no such limit");
+  }
+
   if (peer_is_framed(connection.session.peer))
     append_frame(connection.out, reply);
   else
@@ -1313,6 +1352,16 @@ bool Daemon::pump_events(Connection& connection)
     std::string frame = std::move(connection.events.front());
     connection.events.pop_front();
     connection.event_bytes -= frame.size();
+    if (connection.datagram_limit != 0 && frame.size() > connection.datagram_limit)
+    {
+      // It cannot be delivered, so this subscriber has missed something, which is what resync is for.
+      connection.events.clear();
+      connection.event_bytes = 0;
+      connection.params.clear();
+      connection.param_keys.clear();
+      connection.overflowed = true;
+      return true;
+    }
     if (framed)
       append_frame(connection.out, frame);
     else
